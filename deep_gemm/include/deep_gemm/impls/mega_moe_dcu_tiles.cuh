@@ -30,6 +30,8 @@ __device__ static inline void compute_route_mmac_mtile16_l1_chunk(
     const int c_n_base = lane_group;
     const bool row_valid = lane_m < valid_rows;
     const int l1_rows = intermediate_hidden * 2;
+    const float* l1_weights_sf_expert =
+        l1_weights_sf + static_cast<int64_t>(local_expert) * l1_rows;
     const int inter_base0 = inter_start + wave_id * kMTile16L1NChunksPerWave * 16;
     const int inter_base1 = inter_base0 + 16;
     const int inter_base2 = inter_base0 + 32;
@@ -69,34 +71,50 @@ __device__ static inline void compute_route_mmac_mtile16_l1_chunk(
     const int up_row2 = intermediate_hidden + gate_row2;
     const int gate_row3 = inter_base3 + lane_n;
     const int up_row3 = intermediate_hidden + gate_row3;
+    const int64_t gate_base0 = marlin_nt_kpack2_row_base_offset(
+        local_expert, gate_row0, l1_rows, hidden);
+    const int64_t up_base0 = marlin_nt_kpack2_row_base_offset(
+        local_expert, up_row0, l1_rows, hidden);
+    const int64_t gate_base1 = marlin_nt_kpack2_row_base_offset(
+        local_expert, gate_row1, l1_rows, hidden);
+    const int64_t up_base1 = marlin_nt_kpack2_row_base_offset(
+        local_expert, up_row1, l1_rows, hidden);
+    const int64_t gate_base2 = marlin_nt_kpack2_row_base_offset(
+        local_expert, gate_row2, l1_rows, hidden);
+    const int64_t up_base2 = marlin_nt_kpack2_row_base_offset(
+        local_expert, up_row2, l1_rows, hidden);
+    const int64_t gate_base3 = marlin_nt_kpack2_row_base_offset(
+        local_expert, gate_row3, l1_rows, hidden);
+    const int64_t up_base3 = marlin_nt_kpack2_row_base_offset(
+        local_expert, up_row3, l1_rows, hidden);
     for (int k_base = 0; k_base < hidden; k_base += 32) {
         const int k_idx = k_base + lane_k;
         const dcu::int32x2_t a_vec = row_valid
             ? dcu::pack8_fp8(x_row + k_idx)
             : zero8;
         const dcu::int32x2_t gate_vec0 = inter_valid0
-            ? pack8_fp8_weight_marlin(l1_weights, local_expert, gate_row0, k_idx, l1_rows, hidden)
+            ? pack8_fp8_weight_marlin_row_base(l1_weights, gate_base0, k_idx)
             : zero8;
         const dcu::int32x2_t up_vec0 = inter_valid0
-            ? pack8_fp8_weight_marlin(l1_weights, local_expert, up_row0, k_idx, l1_rows, hidden)
+            ? pack8_fp8_weight_marlin_row_base(l1_weights, up_base0, k_idx)
             : zero8;
         const dcu::int32x2_t gate_vec1 = inter_valid1
-            ? pack8_fp8_weight_marlin(l1_weights, local_expert, gate_row1, k_idx, l1_rows, hidden)
+            ? pack8_fp8_weight_marlin_row_base(l1_weights, gate_base1, k_idx)
             : zero8;
         const dcu::int32x2_t up_vec1 = inter_valid1
-            ? pack8_fp8_weight_marlin(l1_weights, local_expert, up_row1, k_idx, l1_rows, hidden)
+            ? pack8_fp8_weight_marlin_row_base(l1_weights, up_base1, k_idx)
             : zero8;
         const dcu::int32x2_t gate_vec2 = inter_valid2
-            ? pack8_fp8_weight_marlin(l1_weights, local_expert, gate_row2, k_idx, l1_rows, hidden)
+            ? pack8_fp8_weight_marlin_row_base(l1_weights, gate_base2, k_idx)
             : zero8;
         const dcu::int32x2_t up_vec2 = inter_valid2
-            ? pack8_fp8_weight_marlin(l1_weights, local_expert, up_row2, k_idx, l1_rows, hidden)
+            ? pack8_fp8_weight_marlin_row_base(l1_weights, up_base2, k_idx)
             : zero8;
         const dcu::int32x2_t gate_vec3 = inter_valid3
-            ? pack8_fp8_weight_marlin(l1_weights, local_expert, gate_row3, k_idx, l1_rows, hidden)
+            ? pack8_fp8_weight_marlin_row_base(l1_weights, gate_base3, k_idx)
             : zero8;
         const dcu::int32x2_t up_vec3 = inter_valid3
-            ? pack8_fp8_weight_marlin(l1_weights, local_expert, up_row3, k_idx, l1_rows, hidden)
+            ? pack8_fp8_weight_marlin_row_base(l1_weights, up_base3, k_idx)
             : zero8;
         gate_acc0 = dcu::mmac_f32_16x16x32_fp8_fp8(a_vec, gate_vec0, gate_acc0);
         up_acc0 = dcu::mmac_f32_16x16x32_fp8_fp8(a_vec, up_vec0, up_acc0);
@@ -114,10 +132,8 @@ __device__ static inline void compute_route_mmac_mtile16_l1_chunk(
             const int n = c_n_base + 4 * slot;
             const int inter_idx = inter_base0 + n;
             if (inter_idx < intermediate_hidden) {
-                const float gate_scale = x_scale * load_weight_scale_channelwise(
-                    l1_weights_sf, local_expert, inter_idx, l1_rows);
-                const float up_scale = x_scale * load_weight_scale_channelwise(
-                    l1_weights_sf, local_expert, intermediate_hidden + inter_idx, l1_rows);
+                const float gate_scale = x_scale * l1_weights_sf_expert[inter_idx];
+                const float up_scale = x_scale * l1_weights_sf_expert[intermediate_hidden + inter_idx];
                 float gate = vec4_get(gate_acc0, slot) * gate_scale;
                 float up = vec4_get(up_acc0, slot) * up_scale;
                 if (isfinite(activation_clamp)) {
@@ -136,10 +152,8 @@ __device__ static inline void compute_route_mmac_mtile16_l1_chunk(
             const int n = c_n_base + 4 * slot;
             const int inter_idx = inter_base1 + n;
             if (inter_idx < intermediate_hidden) {
-                const float gate_scale = x_scale * load_weight_scale_channelwise(
-                    l1_weights_sf, local_expert, inter_idx, l1_rows);
-                const float up_scale = x_scale * load_weight_scale_channelwise(
-                    l1_weights_sf, local_expert, intermediate_hidden + inter_idx, l1_rows);
+                const float gate_scale = x_scale * l1_weights_sf_expert[inter_idx];
+                const float up_scale = x_scale * l1_weights_sf_expert[intermediate_hidden + inter_idx];
                 float gate = vec4_get(gate_acc1, slot) * gate_scale;
                 float up = vec4_get(up_acc1, slot) * up_scale;
                 if (isfinite(activation_clamp)) {
@@ -158,10 +172,8 @@ __device__ static inline void compute_route_mmac_mtile16_l1_chunk(
             const int n = c_n_base + 4 * slot;
             const int inter_idx = inter_base2 + n;
             if (inter_idx < intermediate_hidden) {
-                const float gate_scale = x_scale * load_weight_scale_channelwise(
-                    l1_weights_sf, local_expert, inter_idx, l1_rows);
-                const float up_scale = x_scale * load_weight_scale_channelwise(
-                    l1_weights_sf, local_expert, intermediate_hidden + inter_idx, l1_rows);
+                const float gate_scale = x_scale * l1_weights_sf_expert[inter_idx];
+                const float up_scale = x_scale * l1_weights_sf_expert[intermediate_hidden + inter_idx];
                 float gate = vec4_get(gate_acc2, slot) * gate_scale;
                 float up = vec4_get(up_acc2, slot) * up_scale;
                 if (isfinite(activation_clamp)) {
@@ -180,10 +192,8 @@ __device__ static inline void compute_route_mmac_mtile16_l1_chunk(
             const int n = c_n_base + 4 * slot;
             const int inter_idx = inter_base3 + n;
             if (inter_idx < intermediate_hidden) {
-                const float gate_scale = x_scale * load_weight_scale_channelwise(
-                    l1_weights_sf, local_expert, inter_idx, l1_rows);
-                const float up_scale = x_scale * load_weight_scale_channelwise(
-                    l1_weights_sf, local_expert, intermediate_hidden + inter_idx, l1_rows);
+                const float gate_scale = x_scale * l1_weights_sf_expert[inter_idx];
+                const float up_scale = x_scale * l1_weights_sf_expert[intermediate_hidden + inter_idx];
                 float gate = vec4_get(gate_acc3, slot) * gate_scale;
                 float up = vec4_get(up_acc3, slot) * up_scale;
                 if (isfinite(activation_clamp)) {
@@ -294,6 +304,8 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
     const int c_n_base = lane_group;
     const bool row_valid = lane_m < valid_rows;
     const int l2_rows = hidden;
+    const float* l2_weights_sf_expert =
+        l2_weights_sf + static_cast<int64_t>(local_expert) * l2_rows;
     const int h_base0 = hidden_start + wave_id * kMTile16L2NChunksPerWave * 16;
     const int h_base1 = h_base0 + 16;
     const int h_base2 = h_base0 + 32;
@@ -318,6 +330,22 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
     const bool hidden_valid5 = h_row5 < hidden;
     const bool hidden_valid6 = h_row6 < hidden;
     const bool hidden_valid7 = h_row7 < hidden;
+    const int64_t h_base_offset0 = marlin_nt_kpack2_row_base_offset(
+        local_expert, h_row0, l2_rows, intermediate_hidden);
+    const int64_t h_base_offset1 = marlin_nt_kpack2_row_base_offset(
+        local_expert, h_row1, l2_rows, intermediate_hidden);
+    const int64_t h_base_offset2 = marlin_nt_kpack2_row_base_offset(
+        local_expert, h_row2, l2_rows, intermediate_hidden);
+    const int64_t h_base_offset3 = marlin_nt_kpack2_row_base_offset(
+        local_expert, h_row3, l2_rows, intermediate_hidden);
+    const int64_t h_base_offset4 = marlin_nt_kpack2_row_base_offset(
+        local_expert, h_row4, l2_rows, intermediate_hidden);
+    const int64_t h_base_offset5 = marlin_nt_kpack2_row_base_offset(
+        local_expert, h_row5, l2_rows, intermediate_hidden);
+    const int64_t h_base_offset6 = marlin_nt_kpack2_row_base_offset(
+        local_expert, h_row6, l2_rows, intermediate_hidden);
+    const int64_t h_base_offset7 = marlin_nt_kpack2_row_base_offset(
+        local_expert, h_row7, l2_rows, intermediate_hidden);
 
     uint16_t* combine_row = nullptr;
     if (row_valid) {
@@ -341,36 +369,28 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
         const dcu::int32x2_t a_vec =
             row_valid ? dcu::pack8_fp8(act_fp8 + lane_m * intermediate_hidden + k_idx) : zero8;
         const dcu::int32x2_t w_vec0 = hidden_valid0
-            ? pack8_fp8_weight_marlin(l2_weights, local_expert, h_row0, k_idx,
-                                      l2_rows, intermediate_hidden)
+            ? pack8_fp8_weight_marlin_row_base(l2_weights, h_base_offset0, k_idx)
             : zero8;
         const dcu::int32x2_t w_vec1 = hidden_valid1
-            ? pack8_fp8_weight_marlin(l2_weights, local_expert, h_row1, k_idx,
-                                      l2_rows, intermediate_hidden)
+            ? pack8_fp8_weight_marlin_row_base(l2_weights, h_base_offset1, k_idx)
             : zero8;
         const dcu::int32x2_t w_vec2 = hidden_valid2
-            ? pack8_fp8_weight_marlin(l2_weights, local_expert, h_row2, k_idx,
-                                      l2_rows, intermediate_hidden)
+            ? pack8_fp8_weight_marlin_row_base(l2_weights, h_base_offset2, k_idx)
             : zero8;
         const dcu::int32x2_t w_vec3 = hidden_valid3
-            ? pack8_fp8_weight_marlin(l2_weights, local_expert, h_row3, k_idx,
-                                      l2_rows, intermediate_hidden)
+            ? pack8_fp8_weight_marlin_row_base(l2_weights, h_base_offset3, k_idx)
             : zero8;
         const dcu::int32x2_t w_vec4 = hidden_valid4
-            ? pack8_fp8_weight_marlin(l2_weights, local_expert, h_row4, k_idx,
-                                      l2_rows, intermediate_hidden)
+            ? pack8_fp8_weight_marlin_row_base(l2_weights, h_base_offset4, k_idx)
             : zero8;
         const dcu::int32x2_t w_vec5 = hidden_valid5
-            ? pack8_fp8_weight_marlin(l2_weights, local_expert, h_row5, k_idx,
-                                      l2_rows, intermediate_hidden)
+            ? pack8_fp8_weight_marlin_row_base(l2_weights, h_base_offset5, k_idx)
             : zero8;
         const dcu::int32x2_t w_vec6 = hidden_valid6
-            ? pack8_fp8_weight_marlin(l2_weights, local_expert, h_row6, k_idx,
-                                      l2_rows, intermediate_hidden)
+            ? pack8_fp8_weight_marlin_row_base(l2_weights, h_base_offset6, k_idx)
             : zero8;
         const dcu::int32x2_t w_vec7 = hidden_valid7
-            ? pack8_fp8_weight_marlin(l2_weights, local_expert, h_row7, k_idx,
-                                      l2_rows, intermediate_hidden)
+            ? pack8_fp8_weight_marlin_row_base(l2_weights, h_base_offset7, k_idx)
             : zero8;
         l2_acc0 = dcu::mmac_f32_16x16x32_fp8_fp8(a_vec, w_vec0, l2_acc0);
         l2_acc1 = dcu::mmac_f32_16x16x32_fp8_fp8(a_vec, w_vec1, l2_acc1);
@@ -389,8 +409,7 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
             const int n = c_n_base + 4 * slot;
             const int h_idx = h_base0 + n;
             if (h_idx < hidden) {
-                const float w2_scale = load_weight_scale_channelwise(
-                    l2_weights_sf, local_expert, h_idx, l2_rows);
+                const float w2_scale = l2_weights_sf_expert[h_idx];
                 combine_row[h_idx] = float_to_bf16_bits(
                     vec4_get(l2_acc0, slot) * row_act_scale * w2_scale);
             }
@@ -400,8 +419,7 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
             const int n = c_n_base + 4 * slot;
             const int h_idx = h_base1 + n;
             if (h_idx < hidden) {
-                const float w2_scale = load_weight_scale_channelwise(
-                    l2_weights_sf, local_expert, h_idx, l2_rows);
+                const float w2_scale = l2_weights_sf_expert[h_idx];
                 combine_row[h_idx] = float_to_bf16_bits(
                     vec4_get(l2_acc1, slot) * row_act_scale * w2_scale);
             }
@@ -411,8 +429,7 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
             const int n = c_n_base + 4 * slot;
             const int h_idx = h_base2 + n;
             if (h_idx < hidden) {
-                const float w2_scale = load_weight_scale_channelwise(
-                    l2_weights_sf, local_expert, h_idx, l2_rows);
+                const float w2_scale = l2_weights_sf_expert[h_idx];
                 combine_row[h_idx] = float_to_bf16_bits(
                     vec4_get(l2_acc2, slot) * row_act_scale * w2_scale);
             }
@@ -422,8 +439,7 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
             const int n = c_n_base + 4 * slot;
             const int h_idx = h_base3 + n;
             if (h_idx < hidden) {
-                const float w2_scale = load_weight_scale_channelwise(
-                    l2_weights_sf, local_expert, h_idx, l2_rows);
+                const float w2_scale = l2_weights_sf_expert[h_idx];
                 combine_row[h_idx] = float_to_bf16_bits(
                     vec4_get(l2_acc3, slot) * row_act_scale * w2_scale);
             }
@@ -433,8 +449,7 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
             const int n = c_n_base + 4 * slot;
             const int h_idx = h_base4 + n;
             if (h_idx < hidden) {
-                const float w2_scale = load_weight_scale_channelwise(
-                    l2_weights_sf, local_expert, h_idx, l2_rows);
+                const float w2_scale = l2_weights_sf_expert[h_idx];
                 combine_row[h_idx] = float_to_bf16_bits(
                     vec4_get(l2_acc4, slot) * row_act_scale * w2_scale);
             }
@@ -444,8 +459,7 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
             const int n = c_n_base + 4 * slot;
             const int h_idx = h_base5 + n;
             if (h_idx < hidden) {
-                const float w2_scale = load_weight_scale_channelwise(
-                    l2_weights_sf, local_expert, h_idx, l2_rows);
+                const float w2_scale = l2_weights_sf_expert[h_idx];
                 combine_row[h_idx] = float_to_bf16_bits(
                     vec4_get(l2_acc5, slot) * row_act_scale * w2_scale);
             }
@@ -455,8 +469,7 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
             const int n = c_n_base + 4 * slot;
             const int h_idx = h_base6 + n;
             if (h_idx < hidden) {
-                const float w2_scale = load_weight_scale_channelwise(
-                    l2_weights_sf, local_expert, h_idx, l2_rows);
+                const float w2_scale = l2_weights_sf_expert[h_idx];
                 combine_row[h_idx] = float_to_bf16_bits(
                     vec4_get(l2_acc6, slot) * row_act_scale * w2_scale);
             }
@@ -466,8 +479,7 @@ __device__ static inline void compute_route_mmac_mtile16_l2_chunk(
             const int n = c_n_base + 4 * slot;
             const int h_idx = h_base7 + n;
             if (h_idx < hidden) {
-                const float w2_scale = load_weight_scale_channelwise(
-                    l2_weights_sf, local_expert, h_idx, l2_rows);
+                const float w2_scale = l2_weights_sf_expert[h_idx];
                 combine_row[h_idx] = float_to_bf16_bits(
                     vec4_get(l2_acc7, slot) * row_act_scale * w2_scale);
             }

@@ -40,6 +40,13 @@ __device__ static inline dcu::int32x2_t pack8_fp8_weight_marlin(const uint8_t* w
     return dcu::pack8_fp8(weight + marlin_nt_kpack2_offset(expert_idx, row_idx, k_idx, rows, k));
 }
 
+__device__ static inline dcu::int32x2_t pack8_fp8_weight_marlin_row_base(
+    const uint8_t* weight,
+    const int64_t row_base_offset,
+    const int k_idx) {
+    return dcu::pack8_fp8(weight + row_base_offset + marlin_nt_kpack2_k_offset(k_idx));
+}
+
 __device__ static inline float load_weight_scale_channelwise(const float* sf,
                                                             const int expert_idx,
                                                             const int row_idx,

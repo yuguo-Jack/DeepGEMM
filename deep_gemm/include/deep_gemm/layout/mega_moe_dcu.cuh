@@ -30,6 +30,28 @@ __host__ __device__ static inline int64_t marlin_nt_kpack2_offset(
            row_inner * kTileK + k_inner;
 }
 
+__host__ __device__ static inline int64_t marlin_nt_kpack2_row_base_offset(
+    const int expert_idx,
+    const int row_idx,
+    const int rows,
+    const int k) {
+    constexpr int kTileN = 16;
+    constexpr int kTileK = 16;
+    const int row_tile = row_idx / kTileN;
+    const int row_inner = row_idx - row_tile * kTileN;
+    const int row_tiles = rows / kTileN;
+    return (static_cast<int64_t>(expert_idx) * row_tiles + row_tile) * k * kTileK +
+           row_inner * kTileK;
+}
+
+__host__ __device__ static inline int marlin_nt_kpack2_k_offset(const int k_idx) {
+    constexpr int kTileN = 16;
+    constexpr int kTileK = 16;
+    const int k_tile = k_idx / kTileK;
+    const int k_inner = k_idx - k_tile * kTileK;
+    return k_tile * kTileN * kTileK + k_inner;
+}
+
 __host__ __device__ static inline int64_t workspace_task_capacity_per_expert(
     const int num_ranks,
     const int num_max_tokens_per_rank) {

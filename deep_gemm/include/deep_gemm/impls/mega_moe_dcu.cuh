@@ -4,6 +4,7 @@
 #include <deep_gemm/comm/mega_moe_dcu.cuh>
 #include <deep_gemm/impls/mega_moe_dcu_task.cuh>
 #include <deep_gemm/impls/mega_moe_dcu_tiles.cuh>
+#include <deep_gemm/scheduler/mega_moe_dcu.cuh>
 
 namespace deep_gemm::mega {
 
@@ -202,12 +203,13 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
         __shared__ int block_quant_subtile;
         __shared__ int block_l2_queue_idx;
         __shared__ int block_stop;
+        const int total_l1_tasks = total_subtiles * num_inter_chunks;
         while (true) {
             if (threadIdx.x == 0)
                 block_l1_task = atomicAdd(pipeline_counters + 0, 1);
             __syncthreads();
 
-            if (block_l1_task < total_subtiles * num_inter_chunks) {
+            if (block_l1_task < total_l1_tasks) {
                 const int subtile_task_id = block_l1_task / num_inter_chunks;
                 const int chunk_id = block_l1_task - subtile_task_id * num_inter_chunks;
                 const int tile_id = subtile_task_id / subtiles_per_tile;
@@ -270,53 +272,17 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
                 }
             }
 
-            if (threadIdx.x == 0) {
-                block_l2_queue_idx = -1;
-                while (true) {
-                    const int head = dcu_load_acquire_int(
-                        reinterpret_cast<volatile int*>(pipeline_counters + 2));
-                    const int tail = dcu_load_acquire_int(
-                        reinterpret_cast<volatile int*>(pipeline_counters + 1));
-                    if (head >= tail)
-                        break;
-                    if (atomicCAS(pipeline_counters + 2, head, head + 1) == head) {
-                        block_l2_queue_idx = head;
-                        break;
-                    }
-                }
-            }
-            __syncthreads();
-
-            if (block_l2_queue_idx >= 0) {
-                while (dcu_load_acquire_int(
-                           reinterpret_cast<volatile int*>(l2_queue_ready + block_l2_queue_idx)) == 0) {}
-                const int task_id = l2_queue[block_l2_queue_idx];
-                const int subtile_task_id = task_id / num_hidden_chunks;
-                const int chunk_id = task_id - subtile_task_id * num_hidden_chunks;
-                const int tile_id = subtile_task_id / subtiles_per_tile;
-                const int subtile_idx = subtile_task_id - tile_id * subtiles_per_tile;
-                const int valid_rows = dcu_route_subtile_valid_rows(tile_counts[tile_id], subtile_idx);
-                if (valid_rows > 0) {
-                    const int64_t tile_meta_base = dcu_route_meta_base(tile_id, route_tile_log2_m, subtile_idx);
-                    const int64_t act_offset =
-                        ((static_cast<int64_t>(tile_id) << route_tile_log2_m) +
-                         (static_cast<int64_t>(subtile_idx) << kDcuMmacTileMLog2)) * intermediate_hidden;
-                    const int64_t scale_offset =
-                        (static_cast<int64_t>(tile_id) << route_tile_log2_m) +
-                        (static_cast<int64_t>(subtile_idx) << kDcuMmacTileMLog2);
-                    compute_route_mmac_mtile16_l2_chunk(
-                        tile_experts[tile_id], chunk_id * hidden_chunk,
-                        valid_rows,
-                        tile_meta_base,
-                        hidden, intermediate_hidden,
-                        tile_combine_row_ptrs,
-                        l2_weights, l2_weights_sf,
-                        all_act_fp8 + act_offset,
-                        all_act_scale + scale_offset);
-                }
-                if (threadIdx.x == 0)
-                    dcu_fetch_add_release_int(pipeline_counters + 3, 1);
-            }
+            dcu_try_run_l2_queue_task(
+                &block_l2_queue_idx,
+                pipeline_counters,
+                l2_queue, l2_queue_ready,
+                num_hidden_chunks, subtiles_per_tile,
+                tile_counts, tile_experts,
+                route_tile_log2_m,
+                hidden_chunk, hidden, intermediate_hidden,
+                tile_combine_row_ptrs,
+                l2_weights, l2_weights_sf,
+                all_act_fp8, all_act_scale);
 
             if (threadIdx.x == 0) {
                 block_stop = dcu_load_acquire_int(
