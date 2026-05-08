@@ -22,3 +22,5 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+hygon_tmp/
+.playwright-cli/

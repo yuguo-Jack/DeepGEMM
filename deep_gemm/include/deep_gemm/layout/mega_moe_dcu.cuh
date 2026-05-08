@@ -1,0 +1,78 @@
+#pragma once
+
+#include <cstdint>
+
+#include <hip/hip_runtime.h>
+
+namespace deep_gemm::mega {
+
+static constexpr int kTokenAlignment = 384;
+
+__host__ __device__ static inline int64_t align_i64(const int64_t value, const int64_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+__host__ __device__ static inline int64_t marlin_nt_kpack2_offset(
+    const int expert_idx,
+    const int row_idx,
+    const int k_idx,
+    const int rows,
+    const int k) {
+    constexpr int kTileN = 16;
+    constexpr int kTileK = 16;
+    const int row_tile = row_idx / kTileN;
+    const int row_inner = row_idx - row_tile * kTileN;
+    const int k_tile = k_idx / kTileK;
+    const int k_inner = k_idx - k_tile * kTileK;
+    const int row_tiles = rows / kTileN;
+    return ((static_cast<int64_t>(expert_idx) * row_tiles + row_tile) * k +
+            k_tile * kTileN) * kTileK +
+           row_inner * kTileK + k_inner;
+}
+
+__host__ __device__ static inline int64_t workspace_task_capacity_per_expert(
+    const int num_ranks,
+    const int num_max_tokens_per_rank) {
+    return static_cast<int64_t>(num_ranks) * num_ranks * num_max_tokens_per_rank;
+}
+
+__host__ __device__ static inline int64_t workspace_bytes(const int num_ranks,
+                                                         const int num_experts,
+                                                         const int num_max_tokens_per_rank) {
+    const int num_experts_per_rank = num_experts / num_ranks;
+    int64_t bytes = 0;
+    bytes += static_cast<int64_t>(num_experts_per_rank) * sizeof(int);
+    bytes = align_i64(bytes, 16);
+    bytes += static_cast<int64_t>(num_experts_per_rank) *
+             workspace_task_capacity_per_expert(num_ranks, num_max_tokens_per_rank) *
+             sizeof(int);
+    return align_i64(bytes, 16);
+}
+
+__host__ __device__ static inline int64_t combine_token_offset(const int num_ranks,
+                                                              const int num_experts,
+                                                              const int num_max_tokens_per_rank,
+                                                              const int num_topk,
+                                                              const int hidden) {
+    const int64_t input_token_offset = workspace_bytes(num_ranks, num_experts, num_max_tokens_per_rank);
+    const int64_t input_sf_offset =
+        input_token_offset + static_cast<int64_t>(num_max_tokens_per_rank) * hidden;
+    const int64_t topk_idx_offset =
+        input_sf_offset + static_cast<int64_t>(num_max_tokens_per_rank) * sizeof(float);
+    const int64_t topk_weights_offset =
+        topk_idx_offset + static_cast<int64_t>(num_max_tokens_per_rank) * num_topk * sizeof(int64_t);
+    return topk_weights_offset +
+           static_cast<int64_t>(num_max_tokens_per_rank) * num_topk * sizeof(float);
+}
+
+__device__ static inline int* workspace_expert_counts(uint8_t* sym_buffer) {
+    return reinterpret_cast<int*>(sym_buffer);
+}
+
+__device__ static inline int* workspace_expert_task_pool(uint8_t* sym_buffer,
+                                                         const int num_experts_per_rank) {
+    const int64_t offset = align_i64(static_cast<int64_t>(num_experts_per_rank) * sizeof(int), 16);
+    return reinterpret_cast<int*>(sym_buffer + offset);
+}
+
+} // namespace deep_gemm::mega

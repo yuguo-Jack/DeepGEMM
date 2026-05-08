@@ -13,6 +13,10 @@ except Exception as exception:
 from .. import _C
 
 
+def _is_hip_backend() -> bool:
+    return getattr(torch.version, 'hip', None) is not None
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  # MoE arguments
@@ -21,6 +25,11 @@ class SymmBuffer:
                  hidden: int, intermediate_hidden: int,
                  use_fp8_dispatch: bool = True,
                  activation: str = 'swiglu'):
+        if _is_hip_backend():
+            raise RuntimeError(
+                'deep_gemm.mega keeps the CUDA FP8/FP4 MegaMoE path; '
+                'use the standalone megamoe package for DCU/HIP W8A8 FP8 MegaMoE')
+
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -114,6 +123,11 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
+    if _is_hip_backend():
+        raise RuntimeError(
+            'fp8_fp4_mega_moe is CUDA/SM100-only. '
+            'Use megamoe.fp8_w8a8_mega_moe for DCU/HIP channelwise W8A8 FP8 MegaMoE')
+
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,

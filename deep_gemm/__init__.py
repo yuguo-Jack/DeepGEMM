@@ -78,6 +78,10 @@ try:
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 except ImportError:
     # Expected behavior for CUDA runtime version before 12.1
+    try:
+        from ._C import transform_sf_into_required_layout
+    except ImportError:
+        pass
     pass
 
 # Mega kernels
@@ -103,6 +107,12 @@ except Exception as e:
 def _find_cuda_home() -> str:
     # TODO: reuse PyTorch API later
     # For some PyTorch versions, the original `_find_cuda_home` will initialize CUDA, which is incompatible with process forks
+    if getattr(torch.version, 'hip', None) is not None:
+        rocm_home = (os.environ.get('ROCM_HOME') or os.environ.get('ROCM_PATH') or
+                     os.environ.get('HIP_PATH') or '/opt/dtk')
+        assert os.path.exists(rocm_home)
+        return rocm_home
+
     cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
     if cuda_home is None:
         # noinspection PyBroadException
