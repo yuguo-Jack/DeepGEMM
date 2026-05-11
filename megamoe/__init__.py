@@ -276,4 +276,4 @@ __all__ = [
     "fp8_w8a8_mega_moe",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1"

@@ -4,14 +4,17 @@
 
 namespace deep_gemm::mega {
 
-static constexpr int kDcuMmacTileM = 16;
-static constexpr int kDcuMmacTileMLog2 = 4;
-static constexpr int kDcuRouteTileMMin = 16;
-static constexpr int kDcuRouteTileMMid = 64;
-static constexpr int kDcuRouteTileMLarge = 128;
 static constexpr int kDcuRouteTileMMinLog2 = 4;
-static constexpr int kDcuRouteTileMMidLog2 = 6;
-static constexpr int kDcuRouteTileMLargeLog2 = 7;
+static constexpr int kDcuPipelinePullTileHead = 0;
+static constexpr int kDcuPipelineL1TaskHead = 1;
+static constexpr int kDcuPipelineL2QueueTail = 2;
+static constexpr int kDcuPipelineL2QueueHead = 3;
+static constexpr int kDcuPipelineL2Done = 4;
+static constexpr int kDcuPipelineCounterCount = 5;
+
+__host__ __device__ static inline int dcu_route_tile_m_from_log2(const int tile_m_log2) {
+    return 1 << tile_m_log2;
+}
 
 struct DcuRouteTileScratchLayout {
     int tile_m;
@@ -19,6 +22,7 @@ struct DcuRouteTileScratchLayout {
     int64_t act_bf16_offset;
     int64_t act_fp8_offset;
     int64_t act_scale_offset;
+    int64_t act_chunk_amax_offset;
     int64_t tile_x_row_ptrs_offset;
     int64_t tile_combine_row_ptrs_offset;
     int64_t tile_route_weight_offset;
@@ -26,6 +30,10 @@ struct DcuRouteTileScratchLayout {
     int64_t tile_expert_offset;
     int64_t tile_pool_base_offset;
     int64_t tile_count_offset;
+    int64_t expert_l1_task_offset;
+    int64_t expert_quant_done_count_offset;
+    int64_t l2_group_done_count_offset;
+    int64_t tile_pull_done_offset;
     int64_t l1_done_count_offset;
     int64_t l2_queue_offset;
     int64_t l2_queue_ready_offset;
@@ -33,37 +41,6 @@ struct DcuRouteTileScratchLayout {
     int64_t total_tiles_offset;
     int64_t bytes;
 };
-
-__host__ __device__ static inline int choose_dcu_route_tile_log2_m(
-    const int num_ranks,
-    const int num_tokens,
-    const int num_topk,
-    const int num_experts_per_rank) {
-    (void)num_ranks;
-    (void)num_tokens;
-    (void)num_topk;
-    (void)num_experts_per_rank;
-    // Keep large route tiles disabled until their direct-to-LDS mainloop is ready.
-    // With the legacy M16 MMAC subpath, M64/M128 only add padding work.
-    return kDcuRouteTileMMinLog2;
-}
-
-__host__ __device__ static inline int dcu_route_tile_m_from_log2(const int tile_m_log2) {
-    return 1 << tile_m_log2;
-}
-
-__host__ __device__ static inline int choose_dcu_route_tile_m(
-    const int num_ranks,
-    const int num_tokens,
-    const int num_topk,
-    const int num_experts_per_rank) {
-    return dcu_route_tile_m_from_log2(
-        choose_dcu_route_tile_log2_m(num_ranks, num_tokens, num_topk, num_experts_per_rank));
-}
-
-__host__ __device__ static inline int dcu_route_subtiles_per_tile_log2(const int tile_m_log2) {
-    return 1 << (tile_m_log2 - kDcuMmacTileMLog2);
-}
 
 __host__ __device__ static inline DcuRouteTileScratchLayout dcu_route_tile_scratch_layout(
     const int64_t max_route_tiles,
@@ -84,6 +61,11 @@ __host__ __device__ static inline DcuRouteTileScratchLayout dcu_route_tile_scrat
     offset = align_i64(offset, 16);
     layout.act_scale_offset = offset;
     offset += max_route_tiles * tile_m * static_cast<int64_t>(sizeof(float));
+    offset = align_i64(offset, 16);
+    layout.act_chunk_amax_offset = offset;
+    offset += max_route_tiles * tile_m *
+              ((intermediate_hidden + 255) / 256) *
+              static_cast<int64_t>(sizeof(float));
     offset = align_i64(offset, 16);
     layout.tile_x_row_ptrs_offset = offset;
     offset += max_route_tiles * tile_m * static_cast<int64_t>(sizeof(uint8_t*));
@@ -106,8 +88,20 @@ __host__ __device__ static inline DcuRouteTileScratchLayout dcu_route_tile_scrat
     layout.tile_count_offset = offset;
     offset += max_route_tiles * static_cast<int64_t>(sizeof(int));
     offset = align_i64(offset, 16);
+    layout.expert_l1_task_offset = offset;
+    offset += (max_route_tiles + 1) * static_cast<int64_t>(sizeof(int));
+    offset = align_i64(offset, 16);
+    layout.expert_quant_done_count_offset = offset;
+    offset += (max_route_tiles + 1) * static_cast<int64_t>(sizeof(int));
+    offset = align_i64(offset, 16);
     const int subtiles_per_tile = tile_m / kDcuMmacTileM;
     const int64_t max_subtiles = max_route_tiles * subtiles_per_tile;
+    layout.l2_group_done_count_offset = offset;
+    offset += max_subtiles * static_cast<int64_t>(sizeof(int));
+    offset = align_i64(offset, 16);
+    layout.tile_pull_done_offset = offset;
+    offset += max_route_tiles * static_cast<int64_t>(sizeof(int));
+    offset = align_i64(offset, 16);
     layout.l1_done_count_offset = offset;
     offset += max_subtiles * static_cast<int64_t>(sizeof(int));
     offset = align_i64(offset, 16);
@@ -119,7 +113,7 @@ __host__ __device__ static inline DcuRouteTileScratchLayout dcu_route_tile_scrat
     offset += max_l2_tasks * static_cast<int64_t>(sizeof(int));
     offset = align_i64(offset, 16);
     layout.pipeline_counter_offset = offset;
-    offset += 4 * static_cast<int64_t>(sizeof(int));
+    offset += kDcuPipelineCounterCount * static_cast<int64_t>(sizeof(int));
     offset = align_i64(offset, 16);
     layout.total_tiles_offset = offset;
     offset += static_cast<int64_t>(sizeof(int));
@@ -147,6 +141,16 @@ __device__ static inline int dcu_route_subtile_valid_rows(
     if (remaining <= 0)
         return 0;
     return remaining < kDcuMmacTileM ? remaining : kDcuMmacTileM;
+}
+
+__device__ static inline int dcu_route_mtile_valid_rows(
+    const int tile_count,
+    const int mtile_row_start,
+    const int mtile_m) {
+    const int remaining = tile_count - mtile_row_start;
+    if (remaining <= 0)
+        return 0;
+    return remaining < mtile_m ? remaining : mtile_m;
 }
 
 __device__ static inline int64_t dcu_route_meta_base(
@@ -221,10 +225,10 @@ __device__ static inline void prepare_dcu_route_tile_metadata(
     }
 }
 
-__device__ static inline void pull_dcu_route_tile_x_pool(
+__device__ static inline void pull_one_dcu_route_tile_x_pool(
     const uint8_t* const* tile_x_row_ptrs,
     const int* tile_counts,
-    const int total_tiles,
+    const int tile_id,
     const int tile_m_log2,
     const int hidden,
     const int block_stride,
@@ -232,19 +236,18 @@ __device__ static inline void pull_dcu_route_tile_x_pool(
     uint8_t* tile_x_pool) {
     constexpr int kVecBytes = 16;
     const int tile_m = dcu_route_tile_m_from_log2(tile_m_log2);
-    const int tile_m_mask = tile_m - 1;
     const int vecs_per_row = hidden / kVecBytes;
-    const int64_t total_vecs =
-        static_cast<int64_t>(total_tiles) * tile_m * vecs_per_row;
-    auto* dst_vecs = reinterpret_cast<uint4*>(tile_x_pool);
+    const int64_t total_vecs = static_cast<int64_t>(tile_m) * vecs_per_row;
+    auto* dst_vecs = reinterpret_cast<uint4*>(
+        tile_x_pool + static_cast<int64_t>(tile_id) * tile_m * hidden);
 
     for (int64_t linear_vec = thread_offset;
          linear_vec < total_vecs;
          linear_vec += block_stride) {
         const int row_linear = static_cast<int>(linear_vec / vecs_per_row);
-        const int vec_idx = static_cast<int>(linear_vec - static_cast<int64_t>(row_linear) * vecs_per_row);
-        const int tile_id = row_linear >> tile_m_log2;
-        const int row = row_linear & tile_m_mask;
+        const int vec_idx =
+            static_cast<int>(linear_vec - static_cast<int64_t>(row_linear) * vecs_per_row);
+        const int row = row_linear;
         const int64_t meta_idx = (static_cast<int64_t>(tile_id) << tile_m_log2) + row;
         uint4 value{0, 0, 0, 0};
         if (row < tile_counts[tile_id]) {

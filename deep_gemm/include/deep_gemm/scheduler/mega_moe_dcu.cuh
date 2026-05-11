@@ -5,7 +5,11 @@
 
 namespace deep_gemm::mega {
 
-__device__ static inline bool dcu_try_run_l2_queue_task(
+template <
+    typename L2TileConfig,
+    bool kUseChunkActScale = false,
+    int kActScaleChunkBytes = L2TileConfig::kKStageBytes>
+__device__ static inline bool dcu_run_l2_queue_task_if_ready(
     int* block_l2_queue_idx,
     int* pipeline_counters,
     const int* l2_queue,
@@ -22,17 +26,20 @@ __device__ static inline bool dcu_try_run_l2_queue_task(
     const uint8_t* l2_weights,
     const float* l2_weights_sf,
     const uint8_t* all_act_fp8,
-    const float* all_act_scale) {
+    const float* all_act_scale,
+    const float* all_act_chunk_scale,
+    const int num_inter_chunks,
+    uint4* lds_a_stage) {
     if (threadIdx.x == 0) {
         *block_l2_queue_idx = -1;
         while (true) {
             const int head = dcu_load_acquire_int(
-                reinterpret_cast<volatile int*>(pipeline_counters + 2));
+                reinterpret_cast<volatile int*>(pipeline_counters + kDcuPipelineL2QueueHead));
             const int tail = dcu_load_acquire_int(
-                reinterpret_cast<volatile int*>(pipeline_counters + 1));
+                reinterpret_cast<volatile int*>(pipeline_counters + kDcuPipelineL2QueueTail));
             if (head >= tail)
                 break;
-            if (atomicCAS(pipeline_counters + 2, head, head + 1) == head) {
+            if (atomicCAS(pipeline_counters + kDcuPipelineL2QueueHead, head, head + 1) == head) {
                 *block_l2_queue_idx = head;
                 break;
             }
@@ -58,7 +65,8 @@ __device__ static inline bool dcu_try_run_l2_queue_task(
             const int64_t scale_offset =
                 (static_cast<int64_t>(tile_id) << route_tile_log2_m) +
                 (static_cast<int64_t>(subtile_idx) << kDcuMmacTileMLog2);
-            compute_route_mmac_mtile16_l2_chunk(
+            compute_route_mmac_mtile16_l2_chunk<
+                L2TileConfig, kUseChunkActScale, kActScaleChunkBytes>(
                 tile_experts[tile_id], chunk_id * hidden_chunk,
                 valid_rows,
                 tile_meta_base,
@@ -66,12 +74,14 @@ __device__ static inline bool dcu_try_run_l2_queue_task(
                 tile_combine_row_ptrs,
                 l2_weights, l2_weights_sf,
                 all_act_fp8 + act_offset,
-                all_act_scale + scale_offset);
+                all_act_scale + scale_offset,
+                all_act_chunk_scale + scale_offset * num_inter_chunks,
+                num_inter_chunks,
+                lds_a_stage);
         }
         if (threadIdx.x == 0)
-            dcu_fetch_add_release_int(pipeline_counters + 3, 1);
+            dcu_fetch_add_release_int(pipeline_counters + kDcuPipelineL2Done, 1);
     }
-    __syncthreads();
     return claimed;
 }
 

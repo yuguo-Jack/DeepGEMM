@@ -139,6 +139,70 @@ deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 
+#### DCU/HIP W8A8 Mega MoE
+
+The DCU path builds a standalone `megamoe` HIP extension for Hygon `gfx938`.  The
+current fused W8A8 FP8 channelwise kernel is specialized for the DSV4-Flash
+MegaMoE size used by the benchmark below:
+
+- EP size: 8 ranks
+- Experts: 256 total, 32 per rank
+- Top-K: 6
+- Hidden size: 4096
+- Intermediate hidden size: 2048
+- Maximum tokens per rank: 1024
+
+Build on a DTK 26.04 environment:
+
+```bash
+source /opt/dtk-26.04/env.sh
+./build_dcu_megamoe.sh
+```
+
+The build script keeps intermediate files under `build/` and writes the wheel to
+`build/whl/`.  It also builds the extension in place, so the local checkout can
+run the tests directly.
+
+Run the DSV4-Flash correctness and performance check:
+
+```bash
+source /opt/dtk-26.04/env.sh
+python tests/test_mega_moe_dcu.py \
+  --num-processes 8 \
+  --num-max-tokens-per-rank 1024 \
+  --num-tokens 512 \
+  --hidden 4096 \
+  --intermediate-hidden 2048 \
+  --num-experts 256 \
+  --num-topk 6 \
+  --correctness-iters 1 \
+  --warmup 3 \
+  --repeat 8 \
+  --out hygon_tmp/megamoe_dcu_dsv4_flash_512.json
+```
+
+To sweep the DSV4-Flash token sizes while keeping the symmetric buffer capacity
+fixed at 1024 tokens per rank:
+
+```bash
+source /opt/dtk-26.04/env.sh
+mkdir -p hygon_tmp/megamoe_dcu_dsv4_flash
+for tokens in 32 64 128 256 512 1024; do
+  python tests/test_mega_moe_dcu.py \
+    --num-processes 8 \
+    --num-max-tokens-per-rank 1024 \
+    --num-tokens "${tokens}" \
+    --hidden 4096 \
+    --intermediate-hidden 2048 \
+    --num-experts 256 \
+    --num-topk 6 \
+    --correctness-iters 1 \
+    --warmup 3 \
+    --repeat 8 \
+    --out "hygon_tmp/megamoe_dcu_dsv4_flash/bench_${tokens}.json"
+done
+```
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:

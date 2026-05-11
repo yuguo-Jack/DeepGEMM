@@ -26,9 +26,23 @@ def build_cpp_function_index(root_path):
             print(f'Failed to read file {file_path}: {e}')
             continue
 
-        # Remove the compile directives and comments
+        # Remove compile directives, line-continued macro bodies, and comments.
+        # Otherwise a macro such as `do { ... } while (0)` can be merged with
+        # the following function and hide the real return type.
         lines = content.split('\n')
-        clean_lines = [line for line in lines if not line.strip().startswith(('#', '//'))]
+        clean_lines = []
+        in_directive = False
+        for line in lines:
+            stripped = line.strip()
+            if in_directive:
+                in_directive = line.rstrip().endswith('\\')
+                continue
+            if stripped.startswith('#'):
+                in_directive = line.rstrip().endswith('\\')
+                continue
+            if stripped.startswith('//'):
+                continue
+            clean_lines.append(line)
         content = '\n'.join(clean_lines)
 
         for match in pattern.finditer(content):
@@ -400,7 +414,7 @@ def parse_mdef_and_attach_cpp_signatures(item, func_index):
         if cpp_func_name and cpp_func_name in func_index:
             cpp_sig = func_index[cpp_func_name]
         else:
-            if not parsed['is_lambda']:
+            if not parsed['is_lambda'] and cpp_func_name not in {'unsupported'}:
                 print(f'Warning: C++ function "{cpp_func_name}" not found in any .cpp file')
 
         parsed['cpp_signature'] = cpp_sig
@@ -622,6 +636,18 @@ def cpp_type_to_python_type(cpp_type: str) -> str:
     if cleaned == 'void':
         return 'None'
 
+    # pybind11 helper types used by the extension API
+    if cleaned == 'pybind11::bytes':
+        return 'bytes'
+    if cleaned == 'pybind11::tuple':
+        return 'tuple[Any, ...]'
+    if cleaned == 'pybind11::dict':
+        return 'dict[str, Any]'
+
+    # Torch scalar dtype arguments
+    if cleaned in {'at::ScalarType', 'torch::ScalarType'}:
+        return 'torch.dtype'
+
     # Handle template types — ORDER MATTERS! Must come before internal type checks.
 
     # std::pair<T1, T2>
@@ -740,6 +766,16 @@ def cpp_default_to_python_default(cpp_default: str):
         return 'False'
     if s == 'true':
         return 'True'
+    if s == 'torch::kFloat32':
+        return 'torch.float32'
+    if s == 'torch::kBFloat16':
+        return 'torch.bfloat16'
+    if s == 'torch::kFloat16':
+        return 'torch.float16'
+    if s == 'torch::kInt32' or s == 'torch::kInt':
+        return 'torch.int32'
+    if s == 'torch::kInt64' or s == 'torch::kLong':
+        return 'torch.int64'
 
     # Handle null-like values: nullptr, nullopt, NULL, etc.
     if s in ('nullptr', 'NULL') or 'nullopt' in s:

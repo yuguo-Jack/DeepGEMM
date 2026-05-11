@@ -16,14 +16,22 @@ namespace deep_gemm::mega {
 } while (0)
 
 __device__ static inline uint16_t float_to_bf16_bits(const float x) {
+#if defined(__gfx938__)
+    return static_cast<uint16_t>(__builtin_hcu_cvt_bf16_f32(x, false, false));
+#else
     uint32_t bits = __float_as_uint(x);
     const uint32_t lsb = (bits >> 16) & 1u;
     bits += 0x7fffu + lsb;
     return static_cast<uint16_t>(bits >> 16);
+#endif
 }
 
 __device__ static inline float bf16_bits_to_float(const uint16_t x) {
+#if defined(__gfx938__)
+    return __builtin_hcu_cvt_f32_bf16(x, false, 0, false);
+#else
     return __uint_as_float(static_cast<uint32_t>(x) << 16);
+#endif
 }
 
 __global__ void deepep_scatter_prefix_kernel(const int* num_recv_tokens_per_expert,

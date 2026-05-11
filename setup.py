@@ -10,11 +10,20 @@ import platform
 import urllib
 import urllib.error
 import urllib.request
+import warnings
 from setuptools import find_packages
 from setuptools.command.build_py import build_py
 from packaging.version import parse
 from pathlib import Path
 from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME, ROCM_HOME, IS_HIP_EXTENSION, BuildExtension
+try:
+    from setuptools.warnings import SetuptoolsDeprecationWarning
+    warnings.filterwarnings(
+        'ignore',
+        message='setup.py install is deprecated.*',
+        category=SetuptoolsDeprecationWarning)
+except Exception:
+    warnings.filterwarnings('ignore', message='setup.py install is deprecated.*')
 try:
     from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 except Exception:
@@ -24,14 +33,19 @@ from scripts.generate_pyi import generate_pyi_file
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
-DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
+DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '0' if IS_HIP_EXTENSION else '1')) == 1
 DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
 
 # Compiler flags
 cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
              f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
+if IS_HIP_EXTENSION:
+    cxx_flags.append('-Wno-return-type')
 if DG_JIT_USE_RUNTIME_API:
     cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
+hipcc_flags = list(cxx_flags)
+if IS_HIP_EXTENSION:
+    hipcc_flags.append('--offload-arch=gfx938')
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -74,7 +88,10 @@ base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag
 
 
 def get_package_version():
-    with open(Path(current_dir) / 'deep_gemm' / '__init__.py', 'r') as f:
+    version_file = Path(current_dir) / package_name / '__init__.py'
+    if not version_file.exists():
+        version_file = Path(current_dir) / 'deep_gemm' / '__init__.py'
+    with open(version_file, 'r') as f:
         version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
 
@@ -85,11 +102,10 @@ def get_package_version():
             status_cmd = ['git', 'status', '--porcelain']
             status_output = subprocess.check_output(status_cmd).decode('ascii').strip()
             if status_output:
-                print(f'Warning: Git working directory is not clean. Uncommitted changes:\n{status_output}')
-                assert False, 'Git working directory is not clean'
-
-            cmd = ['git', 'rev-parse', '--short', 'HEAD']
-            revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
+                revision = '+local'
+            else:
+                cmd = ['git', 'rev-parse', '--short', 'HEAD']
+                revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
         except Exception:
             revision = '+local'
     return f'{public_version}{revision}'
@@ -130,7 +146,7 @@ def get_ext_modules():
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
                           library_dirs=build_library_dirs,
-                          extra_compile_args={'cxx': cxx_flags, 'nvcc': cxx_flags})]
+                          extra_compile_args={'cxx': cxx_flags, 'nvcc': hipcc_flags})]
 
 
 class CustomBuildPy(build_py):
@@ -191,7 +207,7 @@ class CustomBuildPy(build_py):
 if _bdist_wheel is not None:
     class CachedWheelsCommand(_bdist_wheel):
         def run(self):
-            if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
+            if IS_HIP_EXTENSION or DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
                 return super().run()
 
             wheel_url, wheel_filename = get_wheel_url()

@@ -12,6 +12,11 @@
 
 namespace deep_gemm::mega {
 
+static constexpr int kDcuMmacTileM = 16;
+static constexpr int kDcuMmacTileMLog2 = 4;
+static constexpr int kDcuMmacTileN = 16;
+static constexpr int kDcuMmacTileNLog2 = 4;
+
 #define DG_HIP_CHECK(expr) do { \
     const hipError_t status = (expr); \
     if (status != hipSuccess) { \
@@ -21,14 +26,33 @@ namespace deep_gemm::mega {
 
 
 __device__ static inline uint16_t float_to_bf16_bits(const float x) {
+#if defined(__gfx938__)
+    return static_cast<uint16_t>(__builtin_hcu_cvt_bf16_f32(x, false, false));
+#else
     uint32_t bits = __float_as_uint(x);
     const uint32_t lsb = (bits >> 16) & 1u;
     bits += 0x7fffu + lsb;
     return static_cast<uint16_t>(bits >> 16);
+#endif
 }
 
 __device__ static inline float bf16_bits_to_float(const uint16_t x) {
+#if defined(__gfx938__)
+    return __builtin_hcu_cvt_f32_bf16(x, false, 0, false);
+#else
     return __uint_as_float(static_cast<uint32_t>(x) << 16);
+#endif
+}
+
+__device__ static inline uint32_t pack2_f32_to_bf16_bits(const float x,
+                                                         const float y) {
+#if defined(__gfx938__)
+    auto packed = __builtin_hcu_cvt_pk_bf16_f32(0, x, 0, y, 0);
+    return *reinterpret_cast<uint32_t*>(&packed);
+#else
+    return static_cast<uint32_t>(float_to_bf16_bits(x)) |
+           (static_cast<uint32_t>(float_to_bf16_bits(y)) << 16);
+#endif
 }
 
 __device__ static inline dcu::int32x2_t pack8_fp8_weight_marlin(const uint8_t* weight,
