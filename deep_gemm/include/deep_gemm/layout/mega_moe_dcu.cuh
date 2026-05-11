@@ -8,6 +8,7 @@ namespace deep_gemm::mega {
 
 static constexpr int kTokenAlignment = 384;
 static constexpr int kDcuRouteTileMMinLog2 = 4;
+static constexpr int kDcuRouteTileMDefaultLog2 = 5;
 static constexpr int kDcuRouteScratchMmacTileM = 16;
 static constexpr int kDcuRouteScratchPipelineCounterCount = 5;
 

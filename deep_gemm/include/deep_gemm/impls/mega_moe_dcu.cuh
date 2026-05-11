@@ -117,7 +117,7 @@ using DcuMegaMoeEp8Shape = DcuMegaMoeShape<8, 6, 4096, 2048, 32>;
 template <
     typename L1TilePolicy_,
     typename L2TilePolicy_,
-    int kRouteTileLog2M_ = kDcuRouteTileMMinLog2,
+    int kRouteTileLog2M_ = kDcuRouteTileMDefaultLog2,
     typename L1SchedulePolicy_ = DcuMegaMoeL1ExpertChunkMajorSchedule,
     typename L2SchedulePolicy_ = DcuMegaMoeL2ExpertHiddenMajorSchedule<0>,
     int kThreads_ = 256,
@@ -129,9 +129,9 @@ using DcuMegaMoeDefaultTilePolicy = DcuMegaMoeTilePolicy<
 using DcuMegaMoeDefaultPolicy =
     DcuMegaMoeDefaultTilePolicy<
         DcuL1N256Pad64TilePolicy, DcuL2N512TilePolicy,
-        kDcuRouteTileMMinLog2,
+        kDcuRouteTileMDefaultLog2,
         DcuMegaMoeL1ExpertChunkMajorSchedule,
-        DcuMegaMoeL2ExpertHiddenMajorSchedule<8>,
+        DcuMegaMoeL2ExpertHiddenMajorSchedule<16>,
         256, 192>;
 using DcuMegaMoeEp8Config =
     DcuMegaMoeKernelConfig<DcuMegaMoeEp8Shape, DcuMegaMoeDefaultPolicy>;
@@ -183,6 +183,76 @@ __device__ static inline void dcu_decode_l1_task(
     } else {
         *mtile_task_id = task_id / num_inter_chunks;
         *chunk_id = task_id - *mtile_task_id * num_inter_chunks;
+    }
+}
+
+template <typename KernelConfig>
+__device__ static inline void dcu_enqueue_l2_ready_for_subtile(
+    const int subtile_task_id,
+    const int quant_tile_id,
+    const int num_inter_chunks,
+    const int num_hidden_chunks,
+    const int* tile_experts,
+    const int* expert_l1_task_offsets,
+    int* expert_quant_done_counts,
+    int* l2_group_done_counts,
+    int* pipeline_counters,
+    int* l2_queue,
+    int* l2_queue_ready) {
+    if constexpr (KernelConfig::kL2Schedule == DcuMegaMoeL2Schedule::ExpertHiddenMajor) {
+        const int quant_expert = tile_experts[quant_tile_id];
+        const int expert_task_begin = expert_l1_task_offsets[quant_expert];
+        const int expert_task_count =
+            expert_l1_task_offsets[quant_expert + 1] - expert_task_begin;
+        const int expert_subtiles = expert_task_count / num_inter_chunks;
+        const int subtile_begin = expert_task_begin / num_inter_chunks;
+        int group_subtile_begin = 0;
+        int group_subtiles = expert_subtiles;
+        bool enqueue_group = false;
+        if constexpr (KernelConfig::kL2ScheduleGroupSubtiles > 0) {
+            constexpr int group_limit = KernelConfig::kL2ScheduleGroupSubtiles;
+            const int local_subtile = subtile_task_id - subtile_begin;
+            const int group_idx = local_subtile / group_limit;
+            group_subtile_begin = group_idx * group_limit;
+            group_subtiles = min(group_limit, expert_subtiles - group_subtile_begin);
+            const int done = dcu_fetch_add_release_int(
+                l2_group_done_counts + subtile_begin + group_idx, 1) + 1;
+            enqueue_group = (done == group_subtiles);
+        } else {
+            const int done = dcu_fetch_add_release_int(
+                expert_quant_done_counts + quant_expert, 1) + 1;
+            enqueue_group = (done == expert_subtiles);
+        }
+        if (enqueue_group) {
+            const int queue_base = atomicAdd(
+                pipeline_counters + kDcuPipelineL2QueueTail,
+                group_subtiles * num_hidden_chunks);
+            for (int hidden_chunk_id = 0;
+                 hidden_chunk_id < num_hidden_chunks;
+                 ++hidden_chunk_id) {
+                for (int subtile_offset = 0;
+                     subtile_offset < group_subtiles;
+                     ++subtile_offset) {
+                    const int queue_idx =
+                        queue_base + hidden_chunk_id * group_subtiles + subtile_offset;
+                    const int queued_subtile_task_id =
+                        subtile_begin + group_subtile_begin + subtile_offset;
+                    l2_queue[queue_idx] =
+                        queued_subtile_task_id * num_hidden_chunks + hidden_chunk_id;
+                    dcu_store_release_int(l2_queue_ready + queue_idx, 1);
+                }
+            }
+        }
+    } else {
+        const int queue_base = atomicAdd(
+            pipeline_counters + kDcuPipelineL2QueueTail, num_hidden_chunks);
+        for (int hidden_chunk_id = 0;
+             hidden_chunk_id < num_hidden_chunks;
+             ++hidden_chunk_id) {
+            const int queue_idx = queue_base + hidden_chunk_id;
+            l2_queue[queue_idx] = subtile_task_id * num_hidden_chunks + hidden_chunk_id;
+            dcu_store_release_int(l2_queue_ready + queue_idx, 1);
+        }
     }
 }
 
@@ -454,16 +524,20 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
                            reinterpret_cast<volatile int*>(tile_pull_done + tile_id)) == 0) {}
                 block_quant_subtile = -1;
                 if (valid_rows <= 0) {
-                    if (chunk_id == 0 && threadIdx.x == 0)
-                        dcu_fetch_add_release_int(
-                            pipeline_counters + kDcuPipelineL2Done,
-                            num_hidden_chunks);
+                    if (chunk_id == 0 && threadIdx.x == 0) {
+                        dcu_enqueue_l2_ready_for_subtile<KernelConfig>(
+                            subtile_task_id, tile_id, num_inter_chunks, num_hidden_chunks,
+                            tile_experts, expert_l1_task_offsets,
+                            expert_quant_done_counts, l2_group_done_counts,
+                            pipeline_counters, l2_queue, l2_queue_ready);
+                    }
                 } else {
                     const int64_t tile_meta_base =
                         dcu_route_meta_base(tile_id, route_tile_log2_m, subtile_idx);
                     const int64_t act_offset =
                         ((static_cast<int64_t>(tile_id) << route_tile_log2_m) +
-                         (static_cast<int64_t>(subtile_idx) << kDcuMmacTileMLog2)) * intermediate_hidden;
+                         (static_cast<int64_t>(subtile_idx) << kDcuMmacTileMLog2)) *
+                        intermediate_hidden;
                     compute_route_mmac_mtile16_l1_chunk<
                         L1TileConfig, use_l1_chunk_local_quant>(
                         tile_experts[tile_id], chunk_id * inter_chunk,
@@ -482,110 +556,44 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
                     if (threadIdx.x == 0) {
                         const int done = dcu_fetch_add_release_int(
                             l1_done_counts + subtile_task_id, 1) + 1;
-                        block_quant_subtile = (done == num_inter_chunks) ? subtile_task_id : -1;
+                        block_quant_subtile =
+                            (done == num_inter_chunks) ? subtile_task_id : -1;
                     }
-                    __syncthreads();
-
-                    if (block_quant_subtile >= 0) {
-                        const int quant_tile_id = block_quant_subtile / subtiles_per_tile;
-                        const int quant_subtile_idx = block_quant_subtile - quant_tile_id * subtiles_per_tile;
-                        const int quant_valid_rows =
-                            dcu_route_subtile_valid_rows(tile_counts[quant_tile_id], quant_subtile_idx);
-                        const int64_t quant_act_offset =
-                            ((static_cast<int64_t>(quant_tile_id) << route_tile_log2_m) +
-                             (static_cast<int64_t>(quant_subtile_idx) << kDcuMmacTileMLog2)) *
-                            intermediate_hidden;
-                        const int64_t quant_scale_offset =
-                            (static_cast<int64_t>(quant_tile_id) << route_tile_log2_m) +
-                            (static_cast<int64_t>(quant_subtile_idx) << kDcuMmacTileMLog2);
-                        if constexpr (!use_l1_chunk_local_quant) {
-                            quant_bf16_act_channelwise_mtile16_global_with_chunk_amax(
-                                all_act_bf16 + quant_act_offset,
-                                all_act_fp8 + quant_act_offset,
-                                all_act_scale + quant_scale_offset,
-                                all_act_chunk_amax + quant_scale_offset * num_inter_chunks,
-                                quant_valid_rows, intermediate_hidden, num_inter_chunks);
-                            __threadfence();
-                            __syncthreads();
-                        } else {
-                            __threadfence();
-                            __syncthreads();
-                        }
-                        if (threadIdx.x == 0) {
-                            if constexpr (
-                                KernelConfig::kL2Schedule ==
-                                DcuMegaMoeL2Schedule::ExpertHiddenMajor) {
-                                const int quant_expert = tile_experts[quant_tile_id];
-                                const int expert_task_begin =
-                                    expert_l1_task_offsets[quant_expert];
-                                const int expert_task_count =
-                                    expert_l1_task_offsets[quant_expert + 1] -
-                                    expert_task_begin;
-                                const int expert_subtiles =
-                                    expert_task_count / num_inter_chunks;
-                                const int subtile_begin =
-                                    expert_task_begin / num_inter_chunks;
-                                int group_subtile_begin = 0;
-                                int group_subtiles = expert_subtiles;
-                                bool enqueue_group = false;
-                                if constexpr (KernelConfig::kL2ScheduleGroupSubtiles > 0) {
-                                    constexpr int group_limit =
-                                        KernelConfig::kL2ScheduleGroupSubtiles;
-                                    const int local_subtile =
-                                        block_quant_subtile - subtile_begin;
-                                    const int group_idx = local_subtile / group_limit;
-                                    group_subtile_begin = group_idx * group_limit;
-                                    group_subtiles = min(
-                                        group_limit,
-                                        expert_subtiles - group_subtile_begin);
-                                    const int done = dcu_fetch_add_release_int(
-                                        l2_group_done_counts + subtile_begin + group_idx,
-                                        1) + 1;
-                                    enqueue_group = (done == group_subtiles);
-                                } else {
-                                    const int done = dcu_fetch_add_release_int(
-                                        expert_quant_done_counts + quant_expert, 1) + 1;
-                                    enqueue_group = (done == expert_subtiles);
-                                }
-                                if (enqueue_group) {
-                                    const int queue_base = atomicAdd(
-                                        pipeline_counters + kDcuPipelineL2QueueTail,
-                                        group_subtiles * num_hidden_chunks);
-                                    for (int hidden_chunk_id = 0;
-                                         hidden_chunk_id < num_hidden_chunks;
-                                         ++hidden_chunk_id) {
-                                        for (int subtile_offset = 0;
-                                             subtile_offset < group_subtiles;
-                                             ++subtile_offset) {
-                                            const int queue_idx =
-                                                queue_base +
-                                                hidden_chunk_id * group_subtiles +
-                                                subtile_offset;
-                                            const int subtile_task_id =
-                                                subtile_begin +
-                                                group_subtile_begin +
-                                                subtile_offset;
-                                            l2_queue[queue_idx] =
-                                                subtile_task_id * num_hidden_chunks +
-                                                hidden_chunk_id;
-                                            dcu_store_release_int(
-                                                l2_queue_ready + queue_idx, 1);
-                                        }
-                                    }
-                                }
-                            } else {
-                                const int queue_base =
-                                    atomicAdd(
-                                        pipeline_counters + kDcuPipelineL2QueueTail,
-                                        num_hidden_chunks);
-                                for (int chunk_id = 0; chunk_id < num_hidden_chunks; ++chunk_id) {
-                                    const int queue_idx = queue_base + chunk_id;
-                                    l2_queue[queue_idx] =
-                                        block_quant_subtile * num_hidden_chunks + chunk_id;
-                                    dcu_store_release_int(l2_queue_ready + queue_idx, 1);
-                                }
-                            }
-                        }
+                }
+                __syncthreads();
+                if (block_quant_subtile >= 0) {
+                    const int quant_tile_id = block_quant_subtile / subtiles_per_tile;
+                    const int quant_subtile_idx =
+                        block_quant_subtile - quant_tile_id * subtiles_per_tile;
+                    const int quant_valid_rows =
+                        dcu_route_subtile_valid_rows(tile_counts[quant_tile_id], quant_subtile_idx);
+                    const int64_t quant_act_offset =
+                        ((static_cast<int64_t>(quant_tile_id) << route_tile_log2_m) +
+                         (static_cast<int64_t>(quant_subtile_idx) << kDcuMmacTileMLog2)) *
+                        intermediate_hidden;
+                    const int64_t quant_scale_offset =
+                        (static_cast<int64_t>(quant_tile_id) << route_tile_log2_m) +
+                        (static_cast<int64_t>(quant_subtile_idx) << kDcuMmacTileMLog2);
+                    if constexpr (!use_l1_chunk_local_quant) {
+                        quant_bf16_act_channelwise_mtile16_global_with_chunk_amax(
+                            all_act_bf16 + quant_act_offset,
+                            all_act_fp8 + quant_act_offset,
+                            all_act_scale + quant_scale_offset,
+                            all_act_chunk_amax + quant_scale_offset * num_inter_chunks,
+                            quant_valid_rows, intermediate_hidden, num_inter_chunks);
+                        __threadfence();
+                        __syncthreads();
+                    } else {
+                        __threadfence();
+                        __syncthreads();
+                    }
+                    if (threadIdx.x == 0) {
+                        dcu_enqueue_l2_ready_for_subtile<KernelConfig>(
+                            block_quant_subtile, quant_tile_id,
+                            num_inter_chunks, num_hidden_chunks,
+                            tile_experts, expert_l1_task_offsets,
+                            expert_quant_done_counts, l2_group_done_counts,
+                            pipeline_counters, l2_queue, l2_queue_ready);
                     }
                 }
             }

@@ -149,7 +149,7 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
     TORCH_CHECK(hidden > 0 && intermediate_hidden > 0, "hidden sizes must be positive");
 
-    constexpr int route_tile_m = 1 << kDcuRouteTileMMinLog2;
+    constexpr int route_tile_m = 1 << kDcuRouteTileMDefaultLog2;
     return dcu_route_scratch_bytes(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
         route_tile_m, hidden, intermediate_hidden);
