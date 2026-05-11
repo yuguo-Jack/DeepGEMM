@@ -90,8 +90,23 @@ class SymmBuffer:
             use_fp8_dispatch,
             activation,
         )
+        route_scratch_num_bytes = _C.get_mega_moe_route_scratch_size_for_mega_moe(
+            group.size(),
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            use_fp8_dispatch,
+            activation,
+        )
 
         self.buffer, buffer_ptr, local_handle = _C.allocate_hip_ipc_buffer(num_bytes)
+        self.route_scratch = torch.empty(
+            (route_scratch_num_bytes,),
+            dtype=torch.int8,
+            device="cuda",
+        )
         ipc_handles = [None] * group.size()
         dist.all_gather_object(ipc_handles, local_handle, group)
         buffer_ptrs = _C.open_hip_ipc_handles(ipc_handles, group.rank())
@@ -111,8 +126,9 @@ class SymmBuffer:
         )
 
         self.buffer.zero_()
-        self.group.barrier()
+        _C.set_mega_moe_peer_ptrs(self.buffer, buffer_ptrs, signal_ptrs)
         torch.cuda.synchronize()
+        self.group.barrier()
 
         (
             self.x,
@@ -147,6 +163,7 @@ class SymmBuffer:
         self.x_sf = None
         self.topk_idx = None
         self.topk_weights = None
+        self.route_scratch = None
 
 
 def get_symm_buffer_for_mega_moe(
@@ -240,6 +257,7 @@ def fp8_mega_moe(
         l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
+        sym_buffer.route_scratch,
         sym_buffer.handle.buffer_ptrs,
         sym_buffer.handle.signal_ptrs,
         sym_buffer.group.rank(),

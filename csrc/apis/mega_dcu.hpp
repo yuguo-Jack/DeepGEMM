@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -43,7 +44,7 @@ void launch_mega_moe_multirank_persistent_hip_w8a8_channelwise(
     const void* l2_weights, const float* l2_weights_sf,
     int* cumulative_local_expert_recv_stats,
     const int64_t* sym_buffer_ptrs,
-    const int64_t* signal_ptrs,
+    void* route_scratch,
     int rank_idx, int num_ranks,
     int num_max_tokens_per_rank,
     int num_experts_per_rank,
@@ -104,7 +105,8 @@ get_symm_buffer_size_for_mega_moe(
         topk_weights_offset + static_cast<int64_t>(num_max_tokens_per_rank) * num_topk * sizeof(float);
     const int64_t total_bytes = align_i64(
         combine_offset +
-        static_cast<int64_t>(num_topk) * num_max_tokens_per_rank * hidden * sizeof(uint16_t),
+            static_cast<int64_t>(num_topk) * num_max_tokens_per_rank *
+                hidden * static_cast<int64_t>(sizeof(uint16_t)),
         16);
 
     auto slice_input_buffers = [=](const torch::Tensor& buffer) {
@@ -136,6 +138,62 @@ get_symm_buffer_size_for_mega_moe(
                                empty_fp8, empty_f32, empty_fp8, empty_f32);
     };
     return {total_bytes, slice_input_buffers};
+}
+
+static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
+    const int& num_ranks, const int& num_experts,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const bool&, const std::string&) {
+    TORCH_CHECK(num_ranks > 0, "num_ranks must be positive");
+    TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
+    TORCH_CHECK(hidden > 0 && intermediate_hidden > 0, "hidden sizes must be positive");
+
+    constexpr int route_tile_m = 1 << kDcuRouteTileMMinLog2;
+    return dcu_route_scratch_bytes(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        route_tile_m, hidden, intermediate_hidden);
+}
+
+static void set_mega_moe_peer_ptrs(
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const std::vector<int64_t>& signal_ptrs) {
+    static_assert(sizeof(int64_t) == sizeof(uint8_t*),
+                  "DCU peer pointer header expects 64-bit device pointers");
+    static_assert(sizeof(int64_t) == sizeof(int*),
+                  "DCU signal pointer header expects 64-bit device pointers");
+
+    TORCH_CHECK(sym_buffer.is_cuda(), "sym_buffer must be CUDA/HIP memory");
+    TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8, "sym_buffer must be int8");
+    TORCH_CHECK(sym_buffer.is_contiguous(), "sym_buffer must be contiguous");
+    const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    TORCH_CHECK(num_ranks > 0, "sym_buffer_ptrs must be non-empty");
+    TORCH_CHECK(signal_ptrs.size() == sym_buffer_ptrs.size(),
+                "signal_ptrs must match sym_buffer_ptrs");
+    TORCH_CHECK(static_cast<int64_t>(sym_buffer.nbytes()) >= dcu_workspace_offset(num_ranks),
+                "sym_buffer is too small for DCU MegaMoE peer pointer header");
+
+    auto* base = static_cast<uint8_t*>(sym_buffer.data_ptr());
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    hipError_t status = hipMemcpyAsync(
+        base + dcu_sym_buffer_ptrs_offset(),
+        sym_buffer_ptrs.data(),
+        sizeof(int64_t) * num_ranks,
+        hipMemcpyHostToDevice,
+        stream);
+    TORCH_CHECK(status == hipSuccess,
+                "copying DCU MegaMoE peer sym_buffer pointers failed: ",
+                hipGetErrorString(status));
+    status = hipMemcpyAsync(
+        base + dcu_signal_ptrs_offset(num_ranks),
+        signal_ptrs.data(),
+        sizeof(int64_t) * num_ranks,
+        hipMemcpyHostToDevice,
+        stream);
+    TORCH_CHECK(status == hipSuccess,
+                "copying DCU MegaMoE peer signal pointers failed: ",
+                hipGetErrorString(status));
 }
 
 static torch::Tensor transform_sf_into_required_layout(
@@ -270,6 +328,7 @@ static void fp8_mega_moe(
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const torch::Tensor& sym_buffer,
+    const torch::Tensor& route_scratch,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const std::vector<int64_t>& signal_ptrs,
     const int& rank_idx,
@@ -284,6 +343,9 @@ static void fp8_mega_moe(
     TORCH_CHECK(activation == "swiglu", "DCU W8A8 MegaMoE supports swiglu only");
     TORCH_CHECK(y.scalar_type() == torch::kBFloat16, "y must be BF16");
     TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8, "sym_buffer must be int8");
+    TORCH_CHECK(route_scratch.is_cuda(), "route_scratch must be CUDA/HIP memory");
+    TORCH_CHECK(route_scratch.scalar_type() == torch::kInt8, "route_scratch must be int8");
+    TORCH_CHECK(route_scratch.is_contiguous(), "route_scratch must be contiguous");
 
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -325,6 +387,16 @@ static void fp8_mega_moe(
                 l2_weights_sf.size(1) == l2_rows,
                 "invalid L2 scale shape");
     TORCH_CHECK(num_tokens <= num_max_tokens_per_rank, "too many tokens");
+    const int64_t num_required_bytes = std::get<0>(get_symm_buffer_size_for_mega_moe(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, true, activation));
+    TORCH_CHECK(static_cast<int64_t>(sym_buffer.nbytes()) >= num_required_bytes,
+                "sym_buffer is too small for the requested DCU MegaMoE capacity");
+    const int64_t route_scratch_required_bytes = get_mega_moe_route_scratch_size_for_mega_moe(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, true, activation);
+    TORCH_CHECK(static_cast<int64_t>(route_scratch.nbytes()) >= route_scratch_required_bytes,
+                "route_scratch is too small for the requested DCU MegaMoE capacity");
 
     int* stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value()) {
@@ -340,7 +412,7 @@ static void fp8_mega_moe(
         y.data_ptr(),
         l1_weights.data_ptr(), l1_weights_sf.data_ptr<float>(),
         l2_weights.data_ptr(), l2_weights_sf.data_ptr<float>(),
-        stats_ptr, sym_buffer_ptrs.data(), signal_ptrs.data(),
+        stats_ptr, sym_buffer_ptrs.data(), route_scratch.data_ptr(),
         rank_idx, num_ranks, num_max_tokens_per_rank,
         num_experts_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, activation_clamp, fast_math);
@@ -349,7 +421,10 @@ static void fp8_mega_moe(
 static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
+    m.def("get_mega_moe_route_scratch_size_for_mega_moe",
+          &get_mega_moe_route_scratch_size_for_mega_moe);
     m.def("get_mega_moe_hip_build_config", &get_mega_moe_hip_build_config);
+    m.def("set_mega_moe_peer_ptrs", &set_mega_moe_peer_ptrs);
     m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
           pybind11::arg("sf"), pybind11::arg("mn"), pybind11::arg("k"), pybind11::arg("recipe"),
           pybind11::arg("num_groups") = std::nullopt,

@@ -214,10 +214,10 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
     constexpr int intermediate_hidden = Shape::kIntermediate;
     constexpr int num_experts = Shape::kNumExperts;
     const int num_local_blocks = static_cast<int>(gridDim.x);
-    auto* local_workspace = sym_buffers[rank_idx];
     auto* local_signals = signal_buffers[rank_idx];
-    int* expert_counts = workspace_expert_counts(local_workspace);
-    int* expert_task_pool = workspace_expert_task_pool(local_workspace, num_experts_per_rank_static);
+    int* expert_counts = route_scratch_expert_counts(route_scratch);
+    int* expert_task_pool = route_scratch_expert_task_pool(
+        route_scratch, num_experts_per_rank_static);
     const int64_t max_tasks_per_expert =
         workspace_task_capacity_per_expert(num_ranks_static, num_max_tokens_per_rank);
 
@@ -283,37 +283,39 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
         constexpr int route_tile_m = 1 << KernelConfig::kRouteTileLog2M;
         constexpr int subtiles_per_tile =
             1 << (KernelConfig::kRouteTileLog2M - kDcuMmacTileMLog2);
+        uint8_t* route_tile_scratch = route_tile_scratch_base(
+            route_scratch, num_ranks_static, num_experts, num_max_tokens_per_rank);
         const auto layout = dcu_route_tile_scratch_layout(
             route_scratch_tiles, route_tile_m, hidden, intermediate_hidden);
-        auto* all_x_fp8 = route_scratch + layout.x_fp8_offset;
-        auto* all_act_bf16 = reinterpret_cast<uint16_t*>(route_scratch + layout.act_bf16_offset);
-        auto* all_act_fp8 = route_scratch + layout.act_fp8_offset;
-        auto* all_act_scale = reinterpret_cast<float*>(route_scratch + layout.act_scale_offset);
+        auto* all_x_fp8 = route_tile_scratch + layout.x_fp8_offset;
+        auto* all_act_bf16 = reinterpret_cast<uint16_t*>(route_tile_scratch + layout.act_bf16_offset);
+        auto* all_act_fp8 = route_tile_scratch + layout.act_fp8_offset;
+        auto* all_act_scale = reinterpret_cast<float*>(route_tile_scratch + layout.act_scale_offset);
         auto* all_act_chunk_amax =
-            reinterpret_cast<float*>(route_scratch + layout.act_chunk_amax_offset);
+            reinterpret_cast<float*>(route_tile_scratch + layout.act_chunk_amax_offset);
         auto* tile_x_row_ptrs =
-            reinterpret_cast<const uint8_t**>(route_scratch + layout.tile_x_row_ptrs_offset);
+            reinterpret_cast<const uint8_t**>(route_tile_scratch + layout.tile_x_row_ptrs_offset);
         auto* tile_combine_row_ptrs =
-            reinterpret_cast<uint16_t**>(route_scratch + layout.tile_combine_row_ptrs_offset);
+            reinterpret_cast<uint16_t**>(route_tile_scratch + layout.tile_combine_row_ptrs_offset);
         auto* tile_route_weights =
-            reinterpret_cast<float*>(route_scratch + layout.tile_route_weight_offset);
+            reinterpret_cast<float*>(route_tile_scratch + layout.tile_route_weight_offset);
         auto* tile_x_scales =
-            reinterpret_cast<float*>(route_scratch + layout.tile_x_scale_offset);
-        auto* tile_experts = reinterpret_cast<int*>(route_scratch + layout.tile_expert_offset);
-        auto* tile_pool_bases = reinterpret_cast<int*>(route_scratch + layout.tile_pool_base_offset);
-        auto* tile_counts = reinterpret_cast<int*>(route_scratch + layout.tile_count_offset);
+            reinterpret_cast<float*>(route_tile_scratch + layout.tile_x_scale_offset);
+        auto* tile_experts = reinterpret_cast<int*>(route_tile_scratch + layout.tile_expert_offset);
+        auto* tile_pool_bases = reinterpret_cast<int*>(route_tile_scratch + layout.tile_pool_base_offset);
+        auto* tile_counts = reinterpret_cast<int*>(route_tile_scratch + layout.tile_count_offset);
         auto* expert_l1_task_offsets =
-            reinterpret_cast<int*>(route_scratch + layout.expert_l1_task_offset);
+            reinterpret_cast<int*>(route_tile_scratch + layout.expert_l1_task_offset);
         auto* expert_quant_done_counts =
-            reinterpret_cast<int*>(route_scratch + layout.expert_quant_done_count_offset);
+            reinterpret_cast<int*>(route_tile_scratch + layout.expert_quant_done_count_offset);
         auto* l2_group_done_counts =
-            reinterpret_cast<int*>(route_scratch + layout.l2_group_done_count_offset);
-        auto* tile_pull_done = reinterpret_cast<int*>(route_scratch + layout.tile_pull_done_offset);
-        auto* l1_done_counts = reinterpret_cast<int*>(route_scratch + layout.l1_done_count_offset);
-        auto* l2_queue = reinterpret_cast<int*>(route_scratch + layout.l2_queue_offset);
-        auto* l2_queue_ready = reinterpret_cast<int*>(route_scratch + layout.l2_queue_ready_offset);
-        auto* pipeline_counters = reinterpret_cast<int*>(route_scratch + layout.pipeline_counter_offset);
-        auto* total_tiles_ptr = reinterpret_cast<int*>(route_scratch + layout.total_tiles_offset);
+            reinterpret_cast<int*>(route_tile_scratch + layout.l2_group_done_count_offset);
+        auto* tile_pull_done = reinterpret_cast<int*>(route_tile_scratch + layout.tile_pull_done_offset);
+        auto* l1_done_counts = reinterpret_cast<int*>(route_tile_scratch + layout.l1_done_count_offset);
+        auto* l2_queue = reinterpret_cast<int*>(route_tile_scratch + layout.l2_queue_offset);
+        auto* l2_queue_ready = reinterpret_cast<int*>(route_tile_scratch + layout.l2_queue_ready_offset);
+        auto* pipeline_counters = reinterpret_cast<int*>(route_tile_scratch + layout.pipeline_counter_offset);
+        auto* total_tiles_ptr = reinterpret_cast<int*>(route_tile_scratch + layout.total_tiles_offset);
 
         constexpr bool use_l1_chunk_local_quant =
             L1TileConfig::kTileM == kDcuMmacTileM &&

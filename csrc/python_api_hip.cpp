@@ -38,7 +38,7 @@ static pybind11::bytes get_hip_ipc_handle(const torch::Tensor& tensor) {
 static pybind11::tuple allocate_hip_ipc_buffer(const int64_t& num_bytes) {
     TORCH_CHECK(num_bytes > 0, "HIP IPC buffer size must be positive");
     void* ptr = nullptr;
-    DG_HIP_CHECK(hipExtMallocWithFlags(&ptr, static_cast<size_t>(num_bytes), hipDeviceMallocUncached));
+    DG_HIP_CHECK(hipExtMallocWithFlags(&ptr, static_cast<size_t>(num_bytes), hipDeviceMallocFinegrained));
     DG_HIP_CHECK(hipMemset(ptr, 0, static_cast<size_t>(num_bytes)));
 
     hipIpcMemHandle_t handle{};
