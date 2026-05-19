@@ -1,82 +1,12 @@
 from __future__ import annotations
 
-import os
-from functools import lru_cache
-from pathlib import Path
-
 import torch
-from torch.utils.cpp_extension import load
+
+from . import k2_fused_ext as _ext
 
 
-THIS_DIR = Path(__file__).resolve().parent
-
-
-def _find_scratch_root(start: Path) -> Path:
-    for path in (start, *start.parents):
-        if (path / "setup.py").exists():
-            return path
-    return Path.cwd()
-
-
-SCRATCH_ROOT = _find_scratch_root(THIS_DIR)
-SCRATCH_DIR = SCRATCH_ROOT / "hygon_tmp" / "large_opt" / "K2_fused"
-
-
-def _prepend_env_path(name: str, values: list[str]) -> None:
-    old = os.environ.get(name, "")
-    parts = [value for value in values if value and Path(value).exists()]
-    if old:
-        parts.append(old)
-    os.environ[name] = ":".join(parts)
-
-
-def configure_dtk_env() -> None:
-    dtk = Path(os.environ.get("DTK_ROOT", os.environ.get("ROCM_HOME", "/opt/dtk")))
-    os.environ.setdefault("ROCM_HOME", str(dtk))
-    os.environ.setdefault("ROCM_PATH", str(dtk))
-    os.environ.setdefault("HIP_PATH", str(dtk / "hip"))
-    _prepend_env_path(
-        "LD_LIBRARY_PATH",
-        [
-            "/opt/hyhal/lib",
-            str(dtk / ".hyhal" / "rocm_smi" / "lib"),
-            str(dtk / "lib"),
-            str(dtk / "lib64"),
-            str(dtk / "hip" / "lib"),
-            str(dtk / "hip" / "lib64"),
-        ],
-    )
-    _prepend_env_path(
-        "PATH",
-        [
-            str(dtk / "bin"),
-            str(dtk / "hip" / "bin"),
-            str(dtk / "aillvm" / "bin"),
-        ],
-    )
-
-
-@lru_cache(maxsize=1)
 def load_extension(verbose: bool = False):
-    configure_dtk_env()
-    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-    os.environ["PYTORCH_ROCM_ARCH"] = "gfx938"
-    os.environ["AMDGPU_TARGETS"] = "gfx938"
-    os.environ["TORCH_EXTENSIONS_DIR"] = str(SCRATCH_DIR / "torch_extensions")
-    return load(
-        name="k2_fused_ext",
-        sources=[str(THIS_DIR / "k2_fused_ext.cu")],
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=[
-            "-O3",
-            "-std=c++17",
-            "--offload-arch=gfx938",
-            "-DNDEBUG",
-            "-ffast-math",
-        ],
-        with_cuda=True,
-        verbose=verbose,
-    )
+    return _ext
 
 
 def swiglu_quant_channelwise_out(

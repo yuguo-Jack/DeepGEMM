@@ -1,217 +1,38 @@
 from __future__ import annotations
 
-import os
-import subprocess
-import time
-import hashlib
-from functools import lru_cache
 from pathlib import Path
 
 import torch
-from torch.utils.cpp_extension import load
+
+from . import k3_fused_ext as _ext
 
 
 THIS_DIR = Path(__file__).resolve().parent
 
-
-def _find_scratch_root(start: Path) -> Path:
-    for path in (start, *start.parents):
-        if (path / "setup.py").exists():
-            return path
-    return Path.cwd()
-
-
-def _find_deep_gemm_include_dir(start: Path) -> Path:
-    env_dir = os.getenv("MEGAMOE_DCU_INCLUDE_DIR")
-    if env_dir:
-        return Path(env_dir)
-    candidates = [
-        start.parents[2] / "deep_gemm" / "include",
-        start.parents[1] / "include",
-    ]
-    for path in candidates:
-        if (path / "deep_gemm").exists():
-            return path
-    return candidates[0]
-
-
-SCRATCH_ROOT = _find_scratch_root(THIS_DIR)
-DEEP_GEMM_INCLUDE_DIR = _find_deep_gemm_include_dir(THIS_DIR)
-SCRATCH_DIR = SCRATCH_ROOT / "hygon_tmp" / "large_opt" / "K3_fused"
-
 K3_COMBINE_ASM_NAME = "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE"
-K3_COMBINE_ASM_SRC = THIS_DIR / (
-    "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE.s"
-)
-K3_COMBINE_ASM_CO = SCRATCH_DIR / f"{K3_COMBINE_ASM_NAME}.co"
-K3_COMBINE_TAIL_REDUCE_ASM_SRC = THIS_DIR / (
-    "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE.s"
-)
-K3_COMBINE_TAIL_REDUCE_ASM_CO = SCRATCH_DIR / f"{K3_COMBINE_ASM_NAME}_TAILREDUCE.co"
-ASM_CACHE_VERSION = "gfx938-cov4-v1"
+K3_COMBINE_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}.co"
+K3_COMBINE_TAIL_REDUCE_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_TAILREDUCE.co"
 
 
-def _prepend_env_path(name: str, values: list[str]) -> None:
-    old = os.environ.get(name, "")
-    parts = [value for value in values if value and Path(value).exists()]
-    if old:
-        parts.append(old)
-    os.environ[name] = ":".join(parts)
-
-
-def configure_dtk_env() -> None:
-    dtk = Path(os.environ.get("DTK_ROOT", os.environ.get("ROCM_HOME", "/opt/dtk")))
-    os.environ.setdefault("ROCM_HOME", str(dtk))
-    os.environ.setdefault("ROCM_PATH", str(dtk))
-    os.environ.setdefault("HIP_PATH", str(dtk / "hip"))
-    _prepend_env_path(
-        "LD_LIBRARY_PATH",
-        [
-            "/opt/hyhal/lib",
-            str(dtk / ".hyhal" / "rocm_smi" / "lib"),
-            str(dtk / "lib"),
-            str(dtk / "lib64"),
-            str(dtk / "hip" / "lib"),
-            str(dtk / "hip" / "lib64"),
-        ],
-    )
-    _prepend_env_path(
-        "PATH",
-        [
-            str(dtk / "bin"),
-            str(dtk / "hip" / "bin"),
-            str(dtk / "aillvm" / "bin"),
-        ],
-    )
-
-
-def _asm_source_signature(src: Path) -> str:
-    digest = hashlib.sha256()
-    digest.update(ASM_CACHE_VERSION.encode("ascii"))
-    digest.update(b"\0")
-    digest.update(src.read_bytes())
-    return digest.hexdigest()
-
-
-def _asm_signature_path(co: Path) -> Path:
-    return co.with_suffix(f"{co.suffix}.sha256")
-
-
-def _asm_code_object_current(src: Path, co: Path) -> bool:
-    sig_path = _asm_signature_path(co)
-    if not co.exists() or not sig_path.exists():
-        return False
-    try:
-        return sig_path.read_text(encoding="ascii").strip() == _asm_source_signature(src)
-    except OSError:
-        return False
-
-
-def _write_asm_signature(src: Path, co: Path) -> None:
-    _asm_signature_path(co).write_text(_asm_source_signature(src) + "\n", encoding="ascii")
-
-
-def _compile_asm_code_object(src: Path, co: Path) -> Path:
-    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-    if not src.exists():
-        raise FileNotFoundError(f"asm source not found: {src}")
-    if _asm_code_object_current(src, co):
-        return co
-
-    lock_dir = co.with_name(f"{co.name}.lock")
-    lock_acquired = False
-    while not lock_acquired:
-        try:
-            lock_dir.mkdir()
-            lock_acquired = True
-        except FileExistsError:
-            if _asm_code_object_current(src, co):
-                return co
-            try:
-                lock_age = time.time() - lock_dir.stat().st_mtime
-            except FileNotFoundError:
-                continue
-            if lock_age > 180:
-                try:
-                    lock_dir.rmdir()
-                except OSError:
-                    pass
-                continue
-            time.sleep(0.1)
-
-    configure_dtk_env()
-    try:
-        if _asm_code_object_current(src, co):
-            return co
-        dtk = Path(os.environ["ROCM_HOME"])
-        clang = Path(os.environ.get("K3_CLANG", str(dtk / "aillvm" / "bin" / "clang")))
-        if not clang.exists():
-            clang = Path("clang")
-        obj = SCRATCH_DIR / f"{src.stem}.o"
-        subprocess.run(
-            [
-                str(clang),
-                "-x",
-                "assembler",
-                "-target",
-                "amdgcn-amd-amdhsa",
-                "-mcode-object-version=4",
-                "-mcpu=gfx938",
-                "-c",
-                "-o",
-                str(obj),
-                str(src),
-            ],
-            check=True,
+def _ensure_prebuilt_code_object(co: Path, label: str) -> Path:
+    if not co.exists():
+        raise FileNotFoundError(
+            f"prebuilt {label} asm code object not found: {co}. "
+            "Rebuild and reinstall the megamoe wheel."
         )
-        subprocess.run(
-            [
-                str(clang),
-                "-target",
-                "amdgcn-amd-amdhsa",
-                str(obj),
-                "-o",
-                str(co),
-            ],
-            check=True,
-        )
-        _write_asm_signature(src, co)
-        return co
-    finally:
-        if lock_acquired:
-            try:
-                lock_dir.rmdir()
-            except OSError:
-                pass
+    return co
 
 
 def ensure_k3_combine_asm_code_object() -> Path:
-    return _compile_asm_code_object(K3_COMBINE_ASM_SRC, K3_COMBINE_ASM_CO)
+    return _ensure_prebuilt_code_object(K3_COMBINE_ASM_CO, "K3 combine")
 
 
 def ensure_k3_combine_tail_reduce_asm_code_object() -> Path:
-    return _compile_asm_code_object(K3_COMBINE_TAIL_REDUCE_ASM_SRC, K3_COMBINE_TAIL_REDUCE_ASM_CO)
+    return _ensure_prebuilt_code_object(K3_COMBINE_TAIL_REDUCE_ASM_CO, "K3 tail-reduce")
 
 
-@lru_cache(maxsize=1)
 def load_extension(verbose: bool = False):
-    configure_dtk_env()
-    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-    os.environ["TORCH_EXTENSIONS_DIR"] = str(SCRATCH_DIR / "torch_extensions")
-    return load(
-        name="k3_fused_ext",
-        sources=[str(THIS_DIR / "k3_fused_ext.cu")],
-        extra_include_paths=[str(DEEP_GEMM_INCLUDE_DIR)],
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=[
-            "-O3",
-            "-std=c++17",
-            "--offload-arch=gfx938",
-            "-DNDEBUG",
-        ],
-        with_cuda=True,
-        verbose=verbose,
-    )
+    return _ext
 
 
 def build_asm_tail_signal_addrs(

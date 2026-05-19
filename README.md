@@ -162,9 +162,21 @@ source /opt/dtk-26.04/env.sh
 The build script keeps intermediate files under `build/` and writes the wheel to
 `build/whl/`.  It also builds the extension in place, so the local checkout can
 run the tests directly.
-The optional large-token staged path is packaged as source and compiled by JIT
-on first use; `build_dcu_megamoe.sh` does not prebuild or require any
-`hygon_tmp` artifacts.
+The optional large-token staged path is built ahead of time as part of the
+`megamoe` wheel.  Wheel installation places the staged extension modules and asm
+code objects under the Python package directory, alongside the original
+MegaMoE fused extension:
+
+- `megamoe/_C*.so`
+- `megamoe/dcu_megamoe_large_opt/K1_fused/k1_fused_ext*.so`
+- `megamoe/dcu_megamoe_large_opt/K2_fused/k2_fused_ext*.so`
+- `megamoe/dcu_megamoe_large_opt/K3_fused/k3_fused_ext*.so`
+- `megamoe/dcu_megamoe_large_opt/K1_fused/*.co`
+- `megamoe/dcu_megamoe_large_opt/K3_fused/*.co`
+
+If any staged HIP or asm source changes, rebuild and reinstall the wheel.  The
+`hygon_tmp` directory is only used by test scripts for temporary reports or
+scratch files; it is not required for installed kernel binaries.
 
 Run the DSV4-Flash correctness and performance check:
 
@@ -193,16 +205,8 @@ Set `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1` to route the same public
 - K3: L2 FP8 grouped GEMM + combine reduce
 
 The staged path is intended for the DeepSeek-V4-Flash EP8 shape above and keeps
-JIT/cache products under `hygon_tmp/large_opt/`.
-Its Python/JIT implementation is packaged under
-`megamoe.dcu_megamoe_large_opt` so the public and optional large-token paths
-stay inside the `megamoe` package.
-The wheel carries the K1/K2/K3 Python, HIP, asm sources and the headers needed
-by those JIT extensions; `hygon_tmp` is generated on demand and is not required
-as committed input.
-The asm `.co` files are not stored in the wheel. They are rebuilt from the
-packaged `.s` files into `hygon_tmp/large_opt/` and guarded by a source hash, so
-installing a wheel with changed asm sources invalidates any older cached `.co`.
+all K1/K2/K3 implementation files under `megamoe.dcu_megamoe_large_opt`, so the
+public and optional large-token paths stay inside the `megamoe` package.
 Its large temporary activations reuse the original DCU MegaMoE `route_scratch`
 allocation; the integration does not allocate a second persistent L1/K2/K3
 activation workspace.

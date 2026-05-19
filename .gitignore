@@ -22,5 +22,10 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+megamoe/*.so
+megamoe/dcu_megamoe_large_opt/**/*.so
+megamoe/dcu_megamoe_large_opt/**/*.co
+megamoe/dcu_megamoe_large_opt/**/*.o
+megamoe/dcu_megamoe_large_opt/**/*.hip
 hygon_tmp/
 .playwright-cli/
