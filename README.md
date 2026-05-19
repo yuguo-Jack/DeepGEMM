@@ -162,6 +162,22 @@ source /opt/dtk-26.04/env.sh
 The build script keeps intermediate files under `build/` and writes the wheel to
 `build/whl/`.  It also builds the extension in place, so the local checkout can
 run the tests directly.
+If you do not install the wheel but want to import `megamoe` from another
+directory, either set `PYTHONPATH` to this repository root or install the source
+tree in editable mode after building:
+
+```bash
+PYTHONPATH=/workspace/DeepGEMM python your_script.py
+# or
+pip install -e .
+```
+
+Editable installs point Python back to this checkout, so they use the in-place
+`megamoe/_C*.so`, staged `k1/k2/k3_fused_ext*.so`, and staged `.co` files
+created by `build_dcu_megamoe.sh`.  Python-only edits are picked up directly;
+after changing HIP, asm, or `setup.py`, rerun `build_dcu_megamoe.sh`.  If you
+run from an installed wheel instead, reinstall the newly generated wheel after
+rebuilding.
 The optional large-token staged path is built ahead of time as part of the
 `megamoe` wheel.  Wheel installation places the staged extension modules and asm
 code objects under the Python package directory, alongside the original
