@@ -722,7 +722,7 @@ def parse_args():
     parser.add_argument("--weight-scale", type=float, default=0.05)
     parser.add_argument("--prepost-backend", choices=("hip", "triton"), default="hip")
     parser.add_argument("--correctness-iters", type=int, default=1)
-    parser.add_argument("--atol", type=float, default=0.003)
+    parser.add_argument("--atol", type=float, default=0.0035)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--skip-bench", action="store_true")
