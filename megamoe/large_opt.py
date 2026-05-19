@@ -45,9 +45,13 @@ class _LargeOptState:
     asm_tail_signal_addrs_ready: bool = False
 
 
+_LARGE_OPT_FORCE_VALUES = {"1", "true", "yes", "on", "large_opt", "3stage"}
+_LARGE_OPT_AUTO_VALUES = {"auto", "threshold", "adaptive"}
+
+
 def env_enabled() -> bool:
-    value = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "0").strip().lower()
-    return value in {"1", "true", "yes", "on", "large_opt", "3stage"}
+    value = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "auto").strip().lower()
+    return value in _LARGE_OPT_FORCE_VALUES or value in _LARGE_OPT_AUTO_VALUES
 
 
 def k3_tail_reduce_enabled() -> bool:

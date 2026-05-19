@@ -212,20 +212,34 @@ python tests/test_mega_moe_dcu.py \
   --out hygon_tmp/megamoe_dcu_dsv4_flash_512.json
 ```
 
-The default DCU execution path remains the original persistent fused kernel.
-Set `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1` to route the same public
-`megamoe.fp8_w8a8_mega_moe` API through the large-token staged path:
+The default DCU execution path uses token-threshold auto selection.  Without
+setting `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE`, the same public
+`megamoe.fp8_w8a8_mega_moe` API uses the original persistent fused kernel for
+small token counts and the large-token staged path for larger token counts:
 
 - K1: dispatch pull + L1 FP8 grouped GEMM
 - K2: SwiGLU + channelwise FP8 quant
 - K3: L2 FP8 grouped GEMM + combine reduce
+
+The default threshold is 128 tokens per rank: `num_tokens_per_rank <= 128` uses
+the original persistent fused kernel, and `num_tokens_per_rank > 128` uses the
+staged K1/K2/K3 path.  Override the threshold with
+`MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD`; the comparison is strictly
+greater than the threshold.  Set `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1` to force
+the staged path for all token counts, or `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=0`
+to force the original persistent fused kernel.  Set these environment variables
+before creating `SymmBuffer`: the mode and threshold are captured on buffer
+initialization so graph-captured runs see a stable branch choice.
 
 The staged path is intended for the DeepSeek-V4-Flash EP8 shape above and keeps
 all K1/K2/K3 implementation files under `megamoe.dcu_megamoe_large_opt`, so the
 public and optional large-token paths stay inside the `megamoe` package.
 Its large temporary activations reuse the original DCU MegaMoE `route_scratch`
 allocation; the integration does not allocate a second persistent L1/K2/K3
-activation workspace.
+activation workspace.  In `auto` mode, `SymmBuffer` also prepares the staged
+path during initialization by creating tensor views into the same `route_scratch`
+storage; no extra device kernels, D2H synchronization, or duplicate activation
+buffers are introduced for the later first large-token call.
 By default K3 uses the integrated `ASM combine -> barrier -> reduce` path.
 Set `K3_USE_ASM_TAIL_REDUCE=1` together with
 `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1`, or run the sweep script with
@@ -236,11 +250,16 @@ default.
 The staged path keeps the tail-reduce signal state in `route_scratch`; when the
 large-opt environment is enabled before creating the symmetric buffer, this
 state is prepared during buffer initialization rather than the timed execution
-path.
+path.  The original persistent fused path and the staged path both read the same
+input slices in the symmetric buffer (`x`, `x_sf`, `topk_idx`, and
+`topk_weights`), so switching by token threshold does not require duplicate
+input copies.
 
-One host-side tuning knob is available for the staged path and does not add
-device kernels:
+Host-side tuning knobs for the staged path do not add device kernels:
 
+- `MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD` controls the `auto` token
+  cutoff. The default is 128 based on the DSV4-Flash sweep where 32/64/128
+  favor the persistent fused kernel and 256+ favors the staged path.
 - `K2_SKIP_INACTIVE_ROWS_MIN_TOKENS` controls when K2 consumes K1's
   `row_combine_ptrs` validity metadata. The default is 1536, so larger token
   counts skip inactive-row activation work while smaller token counts keep the

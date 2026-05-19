@@ -16,6 +16,33 @@ def _is_hip_backend() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
+_LARGE_OPT_FORCE_VALUES = {"1", "true", "yes", "on", "large_opt", "3stage"}
+_LARGE_OPT_AUTO_VALUES = {"auto", "threshold", "adaptive"}
+_LARGE_OPT_THRESHOLD_ENV = "MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD"
+_LARGE_OPT_DEFAULT_THRESHOLD = 128
+
+
+def _large_opt_3stage_mode() -> str:
+    value = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "auto").strip().lower()
+    if value in _LARGE_OPT_FORCE_VALUES:
+        return "force"
+    if value in _LARGE_OPT_AUTO_VALUES:
+        return "auto"
+    return "off"
+
+
+def _large_opt_3stage_threshold() -> int:
+    return int(os.getenv(_LARGE_OPT_THRESHOLD_ENV, str(_LARGE_OPT_DEFAULT_THRESHOLD)))
+
+
+def _large_opt_3stage_selected(num_tokens: int, mode: str, threshold: int) -> bool:
+    if mode == "force":
+        return True
+    if mode == "auto":
+        return num_tokens > threshold
+    return False
+
+
 def cast_to_fp8_channelwise(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError("channelwise FP8 cast expects a 2D tensor")
@@ -69,6 +96,9 @@ def weight8bit_nt_kpack2_marlin(
 def get_mega_moe_hip_build_config():
     config = _C.get_mega_moe_hip_build_config()
     config["large_opt_3stage_env"] = "MEGAMOE_DCU_USE_LARGE_OPT_3STAGE"
+    config["large_opt_3stage_auto_values"] = sorted(_LARGE_OPT_AUTO_VALUES)
+    config["large_opt_3stage_threshold_env"] = _LARGE_OPT_THRESHOLD_ENV
+    config["large_opt_3stage_default_threshold"] = _LARGE_OPT_DEFAULT_THRESHOLD
     config["large_opt_3stage_shape"] = "EP8 experts=256 topk=6 hidden=4096 intermediate=2048"
     return config
 
@@ -94,6 +124,8 @@ class SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        self._large_opt_3stage_mode = _large_opt_3stage_mode()
+        self._large_opt_3stage_threshold = _large_opt_3stage_threshold()
 
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(),
@@ -156,14 +188,7 @@ class SymmBuffer:
             self.l2_acts_sf,
         ) = slice_input_buffers(self.buffer)
 
-        if os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-            "large_opt",
-            "3stage",
-        }:
+        if self._large_opt_3stage_mode in {"force", "auto"}:
             from .large_opt import prepare_large_opt_3stage
 
             prepare_large_opt_3stage(
@@ -281,14 +306,12 @@ def fp8_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
 ):
-    if os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-        "large_opt",
-        "3stage",
-    }:
+    large_opt_mode = getattr(sym_buffer, "_large_opt_3stage_mode", None)
+    large_opt_threshold = getattr(sym_buffer, "_large_opt_3stage_threshold", None)
+    if large_opt_mode is None or large_opt_threshold is None:
+        large_opt_mode = _large_opt_3stage_mode()
+        large_opt_threshold = _large_opt_3stage_threshold()
+    if _large_opt_3stage_selected(int(y.size(0)), large_opt_mode, large_opt_threshold):
         from .large_opt import fp8_mega_moe_large_opt_3stage
 
         fp8_mega_moe_large_opt_3stage(
