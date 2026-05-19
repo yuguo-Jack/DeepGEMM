@@ -1,11 +1,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <tuple>
 
 #define K2_HIP_CHECK(expr)                                                       \
@@ -154,6 +156,7 @@ __global__ __launch_bounds__(Threads)
 void swiglu_quant_channelwise_kernel(
     const uint16_t* __restrict__ x,
     const float* __restrict__ topk_weights,
+    const int64_t* __restrict__ row_combine_ptrs,
     uint8_t* __restrict__ out_fp8,
     float* __restrict__ out_scale,
     uint16_t* __restrict__ out_bf16,
@@ -174,7 +177,25 @@ void swiglu_quant_channelwise_kernel(
     const int tid = static_cast<int>(threadIdx.x);
     const int stride = hidden * 2;
     const int64_t row_base = static_cast<int64_t>(row) * stride;
+    if (!output_bf16 && row_combine_ptrs != nullptr &&
+        row_combine_ptrs[row] == 0) {
+        return;
+    }
     const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
+    if (has_topk_weights && route_weight == 0.0f) {
+        if (tid == 0)
+            out_scale[row] = 1.0e-4f / 448.0f;
+        const int64_t out_base = static_cast<int64_t>(row) * hidden;
+        for (int col = tid * 4; col < hidden; col += Threads * 4) {
+            *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) = 0u;
+            if (output_bf16) {
+                uint32_t* bf16_ptr = reinterpret_cast<uint32_t*>(out_bf16 + out_base + col);
+                bf16_ptr[0] = 0u;
+                bf16_ptr[1] = 0u;
+            }
+        }
+        return;
+    }
 
     float local_amax = 0.0f;
     for (int col = tid * 4; col < hidden; col += Threads * 4) {
@@ -235,6 +256,7 @@ __global__ __launch_bounds__(Threads)
 void swiglu_quant_channelwise_reg_kernel(
     const uint16_t* __restrict__ x,
     const float* __restrict__ topk_weights,
+    const int64_t* __restrict__ row_combine_ptrs,
     uint8_t* __restrict__ out_fp8,
     float* __restrict__ out_scale,
     uint16_t* __restrict__ out_bf16,
@@ -254,7 +276,27 @@ void swiglu_quant_channelwise_reg_kernel(
     const int tid = static_cast<int>(threadIdx.x);
     const int stride = hidden * 2;
     const int64_t row_base = static_cast<int64_t>(row) * stride;
+    if (!output_bf16 && row_combine_ptrs != nullptr &&
+        row_combine_ptrs[row] == 0) {
+        return;
+    }
     const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
+    if (has_topk_weights && route_weight == 0.0f) {
+        if (tid == 0)
+            out_scale[row] = 1.0e-4f / 448.0f;
+        const int64_t out_base = static_cast<int64_t>(row) * hidden;
+#pragma unroll
+        for (int g = 0; g < VecGroups; ++g) {
+            const int col = (g * Threads + tid) * 4;
+            *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) = 0u;
+            if (output_bf16) {
+                uint32_t* bf16_ptr = reinterpret_cast<uint32_t*>(out_bf16 + out_base + col);
+                bf16_ptr[0] = 0u;
+                bf16_ptr[1] = 0u;
+            }
+        }
+        return;
+    }
 
     float y0[VecGroups];
     float y1[VecGroups];
@@ -338,6 +380,7 @@ template <int Threads>
 void launch_swiglu_quant_channelwise(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
+    const int64_t* row_combine_ptrs,
     torch::Tensor& out_fp8,
     torch::Tensor& out_scale,
     torch::Tensor& out_bf16,
@@ -362,6 +405,7 @@ void launch_swiglu_quant_channelwise(
             stream,
             reinterpret_cast<const uint16_t*>(x.data_ptr<at::BFloat16>()),
             has_topk_weights ? topk_weights.data_ptr<float>() : nullptr,
+            row_combine_ptrs,
             reinterpret_cast<uint8_t*>(out_fp8.data_ptr()),
             out_scale.data_ptr<float>(),
             output_bf16 ? reinterpret_cast<uint16_t*>(out_bf16.data_ptr<at::BFloat16>()) : nullptr,
@@ -380,6 +424,7 @@ void launch_swiglu_quant_channelwise(
             stream,
             reinterpret_cast<const uint16_t*>(x.data_ptr<at::BFloat16>()),
             has_topk_weights ? topk_weights.data_ptr<float>() : nullptr,
+            row_combine_ptrs,
             reinterpret_cast<uint8_t*>(out_fp8.data_ptr()),
             out_scale.data_ptr<float>(),
             output_bf16 ? reinterpret_cast<uint16_t*>(out_bf16.data_ptr<at::BFloat16>()) : nullptr,
@@ -399,6 +444,7 @@ void launch_swiglu_quant_channelwise(
             stream,
             reinterpret_cast<const uint16_t*>(x.data_ptr<at::BFloat16>()),
             has_topk_weights ? topk_weights.data_ptr<float>() : nullptr,
+            row_combine_ptrs,
             reinterpret_cast<uint8_t*>(out_fp8.data_ptr()),
             out_scale.data_ptr<float>(),
             output_bf16 ? reinterpret_cast<uint16_t*>(out_bf16.data_ptr<at::BFloat16>()) : nullptr,
@@ -415,6 +461,7 @@ void launch_swiglu_quant_channelwise(
 void launch_swiglu_quant_channelwise_auto(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
+    const int64_t* row_combine_ptrs,
     torch::Tensor& out_fp8,
     torch::Tensor& out_scale,
     torch::Tensor& out_bf16,
@@ -424,19 +471,19 @@ void launch_swiglu_quant_channelwise_auto(
     const int hidden = static_cast<int>(x.size(1) / 2);
     if (hidden <= 2048 && !output_bf16) {
         launch_swiglu_quant_channelwise<64>(
-            x, topk_weights, out_fp8, out_scale, out_bf16,
+            x, topk_weights, row_combine_ptrs, out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value);
     } else if (hidden <= 2048) {
         launch_swiglu_quant_channelwise<128>(
-            x, topk_weights, out_fp8, out_scale, out_bf16,
+            x, topk_weights, row_combine_ptrs, out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value);
     } else if (hidden == 4096) {
         launch_swiglu_quant_channelwise<128>(
-            x, topk_weights, out_fp8, out_scale, out_bf16,
+            x, topk_weights, row_combine_ptrs, out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value);
     } else {
         launch_swiglu_quant_channelwise<256>(
-            x, topk_weights, out_fp8, out_scale, out_bf16,
+            x, topk_weights, row_combine_ptrs, out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value);
     }
 }
@@ -448,23 +495,37 @@ void check_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
 
 } // namespace
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-swiglu_quant_channelwise(
+void swiglu_quant_channelwise_out(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
+    const torch::Tensor& out_fp8,
+    const torch::Tensor& out_scale,
+    const torch::Tensor& out_bf16,
     const bool output_bf16,
     const bool has_clamp_value,
-    const double clamp_value) {
+    const double clamp_value,
+    const std::optional<torch::Tensor>& row_combine_ptrs) {
     check_cuda_contiguous(x, "x");
+    check_cuda_contiguous(out_fp8, "out_fp8");
+    check_cuda_contiguous(out_scale, "out_scale");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
-    TORCH_CHECK(x.dim() == 2, "x must be [rows, 2 * hidden]");
-    TORCH_CHECK(x.size(1) % 2 == 0, "x hidden dimension must be even");
+    TORCH_CHECK(out_fp8.scalar_type() == torch::kFloat8_e4m3fn,
+                "out_fp8 must be FP8 E4M3");
+    TORCH_CHECK(out_scale.scalar_type() == torch::kFloat32,
+                "out_scale must be FP32");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) % 2 == 0,
+                "x must be [rows, 2 * hidden]");
     const int64_t rows = x.size(0);
     const int64_t hidden = x.size(1) / 2;
     TORCH_CHECK(hidden > 0 && hidden <= 4096,
                 "K2 fused currently supports hidden in (0, 4096]");
     TORCH_CHECK(hidden % 4 == 0,
                 "K2 fused vectorized path requires hidden to be divisible by 4");
+    TORCH_CHECK(out_fp8.dim() == 2 && out_fp8.size(0) == rows &&
+                    out_fp8.size(1) == hidden,
+                "out_fp8 shape must be [rows, hidden]");
+    TORCH_CHECK(out_scale.numel() >= rows,
+                "out_scale must have at least one scale per row");
     if (topk_weights.numel() > 0) {
         check_cuda_contiguous(topk_weights, "topk_weights");
         TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32,
@@ -472,33 +533,43 @@ swiglu_quant_channelwise(
         TORCH_CHECK(topk_weights.numel() >= rows,
                     "topk_weights must cover every row");
     }
+    const int64_t* row_combine_ptrs_data = nullptr;
+    if (row_combine_ptrs.has_value()) {
+        const auto& ptrs = row_combine_ptrs.value();
+        check_cuda_contiguous(ptrs, "row_combine_ptrs");
+        TORCH_CHECK(ptrs.scalar_type() == torch::kInt64,
+                    "row_combine_ptrs must be int64");
+        TORCH_CHECK(ptrs.numel() >= rows,
+                    "row_combine_ptrs must cover every row");
+        row_combine_ptrs_data = ptrs.data_ptr<int64_t>();
+    }
+    if (output_bf16) {
+        check_cuda_contiguous(out_bf16, "out_bf16");
+        TORCH_CHECK(out_bf16.scalar_type() == torch::kBFloat16,
+                    "out_bf16 must be BF16");
+        TORCH_CHECK(out_bf16.dim() == 2 && out_bf16.size(0) == rows &&
+                        out_bf16.size(1) == hidden,
+                    "out_bf16 shape must be [rows, hidden]");
+    }
 
-    auto out_fp8 = torch::empty(
-        {rows, hidden},
-        torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(x.device()));
-    auto out_scale = torch::empty(
-        {rows},
-        torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
-    auto out_bf16 = output_bf16
-        ? torch::empty(
-              {rows, hidden},
-              torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()))
-        : torch::empty(
-              {0},
-              torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()));
-
+    auto out_fp8_view = out_fp8;
+    auto out_scale_view = out_scale.view({-1});
+    auto out_bf16_view = out_bf16;
     launch_swiglu_quant_channelwise_auto(
-        x, topk_weights, out_fp8, out_scale, out_bf16,
+        x, topk_weights, row_combine_ptrs_data,
+        out_fp8_view, out_scale_view, out_bf16_view,
         output_bf16, has_clamp_value, clamp_value);
-
-    return {out_fp8, out_scale, out_bf16};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("swiglu_quant_channelwise", &swiglu_quant_channelwise,
+    m.def("swiglu_quant_channelwise_out", &swiglu_quant_channelwise_out,
           pybind11::arg("x"),
           pybind11::arg("topk_weights"),
+          pybind11::arg("out_fp8"),
+          pybind11::arg("out_scale"),
+          pybind11::arg("out_bf16"),
           pybind11::arg("output_bf16") = false,
           pybind11::arg("has_clamp_value") = true,
-          pybind11::arg("clamp_value") = 10.0);
+          pybind11::arg("clamp_value") = 10.0,
+          pybind11::arg("row_combine_ptrs") = std::nullopt);
 }

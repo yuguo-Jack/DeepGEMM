@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include <algorithm>
@@ -9,8 +10,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <deep_gemm/common/mega_moe_dcu.cuh>
 #include <deep_gemm/comm/mega_moe_dcu.cuh>
@@ -25,12 +28,8 @@
 
 namespace {
 
-static constexpr const char* kAsmKernelName =
-    "DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16";
 static constexpr const char* kCombineAsmKernelName =
     "DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE";
-static constexpr int64_t kAsmRowPointerPadding = 512;
-
 struct __attribute__((packed)) GpuProb {
     uint32_t m;
     uint32_t n;
@@ -166,7 +165,8 @@ void launch_l2_deepgemm_original_asm(
     const int64_t reduce_num_max_tokens_per_rank = 0,
     const int64_t reduce_num_tokens = 0,
     const int64_t reduce_num_topk = 0,
-    const int64_t reduce_hidden = 0) {
+    const int64_t reduce_hidden = 0,
+    const torch::Tensor* prob_storage_override = nullptr) {
     check_cuda_contiguous(output, "output");
     check_cuda_contiguous(act_fp8, "act_fp8");
     check_cuda_contiguous(act_scale, "act_scale");
@@ -305,8 +305,8 @@ void launch_l2_deepgemm_original_asm(
             static_cast<int>(reduce_num_max_tokens_per_rank),
             static_cast<int>(reduce_num_topk),
             static_cast<int>(reduce_hidden));
-        const int reduce_blocks =
-            std::clamp(env_int("K3_ASM_TAIL_REDUCE_BLOCKS", 128), 0, 128);
+        const int default_reduce_blocks =
+            reduce_num_max_tokens_per_rank <= 2048 ? 64 : 128;
         prob.asm_reduce_y = reinterpret_cast<uint16_t*>(asm_reduce_y->data_ptr());
         prob.asm_reduce_combine = reinterpret_cast<uint16_t*>(
             reinterpret_cast<uint8_t*>(sym_buffer->data_ptr<int8_t>()) + combine_offset);
@@ -316,14 +316,25 @@ void launch_l2_deepgemm_original_asm(
             reduce_num_max_tokens_per_rank * (reduce_hidden / 8));
         prob.asm_signal_generation = static_cast<uint32_t>(asm_signal_generation);
         prob.asm_tail_reduce = 1;
-        prob.asm_reduce_blocks = static_cast<uint32_t>(reduce_blocks);
+        prob.asm_reduce_blocks = static_cast<uint32_t>(default_reduce_blocks);
     }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto prob_storage = torch::empty(
-        {static_cast<int64_t>(sizeof(GpuProb))},
-        torch::TensorOptions().dtype(torch::kUInt8).device(output.device()));
-    void* prob_device = prob_storage.data_ptr();
+    torch::Tensor prob_storage;
+    void* prob_device = nullptr;
+    if (prob_storage_override != nullptr) {
+        check_cuda_contiguous(*prob_storage_override, "prob_storage");
+        TORCH_CHECK(prob_storage_override->scalar_type() == torch::kUInt8,
+                    "prob_storage must be uint8");
+        TORCH_CHECK(prob_storage_override->numel() >= static_cast<int64_t>(sizeof(GpuProb)),
+                    "prob_storage is too small for K3 launch arguments");
+        prob_device = prob_storage_override->data_ptr();
+    } else {
+        prob_storage = torch::empty(
+            {static_cast<int64_t>(sizeof(GpuProb))},
+            torch::TensorOptions().dtype(torch::kUInt8).device(output.device()));
+        prob_device = prob_storage.data_ptr();
+    }
     K3_HIP_CHECK(hipMemcpyAsync(
         prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice, stream));
 
@@ -366,82 +377,6 @@ void launch_l2_deepgemm_original_asm(
     TORCH_CHECK(post_launch_status == hipSuccess,
                 "hipGetLastError after K3 L2 asm launch failed: ",
                 hipGetErrorString(post_launch_status));
-}
-
-__global__ void build_row_combine_ptrs_kernel(
-    uint8_t* local_sym_buffer,
-    const int* output_index,
-    const int* recv_to_global_token,
-    uint64_t* row_combine_ptrs,
-    const int total_rows,
-    const int recv_rows,
-    const int num_ranks,
-    const int num_experts,
-    const int num_max_tokens_per_rank,
-    const int num_tokens,
-    const int num_topk,
-    const int hidden) {
-    uint8_t** sym_buffers =
-        deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
-    const int64_t routes = static_cast<int64_t>(recv_rows) * num_topk;
-    for (int64_t route =
-             static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         route < routes;
-         route += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-        const int row = output_index[route];
-        if (row < 0 || row >= total_rows)
-            continue;
-        const int recv_row = static_cast<int>(route / num_topk);
-        const int topk_slot = static_cast<int>(route - static_cast<int64_t>(recv_row) * num_topk);
-        const int global_token = recv_to_global_token[recv_row];
-        if (global_token < 0)
-            continue;
-        const int source_rank = global_token / num_tokens;
-        const int token_idx = global_token - source_rank * num_tokens;
-        if (source_rank < 0 || source_rank >= num_ranks ||
-            token_idx < 0 || token_idx >= num_tokens)
-            continue;
-        auto sections = deep_gemm::mega::get_sections(
-            sym_buffers[source_rank], num_ranks, num_experts,
-            num_max_tokens_per_rank, num_topk, hidden);
-        const int64_t partial_row =
-            static_cast<int64_t>(topk_slot) * num_max_tokens_per_rank + token_idx;
-        row_combine_ptrs[row] =
-            reinterpret_cast<uint64_t>(sections.combine + partial_row * hidden);
-    }
-}
-
-__global__ void fill_row_combine_ptrs_kernel(
-    uint64_t* row_combine_ptrs,
-    const int total_rows) {
-    for (int row = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-         row < total_rows;
-         row += static_cast<int>(gridDim.x) * blockDim.x) {
-        row_combine_ptrs[row] = 0;
-    }
-}
-
-__global__ void scatter_l2_to_combine_vec_kernel(
-    const uint16_t* l2_out,
-    const uint64_t* row_combine_ptrs,
-    const int total_rows,
-    const int hidden) {
-    constexpr int kBf16PerVec = 8;
-    const int vecs_per_row = hidden / kBf16PerVec;
-    const int64_t total_vecs = static_cast<int64_t>(total_rows) * vecs_per_row;
-    const auto* src_vec = reinterpret_cast<const uint4*>(l2_out);
-    for (int64_t task =
-             static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         task < total_vecs;
-         task += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-        const int row = static_cast<int>(task / vecs_per_row);
-        const int vec = static_cast<int>(task - static_cast<int64_t>(row) * vecs_per_row);
-        const uint64_t ptr = row_combine_ptrs[row];
-        if (ptr == 0)
-            continue;
-        auto* dst_vec = reinterpret_cast<uint4*>(reinterpret_cast<uint16_t*>(ptr));
-        dst_vec[vec] = src_vec[task];
-    }
 }
 
 __global__ void reduce_local_combine_vec_kernel(
@@ -503,64 +438,41 @@ __global__ void reduce_local_combine_vec_kernel(
 __global__ void rank_barrier_kernel(
     uint8_t* local_sym_buffer,
     const int rank_idx,
-    const int num_ranks) {
-    auto* signal_buffers =
-        deep_gemm::mega::dcu_peer_signal_ptrs(local_sym_buffer, num_ranks);
-    deep_gemm::mega::mega_moe_rank_barrier(signal_buffers, rank_idx, num_ranks);
-}
-
-__global__ void reset_asm_tail_signal_slots_kernel(
-    uint8_t* local_sym_buffer,
-    const int rank_idx,
-    const int num_ranks) {
+    const int num_ranks,
+    int32_t* asm_done_counter,
+    const bool reset_tail_signal_slots) {
     auto* signal_buffers =
         deep_gemm::mega::dcu_peer_signal_ptrs(local_sym_buffer, num_ranks);
     auto* my_signals = signal_buffers[rank_idx];
     const int thread_id = static_cast<int>(threadIdx.x);
-    if (thread_id < num_ranks) {
+    if (thread_id == 0 && asm_done_counter != nullptr) {
+        *asm_done_counter = 0;
+    }
+    if (reset_tail_signal_slots && thread_id < num_ranks) {
         __hip_atomic_store(my_signals + 8 + thread_id, 0, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
     }
+    deep_gemm::mega::mega_moe_rank_barrier(signal_buffers, rank_idx, num_ranks);
 }
 
-torch::Tensor k3_l2_original_asm(
-    const torch::Tensor& act_fp8,
-    const torch::Tensor& act_scale,
-    const torch::Tensor& m_indices,
-    const torch::Tensor& l2_weight,
-    const torch::Tensor& l2_scale,
-    const std::string& code_object_path) {
-    const int64_t rows = act_fp8.size(0);
-    const int64_t hidden = l2_weight.size(1) * 16;
-    auto out = torch::empty(
-        {rows, hidden},
-        torch::TensorOptions().dtype(torch::kBFloat16).device(act_fp8.device()));
-    launch_l2_deepgemm_original_asm(
-        out, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
-        code_object_path, kAsmKernelName, nullptr);
-    return out;
-}
-
-torch::Tensor k3_l2_combine_asm(
+void k3_l2_combine_asm_out(
     const torch::Tensor& act_fp8,
     const torch::Tensor& act_scale,
     const torch::Tensor& m_indices,
     const torch::Tensor& l2_weight,
     const torch::Tensor& l2_scale,
     const torch::Tensor& row_combine_ptrs,
+    const torch::Tensor& output_workspace,
+    const torch::Tensor& prob_storage,
     const std::string& code_object_path) {
-    const int64_t rows = act_fp8.size(0);
-    const int64_t hidden = l2_weight.size(1) * 16;
-    auto dummy_out = torch::empty(
-        {rows, hidden},
-        torch::TensorOptions().dtype(torch::kBFloat16).device(act_fp8.device()));
     launch_l2_deepgemm_original_asm(
-        dummy_out, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
-        code_object_path, kCombineAsmKernelName, &row_combine_ptrs);
-    return dummy_out;
+        output_workspace, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
+        code_object_path, kCombineAsmKernelName, &row_combine_ptrs,
+        nullptr, nullptr, 0, 0, false, nullptr, nullptr,
+        0, 0, 0, 0, 0, 0, 0, &prob_storage);
 }
 
-torch::Tensor k3_l2_combine_asm_tail_reduce(
+void k3_l2_combine_asm_tail_reduce_out(
     const torch::Tensor& act_fp8,
     const torch::Tensor& act_scale,
     const torch::Tensor& m_indices,
@@ -571,6 +483,8 @@ torch::Tensor k3_l2_combine_asm_tail_reduce(
     const torch::Tensor& asm_signal_addrs,
     const torch::Tensor& asm_reduce_y,
     const torch::Tensor& sym_buffer,
+    const torch::Tensor& output_workspace,
+    const torch::Tensor& prob_storage,
     const int64_t asm_done_target,
     const int64_t asm_signal_num_ranks,
     const int64_t asm_signal_generation,
@@ -581,106 +495,17 @@ torch::Tensor k3_l2_combine_asm_tail_reduce(
     const int64_t num_topk,
     const int64_t hidden_arg,
     const std::string& code_object_path) {
-    const int64_t rows = act_fp8.size(0);
     const int64_t hidden = l2_weight.size(1) * 16;
     TORCH_CHECK(hidden_arg == hidden,
                 "hidden_arg must match L2 weight hidden");
-    auto dummy_out = torch::empty(
-        {rows, hidden},
-        torch::TensorOptions().dtype(torch::kBFloat16).device(act_fp8.device()));
     launch_l2_deepgemm_original_asm(
-        dummy_out, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
+        output_workspace, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
         code_object_path, kCombineAsmKernelName, &row_combine_ptrs,
         &asm_done_counter, &asm_signal_addrs, asm_done_target,
         asm_signal_num_ranks, true, &asm_reduce_y, &sym_buffer,
         asm_signal_generation, num_ranks, num_experts,
-        num_max_tokens_per_rank, num_tokens, num_topk, hidden_arg);
-    return dummy_out;
-}
-
-torch::Tensor build_row_combine_ptrs(
-    const torch::Tensor& sym_buffer,
-    const torch::Tensor& output_index,
-    const torch::Tensor& recv_to_global_token,
-    const int64_t total_rows,
-    const int64_t num_ranks,
-    const int64_t num_experts,
-    const int64_t num_max_tokens_per_rank,
-    const int64_t num_tokens,
-    const int64_t num_topk,
-    const int64_t hidden) {
-    check_cuda_contiguous(sym_buffer, "sym_buffer");
-    check_cuda_contiguous(output_index, "output_index");
-    check_cuda_contiguous(recv_to_global_token, "recv_to_global_token");
-    TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8,
-                "sym_buffer must be int8");
-    TORCH_CHECK(output_index.scalar_type() == torch::kInt,
-                "output_index must be int32");
-    TORCH_CHECK(recv_to_global_token.scalar_type() == torch::kInt,
-                "recv_to_global_token must be int32");
-    TORCH_CHECK(output_index.dim() == 2,
-                "output_index must be [recv_rows, topk]");
-    TORCH_CHECK(output_index.size(1) == num_topk,
-                "output_index topk dimension mismatch");
-    TORCH_CHECK(recv_to_global_token.numel() == output_index.size(0),
-                "recv_to_global_token rows mismatch");
-    const int64_t row_ptr_count = total_rows + kAsmRowPointerPadding;
-    auto row_ptrs = torch::empty(
-        {row_ptr_count},
-        torch::TensorOptions().dtype(torch::kInt64).device(sym_buffer.device()));
-    constexpr int kThreads = 256;
-    const int fill_blocks = std::max<int64_t>(
-        1, std::min<int64_t>(4096, (row_ptr_count + kThreads - 1) / kThreads));
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    hipLaunchKernelGGL(fill_row_combine_ptrs_kernel, dim3(fill_blocks), dim3(kThreads), 0, stream,
-                       reinterpret_cast<uint64_t*>(row_ptrs.data_ptr<int64_t>()),
-                       static_cast<int>(row_ptr_count));
-    K3_HIP_CHECK(hipGetLastError());
-    const int64_t routes = output_index.numel();
-    const int blocks = std::max<int64_t>(1, std::min<int64_t>(4096, (routes + kThreads - 1) / kThreads));
-    hipLaunchKernelGGL(build_row_combine_ptrs_kernel, dim3(blocks), dim3(kThreads), 0, stream,
-                       reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
-                       output_index.data_ptr<int>(),
-                       recv_to_global_token.data_ptr<int>(),
-                       reinterpret_cast<uint64_t*>(row_ptrs.data_ptr<int64_t>()),
-                       static_cast<int>(total_rows),
-                       static_cast<int>(output_index.size(0)),
-                       static_cast<int>(num_ranks),
-                       static_cast<int>(num_experts),
-                       static_cast<int>(num_max_tokens_per_rank),
-                       static_cast<int>(num_tokens),
-                       static_cast<int>(num_topk),
-                       static_cast<int>(hidden));
-    K3_HIP_CHECK(hipGetLastError());
-    return row_ptrs;
-}
-
-void scatter_l2_to_combine(
-    const torch::Tensor& l2_out,
-    const torch::Tensor& row_combine_ptrs) {
-    check_cuda_contiguous(l2_out, "l2_out");
-    check_cuda_contiguous(row_combine_ptrs, "row_combine_ptrs");
-    TORCH_CHECK(l2_out.scalar_type() == torch::kBFloat16,
-                "l2_out must be BF16");
-    TORCH_CHECK(row_combine_ptrs.scalar_type() == torch::kInt64,
-                "row_combine_ptrs must be int64");
-    TORCH_CHECK(l2_out.dim() == 2, "l2_out must be [rows, hidden]");
-    TORCH_CHECK(row_combine_ptrs.numel() >= l2_out.size(0),
-                "row_combine_ptrs must cover every output row");
-    const int total_rows = static_cast<int>(l2_out.size(0));
-    const int hidden = static_cast<int>(l2_out.size(1));
-    TORCH_CHECK(hidden % 8 == 0,
-                "scatter_l2_to_combine currently expects hidden divisible by 8");
-    constexpr int kThreads = 256;
-    const int64_t total_vecs = static_cast<int64_t>(total_rows) * (hidden / 8);
-    const int blocks = std::max<int64_t>(1, std::min<int64_t>(4096, (total_vecs + kThreads - 1) / kThreads));
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    hipLaunchKernelGGL(scatter_l2_to_combine_vec_kernel, dim3(blocks), dim3(kThreads), 0, stream,
-                       reinterpret_cast<const uint16_t*>(l2_out.data_ptr()),
-                       reinterpret_cast<const uint64_t*>(row_combine_ptrs.data_ptr<int64_t>()),
-                       total_rows,
-                       hidden);
-    K3_HIP_CHECK(hipGetLastError());
+        num_max_tokens_per_rank, num_tokens, num_topk, hidden_arg,
+        &prob_storage);
 }
 
 void reduce_local_combine(
@@ -721,54 +546,62 @@ void reduce_local_combine(
 void rank_barrier(
     const torch::Tensor& sym_buffer,
     const int64_t rank_idx,
-    const int64_t num_ranks) {
+    const int64_t num_ranks,
+    const std::optional<torch::Tensor>& asm_done_counter,
+    const bool reset_tail_signal_slots) {
     check_cuda_contiguous(sym_buffer, "sym_buffer");
     TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8,
                 "sym_buffer must be int8");
+    int32_t* done_counter_ptr = nullptr;
+    if (asm_done_counter.has_value()) {
+        const auto& counter = asm_done_counter.value();
+        check_cuda_contiguous(counter, "asm_done_counter");
+        TORCH_CHECK(counter.scalar_type() == torch::kInt &&
+                        counter.numel() >= 1,
+                    "asm_done_counter must be a CUDA int32 tensor");
+        done_counter_ptr = counter.data_ptr<int32_t>();
+    }
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     hipLaunchKernelGGL(rank_barrier_kernel, dim3(1), dim3(64), 0, stream,
                        reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
                        static_cast<int>(rank_idx),
-                       static_cast<int>(num_ranks));
+                       static_cast<int>(num_ranks),
+                       done_counter_ptr,
+                       reset_tail_signal_slots);
     K3_HIP_CHECK(hipGetLastError());
 }
 
-void reset_asm_tail_signal_slots(
-    const torch::Tensor& sym_buffer,
-    const int64_t rank_idx,
-    const int64_t num_ranks) {
-    check_cuda_contiguous(sym_buffer, "sym_buffer");
-    TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8,
-                "sym_buffer must be int8");
-    TORCH_CHECK(num_ranks > 0 && num_ranks <= 8,
-                "reset_asm_tail_signal_slots supports num_ranks in [1, 8]");
+void fill_i64_tensor_from_host(
+    const torch::Tensor& out,
+    const std::vector<int64_t>& values) {
+    check_cuda_contiguous(out, "out");
+    TORCH_CHECK(out.scalar_type() == torch::kInt64,
+                "out must be int64");
+    TORCH_CHECK(out.numel() >= static_cast<int64_t>(values.size()),
+                "out is smaller than host values");
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    hipLaunchKernelGGL(reset_asm_tail_signal_slots_kernel, dim3(1), dim3(64), 0, stream,
-                       reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
-                       static_cast<int>(rank_idx),
-                       static_cast<int>(num_ranks));
-    K3_HIP_CHECK(hipGetLastError());
+    K3_HIP_CHECK(hipMemcpyAsync(
+        out.data_ptr<int64_t>(),
+        values.data(),
+        values.size() * sizeof(int64_t),
+        hipMemcpyHostToDevice,
+        stream));
 }
 
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("k3_l2_original_asm", &k3_l2_original_asm,
-          pybind11::arg("act_fp8"),
-          pybind11::arg("act_scale"),
-          pybind11::arg("m_indices"),
-          pybind11::arg("l2_weight"),
-          pybind11::arg("l2_scale"),
-          pybind11::arg("code_object_path"));
-    m.def("k3_l2_combine_asm", &k3_l2_combine_asm,
+    m.def("k3_l2_combine_asm_out", &k3_l2_combine_asm_out,
           pybind11::arg("act_fp8"),
           pybind11::arg("act_scale"),
           pybind11::arg("m_indices"),
           pybind11::arg("l2_weight"),
           pybind11::arg("l2_scale"),
           pybind11::arg("row_combine_ptrs"),
+          pybind11::arg("output_workspace"),
+          pybind11::arg("prob_storage"),
           pybind11::arg("code_object_path"));
-    m.def("k3_l2_combine_asm_tail_reduce", &k3_l2_combine_asm_tail_reduce,
+    m.def("k3_l2_combine_asm_tail_reduce_out", &k3_l2_combine_asm_tail_reduce_out,
           pybind11::arg("act_fp8"),
           pybind11::arg("act_scale"),
           pybind11::arg("m_indices"),
@@ -779,6 +612,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("asm_signal_addrs"),
           pybind11::arg("asm_reduce_y"),
           pybind11::arg("sym_buffer"),
+          pybind11::arg("output_workspace"),
+          pybind11::arg("prob_storage"),
           pybind11::arg("asm_done_target"),
           pybind11::arg("asm_signal_num_ranks"),
           pybind11::arg("asm_signal_generation"),
@@ -789,20 +624,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_topk"),
           pybind11::arg("hidden"),
           pybind11::arg("code_object_path"));
-    m.def("build_row_combine_ptrs", &build_row_combine_ptrs,
-          pybind11::arg("sym_buffer"),
-          pybind11::arg("output_index"),
-          pybind11::arg("recv_to_global_token"),
-          pybind11::arg("total_rows"),
-          pybind11::arg("num_ranks"),
-          pybind11::arg("num_experts"),
-          pybind11::arg("num_max_tokens_per_rank"),
-          pybind11::arg("num_tokens"),
-          pybind11::arg("num_topk"),
-          pybind11::arg("hidden"));
-    m.def("scatter_l2_to_combine", &scatter_l2_to_combine,
-          pybind11::arg("l2_out"),
-          pybind11::arg("row_combine_ptrs"));
     m.def("reduce_local_combine", &reduce_local_combine,
           pybind11::arg("y"),
           pybind11::arg("sym_buffer"),
@@ -815,9 +636,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rank_barrier", &rank_barrier,
           pybind11::arg("sym_buffer"),
           pybind11::arg("rank_idx"),
-          pybind11::arg("num_ranks"));
-    m.def("reset_asm_tail_signal_slots", &reset_asm_tail_signal_slots,
-          pybind11::arg("sym_buffer"),
-          pybind11::arg("rank_idx"),
-          pybind11::arg("num_ranks"));
+          pybind11::arg("num_ranks"),
+          pybind11::arg("asm_done_counter") = std::nullopt,
+          pybind11::arg("reset_tail_signal_slots") = false);
+    m.def("fill_i64_tensor_from_host", &fill_i64_tensor_from_host,
+          pybind11::arg("out"),
+          pybind11::arg("values"));
 }

@@ -149,6 +149,35 @@ def get_ext_modules():
                           extra_compile_args={'cxx': cxx_flags, 'nvcc': hipcc_flags})]
 
 
+def get_python_packages():
+    if IS_HIP_EXTENSION and package_name == 'megamoe':
+        return [
+            'megamoe',
+            'megamoe.dcu_megamoe_large_opt',
+            'megamoe.dcu_megamoe_large_opt.K1_fused',
+            'megamoe.dcu_megamoe_large_opt.K2_fused',
+            'megamoe.dcu_megamoe_large_opt.K3_fused',
+        ]
+    return find_packages('.')
+
+
+def get_package_data():
+    data = {
+        'deep_gemm': [
+            'include/deep_gemm/**/*',
+            'include/cute/**/*',
+            'include/cutlass/**/*',
+        ] if not IS_HIP_EXTENSION else [],
+    }
+    if IS_HIP_EXTENSION and package_name == 'megamoe':
+        data.update({
+            'megamoe.dcu_megamoe_large_opt.K1_fused': ['*.cu', '*.s'],
+            'megamoe.dcu_megamoe_large_opt.K2_fused': ['*.cu'],
+            'megamoe.dcu_megamoe_large_opt.K3_fused': ['*.cu', '*.s'],
+        })
+    return data
+
+
 class CustomBuildPy(build_py):
     def run(self):
         # First, prepare the include directories
@@ -187,13 +216,19 @@ class CustomBuildPy(build_py):
 
     def prepare_includes(self):
         # Create temporary build directory instead of modifying package directory
-        build_include_dir = os.path.join(self.build_lib, 'deep_gemm/include')
+        build_include_dir = os.path.join(
+            self.build_lib,
+            package_name if IS_HIP_EXTENSION and package_name == 'megamoe' else 'deep_gemm',
+            'include',
+        )
         os.makedirs(build_include_dir, exist_ok=True)
 
-        # Copy third-party includes to the build directory
-        for d in third_party_include_dirs:
-            dirname = d.split('/')[-1]
-            src_dir = os.path.join(current_dir, d)
+        include_sources = [(project_path('deep_gemm', 'include', 'deep_gemm'), 'deep_gemm')] \
+            if IS_HIP_EXTENSION and package_name == 'megamoe' else []
+        include_sources.extend((os.path.join(current_dir, d), d.split('/')[-1]) for d in third_party_include_dirs)
+
+        # Copy JIT includes to the build directory.
+        for src_dir, dirname in include_sources:
             dst_dir = os.path.join(build_include_dir, dirname)
 
             # Remove existing directory if it exists
@@ -244,14 +279,8 @@ if __name__ == '__main__':
     setuptools.setup(
         name=package_name,
         version=get_package_version(),
-        packages=['megamoe'] if IS_HIP_EXTENSION and package_name == 'megamoe' else find_packages('.'),
-        package_data={
-            'deep_gemm': [
-                'include/deep_gemm/**/*',
-                'include/cute/**/*',
-                'include/cutlass/**/*',
-            ] if not IS_HIP_EXTENSION else [],
-        },
+        packages=get_python_packages(),
+        package_data=get_package_data(),
         ext_modules=get_ext_modules(),
         zip_safe=False,
         cmdclass=cmdclass,

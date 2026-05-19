@@ -9,8 +9,17 @@ from torch.utils.cpp_extension import load
 
 
 THIS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parents[1]
-SCRATCH_DIR = REPO_ROOT / "hygon_tmp" / "largesize" / "K2_fused"
+
+
+def _find_scratch_root(start: Path) -> Path:
+    for path in (start, *start.parents):
+        if (path / "setup.py").exists():
+            return path
+    return Path.cwd()
+
+
+SCRATCH_ROOT = _find_scratch_root(THIS_DIR)
+SCRATCH_DIR = SCRATCH_ROOT / "hygon_tmp" / "large_opt" / "K2_fused"
 
 
 def _prepend_env_path(name: str, values: list[str]) -> None:
@@ -70,9 +79,12 @@ def load_extension(verbose: bool = False):
     )
 
 
-def swiglu_quant_channelwise(
+def swiglu_quant_channelwise_out(
     x: torch.Tensor,
     topk_weights: torch.Tensor | None,
+    out_fp8: torch.Tensor,
+    out_scale: torch.Tensor,
+    out_bf16: torch.Tensor,
     *,
     num_per_channels: int,
     use_col_major_scales: bool = False,
@@ -80,6 +92,7 @@ def swiglu_quant_channelwise(
     ue8m0_scale: bool = False,
     output_bf16: bool = False,
     clamp_value: float | None = 10.0,
+    row_combine_ptrs: torch.Tensor | None = None,
     verbose_build: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
@@ -98,15 +111,18 @@ def swiglu_quant_channelwise(
 
     ext = load_extension(verbose=verbose_build)
     weights = topk_weights if topk_weights is not None else torch.empty(0, device=x.device, dtype=torch.float32)
-    out_fp8, out_scale, out_bf16 = ext.swiglu_quant_channelwise(
+    ext.swiglu_quant_channelwise_out(
         x.contiguous(),
         weights.contiguous(),
+        out_fp8,
+        out_scale,
+        out_bf16,
         bool(output_bf16),
         clamp_value is not None,
         float(clamp_value or 0.0),
+        row_combine_ptrs.contiguous() if row_combine_ptrs is not None else None,
     )
-    # Match TileLang DCU wrapper for non-col-major single-channel scales: [1, rows].
-    out_scale = out_scale.view(1, x.shape[0])
+    out_scale_view = out_scale.view(1, x.shape[0])
     if output_bf16:
-        return out_fp8, out_scale, out_bf16
-    return out_fp8, out_scale
+        return out_fp8, out_scale_view, out_bf16
+    return out_fp8, out_scale_view

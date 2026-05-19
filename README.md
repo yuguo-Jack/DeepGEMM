@@ -150,7 +150,7 @@ MegaMoE size used by the benchmark below:
 - Top-K: 6
 - Hidden size: 4096
 - Intermediate hidden size: 2048
-- Maximum tokens per rank: 1024
+- Maximum tokens per rank: 2048 for the staged large-shape path in this tree
 
 Build on a DTK 26.04 environment:
 
@@ -162,6 +162,9 @@ source /opt/dtk-26.04/env.sh
 The build script keeps intermediate files under `build/` and writes the wheel to
 `build/whl/`.  It also builds the extension in place, so the local checkout can
 run the tests directly.
+The optional large-token staged path is packaged as source and compiled by JIT
+on first use; `build_dcu_megamoe.sh` does not prebuild or require any
+`hygon_tmp` artifacts.
 
 Run the DSV4-Flash correctness and performance check:
 
@@ -169,7 +172,7 @@ Run the DSV4-Flash correctness and performance check:
 source /opt/dtk-26.04/env.sh
 python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
-  --num-max-tokens-per-rank 1024 \
+  --num-max-tokens-per-rank 2048 \
   --num-tokens 512 \
   --hidden 4096 \
   --intermediate-hidden 2048 \
@@ -181,16 +184,89 @@ python tests/test_mega_moe_dcu.py \
   --out hygon_tmp/megamoe_dcu_dsv4_flash_512.json
 ```
 
-To sweep the DSV4-Flash token sizes while keeping the symmetric buffer capacity
-fixed at 1024 tokens per rank:
+The default DCU execution path remains the original persistent fused kernel.
+Set `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1` to route the same public
+`megamoe.fp8_w8a8_mega_moe` API through the large-token staged path:
+
+- K1: dispatch pull + L1 FP8 grouped GEMM
+- K2: SwiGLU + channelwise FP8 quant
+- K3: L2 FP8 grouped GEMM + combine reduce
+
+The staged path is intended for the DeepSeek-V4-Flash EP8 shape above and keeps
+JIT/cache products under `hygon_tmp/large_opt/`.
+Its Python/JIT implementation is packaged under
+`megamoe.dcu_megamoe_large_opt` so the public and optional large-token paths
+stay inside the `megamoe` package.
+The wheel carries the K1/K2/K3 Python, HIP, asm sources and the headers needed
+by those JIT extensions; `hygon_tmp` is generated on demand and is not required
+as committed input.
+The asm `.co` files are not stored in the wheel. They are rebuilt from the
+packaged `.s` files into `hygon_tmp/large_opt/` and guarded by a source hash, so
+installing a wheel with changed asm sources invalidates any older cached `.co`.
+Its large temporary activations reuse the original DCU MegaMoE `route_scratch`
+allocation; the integration does not allocate a second persistent L1/K2/K3
+activation workspace.
+By default K3 uses the integrated `ASM combine -> barrier -> reduce` path.
+Set `K3_USE_ASM_TAIL_REDUCE=1` together with
+`MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1`, or run the sweep script with
+`K3_PATH=tail-reduce`, to test the K3 tail-reduce variant.
+For `num_max_tokens_per_rank <= 2048`, the tail reducer defaults to 64
+reducer workgroups; larger max-token buffers keep the previous 128-workgroup
+default.
+The staged path keeps the tail-reduce signal state in `route_scratch`; when the
+large-opt environment is enabled before creating the symmetric buffer, this
+state is prepared during buffer initialization rather than the timed execution
+path.
+
+One host-side tuning knob is available for the staged path and does not add
+device kernels:
+
+- `K2_SKIP_INACTIVE_ROWS_MIN_TOKENS` controls when K2 consumes K1's
+  `row_combine_ptrs` validity metadata. The default is 1536, so larger token
+  counts skip inactive-row activation work while smaller token counts keep the
+  leaner K2 launch path.
+
+Run the requested token-per-rank sweep. The default list includes compact-window
+representatives around 1025..1441 as well as the main 512/1024/2048 sizes:
+
+```bash
+source /opt/dtk-26.04/env.sh
+bash scripts/run_dcu_megamoe_large_opt.sh
+```
+
+For a correctness-only smoke run, set `SKIP_BENCH=1`.  The staged test keeps
+the weight FP8 conversion chunked by default; tune
+`MEGAMOE_DCU_WEIGHT_CAST_CHUNK_ROWS` if the random-weight setup needs a smaller
+or larger temporary allocation.
+
+Or run one size directly:
+
+```bash
+source /opt/dtk-26.04/env.sh
+MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1 python tests/test_mega_moe_dcu.py \
+  --num-processes 8 \
+  --num-max-tokens-per-rank 2048 \
+  --num-tokens 1024 \
+  --hidden 4096 \
+  --intermediate-hidden 2048 \
+  --num-experts 256 \
+  --num-topk 6 \
+  --correctness-iters 1 \
+  --warmup 3 \
+  --repeat 8 \
+  --out hygon_tmp/large_opt/integrated/dsv4_flash_large_opt_1024.json
+```
+
+To sweep the original persistent fused path while keeping the symmetric buffer
+capacity fixed at 2048 tokens per rank:
 
 ```bash
 source /opt/dtk-26.04/env.sh
 mkdir -p hygon_tmp/megamoe_dcu_dsv4_flash
-for tokens in 32 64 128 256 512 1024; do
+for tokens in 512 1024 2048; do
   python tests/test_mega_moe_dcu.py \
     --num-processes 8 \
-    --num-max-tokens-per-rank 1024 \
+    --num-max-tokens-per-rank 2048 \
     --num-tokens "${tokens}" \
     --hidden 4096 \
     --intermediate-hidden 2048 \

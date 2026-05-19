@@ -25,11 +25,11 @@ TILELANG_BENCH_BACKEND = "event"
 import deep_ep
 import deepgemm
 from tilelang.profiler.bench import do_bench as tilelang_bench
-from tilelang_ops import swiglu_apply_weight_to_fp8_dcu
 from triton_ops import (
     triton_ep_gather_channelwise,
     triton_ep_scatter_channelwise,
 )
+from megamoe.dcu_megamoe_large_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
 
 
 def print_once(rank: int, msg: str = ""):
@@ -245,24 +245,27 @@ def run_deepgemm_megamoe_baseline(
         grouped["m_indices"],
     )
 
-    l2_a_fp8, l2_a_scale, _ = swiglu_apply_weight_to_fp8_dcu(
-        l1_out,
-        grouped["route_weights"],
-        None,
-        num_per_channels=intermediate_hidden,
-        use_col_major_scales=False,
-        round_scale=False,
-        ue8m0_scale=False,
-        output_bf16=True,
-        clamp_value=activation_clamp,
+    l2_a_fp8 = torch.empty(
+        (l1_out.shape[0], intermediate_hidden),
+        device=x_fp8.device,
+        dtype=torch.float8_e4m3fn,
     )
-    if l2_a_scale.dim() == 2:
-        l2_a_scale = l2_a_scale[:, 0].contiguous()
-
+    l2_a_scale = torch.empty((l1_out.shape[0],), device=x_fp8.device, dtype=torch.float32)
     l2_out = torch.empty(
         (grouped["a"][0].shape[0], hidden),
         device=x_fp8.device,
         dtype=torch.bfloat16,
+    )
+    swiglu_quant_channelwise_out(
+        l1_out,
+        grouped["route_weights"],
+        l2_a_fp8,
+        l2_a_scale,
+        l2_out,
+        num_per_channels=intermediate_hidden,
+        output_bf16=False,
+        clamp_value=activation_clamp,
+        row_combine_ptrs=None,
     )
     deepgemm.m_grouped_fp8_gemm_nt_contiguous(
         (l2_a_fp8, l2_a_scale),
@@ -407,11 +410,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
 
-    print_once(rank, "DCU MegaMoE channelwise W8A8 baseline:")
+    large_opt_enabled = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "0").strip().lower() in {
+        "1", "true", "yes", "on", "large_opt", "3stage"
+    }
+    fused_execution = "large_opt_3stage" if large_opt_enabled else "persistent_fused"
+    print_once(rank, "DCU MegaMoE channelwise W8A8 test:")
     print_once(rank, f" > megamoe: {getattr(megamoe, '__file__', None)}")
     print_once(rank, f" > deep_ep: {getattr(deep_ep, '__file__', None)}")
     print_once(rank, f" > deepgemm: {getattr(deepgemm, '__file__', None)}")
     print_once(rank, f" > build config: {megamoe.get_mega_moe_hip_build_config()}")
+    print_once(rank, f" > fused execution={fused_execution}")
 
     sym_buffer = megamoe.get_symm_buffer_for_mega_moe(
         group,
@@ -514,6 +522,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     print_once(rank, f" > baseline preprocess={args.prepost_backend} SGLang DeepEP normal ep_scatter/ep_gather style")
     print_once(rank, " > router weights=CUDA MegaMoE compatible SwiGLU-pre-L2-quant")
     print_once(rank, f" > sym_buffer={sym_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
+    print_once(rank, f" > route_scratch={sym_buffer.route_scratch.nbytes / 2 ** 30:.3f} GiB")
 
     for i in range(args.correctness_iters):
         fused_y, fused_stats = run_fused(reset_stats=True)
@@ -545,6 +554,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "num_experts": num_experts,
                 "num_topk": num_topk,
                 "prepost_backend": args.prepost_backend,
+                "fused_execution": fused_execution,
                 "correctness_iters": args.correctness_iters,
                 "atol": args.atol,
             }
@@ -646,7 +656,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "fused_min_ms_avg_per_rank": avg_fused_min_s * 1e3,
             "baseline_median_ms_avg_per_rank": avg_baseline_s * 1e3,
             "baseline_min_ms_avg_per_rank": avg_baseline_min_s * 1e3,
-            "baseline_kind": f"deepep_dispatch_{args.prepost_backend}_scatter_deepgemm_tilelang_swiglu_{args.prepost_backend}_gather_deepep_combine_channelwise",
+            "baseline_kind": f"deepep_dispatch_{args.prepost_backend}_scatter_deepgemm_k2_swiglu_quant_{args.prepost_backend}_gather_deepep_combine_channelwise",
+            "fused_execution": fused_execution,
             "bench_backend": f"tilelang_{fused_timing['backend']}",
             "router_weight_stage": "swiglu_pre_l2_quant",
             "speedup_vs_deepep_deepgemm_baseline": speedup,
@@ -715,12 +726,16 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--skip-bench", action="store_true")
+    parser.add_argument("--large-opt-3stage", action="store_true",
+                        help="route megamoe.fp8_w8a8_mega_moe through K1/K2/K3 staged large-shape path")
     parser.add_argument("--out", type=str, default="hygon_tmp/megamoe_dcu_baseline/default_perf.json")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.large_opt_3stage:
+        os.environ["MEGAMOE_DCU_USE_LARGE_OPT_3STAGE"] = "1"
     if args.local_rank_idx is not None:
         test(args.local_rank_idx, args.num_processes, args)
     else:

@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <tuple>
 
@@ -28,8 +30,6 @@
 
 namespace {
 
-static constexpr const char* kAsmKernelName =
-    "DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16";
 static constexpr const char* kFusedL1AsmKernelName =
     "DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1";
 static constexpr int kK1SupportedRanks = 8;
@@ -40,7 +40,9 @@ static constexpr int kK1SupportedL1Rows = 4096;
 static constexpr int kK1RouteTileM = 256;
 static constexpr int kK1SupportedAlignment = 256;
 static constexpr int kK1RouteCapacitySlack = 64;
+static constexpr int64_t kK1RowPointerPadding = 512;
 static constexpr double kK1AutoCompactMinSaving = 0.10;
+static constexpr double kK1CompactTightMarginMinSaving = 0.45;
 static constexpr const char* kK1ShapeContract =
     "K1_fused dispatch-pull L1 asm is currently specialized for ranks=8, "
     "experts=256, local_experts=32, topk=6, hidden=4096, "
@@ -105,14 +107,19 @@ int64_t compact_capacity_tiles(
     if (asm_tiles_per_expert <= 1) {
         return fixed_capacity_tiles;
     }
-    const double estimated_tiles =
+    const double compact_tiles_per_expert =
         estimate_compact_tiles_per_expert(
-            total_tasks, num_experts, asm_tiles_per_expert) *
-        static_cast<double>(local_experts);
-    constexpr int64_t kCompactCapacityMarginTiles = 4;
+            total_tasks, num_experts, asm_tiles_per_expert);
+    const double estimated_tiles =
+        compact_tiles_per_expert * static_cast<double>(local_experts);
+    const double saving =
+        (static_cast<double>(asm_tiles_per_expert) - compact_tiles_per_expert) /
+        static_cast<double>(asm_tiles_per_expert);
+    const int64_t margin_tiles =
+        saving >= kK1CompactTightMarginMinSaving ? 2 : 4;
     int64_t capacity_tiles =
         static_cast<int64_t>(std::ceil(estimated_tiles)) +
-        kCompactCapacityMarginTiles;
+        margin_tiles;
     capacity_tiles = std::max<int64_t>(local_experts, capacity_tiles);
     return std::min<int64_t>(fixed_capacity_tiles, capacity_tiles);
 }
@@ -155,8 +162,9 @@ struct __attribute__((packed)) GpuProb {
     uint32_t expert_tiles_per_expert;
     float* route_weights;
     int32_t* output_index;
-    int32_t* route_tasks;
+    int64_t* row_combine_ptrs;
     int32_t* meta_flags;
+    int32_t* local_expert_stats;
 };
 
 static_assert(offsetof(GpuProb, staged_x) == 0x80,
@@ -177,10 +185,12 @@ static_assert(offsetof(GpuProb, route_weights) == 0xd0,
               "fused L1 asm expects route_weights at GpuProb+0xd0");
 static_assert(offsetof(GpuProb, output_index) == 0xd8,
               "fused L1 asm expects output_index at GpuProb+0xd8");
-static_assert(offsetof(GpuProb, route_tasks) == 0xe0,
-              "fused L1 asm expects route_tasks at GpuProb+0xe0");
+static_assert(offsetof(GpuProb, row_combine_ptrs) == 0xe0,
+              "fused L1 asm expects row_combine_ptrs at GpuProb+0xe0");
 static_assert(offsetof(GpuProb, meta_flags) == 0xe8,
               "fused L1 asm expects meta_flags at GpuProb+0xe8");
+static_assert(offsetof(GpuProb, local_expert_stats) == 0xf0,
+              "fused L1 asm expects local_expert_stats at GpuProb+0xf0");
 
 struct __attribute__((packed)) KernelArgs {
     uint32_t gemm_count;
@@ -206,20 +216,6 @@ struct LoadedAsmKernel {
 LoadedAsmKernel& asm_kernel_cache() {
     static LoadedAsmKernel cache;
     return cache;
-}
-
-void* device_prob_buffer() {
-    static std::mutex mutex;
-    static void* buffers[64] = {};
-    int device = -1;
-    K1_HIP_CHECK(hipGetDevice(&device));
-    TORCH_CHECK(device >= 0 && device < 64,
-                "unexpected HIP device id for K1 asm launch: ", device);
-    std::lock_guard<std::mutex> guard(mutex);
-    if (buffers[device] == nullptr) {
-        K1_HIP_CHECK(hipMalloc(&buffers[device], sizeof(GpuProb)));
-    }
-    return buffers[device];
 }
 
 uint32_t initial_fused_l1_flag_generation() {
@@ -299,6 +295,7 @@ __global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
     int32_t* route_scratch_i32,
     float* route_weights,
     int64_t* row_x_ptrs,
+    int64_t* row_combine_ptrs,
     float* row_x_scales,
     int32_t* m_indices,
     const int capacity_tiles) {
@@ -326,13 +323,20 @@ __global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
     }
     __syncthreads();
     const int active_rows = active_tiles_shared * kTileM;
-    for (int row = tid; row < active_rows; row += static_cast<int>(blockDim.x)) {
+    const int capacity_rows = capacity_tiles * kTileM;
+    for (int row = tid; row < capacity_rows; row += static_cast<int>(blockDim.x)) {
         const int tile_id = row / kTileM;
-        const int expert = route_scratch_i32[65 + tile_id];
+        const int expert =
+            row < active_rows ? route_scratch_i32[65 + tile_id] : 0;
         row_x_ptrs[row] = -1;
         row_x_scales[row] = 0.0f;
         route_weights[row] = 0.0f;
         m_indices[row] = expert >= 0 ? expert : 0;
+    }
+    for (int row = tid;
+         row < capacity_rows + static_cast<int>(kK1RowPointerPadding);
+         row += static_cast<int>(blockDim.x)) {
+        row_combine_ptrs[row] = 0;
     }
 }
 
@@ -341,9 +345,11 @@ __global__ void k1_emit_compact_routes_kernel(
     int32_t* route_scratch_i32,
     float* route_weights,
     int64_t* row_x_ptrs,
+    int64_t* row_combine_ptrs,
     float* row_x_scales,
     int32_t* m_indices,
     int32_t* output_index,
+    int32_t* local_expert_stats,
     const uint64_t symm_base_addr,
     const int rank_idx,
     const int num_ranks,
@@ -373,6 +379,7 @@ __global__ void k1_emit_compact_routes_kernel(
     const float* x_sf = sections.x_sf;
     const int64_t* topk_idx = sections.topk_idx;
     const float* topk_weights = sections.topk_weights;
+    uint16_t* combine = sections.combine;
     for (int route_offset =
              static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
          route_offset < routes_per_rank;
@@ -415,6 +422,15 @@ __global__ void k1_emit_compact_routes_kernel(
         row_x_scales[row] = x_sf[token_idx];
         route_weights[row] = weight;
         m_indices[row] = local_expert;
+        const int topk_slot = route_offset - token_idx * num_topk;
+        const int64_t partial_row =
+            static_cast<int64_t>(topk_slot) * num_max_tokens_per_rank + token_idx;
+        row_combine_ptrs[row] =
+            static_cast<int64_t>(
+                reinterpret_cast<uintptr_t>(combine + partial_row * hidden));
+        if (local_expert_stats != nullptr) {
+            atomicAdd(local_expert_stats + local_expert, 1);
+        }
     }
 }
 
@@ -440,95 +456,6 @@ hipFunction_t get_asm_function(const std::string& code_object_path,
     return cache.function;
 }
 
-void launch_l1_deepgemm_original_asm(
-    const torch::Tensor& output,
-    const torch::Tensor& grouped_x,
-    const torch::Tensor& grouped_x_scale,
-    const torch::Tensor& l1_weight,
-    const torch::Tensor& l1_scale,
-    const torch::Tensor& m_indices,
-    const std::string& code_object_path) {
-    const int total_rows = static_cast<int>(grouped_x.size(0));
-    const int hidden = static_cast<int>(grouped_x.size(1));
-    const int n = static_cast<int>(output.size(1));
-    const int local_experts = static_cast<int>(l1_weight.size(0));
-    TORCH_CHECK(hidden == kK1SupportedHidden && n == kK1SupportedL1Rows,
-                "current K1 original asm path is specialized for K=N=4096");
-    TORCH_CHECK(total_rows > 0 && total_rows % kK1RouteTileM == 0,
-                "original asm K1 expects total_rows padded to a 256-row tile");
-    TORCH_CHECK(local_experts > 0, "local_experts must be positive");
-
-    GpuProb prob{};
-    prob.m = static_cast<uint32_t>(n);
-    prob.n = static_cast<uint32_t>(total_rows);
-    prob.batch = 1;
-    prob.k = static_cast<uint32_t>(hidden);
-    prob.d = output.data_ptr();
-    prob.c = output.data_ptr();
-    prob.a = l1_weight.data_ptr();
-    prob.b = grouped_x.data_ptr();
-    prob.strideD1 = static_cast<uint32_t>(n);
-    prob.strideD2 = static_cast<uint32_t>(total_rows * n);
-    prob.strideC1 = static_cast<uint32_t>(n);
-    prob.strideC2 = static_cast<uint32_t>(total_rows * n);
-    prob.strideA1 = static_cast<uint32_t>(hidden);
-    prob.strideA2 = static_cast<uint32_t>(n * hidden);
-    prob.strideB1 = static_cast<uint32_t>(hidden);
-    prob.strideB2 = static_cast<uint32_t>(total_rows * hidden);
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    std::memcpy(prob.alpha, &alpha, sizeof(float));
-    std::memcpy(prob.beta, &beta, sizeof(float));
-    prob.scaleA = l1_scale.data_ptr<float>();
-    prob.scaleB = grouped_x_scale.data_ptr<float>();
-    prob.staged_x = nullptr;
-    prob.staged_flags = nullptr;
-    prob.symm_base = nullptr;
-
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    void* prob_device = device_prob_buffer();
-    K1_HIP_CHECK(hipMemcpyAsync(
-        prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice, stream));
-
-    KernelArgs args{};
-    args.gemm_count = 1;
-    args.DeviceUserArguments = prob_device;
-    args.argsPtr = nullptr;
-    args.kipWgTableGen = 0;
-    args.gsu = 1;
-    args.m_indics = m_indices.data_ptr<int32_t>();
-    args.row_x_offsets = nullptr;
-    args.staged_x = nullptr;
-    args.staged_flags = nullptr;
-    args.symm_base = nullptr;
-
-    const int local_work_size = 768;
-    const int wg_m = (n + 255) / 256;
-    const int wg_n = (total_rows + 255) / 256;
-    const size_t global_work_items =
-        static_cast<size_t>(local_work_size) * wg_m * wg_n;
-
-    hipFunction_t function = get_asm_function(code_object_path, kAsmKernelName);
-    size_t arg_size = sizeof(args);
-    void* config[] = {
-        HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-        HIP_LAUNCH_PARAM_BUFFER_SIZE, &arg_size,
-        HIP_LAUNCH_PARAM_END};
-    const hipError_t launch_status = hipExtModuleLaunchKernel(
-        function,
-        global_work_items, 1, 1,
-        local_work_size, 1, 1,
-        0, stream, nullptr, reinterpret_cast<void**>(&config),
-        nullptr, 0, 0);
-    const hipError_t post_launch_status = hipGetLastError();
-    TORCH_CHECK(launch_status == hipSuccess,
-                "hipExtModuleLaunchKernel(original asm) failed: ",
-                hipGetErrorString(launch_status));
-    TORCH_CHECK(post_launch_status == hipSuccess,
-                "hipGetLastError after original asm launch failed: ",
-                hipGetErrorString(post_launch_status));
-}
-
 void launch_l1_deepgemm_fused_asm(
     const torch::Tensor& output,
     const torch::Tensor& sym_buffer,
@@ -541,8 +468,9 @@ void launch_l1_deepgemm_fused_asm(
     const torch::Tensor& l1_scale,
     const torch::Tensor& m_indices,
     const torch::Tensor& route_weights,
-    const torch::Tensor& route_tasks,
+    const torch::Tensor& row_combine_ptrs,
     const torch::Tensor& output_index,
+    const torch::Tensor* local_expert_stats,
     const int64_t rank_idx,
     const int64_t num_ranks,
     const int64_t num_experts,
@@ -585,14 +513,22 @@ void launch_l1_deepgemm_fused_asm(
                     route_weights.is_contiguous() &&
                     route_weights.numel() >= total_rows,
                 "route_weights must be a contiguous CUDA fp32 tensor");
-    TORCH_CHECK(route_tasks.is_cuda() && route_tasks.scalar_type() == torch::kInt &&
-                    route_tasks.is_contiguous() &&
-                    route_tasks.numel() >= total_rows,
-                "route_tasks must be a contiguous CUDA int32 tensor");
+    TORCH_CHECK(row_combine_ptrs.is_cuda() &&
+                    row_combine_ptrs.scalar_type() == torch::kInt64 &&
+                    row_combine_ptrs.is_contiguous() &&
+                    row_combine_ptrs.numel() >= total_rows + kK1RowPointerPadding,
+                "row_combine_ptrs must be a contiguous CUDA int64 tensor");
     TORCH_CHECK(output_index.is_cuda() && output_index.scalar_type() == torch::kInt &&
                     output_index.is_contiguous() &&
                     output_index.numel() >= num_ranks * num_tokens * num_topk,
                 "output_index must be a contiguous CUDA int32 tensor");
+    if (local_expert_stats != nullptr) {
+        TORCH_CHECK(local_expert_stats->is_cuda() &&
+                        local_expert_stats->scalar_type() == torch::kInt &&
+                        local_expert_stats->is_contiguous() &&
+                        local_expert_stats->numel() >= local_experts,
+                    "local_expert_stats must be a contiguous CUDA int32 tensor");
+    }
     const int wg_m = (n + 255) / 256;
     const int wg_n = (total_rows + 255) / 256;
     const int capacity_tiles = wg_n;
@@ -654,6 +590,7 @@ void launch_l1_deepgemm_fused_asm(
             reinterpret_cast<int32_t*>(route_scratch.data_ptr()),
             route_weights.data_ptr<float>(),
             row_x_ptrs.data_ptr<int64_t>(),
+            row_combine_ptrs.data_ptr<int64_t>(),
             row_x_scales.data_ptr<float>(),
             m_indices.data_ptr<int32_t>(),
             capacity_tiles);
@@ -663,9 +600,13 @@ void launch_l1_deepgemm_fused_asm(
             reinterpret_cast<int32_t*>(route_scratch.data_ptr()),
             route_weights.data_ptr<float>(),
             row_x_ptrs.data_ptr<int64_t>(),
+            row_combine_ptrs.data_ptr<int64_t>(),
             row_x_scales.data_ptr<float>(),
             m_indices.data_ptr<int32_t>(),
             output_index.data_ptr<int32_t>(),
+            local_expert_stats == nullptr
+                ? nullptr
+                : local_expert_stats->data_ptr<int32_t>(),
             symm_base_addr,
             static_cast<int>(rank_idx),
             static_cast<int>(num_ranks),
@@ -727,10 +668,17 @@ void launch_l1_deepgemm_fused_asm(
     prob.expert_tiles_per_expert = expert_tiles_per_expert;
     prob.route_weights = route_weights.data_ptr<float>();
     prob.output_index = output_index.data_ptr<int32_t>();
-    prob.route_tasks = route_tasks.data_ptr<int32_t>();
+    prob.row_combine_ptrs = row_combine_ptrs.data_ptr<int64_t>();
     prob.meta_flags = meta_flags;
+    prob.local_expert_stats = local_expert_stats == nullptr
+        ? nullptr
+        : local_expert_stats->data_ptr<int32_t>();
 
-    void* prob_device = device_prob_buffer();
+    const int64_t prob_offset =
+        deep_gemm::mega::align_i64(meta_flags_offset + meta_flags_bytes, 16);
+    TORCH_CHECK(prob_offset + static_cast<int64_t>(sizeof(GpuProb)) <= route_scratch.numel(),
+                "route_scratch is too small for K1 fused L1 launch arguments");
+    void* prob_device = static_cast<uint8_t*>(route_scratch.data_ptr()) + prob_offset;
     K1_HIP_CHECK(hipMemcpyAsync(
         prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice, stream));
     KernelArgs args{};
@@ -774,57 +722,7 @@ void launch_l1_deepgemm_fused_asm(
 
 } // namespace
 
-torch::Tensor k1_l1_original_asm(
-    const torch::Tensor& grouped_x,
-    const torch::Tensor& grouped_x_scale,
-    const torch::Tensor& m_indices,
-    const torch::Tensor& l1_weight,
-    const torch::Tensor& l1_scale,
-    const std::string& code_object_path) {
-    TORCH_CHECK(grouped_x.is_cuda() && grouped_x_scale.is_cuda() &&
-                    m_indices.is_cuda() && l1_weight.is_cuda() &&
-                    l1_scale.is_cuda(),
-                "K1 local asm tensors must be CUDA/HIP tensors");
-    TORCH_CHECK(grouped_x.scalar_type() == torch::kFloat8_e4m3fn,
-                "grouped_x must be FP8 E4M3");
-    TORCH_CHECK(l1_weight.scalar_type() == torch::kFloat8_e4m3fn,
-                "l1_weight must be FP8 E4M3");
-    TORCH_CHECK(grouped_x_scale.scalar_type() == torch::kFloat32 &&
-                    l1_scale.scalar_type() == torch::kFloat32,
-                "scales must be FP32");
-    TORCH_CHECK(m_indices.scalar_type() == torch::kInt,
-                "m_indices must be int32");
-    TORCH_CHECK(grouped_x.is_contiguous() && grouped_x_scale.is_contiguous() &&
-                    m_indices.is_contiguous() && l1_weight.is_contiguous() &&
-                    l1_scale.is_contiguous(),
-                "all K1 local asm tensors must be contiguous");
-    TORCH_CHECK(!code_object_path.empty(),
-                "K1 local asm requires an explicit code object path");
-    TORCH_CHECK(grouped_x.dim() == 2 && grouped_x_scale.dim() == 1 &&
-                    m_indices.dim() == 1 && l1_scale.dim() == 2,
-                "invalid local asm tensor ranks");
-    TORCH_CHECK(grouped_x.size(0) == grouped_x_scale.numel() &&
-                    grouped_x.size(0) == m_indices.numel(),
-                "grouped rows, scales, and m_indices must match");
-    const int64_t hidden = grouped_x.size(1);
-    const int64_t l1_rows = l1_scale.size(1);
-    TORCH_CHECK(l1_rows == kK1SupportedL1Rows,
-                "current K1 local asm expects L1 rows == 4096");
-    TORCH_CHECK(l1_weight.size(0) == l1_scale.size(0) &&
-                    l1_weight.size(1) == l1_rows / 16 &&
-                    l1_weight.size(2) == hidden * 16,
-                "invalid Marlin-packed L1 weight shape");
-
-    auto output = torch::zeros(
-        {grouped_x.size(0), l1_rows},
-        torch::TensorOptions().dtype(torch::kBFloat16).device(grouped_x.device()));
-    launch_l1_deepgemm_original_asm(
-        output, grouped_x, grouped_x_scale, l1_weight, l1_scale,
-        m_indices, code_object_path);
-    return output;
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 k1_symm_fused_l1(
     const torch::Tensor& sym_buffer,
     const torch::Tensor& route_scratch,
@@ -840,7 +738,9 @@ k1_symm_fused_l1(
     const int64_t symm_base_addr_value,
     const int64_t symm_x_span_value,
     const int64_t alignment,
-    const std::string& code_object_path) {
+    const std::string& code_object_path,
+    const std::optional<torch::Tensor>& l1_out_workspace,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats) {
     TORCH_CHECK(sym_buffer.is_cuda() && route_scratch.is_cuda() &&
                     l1_weight.is_cuda() && l1_scale.is_cuda(),
                 "symm K1 tensors must be CUDA/HIP tensors");
@@ -943,8 +843,9 @@ k1_symm_fused_l1(
     reserve_scratch((local_experts + local_experts + 1 + capacity_tiles +
                      capacity_tiles + capacity_tiles * 16) *
                     static_cast<int64_t>(sizeof(int32_t)));
-    const int64_t route_tasks_offset =
-        reserve_scratch(capacity_rows * static_cast<int64_t>(sizeof(int32_t)));
+    const int64_t row_combine_ptrs_offset =
+        reserve_scratch((capacity_rows + kK1RowPointerPadding) *
+                        static_cast<int64_t>(sizeof(int64_t)));
     const int64_t route_weights_offset =
         reserve_scratch(capacity_rows * static_cast<int64_t>(sizeof(float)));
     const int64_t row_x_ptrs_offset =
@@ -972,9 +873,20 @@ k1_symm_fused_l1(
     auto make_f32_view = [&](const int64_t offset, std::initializer_list<int64_t> shape) {
         return torch::from_blob(scratch_base + offset, shape, f32_options);
     };
-    auto route_tasks = make_i32_view(route_tasks_offset, {capacity_rows});
+    auto row_combine_ptrs =
+        make_i64_view(row_combine_ptrs_offset,
+                      {capacity_rows + kK1RowPointerPadding});
     auto output_index =
         make_i32_view(output_index_offset, {num_ranks * num_tokens, num_topk});
+    const torch::Tensor* local_expert_stats = nullptr;
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        const auto& stats = cumulative_local_expert_recv_stats.value();
+        TORCH_CHECK(stats.is_cuda() && stats.is_contiguous() &&
+                        stats.scalar_type() == torch::kInt &&
+                        stats.numel() >= local_experts,
+                    "cumulative_local_expert_recv_stats must be contiguous CUDA int32");
+        local_expert_stats = &stats;
+    }
     const uint64_t symm_base_addr =
         static_cast<uint64_t>(symm_base_addr_value);
     bool use_absolute_x_ptrs =
@@ -1005,29 +917,36 @@ k1_symm_fused_l1(
     auto staged_x =
         torch::from_blob(scratch_base + staged_x_offset,
                          {total_rows, hidden}, fp8_options);
-    auto l1_out = torch::empty({total_rows, l1_rows}, bf16_options);
+    torch::Tensor l1_out;
+    if (l1_out_workspace.has_value()) {
+        const auto& workspace = l1_out_workspace.value();
+        TORCH_CHECK(workspace.is_cuda() && workspace.is_contiguous(),
+                    "l1_out_workspace must be contiguous CUDA/HIP memory");
+        TORCH_CHECK(workspace.scalar_type() == torch::kBFloat16,
+                    "l1_out_workspace must be BF16");
+        TORCH_CHECK(workspace.dim() == 2 && workspace.size(0) >= total_rows &&
+                        workspace.size(1) == l1_rows,
+                    "l1_out_workspace must be [>=total_rows, l1_rows]");
+        l1_out = workspace.narrow(0, 0, total_rows);
+    } else {
+        l1_out = torch::empty({total_rows, l1_rows}, bf16_options);
+    }
     launch_l1_deepgemm_fused_asm(
         l1_out, sym_buffer, route_scratch, symm_base_addr,
         row_x_ptrs, row_x_scales,
         staged_x, l1_weight, l1_scale, m_indices,
-        route_weights, route_tasks, output_index,
+        route_weights, row_combine_ptrs, output_index,
+        local_expert_stats,
         rank_idx, num_ranks, num_experts, num_max_tokens_per_rank,
         num_tokens, num_topk, expert_tiles_per_expert,
         use_absolute_x_ptrs, use_compact_prebuild,
         code_object_path);
 
     return std::make_tuple(
-        l1_out, route_weights, m_indices, output_index);
+        l1_out, route_weights, m_indices, output_index, row_combine_ptrs);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("k1_l1_original_asm", &k1_l1_original_asm,
-          pybind11::arg("grouped_x"),
-          pybind11::arg("grouped_x_scale"),
-          pybind11::arg("m_indices"),
-          pybind11::arg("l1_weight"),
-          pybind11::arg("l1_scale"),
-          pybind11::arg("code_object_path"));
     m.def("k1_symm_fused_l1", &k1_symm_fused_l1,
           pybind11::arg("sym_buffer"),
           pybind11::arg("route_scratch"),
@@ -1043,5 +962,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("symm_base_addr"),
           pybind11::arg("symm_x_span"),
           pybind11::arg("alignment") = 256,
-          pybind11::arg("code_object_path") = "");
+          pybind11::arg("code_object_path") = "",
+          pybind11::arg("l1_out_workspace") = std::nullopt,
+          pybind11::arg("cumulative_local_expert_recv_stats") = std::nullopt);
 }

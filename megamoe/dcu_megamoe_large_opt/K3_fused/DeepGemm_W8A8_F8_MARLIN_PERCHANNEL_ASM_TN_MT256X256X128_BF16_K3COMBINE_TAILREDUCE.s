@@ -3201,10 +3201,11 @@ K3_INC_ADDR4
 K3_STORE4 v120, v121, v122, v123
 K3_INC_ADDR4
 K3_STORE4 v124, v125, v126, v127
-s_waitcnt vmcnt(0)
-buffer_wbinvl1_vol
 s_branch label_GW_End_20                           // jump to end
 label_GW_End_20:
+s_waitcnt vmcnt(0)
+buffer_wbinvl1_vol
+s_barrier
 
 /* K3COMBINE tail reduce experiment. Every WG increments the per-rank done
  * counter after remote combine stores. Only the last local WG publishes this

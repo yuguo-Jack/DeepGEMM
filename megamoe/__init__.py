@@ -30,7 +30,19 @@ def cast_grouped_weight_to_fp8_channelwise(
     if weights.dim() != 3:
         raise ValueError("MegaMoE grouped weights must be 3D tensors")
     num_groups, rows, k = weights.shape
-    fp8, scale = cast_to_fp8_channelwise(weights.reshape(num_groups * rows, k))
+    flat_weights = weights.reshape(num_groups * rows, k)
+    chunk_rows = int(os.getenv("MEGAMOE_DCU_WEIGHT_CAST_CHUNK_ROWS", "8192"))
+    if chunk_rows <= 0 or flat_weights.size(0) <= chunk_rows:
+        fp8, scale = cast_to_fp8_channelwise(flat_weights)
+    else:
+        fp8 = torch.empty(flat_weights.shape, dtype=torch.float8_e4m3fn, device=flat_weights.device)
+        scale = torch.empty((flat_weights.size(0),), dtype=torch.float32, device=flat_weights.device)
+        for offset in range(0, flat_weights.size(0), chunk_rows):
+            end = min(offset + chunk_rows, flat_weights.size(0))
+            chunk = flat_weights[offset:end]
+            chunk_scale = chunk.abs().float().amax(dim=1).clamp(min=1.0e-4) / 448.0
+            fp8[offset:end].copy_((chunk.float() / chunk_scale.view(-1, 1)).to(torch.float8_e4m3fn))
+            scale[offset:end].copy_(chunk_scale)
     return fp8.reshape(num_groups, rows, k).contiguous(), scale.reshape(num_groups, rows).contiguous()
 
 
@@ -55,7 +67,10 @@ def weight8bit_nt_kpack2_marlin(
 
 
 def get_mega_moe_hip_build_config():
-    return _C.get_mega_moe_hip_build_config()
+    config = _C.get_mega_moe_hip_build_config()
+    config["large_opt_3stage_env"] = "MEGAMOE_DCU_USE_LARGE_OPT_3STAGE"
+    config["large_opt_3stage_shape"] = "EP8 experts=256 topk=6 hidden=4096 intermediate=2048"
+    return config
 
 
 class SymmBuffer:
@@ -140,6 +155,21 @@ class SymmBuffer:
             self.l2_acts,
             self.l2_acts_sf,
         ) = slice_input_buffers(self.buffer)
+
+        if os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "large_opt",
+            "3stage",
+        }:
+            from .large_opt import prepare_large_opt_3stage
+
+            prepare_large_opt_3stage(
+                self,
+                verbose_build=os.getenv("MEGAMOE_DCU_LARGE_OPT_VERBOSE_BUILD", "0") == "1",
+            )
 
     def destroy(self):
         if self.handle is not None:
@@ -251,6 +281,31 @@ def fp8_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
 ):
+    if os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "large_opt",
+        "3stage",
+    }:
+        from .large_opt import fp8_mega_moe_large_opt_3stage
+
+        fp8_mega_moe_large_opt_3stage(
+            y,
+            l1_weights,
+            l2_weights,
+            cumulative_local_expert_recv_stats,
+            sym_buffer,
+            rank_idx=sym_buffer.group.rank(),
+            num_ranks=len(sym_buffer.handle.buffer_ptrs),
+            num_experts=sym_buffer.num_experts,
+            num_topk=sym_buffer.num_topk,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+        )
+        return
+
     _C.fp8_mega_moe(
         y,
         l1_weights,

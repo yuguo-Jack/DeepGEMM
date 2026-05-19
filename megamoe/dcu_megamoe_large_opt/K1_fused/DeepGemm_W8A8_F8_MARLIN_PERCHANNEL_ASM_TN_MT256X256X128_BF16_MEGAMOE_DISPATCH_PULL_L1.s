@@ -1770,6 +1770,12 @@ s_mov_b32 s54, BufferLimit
 s_mov_b32 s55, Srd127_96
 v_lshlrev_b32 v254, 3, v251
 buffer_store_dwordx2 v[252:253], v254, s[52:55], 0, offen, offset:0 glc
+v_mov_b32 v252, 0
+v_mov_b32 v253, 0
+s_mov_b64 s[52:53], s[88:89]                    // row_combine_ptrs
+s_mov_b32 s54, BufferLimit
+s_mov_b32 s55, Srd127_96
+buffer_store_dwordx2 v[252:253], v254, s[52:55], 0, offen, offset:0 glc
 s_mov_b64 exec, s[80:81]
 v_add_u32 v250, 0x300, v250
 s_branch label_SymmRouteInitLoop
@@ -1854,6 +1860,7 @@ s_load_dword s91, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb4 // ma
 s_load_dwordx2 s[68:69], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x90
 s_load_dword s70, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa8 // rank
 s_waitcnt lgkmcnt(0)
+s_mov_b32 s14, s91                                // preserve max tokens; s[90:91] is reused for exec masks below
 s_lshl_b32 s70, s70, 5                            // global expert base for rank
 s_add_u32 s74, s70, s[sgprScaleFlag]              // target global expert
 s_mul_i32 s71, s91, 0x1000
@@ -1899,6 +1906,7 @@ v_mul_hi_u32 v251, v250, v236
 v_lshrrev_b32 v251, 2, v251
 v_mul_u32_u24 v252, v251, 6
 v_sub_u32 v253, v250, v252
+v_mov_b32 v245, v253                              // topk slot for combine row
 v_add_u32 v239, s63, v250                         // global task
 
 v_lshlrev_b32 v254, 3, v250
@@ -1999,10 +2007,22 @@ s_mov_b64 s[76:77], s[84:85]
 s_mov_b32 s78, BufferLimit
 s_mov_b32 s79, Srd127_96
 buffer_store_dword v237, v253, s[76:79], 0, offen, offset:0
+v_lshlrev_b32 v254, 3, v241
+v_mul_lo_u32 v238, v245, s14
+v_add_u32 v238, v238, v251
+v_lshlrev_b32 v238, 13, v238
+s_mul_i32 s76, s14, 0x104c
+s_add_u32 s76, s76, 0x80
+v_add_u32 v238, s76, v238
+v_add_u32 v252, s64, v238
+v_cmp_lt_u32 s[50:51], v252, v238
+v_cndmask_b32 v239, 0, 1, s[50:51]
+v_add_u32 v239, s65, v239
+v_mov_b32 v238, v252
 s_mov_b64 s[76:77], s[88:89]
 s_mov_b32 s78, BufferLimit
 s_mov_b32 s79, Srd127_96
-buffer_store_dword v239, v253, s[76:79], 0, offen, offset:0
+buffer_store_dwordx2 v[238:239], v254, s[76:79], 0, offen, offset:0
 s_mov_b64 s[76:77], s[98:99]
 s_mov_b32 s78, BufferLimit
 s_mov_b32 s79, Srd127_96
@@ -2077,9 +2097,34 @@ s_branch label_SymmRouteWaitMeta
 label_SymmRoutePublishMeta:
 s_waitcnt vmcnt(0)
 s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xe8
+s_load_dwordx2 s[76:77], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xf0
 s_waitcnt lgkmcnt(0)
 s_mov_b32 s54, BufferLimit
 s_mov_b32 s55, Srd127_96
+/* Fold per-expert receive stats into the route scan's final publisher. */
+s_cmp_eq_u64 s[76:77], 0
+s_cbranch_scc1 label_SymmRouteStatsDone
+v_mov_b32 v250, v[vgprSerial]
+v_cmp_lt_u32 vcc, v250, 32
+s_and_saveexec_b64 s[80:81], vcc
+s_cbranch_execz label_SymmRouteStatsLaneDone
+s_mov_b64 s[52:53], s[92:93]
+s_mov_b32 s54, BufferLimit
+s_mov_b32 s55, Srd127_96
+v_lshlrev_b32 v253, 2, v250
+buffer_load_dword v252, v253, s[52:55], 0, offen, offset:0 glc
+s_waitcnt vmcnt(0)
+s_mov_b32 s78, BufferLimit
+s_mov_b32 s79, Srd127_96
+global_atomic_add v240, v253, v252, s[76:77] glc
+label_SymmRouteStatsLaneDone:
+s_mov_b64 exec, s[80:81]
+s_waitcnt vmcnt(0)
+s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xe8
+s_waitcnt lgkmcnt(0)
+s_mov_b32 s54, BufferLimit
+s_mov_b32 s55, Srd127_96
+label_SymmRouteStatsDone:
 /* Publish every tile for all local experts. */
 s_mov_b32 s60, 32
 s_mul_i32 s60, s60, s10
