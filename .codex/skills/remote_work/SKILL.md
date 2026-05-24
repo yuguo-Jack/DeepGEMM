@@ -11,7 +11,9 @@ Follow this rule for all downstream remote skills:
 
 - Edit code only in the local repository.
 - Sync local changes to remote using `.vscode/sftp.json` (`uploadOnSave: true`) or explicit upload commands.
-- Execute remote work only with `ssh ... "docker exec ... sh -lc '<cmd>'"`.
+- Execute remote work only with `ssh ... "docker exec ... bash -lc 'source /opt/dtk/env.sh && <cmd>'"`.
+- Every `docker exec` command that runs inside the container must source DTK first with `source /opt/dtk/env.sh && ...`.
+- Host-side Docker management commands such as `docker ps`, `docker inspect`, and `docker start` do not run inside the container and do not source `/opt/dtk/env.sh`.
 - Avoid direct remote-host compilation and testing outside Docker unless explicitly requested.
 - For this workspace, the host mount root is `/home/hg/yuguo` and the container mount root is `/workspace`.
 - The local project may not be uploaded yet. Before first upload, remote `/home/hg/yuguo/DeepDEMM` and container `/workspace/DeepDEMM` may be missing; treat that as setup state, not an environment failure.
@@ -109,28 +111,28 @@ ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker ps -a --filter name=$DOC
 
 ```powershell
 ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker inspect $DOCKER_NAME --format '{{json .Mounts}}'"
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'pwd && ls -la /workspace && test -d /workspace && echo container_workspace_ok=/workspace && if [ -d $CONTAINER_REPO ]; then echo container_repo_ok=$CONTAINER_REPO; else echo container_repo_missing_not_uploaded_yet=$CONTAINER_REPO; fi && (which hipcc || true)'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && pwd && ls -la /workspace && test -d /workspace && echo container_workspace_ok=/workspace && if [ -d $CONTAINER_REPO ]; then echo container_repo_ok=$CONTAINER_REPO; else echo container_repo_missing_not_uploaded_yet=$CONTAINER_REPO; fi && (which hipcc || true)'"
 ```
 
 4. Check GPU/DCU/ROCm status, memory usage, and hardware information in container.
 
 ```powershell
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'hy-smi || rocm-smi --showuse --showmemuse || rocm-smi || /opt/dtk/bin/rocm-smi || true'"
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc '(rocninfo || rocminfo || /opt/dtk/bin/rocminfo) 2>/dev/null | egrep `"Name:|Marketing Name:|Vendor Name:|Device Type:|Compute Unit:|SIMDs per CU:|Wavefront Size:|ISA`" || true'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && (hy-smi || rocm-smi --showuse --showmemuse || rocm-smi || /opt/dtk/bin/rocm-smi || true)'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && (rocninfo || rocminfo || /opt/dtk/bin/rocminfo) 2>/dev/null | egrep `"Name:|Marketing Name:|Vendor Name:|Device Type:|Compute Unit:|SIMDs per CU:|Wavefront Size:|ISA`" || true'"
 ```
 Choose a device with low or zero compute and memory use, then use `HIP_VISIBLE_DEVICES=` to pin to that device for best performance and isolation.
 
 If VRAM is unexpectedly high, list owning KFD PIDs and map them to host processes:
 
 ```powershell
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'hy-smi --showpids || true'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && hy-smi --showpids || true'"
 ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "ps -fp <pid1>,<pid2>,<pid3>"
 ```
 
 5. Check Python package inventory in container.
 
 ```powershell
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'cd $CONTAINER_REPO && pip3 list'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && cd $CONTAINER_REPO && pip3 list'"
 ```
 
 ## Compile, Test, Debug Templates
@@ -139,22 +141,22 @@ Run all project validation through the same remote execution pattern:
 
 ```powershell
 # Compile check
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'cd $CONTAINER_REPO && python3 -m compileall .'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && cd $CONTAINER_REPO && python3 -m compileall .'"
 
 # Targeted tests
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'cd $CONTAINER_REPO && pytest -q <path/to/test.py> -q'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && cd $CONTAINER_REPO && pytest -q <path/to/test.py> -q'"
 
 # Debug command (example)
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'cd $CONTAINER_REPO && python3 <your_script.py>'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && cd $CONTAINER_REPO && python3 <your_script.py>'"
 
 # HIP/DTK sample compile + run (example)
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'cd $CONTAINER_REPO && /opt/dtk/bin/hipcc -O2 hip_vector_add.cpp -o hip_vector_add && HIP_VISIBLE_DEVICES=<the device of HCU memory use 0 and HCU use 0> ./hip_vector_add'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && cd $CONTAINER_REPO && /opt/dtk/bin/hipcc -O2 hip_vector_add.cpp -o hip_vector_add && HIP_VISIBLE_DEVICES=<the device of HCU memory use 0 and HCU use 0> ./hip_vector_add'"
 ```
 
 For GPU pinning, prefix the inner command with environment variables:
 
 ```powershell
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'cd $CONTAINER_REPO && HIP_VISIBLE_DEVICES=<the device of HCU memory use 0 and HCU use 0> PYTHONPATH=. pytest -q <gpu_test.py> -q'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && cd $CONTAINER_REPO && HIP_VISIBLE_DEVICES=<the device of HCU memory use 0 and HCU use 0> PYTHONPATH=. pytest -q <gpu_test.py> -q'"
 ```
 
 ## Sync Guidance
@@ -171,7 +173,7 @@ ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "mkdir -p $REMOTE_PATH"
 
 ```powershell
 ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "test -d $REMOTE_PATH && echo remote_repo_ok=$REMOTE_PATH"
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'test -d $CONTAINER_REPO && echo container_repo_ok=$CONTAINER_REPO'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && test -d $CONTAINER_REPO && echo container_repo_ok=$CONTAINER_REPO'"
 ```
 
 - If a file does not appear remotely in time, upload it explicitly:
@@ -189,7 +191,7 @@ ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "ls -l $REMOTE_PATH/<relative_ta
 - If host-side verification passes but the file is still missing in Docker, verify the mounted path inside the container:
 
 ```powershell
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'cd $CONTAINER_REPO && ls -l <relative_target>'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && cd $CONTAINER_REPO && ls -l <relative_target>'"
 ```
 
 ## Sync Back Container Outputs
@@ -202,11 +204,11 @@ Files generated inside `megamoe` are usually owned by `root` on the host bind mo
 
 ```powershell
 $HOST_UID_GID = ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "stat -c '%u:%g' /home/hg/yuguo"
-ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME sh -lc 'chown -R $HOST_UID_GID $CONTAINER_REPO/<output_dir>'"
+ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -lc 'source /opt/dtk/env.sh && chown -R $HOST_UID_GID $CONTAINER_REPO/<output_dir>'"
 scp -F NUL -P $SSH_PORT -i $SSH_KEY -r "${SSH_TARGET}:$REMOTE_PATH/<output_dir>" <local_target_dir>
 ```
 
-- If ownership cannot be changed, use `chmod -R u+rwX,go+rX <output_dir>` in Docker as a read-only pull fallback. Avoid broad `chmod 777`.
+- If ownership cannot be changed, use `source /opt/dtk/env.sh && chmod -R u+rwX,go+rX <output_dir>` in Docker as a read-only pull fallback. Avoid broad `chmod 777`.
 - In PowerShell, write remote scp paths as `"${SSH_TARGET}:$REMOTE_PATH/<path>"`; `"$SSH_TARGET:$REMOTE_PATH"` is parsed incorrectly.
 - Avoid creating `/workspace/DeepDEMM` as root before the first upload. If the repo path is not uploaded yet, create sync-back tests under `/workspace/.codex_*` or upload the project first.
 
