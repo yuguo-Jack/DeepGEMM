@@ -256,7 +256,7 @@ __device__ static inline void dcu_enqueue_l2_ready_for_subtile(
     }
 }
 
-template <typename KernelConfig>
+template <typename KernelConfig, bool kUseRuntimeNumTokens>
 __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channelwise_kernel(
     uint16_t* y,
     uint8_t** sym_buffers,
@@ -268,7 +268,8 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
     int* cumulative_local_expert_recv_stats,
     const int rank_idx,
     const int num_max_tokens_per_rank,
-    const int num_tokens,
+    const int launch_num_tokens,
+    const int* runtime_num_tokens,
     const float activation_clamp) {
     using Shape = typename KernelConfig::Shape;
     using L1TileConfig = typename KernelConfig::L1TileConfig;
@@ -283,6 +284,10 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
     constexpr int hidden = Shape::kHidden;
     constexpr int intermediate_hidden = Shape::kIntermediate;
     constexpr int num_experts = Shape::kNumExperts;
+    int num_tokens = launch_num_tokens;
+    if constexpr (kUseRuntimeNumTokens) {
+        num_tokens = min(max(*runtime_num_tokens, 0), launch_num_tokens);
+    }
     const int num_local_blocks = static_cast<int>(gridDim.x);
     auto* local_signals = signal_buffers[rank_idx];
     int* expert_counts = route_scratch_expert_counts(route_scratch);

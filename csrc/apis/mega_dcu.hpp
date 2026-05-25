@@ -51,7 +51,8 @@ void launch_mega_moe_multirank_persistent_hip_w8a8_channelwise(
     int num_tokens, int num_topk,
     int hidden, int intermediate_hidden,
     float activation_clamp,
-    bool fast_math);
+    bool fast_math,
+    const int* runtime_num_tokens = nullptr);
 
 void launch_mega_moe_deepep_scatter_channelwise_hip(
     void* grouped_x,
@@ -322,7 +323,7 @@ static void deepep_deepgemm_postprocess_channelwise(
         apply_topk_weights);
 }
 
-static void fp8_mega_moe(
+static void fp8_mega_moe_impl(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
@@ -337,7 +338,8 @@ static void fp8_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math) {
+    const bool& fast_math,
+    const std::optional<torch::Tensor>& runtime_num_tokens) {
     const auto [rm, rn, rk] = recipe;
     TORCH_CHECK(rm == 1 && rn == 1 && rk == 32, "DCU W8A8 MegaMoE expects recipe=(1,1,32)");
     TORCH_CHECK(activation == "swiglu", "DCU W8A8 MegaMoE supports swiglu only");
@@ -406,6 +408,17 @@ static void fp8_mega_moe(
                     "stats must have num_experts_per_rank elements");
         stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
     }
+    const int* runtime_num_tokens_ptr = nullptr;
+    if (runtime_num_tokens.has_value()) {
+        TORCH_CHECK(runtime_num_tokens->is_cuda(), "runtime_num_tokens must be CUDA/HIP memory");
+        TORCH_CHECK(runtime_num_tokens->scalar_type() == torch::kInt,
+                    "runtime_num_tokens must be int32");
+        TORCH_CHECK(runtime_num_tokens->is_contiguous(),
+                    "runtime_num_tokens must be contiguous");
+        TORCH_CHECK(runtime_num_tokens->numel() == 1,
+                    "runtime_num_tokens must contain exactly one element");
+        runtime_num_tokens_ptr = runtime_num_tokens->data_ptr<int>();
+    }
 
     const float activation_clamp = activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     launch_mega_moe_multirank_persistent_hip_w8a8_channelwise(
@@ -415,7 +428,81 @@ static void fp8_mega_moe(
         stats_ptr, sym_buffer_ptrs.data(), route_scratch.data_ptr(),
         rank_idx, num_ranks, num_max_tokens_per_rank,
         num_experts_per_rank, num_tokens, num_topk,
-        hidden, intermediate_hidden, activation_clamp, fast_math);
+        hidden, intermediate_hidden, activation_clamp, fast_math,
+        runtime_num_tokens_ptr);
+}
+
+static void fp8_mega_moe(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const torch::Tensor& route_scratch,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const std::vector<int64_t>& signal_ptrs,
+    const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math) {
+    fp8_mega_moe_impl(
+        y,
+        l1_weights_tuple,
+        l2_weights_tuple,
+        cumulative_local_expert_recv_stats,
+        sym_buffer,
+        route_scratch,
+        sym_buffer_ptrs,
+        signal_ptrs,
+        rank_idx,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        recipe,
+        activation,
+        activation_clamp_opt,
+        fast_math,
+        std::nullopt);
+}
+
+static void fp8_mega_moe_with_graph_tokens(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const torch::Tensor& route_scratch,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const std::vector<int64_t>& signal_ptrs,
+    const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math,
+    const torch::Tensor& runtime_num_tokens) {
+    fp8_mega_moe_impl(
+        y,
+        l1_weights_tuple,
+        l2_weights_tuple,
+        cumulative_local_expert_recv_stats,
+        sym_buffer,
+        route_scratch,
+        sym_buffer_ptrs,
+        signal_ptrs,
+        rank_idx,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        recipe,
+        activation,
+        activation_clamp_opt,
+        fast_math,
+        runtime_num_tokens);
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -432,6 +519,7 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("disable_ue8m0_cast") = false);
     m.def("fp8_mega_moe", &fp8_mega_moe);
     m.def("fp8_w8a8_mega_moe", &fp8_mega_moe);
+    m.def("fp8_mega_moe_with_graph_tokens", &fp8_mega_moe_with_graph_tokens);
     m.def("deepep_deepgemm_preprocess_channelwise", &deepep_deepgemm_preprocess_channelwise,
           pybind11::arg("recv_x"),
           pybind11::arg("recv_x_scale"),

@@ -162,6 +162,45 @@ input slices in the symmetric buffer (`x`, `x_sf`, `topk_idx`, and
 `topk_weights`), so switching by token threshold does not require duplicate
 input copies.
 
+### CUDA Graph Mode
+
+DCU MegaMoE exposes a graph-bucket mode for the original persistent fused
+kernel.  Pass `cuda_graph=True` to `megamoe.fp8_w8a8_mega_moe` and provide a
+fixed output buffer with at least
+`MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK` rows.  The default graph bucket is
+256 tokens per rank, and the resolved value is available as
+`sym_buffer.cuda_graph_max_tokens_per_rank`:
+
+```python
+y_graph = torch.empty((256, hidden), dtype=torch.bfloat16, device="cuda")
+megamoe.fp8_w8a8_mega_moe(
+    y_graph,
+    l1_weights,
+    l2_weights,
+    sym_buffer,
+    cuda_graph=True,
+)
+```
+
+The captured graph always runs the persistent fused kernel for the fixed graph
+bucket size.  For a smaller request, write the actual token count into
+`sym_buffer.cuda_graph_num_tokens`, update only the valid input prefix in
+`sym_buffer` before replay, replay the graph, and consume only
+`y_graph[:token_count]`.  The kernel reads the device-side token count during
+replay, so route building, expert task generation, and local reduce use the
+valid prefix rather than forcing invalid tail routes through the graph bucket.
+This matches the usual static-buffer CUDA Graph usage: the graph shape is fixed,
+while the framework owns the valid-token prefix.
+
+The staged K1/K2/K3 large-token path is intentionally not CUDA-Graph compatible.
+When `cuda_graph=True`, the API bypasses token-threshold routing and uses only
+the persistent fused kernel.  Without `cuda_graph=True`, routing keeps the
+normal behavior described above; if the staged path is selected while the
+current stream is being captured, the API raises instead of silently capturing
+an unsupported graph.  Graph mode also rejects
+`cumulative_local_expert_recv_stats`, because graph replay should not accumulate
+per-expert statistics across variable-token requests.
+
 Host-side tuning knobs for the staged path do not add device kernels:
 
 - `MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD` controls the `auto` token
@@ -204,6 +243,24 @@ For a correctness-only smoke run, set `SKIP_BENCH=1`.  The staged test keeps
 the weight FP8 conversion chunked by default; tune
 `MEGAMOE_DCU_WEIGHT_CAST_CHUNK_ROWS` if the random-weight setup needs a smaller
 or larger temporary allocation.
+
+Check one captured persistent-fused graph bucket across several token prefixes:
+
+```bash
+source /opt/dtk-26.04/env.sh
+MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK=256 \
+python tests/test_mega_moe_dcu.py \
+  --num-processes 8 \
+  --num-max-tokens-per-rank 256 \
+  --num-tokens 256 \
+  --hidden 4096 \
+  --intermediate-hidden 2048 \
+  --num-experts 256 \
+  --num-topk 6 \
+  --cuda-graph \
+  --cuda-graph-test-tokens 32,64,128,256 \
+  --skip-bench
+```
 
 Force one staged-path size directly:
 

@@ -27,7 +27,7 @@ static bool dcu_mega_moe_shape_matches(
            intermediate_hidden == Shape::kIntermediate;
 }
 
-template <typename KernelConfig>
+template <typename KernelConfig, bool kUseRuntimeNumTokens>
 static void launch_mega_moe_dcu_template(
     void* y,
     const void* l1_weights, const float* l1_weights_sf,
@@ -38,6 +38,7 @@ static void launch_mega_moe_dcu_template(
     int rank_idx,
     int num_max_tokens_per_rank,
     int num_tokens,
+    const int* runtime_num_tokens,
     float activation_clamp,
     hipStream_t stream) {
     using Shape = typename KernelConfig::Shape;
@@ -56,7 +57,7 @@ static void launch_mega_moe_dcu_template(
 
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(mega_moe_multirank_persistent_w8a8_channelwise_kernel<
-            KernelConfig>),
+            KernelConfig, kUseRuntimeNumTokens>),
         dim3(blocks), dim3(threads), 0, stream,
         static_cast<uint16_t*>(y),
         device_sym_buffer_ptrs, device_signal_ptrs,
@@ -64,7 +65,8 @@ static void launch_mega_moe_dcu_template(
         static_cast<const uint8_t*>(l1_weights), l1_weights_sf,
         static_cast<const uint8_t*>(l2_weights), l2_weights_sf,
         cumulative_local_expert_recv_stats,
-        rank_idx, num_max_tokens_per_rank, num_tokens, activation_clamp);
+        rank_idx, num_max_tokens_per_rank, num_tokens, runtime_num_tokens,
+        activation_clamp);
 }
 
 void launch_mega_moe_multirank_persistent_hip_w8a8_channelwise(
@@ -80,7 +82,8 @@ void launch_mega_moe_multirank_persistent_hip_w8a8_channelwise(
     int num_tokens, int num_topk,
     int hidden, int intermediate_hidden,
     float activation_clamp,
-    bool fast_math) {
+    bool fast_math,
+    const int* runtime_num_tokens) {
     if (!fast_math) {
         throw std::runtime_error(
             "DCU MegaMoE W8A8 channelwise persistent fused path requires "
@@ -90,14 +93,25 @@ void launch_mega_moe_multirank_persistent_hip_w8a8_channelwise(
 
     if (dcu_mega_moe_shape_matches<DcuMegaMoeEp8Config>(
             num_ranks, num_experts_per_rank, num_topk, hidden, intermediate_hidden)) {
-        launch_mega_moe_dcu_template<DcuMegaMoeEp8Config>(
-            y,
-            l1_weights, l1_weights_sf,
-            l2_weights, l2_weights_sf,
-            cumulative_local_expert_recv_stats,
-            sym_buffer_ptrs, route_scratch,
-            rank_idx, num_max_tokens_per_rank, num_tokens,
-            activation_clamp, stream);
+        if (runtime_num_tokens != nullptr) {
+            launch_mega_moe_dcu_template<DcuMegaMoeEp8Config, true>(
+                y,
+                l1_weights, l1_weights_sf,
+                l2_weights, l2_weights_sf,
+                cumulative_local_expert_recv_stats,
+                sym_buffer_ptrs, route_scratch,
+                rank_idx, num_max_tokens_per_rank, num_tokens,
+                runtime_num_tokens, activation_clamp, stream);
+        } else {
+            launch_mega_moe_dcu_template<DcuMegaMoeEp8Config, false>(
+                y,
+                l1_weights, l1_weights_sf,
+                l2_weights, l2_weights_sf,
+                cumulative_local_expert_recv_stats,
+                sym_buffer_ptrs, route_scratch,
+                rank_idx, num_max_tokens_per_rank, num_tokens,
+                nullptr, activation_clamp, stream);
+        }
     } else {
         throw std::runtime_error(
             "Unsupported DCU MegaMoE W8A8 fused shape. Registered templates: "
