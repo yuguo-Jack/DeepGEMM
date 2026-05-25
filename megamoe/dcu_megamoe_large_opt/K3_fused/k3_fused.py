@@ -71,15 +71,29 @@ def rank_barrier(
     num_ranks: int,
     asm_done_counter: torch.Tensor | None = None,
     reset_tail_signal_slots: bool = False,
+    k1_graph_reset_layout: tuple[int, int, int, int] | None = None,
     verbose_build: bool = False,
 ) -> None:
     ext = load_extension(verbose=verbose_build)
+    if k1_graph_reset_layout is None:
+        route_scratch = None
+        flags_offset = flags_numel = meta_flags_offset = meta_flags_numel = 0
+    else:
+        route_scratch = sym_buffer.route_scratch
+        flags_offset, flags_numel, meta_flags_offset, meta_flags_numel = (
+            int(v) for v in k1_graph_reset_layout
+        )
     ext.rank_barrier(
         sym_buffer.buffer,
         int(rank_idx),
         int(num_ranks),
         asm_done_counter,
         bool(reset_tail_signal_slots),
+        route_scratch,
+        flags_offset,
+        flags_numel,
+        meta_flags_offset,
+        meta_flags_numel,
     )
 
 
@@ -107,6 +121,32 @@ def reduce_local_combine(
     )
 
 
+def reduce_local_combine_graph(
+    y: torch.Tensor,
+    sym_buffer,
+    *,
+    num_ranks: int,
+    num_experts: int,
+    graph_num_tokens: int,
+    runtime_num_tokens: torch.Tensor,
+    num_topk: int,
+    hidden: int,
+    verbose_build: bool = False,
+) -> None:
+    ext = load_extension(verbose=verbose_build)
+    ext.reduce_local_combine_graph(
+        y,
+        sym_buffer.buffer,
+        int(num_ranks),
+        int(num_experts),
+        int(sym_buffer.num_max_tokens_per_rank),
+        int(graph_num_tokens),
+        runtime_num_tokens.contiguous(),
+        int(num_topk),
+        int(hidden),
+    )
+
+
 def k3_l2_fused_asm_to_combine(
     act_fp8: torch.Tensor,
     act_scale: torch.Tensor,
@@ -128,6 +168,7 @@ def k3_l2_fused_asm_to_combine(
     hidden: int = 0,
     output_workspace: torch.Tensor | None = None,
     prob_storage: torch.Tensor | None = None,
+    active_tiles: torch.Tensor | None = None,
     verbose_build: bool = False,
 ) -> torch.Tensor | None:
     l2_weight, l2_scale = l2_weights
@@ -135,6 +176,8 @@ def k3_l2_fused_asm_to_combine(
     if output_workspace is None or prob_storage is None:
         raise ValueError("integrated K3 path requires output_workspace and prob_storage")
     if asm_reduce_y is not None:
+        if active_tiles is not None:
+            raise ValueError("K3 graph active-tile gate is not supported with tail-reduce asm")
         if asm_done_counter is None or asm_signal_addrs is None:
             raise ValueError("asm_done_counter and asm_signal_addrs are required with asm_reduce_y")
         if sym_buffer is None:
@@ -178,5 +221,6 @@ def k3_l2_fused_asm_to_combine(
             output_workspace,
             prob_storage,
             str(code_object),
+            active_tiles.contiguous() if active_tiles is not None else None,
         )
     return None

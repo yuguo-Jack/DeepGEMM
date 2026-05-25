@@ -164,12 +164,17 @@ input copies.
 
 ### CUDA Graph Mode
 
-DCU MegaMoE exposes a graph-bucket mode for the original persistent fused
-kernel.  Pass `cuda_graph=True` to `megamoe.fp8_w8a8_mega_moe` and provide a
-fixed output buffer with at least
-`MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK` rows.  The default graph bucket is
-256 tokens per rank, and the resolved value is available as
-`sym_buffer.cuda_graph_max_tokens_per_rank`:
+DCU MegaMoE exposes graph-bucket mode through the public
+`megamoe.fp8_w8a8_mega_moe(..., cuda_graph=True)` API.  The graph path is
+bucketed by the fixed output buffer rows used during capture:
+
+- `y.size(0) <= MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK` captures the
+  original persistent fused kernel.  The default small bucket is 256 tokens per
+  rank, available as `sym_buffer.cuda_graph_max_tokens_per_rank`.
+- `y.size(0) > MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK` captures the staged
+  K1/K2/K3 large-token path when `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE` is `auto`
+  or forced on.  The default large bucket cap is 2048 tokens per rank and can be
+  overridden with `MEGAMOE_DCU_CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_PER_RANK`.
 
 ```python
 y_graph = torch.empty((256, hidden), dtype=torch.bfloat16, device="cuda")
@@ -182,24 +187,21 @@ megamoe.fp8_w8a8_mega_moe(
 )
 ```
 
-The captured graph always runs the persistent fused kernel for the fixed graph
-bucket size.  For a smaller request, write the actual token count into
+For a smaller request, write the actual token count into
 `sym_buffer.cuda_graph_num_tokens`, update only the valid input prefix in
 `sym_buffer` before replay, replay the graph, and consume only
 `y_graph[:token_count]`.  The kernel reads the device-side token count during
 replay, so route building, expert task generation, and local reduce use the
 valid prefix rather than forcing invalid tail routes through the graph bucket.
 This matches the usual static-buffer CUDA Graph usage: the graph shape is fixed,
-while the framework owns the valid-token prefix.
+while the framework owns the valid-token prefix and chooses which captured graph
+to replay.  A typical framework setup captures two graphs: a 256-row persistent
+fused bucket and a 2048-row staged bucket, then replays by token threshold.
 
-The staged K1/K2/K3 large-token path is intentionally not CUDA-Graph compatible.
-When `cuda_graph=True`, the API bypasses token-threshold routing and uses only
-the persistent fused kernel.  Without `cuda_graph=True`, routing keeps the
-normal behavior described above; if the staged path is selected while the
-current stream is being captured, the API raises instead of silently capturing
-an unsupported graph.  Graph mode also rejects
-`cumulative_local_expert_recv_stats`, because graph replay should not accumulate
-per-expert statistics across variable-token requests.
+The staged graph bucket currently supports the non-tail-reduce K3 combine path;
+leave `K3_USE_ASM_TAIL_REDUCE` unset or `0` for graph capture.  Graph mode also
+rejects `cumulative_local_expert_recv_stats`, because graph replay should not
+accumulate per-expert statistics across variable-token requests.
 
 Host-side tuning knobs for the staged path do not add device kernels:
 
@@ -259,6 +261,30 @@ python tests/test_mega_moe_dcu.py \
   --num-topk 6 \
   --cuda-graph \
   --cuda-graph-test-tokens 32,64,128,256 \
+  --skip-bench
+```
+
+Check one captured staged K1/K2/K3 graph bucket across large-token prefixes
+while keeping the small persistent-fused bucket at 256 rows:
+
+```bash
+source /opt/dtk-26.04/env.sh
+MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=auto \
+MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK=256 \
+MEGAMOE_DCU_CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_PER_RANK=2048 \
+K3_USE_ASM_TAIL_REDUCE=0 \
+python tests/test_mega_moe_dcu.py \
+  --num-processes 8 \
+  --num-max-tokens-per-rank 2048 \
+  --num-tokens 2048 \
+  --hidden 4096 \
+  --intermediate-hidden 2048 \
+  --num-experts 256 \
+  --num-topk 6 \
+  --cuda-graph \
+  --cuda-graph-max-tokens-per-rank 256 \
+  --cuda-graph-capture-tokens-per-rank 2048 \
+  --cuda-graph-test-tokens 512,1024,2048 \
   --skip-bench
 ```
 

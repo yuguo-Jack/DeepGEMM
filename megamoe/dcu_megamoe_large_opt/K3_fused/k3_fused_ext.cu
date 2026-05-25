@@ -64,6 +64,8 @@ struct __attribute__((packed)) GpuProb {
     uint32_t asm_signal_generation;
     uint32_t asm_tail_reduce;
     uint32_t asm_reduce_blocks;
+    uint32_t graph_reserved_c4;
+    int32_t* active_tiles;
 };
 
 static_assert(offsetof(GpuProb, scaleA) == 0x70,
@@ -84,6 +86,8 @@ static_assert(offsetof(GpuProb, asm_reduce_total_vecs) == 0xb0,
               "K3 tail reduce asm expects total vecs at GpuProb+0xb0");
 static_assert(offsetof(GpuProb, asm_reduce_blocks) == 0xc0,
               "K3 tail reduce asm expects reduce blocks at GpuProb+0xc0");
+static_assert(offsetof(GpuProb, active_tiles) == 0xc8,
+              "K3 graph asm expects active_tiles at GpuProb+0xc8");
 
 struct __attribute__((packed)) KernelArgs {
     uint32_t gemm_count;
@@ -106,6 +110,12 @@ struct LoadedAsmKernel {
 LoadedAsmKernel& asm_kernel_cache() {
     static LoadedAsmKernel cache;
     return cache;
+}
+
+bool is_stream_capturing(const hipStream_t stream) {
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    const hipError_t err = hipStreamIsCapturing(stream, &status);
+    return err == hipSuccess && status != hipStreamCaptureStatusNone;
 }
 
 hipFunction_t get_asm_function(const std::string& code_object_path,
@@ -166,7 +176,8 @@ void launch_l2_deepgemm_original_asm(
     const int64_t reduce_num_tokens = 0,
     const int64_t reduce_num_topk = 0,
     const int64_t reduce_hidden = 0,
-    const torch::Tensor* prob_storage_override = nullptr) {
+    const torch::Tensor* prob_storage_override = nullptr,
+    const torch::Tensor* active_tiles = nullptr) {
     check_cuda_contiguous(output, "output");
     check_cuda_contiguous(act_fp8, "act_fp8");
     check_cuda_contiguous(act_scale, "act_scale");
@@ -318,6 +329,14 @@ void launch_l2_deepgemm_original_asm(
         prob.asm_tail_reduce = 1;
         prob.asm_reduce_blocks = static_cast<uint32_t>(default_reduce_blocks);
     }
+    if (active_tiles != nullptr) {
+        check_cuda_contiguous(*active_tiles, "active_tiles");
+        TORCH_CHECK(active_tiles->scalar_type() == torch::kInt,
+                    "active_tiles must be int32");
+        TORCH_CHECK(active_tiles->numel() >= 1,
+                    "active_tiles must contain at least one int32");
+        prob.active_tiles = active_tiles->data_ptr<int32_t>();
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     torch::Tensor prob_storage;
@@ -335,8 +354,10 @@ void launch_l2_deepgemm_original_asm(
             torch::TensorOptions().dtype(torch::kUInt8).device(output.device()));
         prob_device = prob_storage.data_ptr();
     }
-    K3_HIP_CHECK(hipMemcpyAsync(
-        prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice, stream));
+    if (!is_stream_capturing(stream)) {
+        K3_HIP_CHECK(hipMemcpyAsync(
+            prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice, stream));
+    }
 
     KernelArgs args{};
     args.gemm_count = 1;
@@ -386,15 +407,24 @@ __global__ void reduce_local_combine_vec_kernel(
     const int num_experts,
     const int num_max_tokens_per_rank,
     const int num_tokens,
+    const int* runtime_num_tokens,
     const int num_topk,
     const int hidden) {
+    int effective_num_tokens = num_tokens;
+    if (runtime_num_tokens != nullptr) {
+        effective_num_tokens = runtime_num_tokens[0];
+        if (effective_num_tokens < 0) effective_num_tokens = 0;
+        if (effective_num_tokens > num_tokens) {
+            effective_num_tokens = num_tokens;
+        }
+    }
     constexpr int kBf16PerVec = 8;
     auto local_sections = deep_gemm::mega::get_sections(
         local_sym_buffer, num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk, hidden);
     const int vecs_per_token = hidden / kBf16PerVec;
     const int64_t total_reduce_vecs =
-        static_cast<int64_t>(num_tokens) * vecs_per_token;
+        static_cast<int64_t>(effective_num_tokens) * vecs_per_token;
     auto* y_vec = reinterpret_cast<uint4*>(y);
     for (int64_t task =
              static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -440,7 +470,12 @@ __global__ void rank_barrier_kernel(
     const int rank_idx,
     const int num_ranks,
     int32_t* asm_done_counter,
-    const bool reset_tail_signal_slots) {
+    const bool reset_tail_signal_slots,
+    uint8_t* route_scratch,
+    const int64_t k1_flags_offset,
+    const int64_t k1_flags_numel,
+    const int64_t k1_meta_flags_offset,
+    const int64_t k1_meta_flags_numel) {
     auto* signal_buffers =
         deep_gemm::mega::dcu_peer_signal_ptrs(local_sym_buffer, num_ranks);
     auto* my_signals = signal_buffers[rank_idx];
@@ -451,6 +486,21 @@ __global__ void rank_barrier_kernel(
     if (reset_tail_signal_slots && thread_id < num_ranks) {
         __hip_atomic_store(my_signals + 8 + thread_id, 0, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    if (route_scratch != nullptr) {
+        if (k1_flags_numel > 0) {
+            auto* flags = reinterpret_cast<int32_t*>(route_scratch + k1_flags_offset);
+            for (int64_t i = thread_id; i < k1_flags_numel; i += blockDim.x) {
+                flags[i] = 0;
+            }
+        }
+        if (k1_meta_flags_numel > 0) {
+            auto* meta_flags =
+                reinterpret_cast<int32_t*>(route_scratch + k1_meta_flags_offset);
+            for (int64_t i = thread_id; i < k1_meta_flags_numel; i += blockDim.x) {
+                meta_flags[i] = 0;
+            }
+        }
     }
     deep_gemm::mega::mega_moe_rank_barrier(signal_buffers, rank_idx, num_ranks);
 }
@@ -464,12 +514,14 @@ void k3_l2_combine_asm_out(
     const torch::Tensor& row_combine_ptrs,
     const torch::Tensor& output_workspace,
     const torch::Tensor& prob_storage,
-    const std::string& code_object_path) {
+    const std::string& code_object_path,
+    const std::optional<torch::Tensor>& active_tiles) {
     launch_l2_deepgemm_original_asm(
         output_workspace, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
         code_object_path, kCombineAsmKernelName, &row_combine_ptrs,
         nullptr, nullptr, 0, 0, false, nullptr, nullptr,
-        0, 0, 0, 0, 0, 0, 0, &prob_storage);
+        0, 0, 0, 0, 0, 0, 0, &prob_storage,
+        active_tiles.has_value() ? &active_tiles.value() : nullptr);
 }
 
 void k3_l2_combine_asm_tail_reduce_out(
@@ -538,6 +590,50 @@ void reduce_local_combine(
                        static_cast<int>(num_experts),
                        static_cast<int>(num_max_tokens_per_rank),
                        static_cast<int>(num_tokens),
+                       nullptr,
+                       static_cast<int>(num_topk),
+                       static_cast<int>(hidden));
+    K3_HIP_CHECK(hipGetLastError());
+}
+
+void reduce_local_combine_graph(
+    const torch::Tensor& y,
+    const torch::Tensor& sym_buffer,
+    const int64_t num_ranks,
+    const int64_t num_experts,
+    const int64_t num_max_tokens_per_rank,
+    const int64_t graph_num_tokens,
+    const torch::Tensor& runtime_num_tokens,
+    const int64_t num_topk,
+    const int64_t hidden) {
+    check_cuda_contiguous(y, "y");
+    check_cuda_contiguous(sym_buffer, "sym_buffer");
+    check_cuda_contiguous(runtime_num_tokens, "runtime_num_tokens");
+    TORCH_CHECK(y.scalar_type() == torch::kBFloat16, "y must be BF16");
+    TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8,
+                "sym_buffer must be int8");
+    TORCH_CHECK(runtime_num_tokens.scalar_type() == torch::kInt &&
+                    runtime_num_tokens.numel() == 1,
+                "runtime_num_tokens must be a CUDA int32 scalar");
+    TORCH_CHECK(y.dim() == 2 && y.size(0) >= graph_num_tokens &&
+                    y.size(1) == hidden,
+                "graph y shape mismatch");
+    TORCH_CHECK(hidden % 8 == 0,
+                "reduce_local_combine_graph expects hidden divisible by 8");
+    const int kThreads = std::max(64, std::min(256, env_int("K3_REDUCE_THREADS", 128)));
+    const int64_t total_vecs = static_cast<int64_t>(graph_num_tokens) * (hidden / 8);
+    const int blocks = std::max<int64_t>(
+        1, std::min<int64_t>(4096, (total_vecs + kThreads - 1) / kThreads));
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    hipLaunchKernelGGL(reduce_local_combine_vec_kernel,
+                       dim3(blocks), dim3(kThreads), 0, stream,
+                       reinterpret_cast<uint16_t*>(y.data_ptr()),
+                       reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
+                       static_cast<int>(num_ranks),
+                       static_cast<int>(num_experts),
+                       static_cast<int>(num_max_tokens_per_rank),
+                       static_cast<int>(graph_num_tokens),
+                       runtime_num_tokens.data_ptr<int>(),
                        static_cast<int>(num_topk),
                        static_cast<int>(hidden));
     K3_HIP_CHECK(hipGetLastError());
@@ -548,7 +644,12 @@ void rank_barrier(
     const int64_t rank_idx,
     const int64_t num_ranks,
     const std::optional<torch::Tensor>& asm_done_counter,
-    const bool reset_tail_signal_slots) {
+    const bool reset_tail_signal_slots,
+    const std::optional<torch::Tensor>& route_scratch,
+    const int64_t k1_flags_offset,
+    const int64_t k1_flags_numel,
+    const int64_t k1_meta_flags_offset,
+    const int64_t k1_meta_flags_numel) {
     check_cuda_contiguous(sym_buffer, "sym_buffer");
     TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8,
                 "sym_buffer must be int8");
@@ -561,13 +662,37 @@ void rank_barrier(
                     "asm_done_counter must be a CUDA int32 tensor");
         done_counter_ptr = counter.data_ptr<int32_t>();
     }
+    uint8_t* route_scratch_ptr = nullptr;
+    if (route_scratch.has_value()) {
+        const auto& scratch = route_scratch.value();
+        check_cuda_contiguous(scratch, "route_scratch");
+        TORCH_CHECK(scratch.scalar_type() == torch::kInt8,
+                    "route_scratch must be int8");
+        TORCH_CHECK(k1_flags_offset >= 0 && k1_meta_flags_offset >= 0 &&
+                        k1_flags_numel >= 0 && k1_meta_flags_numel >= 0,
+                    "invalid K1 graph reset layout");
+        const int64_t flags_end =
+            k1_flags_offset + k1_flags_numel * static_cast<int64_t>(sizeof(int32_t));
+        const int64_t meta_flags_end =
+            k1_meta_flags_offset +
+            k1_meta_flags_numel * static_cast<int64_t>(sizeof(int32_t));
+        TORCH_CHECK(flags_end <= scratch.numel() &&
+                        meta_flags_end <= scratch.numel(),
+                    "K1 graph reset layout exceeds route_scratch");
+        route_scratch_ptr = reinterpret_cast<uint8_t*>(scratch.data_ptr<int8_t>());
+    }
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     hipLaunchKernelGGL(rank_barrier_kernel, dim3(1), dim3(64), 0, stream,
                        reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
                        static_cast<int>(rank_idx),
                        static_cast<int>(num_ranks),
                        done_counter_ptr,
-                       reset_tail_signal_slots);
+                       reset_tail_signal_slots,
+                       route_scratch_ptr,
+                       k1_flags_offset,
+                       k1_flags_numel,
+                       k1_meta_flags_offset,
+                       k1_meta_flags_numel);
     K3_HIP_CHECK(hipGetLastError());
 }
 
@@ -600,7 +725,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("row_combine_ptrs"),
           pybind11::arg("output_workspace"),
           pybind11::arg("prob_storage"),
-          pybind11::arg("code_object_path"));
+          pybind11::arg("code_object_path"),
+          pybind11::arg("active_tiles") = std::nullopt);
     m.def("k3_l2_combine_asm_tail_reduce_out", &k3_l2_combine_asm_tail_reduce_out,
           pybind11::arg("act_fp8"),
           pybind11::arg("act_scale"),
@@ -633,12 +759,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_tokens"),
           pybind11::arg("num_topk"),
           pybind11::arg("hidden"));
+    m.def("reduce_local_combine_graph", &reduce_local_combine_graph,
+          pybind11::arg("y"),
+          pybind11::arg("sym_buffer"),
+          pybind11::arg("num_ranks"),
+          pybind11::arg("num_experts"),
+          pybind11::arg("num_max_tokens_per_rank"),
+          pybind11::arg("graph_num_tokens"),
+          pybind11::arg("runtime_num_tokens"),
+          pybind11::arg("num_topk"),
+          pybind11::arg("hidden"));
     m.def("rank_barrier", &rank_barrier,
           pybind11::arg("sym_buffer"),
           pybind11::arg("rank_idx"),
           pybind11::arg("num_ranks"),
           pybind11::arg("asm_done_counter") = std::nullopt,
-          pybind11::arg("reset_tail_signal_slots") = false);
+          pybind11::arg("reset_tail_signal_slots") = false,
+          pybind11::arg("route_scratch") = std::nullopt,
+          pybind11::arg("k1_flags_offset") = 0,
+          pybind11::arg("k1_flags_numel") = 0,
+          pybind11::arg("k1_meta_flags_offset") = 0,
+          pybind11::arg("k1_meta_flags_numel") = 0);
     m.def("fill_i64_tensor_from_host", &fill_i64_tensor_from_host,
           pybind11::arg("out"),
           pybind11::arg("values"));

@@ -149,3 +149,83 @@ def k1_symm_fused_l1_asm(
         l1_out_workspace,
         cumulative_local_expert_recv_stats,
     )
+
+
+def k1_graph_flag_reset_layout(
+    *,
+    num_ranks: int,
+    num_experts: int,
+    num_max_tokens_per_rank: int,
+    num_tokens: int,
+    num_topk: int,
+    hidden: int,
+    l1_rows: int,
+    alignment: int = 256,
+) -> tuple[int, int, int, int, int, int]:
+    ext = load_extension(verbose=False)
+    return tuple(
+        int(v)
+        for v in ext.k1_graph_flag_reset_layout(
+            int(num_ranks),
+            int(num_experts),
+            int(num_max_tokens_per_rank),
+            int(num_tokens),
+            int(num_topk),
+            int(hidden),
+            int(l1_rows),
+            int(alignment),
+        )
+    )
+
+
+def k1_symm_fused_l1_asm_graph(
+    sym_buffer,
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+    *,
+    rank_idx: int,
+    num_ranks: int,
+    num_experts: int,
+    graph_max_tokens: int,
+    num_topk: int,
+    hidden: int,
+    runtime_num_tokens: torch.Tensor,
+    alignment: int = 256,
+    l1_out_workspace: torch.Tensor | None = None,
+    verbose_build: bool = False,
+):
+    _check_fused_l1_shape(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_tokens=graph_max_tokens,
+        num_max_tokens_per_rank=sym_buffer.num_max_tokens_per_rank,
+        num_topk=num_topk,
+        hidden=hidden,
+        alignment=alignment,
+    )
+    l1_weight, l1_scale = l1_weights
+    ext = load_extension(verbose=verbose_build)
+    code_object = ensure_fused_l1_asm_code_object()
+    symm_base_addr, symm_x_span = _cached_symm_x_addr_range(
+        sym_buffer, num_ranks, hidden
+    )
+    return ext.k1_symm_fused_l1(
+        sym_buffer.buffer,
+        sym_buffer.route_scratch,
+        l1_weight.contiguous(),
+        l1_scale.contiguous(),
+        int(rank_idx),
+        int(num_ranks),
+        int(num_experts),
+        int(sym_buffer.num_max_tokens_per_rank),
+        int(graph_max_tokens),
+        int(num_topk),
+        int(hidden),
+        int(symm_base_addr),
+        int(symm_x_span),
+        int(alignment),
+        str(code_object),
+        l1_out_workspace,
+        None,
+        runtime_num_tokens.contiguous(),
+        True,
+    )

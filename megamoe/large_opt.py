@@ -6,13 +6,18 @@ from typing import Optional, Tuple
 
 import torch
 
-from .dcu_megamoe_large_opt.K1_fused.k1_fused import k1_symm_fused_l1_asm
+from .dcu_megamoe_large_opt.K1_fused.k1_fused import (
+    k1_graph_flag_reset_layout,
+    k1_symm_fused_l1_asm,
+    k1_symm_fused_l1_asm_graph,
+)
 from .dcu_megamoe_large_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
 from .dcu_megamoe_large_opt.K3_fused.k3_fused import (
     build_asm_tail_signal_addrs,
     k3_l2_fused_asm_to_combine,
     rank_barrier,
     reduce_local_combine,
+    reduce_local_combine_graph,
 )
 
 
@@ -30,6 +35,7 @@ K_DTYPE_SIZES = {
 
 @dataclass
 class _RouteScratchViews:
+    k1_active_tiles: torch.Tensor
     l1_out: torch.Tensor
     act_fp8: torch.Tensor
     act_scale: torch.Tensor
@@ -185,6 +191,13 @@ def _route_scratch_views(
     )
 
     return _RouteScratchViews(
+        k1_active_tiles=_route_scratch_tensor(
+            route_scratch,
+            byte_offset=64 * K_DTYPE_SIZES[torch.int32],
+            byte_capacity=K_DTYPE_SIZES[torch.int32],
+            dtype=torch.int32,
+            shape=(1,),
+        ),
         l1_out=_route_scratch_tensor(
             route_scratch,
             byte_offset=route_base + act_bf16_offset,
@@ -480,3 +493,149 @@ def fp8_mega_moe_large_opt_3stage(
             hidden=hidden,
             verbose_build=verbose_build,
         )
+
+
+def fp8_mega_moe_large_opt_3stage_graph(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor],
+    sym_buffer,
+    *,
+    rank_idx: int,
+    num_ranks: int,
+    num_experts: int,
+    num_topk: int,
+    activation_clamp: Optional[float],
+    fast_math: bool,
+    graph_max_tokens: Optional[int] = None,
+) -> None:
+    if not fast_math:
+        raise RuntimeError("large-opt DCU MegaMoE graph path requires fast_math")
+    if cumulative_local_expert_recv_stats is not None:
+        raise ValueError("large-opt DCU MegaMoE graph path does not support stats")
+    if k3_tail_reduce_enabled():
+        raise RuntimeError(
+            "large-opt DCU MegaMoE graph prototype supports the non-tail-reduce K3 path only"
+        )
+
+    l1_weight, l1_scale = l1_weights
+    l2_weight, l2_scale = l2_weights
+    hidden = int(y.size(1))
+    intermediate_hidden = int(l1_scale.size(1) // 2)
+    if graph_max_tokens is None:
+        graph_max_tokens = int(getattr(sym_buffer, "cuda_graph_max_tokens_per_rank", y.size(0)))
+    graph_max_tokens = int(graph_max_tokens)
+    if graph_max_tokens <= 0:
+        raise ValueError("graph_max_tokens must be positive")
+    if int(y.size(0)) < graph_max_tokens:
+        raise ValueError(
+            "large-opt graph path requires y to have at least graph_max_tokens rows"
+        )
+    num_max_tokens_per_rank = int(sym_buffer.num_max_tokens_per_rank)
+    _check_shape(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+        num_tokens=graph_max_tokens,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+    )
+
+    alignment = 256
+    verbose_build = os.getenv("MEGAMOE_DCU_LARGE_OPT_VERBOSE_BUILD", "0") == "1"
+    state = _state(
+        sym_buffer,
+        rank_idx=rank_idx,
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+        init_tail_reduce=False,
+        verbose_build=verbose_build,
+    )
+
+    flags_offset, flags_numel, meta_flags_offset, meta_flags_numel, _, _ = (
+        k1_graph_flag_reset_layout(
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_tokens=graph_max_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            l1_rows=int(l1_scale.size(1)),
+            alignment=alignment,
+        )
+    )
+    rank_barrier(
+        sym_buffer,
+        rank_idx=rank_idx,
+        num_ranks=num_ranks,
+        k1_graph_reset_layout=(
+            flags_offset,
+            flags_numel,
+            meta_flags_offset,
+            meta_flags_numel,
+        ),
+        verbose_build=verbose_build,
+    )
+
+    runtime_num_tokens = sym_buffer.cuda_graph_num_tokens
+    l1_out, route_weights, m_indices, output_index, row_combine_ptrs = (
+        k1_symm_fused_l1_asm_graph(
+            sym_buffer,
+            (l1_weight, l1_scale),
+            rank_idx=rank_idx,
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            graph_max_tokens=graph_max_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            runtime_num_tokens=runtime_num_tokens,
+            alignment=alignment,
+            l1_out_workspace=state.scratch.l1_out,
+            verbose_build=verbose_build,
+        )
+    )
+    rows = int(l1_out.size(0))
+
+    act_fp8 = state.scratch.act_fp8[:rows]
+    act_scale = state.scratch.act_scale[:rows]
+    swiglu_quant_channelwise_out(
+        l1_out,
+        route_weights,
+        act_fp8,
+        act_scale,
+        state.empty_bf16,
+        num_per_channels=intermediate_hidden,
+        output_bf16=False,
+        clamp_value=activation_clamp,
+        row_combine_ptrs=row_combine_ptrs,
+        verbose_build=verbose_build,
+    )
+
+    k3_l2_fused_asm_to_combine(
+        act_fp8,
+        act_scale,
+        m_indices,
+        (l2_weight, l2_scale),
+        row_combine_ptrs,
+        output_workspace=l1_out,
+        prob_storage=state.scratch.k3_prob_storage,
+        active_tiles=state.scratch.k1_active_tiles,
+        verbose_build=verbose_build,
+    )
+    rank_barrier(sym_buffer, rank_idx=rank_idx, num_ranks=num_ranks, verbose_build=verbose_build)
+    reduce_local_combine_graph(
+        y[:graph_max_tokens],
+        sym_buffer,
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        graph_num_tokens=graph_max_tokens,
+        runtime_num_tokens=runtime_num_tokens,
+        num_topk=num_topk,
+        hidden=hidden,
+        verbose_build=verbose_build,
+    )

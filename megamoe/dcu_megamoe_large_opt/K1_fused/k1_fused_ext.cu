@@ -218,6 +218,12 @@ LoadedAsmKernel& asm_kernel_cache() {
     return cache;
 }
 
+bool is_stream_capturing(const hipStream_t stream) {
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    const hipError_t err = hipStreamIsCapturing(stream, &status);
+    return err == hipSuccess && status != hipStreamCaptureStatusNone;
+}
+
 uint32_t initial_fused_l1_flag_generation() {
     const auto now = std::chrono::high_resolution_clock::now()
                          .time_since_epoch()
@@ -259,6 +265,7 @@ __global__ void k1_init_compact_routes_kernel(
 __global__ void k1_count_compact_routes_kernel(
     uint8_t* local_sym_buffer,
     int32_t* route_scratch_i32,
+    const int* runtime_num_tokens,
     const int rank_idx,
     const int num_ranks,
     const int num_experts,
@@ -268,7 +275,13 @@ __global__ void k1_count_compact_routes_kernel(
     const int hidden) {
     const int tid = static_cast<int>(threadIdx.x);
     const int source_rank = static_cast<int>(blockIdx.y);
-    const int routes_per_rank = num_tokens * num_topk;
+    int effective_num_tokens = num_tokens;
+    if (runtime_num_tokens != nullptr) {
+        effective_num_tokens = runtime_num_tokens[0];
+        if (effective_num_tokens < 0) effective_num_tokens = 0;
+        if (effective_num_tokens > num_tokens) effective_num_tokens = num_tokens;
+    }
+    const int routes_per_rank = effective_num_tokens * num_topk;
     const int local_experts = num_experts / num_ranks;
     const int first_expert = rank_idx * local_experts;
     const int last_expert = first_expert + local_experts;
@@ -351,6 +364,7 @@ __global__ void k1_emit_compact_routes_kernel(
     int32_t* output_index,
     int32_t* local_expert_stats,
     const uint64_t symm_base_addr,
+    const int* runtime_num_tokens,
     const int rank_idx,
     const int num_ranks,
     const int num_experts,
@@ -363,7 +377,13 @@ __global__ void k1_emit_compact_routes_kernel(
     constexpr int kTileM = kK1RouteTileM;
     const int tid = static_cast<int>(threadIdx.x);
     const int source_rank = static_cast<int>(blockIdx.y);
-    const int routes_per_rank = num_tokens * num_topk;
+    int effective_num_tokens = num_tokens;
+    if (runtime_num_tokens != nullptr) {
+        effective_num_tokens = runtime_num_tokens[0];
+        if (effective_num_tokens < 0) effective_num_tokens = 0;
+        if (effective_num_tokens > num_tokens) effective_num_tokens = num_tokens;
+    }
+    const int routes_per_rank = effective_num_tokens * num_topk;
     const int task_base = source_rank * routes_per_rank;
     const int local_experts = num_experts / num_ranks;
     const int first_expert = rank_idx * local_experts;
@@ -480,6 +500,7 @@ void launch_l1_deepgemm_fused_asm(
     const uint32_t expert_tiles_per_expert,
     const bool use_absolute_x_ptrs,
     const bool use_compact_prebuild,
+    const int* runtime_num_tokens,
     const std::string& code_object_path) {
     const int total_rows = static_cast<int>(row_x_ptrs.size(0));
     const int hidden = static_cast<int>(l1_weight.size(2) / 16);
@@ -578,6 +599,7 @@ void launch_l1_deepgemm_fused_asm(
         k1_count_compact_routes_kernel<<<route_grid, route_threads, 0, stream>>>(
             static_cast<uint8_t*>(sym_buffer.data_ptr()),
             reinterpret_cast<int32_t*>(route_scratch.data_ptr()),
+            runtime_num_tokens,
             static_cast<int>(rank_idx),
             static_cast<int>(num_ranks),
             static_cast<int>(num_experts),
@@ -608,6 +630,7 @@ void launch_l1_deepgemm_fused_asm(
                 ? nullptr
                 : local_expert_stats->data_ptr<int32_t>(),
             symm_base_addr,
+            runtime_num_tokens,
             static_cast<int>(rank_idx),
             static_cast<int>(num_ranks),
             static_cast<int>(num_experts),
@@ -679,8 +702,10 @@ void launch_l1_deepgemm_fused_asm(
     TORCH_CHECK(prob_offset + static_cast<int64_t>(sizeof(GpuProb)) <= route_scratch.numel(),
                 "route_scratch is too small for K1 fused L1 launch arguments");
     void* prob_device = static_cast<uint8_t*>(route_scratch.data_ptr()) + prob_offset;
-    K1_HIP_CHECK(hipMemcpyAsync(
-        prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice, stream));
+    if (!is_stream_capturing(stream)) {
+        K1_HIP_CHECK(hipMemcpyAsync(
+            prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice, stream));
+    }
     KernelArgs args{};
     args.gemm_count = 1;
     args.DeviceUserArguments = prob_device;
@@ -740,7 +765,9 @@ k1_symm_fused_l1(
     const int64_t alignment,
     const std::string& code_object_path,
     const std::optional<torch::Tensor>& l1_out_workspace,
-    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats) {
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const std::optional<torch::Tensor>& runtime_num_tokens,
+    const bool force_compact_prebuild) {
     TORCH_CHECK(sym_buffer.is_cuda() && route_scratch.is_cuda() &&
                     l1_weight.is_cuda() && l1_scale.is_cuda(),
                 "symm K1 tensors must be CUDA/HIP tensors");
@@ -797,20 +824,22 @@ k1_symm_fused_l1(
             expected_per_expert + kK1RouteCapacitySlack);
     const int64_t fixed_capacity_tiles_per_expert =
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
-    bool use_compact_prebuild = false;
+    bool use_compact_prebuild = force_compact_prebuild;
     bool force_asm_route = false;
-    if (const char* mode = std::getenv("K1_PREBUILD_MODE")) {
-        TORCH_CHECK(
-            std::strcmp(mode, "auto") == 0 ||
+    if (!force_compact_prebuild) {
+        if (const char* mode = std::getenv("K1_PREBUILD_MODE")) {
+            TORCH_CHECK(
+                std::strcmp(mode, "auto") == 0 ||
+                    std::strcmp(mode, "asm") == 0 ||
+                    std::strcmp(mode, "asm_route") == 0 ||
+                    std::strcmp(mode, "compact") == 0,
+                "K1_PREBUILD_MODE supports only auto/asm/compact; fixed prebuild "
+                "is intentionally disabled for K1_fused");
+            use_compact_prebuild = std::strcmp(mode, "compact") == 0;
+            force_asm_route =
                 std::strcmp(mode, "asm") == 0 ||
-                std::strcmp(mode, "asm_route") == 0 ||
-                std::strcmp(mode, "compact") == 0,
-            "K1_PREBUILD_MODE supports only auto/asm/compact; fixed prebuild "
-            "is intentionally disabled for K1_fused");
-        use_compact_prebuild = std::strcmp(mode, "compact") == 0;
-        force_asm_route =
-            std::strcmp(mode, "asm") == 0 ||
-            std::strcmp(mode, "asm_route") == 0;
+                std::strcmp(mode, "asm_route") == 0;
+        }
     }
     if (!use_compact_prebuild && !force_asm_route) {
         use_compact_prebuild = should_auto_compact_routes(
@@ -887,6 +916,15 @@ k1_symm_fused_l1(
                     "cumulative_local_expert_recv_stats must be contiguous CUDA int32");
         local_expert_stats = &stats;
     }
+    const int* runtime_num_tokens_ptr = nullptr;
+    if (runtime_num_tokens.has_value()) {
+        const auto& runtime = runtime_num_tokens.value();
+        TORCH_CHECK(runtime.is_cuda() && runtime.is_contiguous() &&
+                        runtime.scalar_type() == torch::kInt &&
+                        runtime.numel() == 1,
+                    "runtime_num_tokens must be a contiguous CUDA int32 scalar");
+        runtime_num_tokens_ptr = runtime.data_ptr<int>();
+    }
     const uint64_t symm_base_addr =
         static_cast<uint64_t>(symm_base_addr_value);
     bool use_absolute_x_ptrs =
@@ -940,10 +978,78 @@ k1_symm_fused_l1(
         rank_idx, num_ranks, num_experts, num_max_tokens_per_rank,
         num_tokens, num_topk, expert_tiles_per_expert,
         use_absolute_x_ptrs, use_compact_prebuild,
+        runtime_num_tokens_ptr,
         code_object_path);
 
     return std::make_tuple(
         l1_out, route_weights, m_indices, output_index, row_combine_ptrs);
+}
+
+std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>
+k1_graph_flag_reset_layout(
+    const int64_t num_ranks,
+    const int64_t num_experts,
+    const int64_t num_max_tokens_per_rank,
+    const int64_t num_tokens,
+    const int64_t num_topk,
+    const int64_t hidden,
+    const int64_t l1_rows,
+    const int64_t alignment) {
+    TORCH_CHECK(num_ranks == kK1SupportedRanks &&
+                    num_experts == kK1SupportedExperts &&
+                    num_topk == kK1SupportedTopk &&
+                    hidden == kK1SupportedHidden &&
+                    l1_rows == kK1SupportedL1Rows &&
+                    alignment == kK1SupportedAlignment &&
+                    num_tokens > 0 && num_tokens <= num_max_tokens_per_rank,
+                kK1ShapeContract);
+    const int64_t local_experts = num_experts / num_ranks;
+    const int64_t total_tasks = num_ranks * num_tokens * num_topk;
+    const int64_t expected_per_expert =
+        (total_tasks + num_experts - 1) / num_experts;
+    const int64_t rows_per_expert_target =
+        std::max<int64_t>(alignment, expected_per_expert + kK1RouteCapacitySlack);
+    const int64_t fixed_capacity_tiles_per_expert =
+        ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
+    const int64_t fixed_capacity_tiles =
+        local_experts * fixed_capacity_tiles_per_expert;
+    const int64_t capacity_tiles = compact_capacity_tiles(
+        total_tasks, num_experts, local_experts, fixed_capacity_tiles_per_expert);
+    const int64_t total_rows = capacity_tiles * kK1RouteTileM;
+    const int64_t route_workspace_bytes =
+        deep_gemm::mega::route_task_workspace_bytes(
+            static_cast<int>(num_ranks),
+            static_cast<int>(num_experts),
+            static_cast<int>(num_max_tokens_per_rank));
+    int64_t scratch_offset = 0;
+    auto reserve_scratch = [&](const int64_t bytes) {
+        const int64_t offset = deep_gemm::mega::align_i64(scratch_offset, 16);
+        scratch_offset = offset + bytes;
+        return offset;
+    };
+    reserve_scratch((local_experts + local_experts + 1 + capacity_tiles +
+                     capacity_tiles + capacity_tiles * 16) *
+                    static_cast<int64_t>(sizeof(int32_t)));
+    reserve_scratch((total_rows + kK1RowPointerPadding) *
+                    static_cast<int64_t>(sizeof(int64_t)));
+    reserve_scratch(total_rows * static_cast<int64_t>(sizeof(float)));
+    reserve_scratch(total_rows * static_cast<int64_t>(sizeof(int64_t)));
+    reserve_scratch(total_rows * static_cast<int64_t>(sizeof(float)));
+    reserve_scratch(total_rows * static_cast<int64_t>(sizeof(int32_t)));
+    reserve_scratch(total_tasks * static_cast<int64_t>(sizeof(int32_t)));
+    scratch_offset = deep_gemm::mega::align_i64(scratch_offset, 16);
+    const int64_t staged_x_offset =
+        deep_gemm::mega::align_i64(std::max(route_workspace_bytes, scratch_offset), 16);
+    const int64_t staged_x_bytes = total_rows * hidden;
+    const int64_t flags_offset =
+        deep_gemm::mega::align_i64(staged_x_offset + staged_x_bytes, 16);
+    const int64_t flags_numel =
+        ((total_rows + 255) / 256) * ((l1_rows + 255) / 256);
+    const int64_t meta_flags_offset =
+        deep_gemm::mega::align_i64(flags_offset + flags_numel * sizeof(int32_t), 16);
+    const int64_t meta_flags_numel = (total_rows + 255) / 256;
+    return std::make_tuple(flags_offset, flags_numel, meta_flags_offset,
+                           meta_flags_numel, total_rows, fixed_capacity_tiles);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -964,5 +1070,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("alignment") = 256,
           pybind11::arg("code_object_path") = "",
           pybind11::arg("l1_out_workspace") = std::nullopt,
-          pybind11::arg("cumulative_local_expert_recv_stats") = std::nullopt);
+          pybind11::arg("cumulative_local_expert_recv_stats") = std::nullopt,
+          pybind11::arg("runtime_num_tokens") = std::nullopt,
+          pybind11::arg("force_compact_prebuild") = false);
+    m.def("k1_graph_flag_reset_layout", &k1_graph_flag_reset_layout,
+          pybind11::arg("num_ranks"),
+          pybind11::arg("num_experts"),
+          pybind11::arg("num_max_tokens_per_rank"),
+          pybind11::arg("num_tokens"),
+          pybind11::arg("num_topk"),
+          pybind11::arg("hidden"),
+          pybind11::arg("l1_rows"),
+          pybind11::arg("alignment") = 256);
 }

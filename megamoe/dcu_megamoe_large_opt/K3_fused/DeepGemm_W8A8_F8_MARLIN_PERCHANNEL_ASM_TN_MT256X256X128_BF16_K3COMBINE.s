@@ -1848,6 +1848,20 @@ label_EarlyStop_if_wg_exceed:
 s_endpgm
 label_NoEarlyStop_wgExceed:
 
+/* K3 graph bucket: skip row tiles beyond K1 compact runtime active tile count. */
+s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
+s_cbranch_scc1 .L_k3_active_tile_gate_done
+s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
+s_waitcnt lgkmcnt(0)
+s_cmp_eq_u64 s[90:91], 0
+s_cbranch_scc1 .L_k3_active_tile_gate_done
+s_load_dword s88, s[90:91], 0x0
+s_waitcnt lgkmcnt(0)
+s_cmp_ge_u32 s[sgprWorkGroup1], s88
+s_cbranch_scc0 .L_k3_active_tile_gate_done
+s_endpgm
+.L_k3_active_tile_gate_done:
+
 s_sub_u32 s[sgprAddressA+0], s[sgprAddressA+0], 16 // pre-pad to make room for possible pointer shift
 s_subb_u32 s[sgprAddressA+1], s[sgprAddressA+1], 0 // pre-pad to make room for possible pointer shift
 s_sub_u32 s[sgprAddressB+0], s[sgprAddressB+0], 16 // pre-pad to make room for possible pointer shift
