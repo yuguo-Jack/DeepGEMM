@@ -458,16 +458,6 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    v_lshlrev_b32 v159, 3, v158
    buffer_load_dwordx2 v[138:139], v159, s[92:95], 0, offen, offset:\rowptr_offset
 
-   v_add_u32 v163, 16, v151
-   _v_add_co_u32 v164, vcc, v163, s56
-   v_lshlrev_b32 v164, 3, v164
-   buffer_load_dwordx2 v[140:141], v164, s[92:95], 0, offen, offset:\rowptr_offset
-
-   v_add_u32 v165, 24, v151
-   _v_add_co_u32 v166, vcc, v165, s56
-   v_lshlrev_b32 v166, 3, v166
-   buffer_load_dwordx2 v[142:143], v166, s[92:95], 0, offen, offset:\rowptr_offset
-
    v_lshlrev_b32 v148, 9, v151
    v_and_b32 v154, 31, v150
    v_lshlrev_b32 v154, 4, v154
@@ -478,30 +468,16 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    v_add_u32 v161, v161, v154
    ds_read_b128 v[236:239], v161
 
-   v_lshlrev_b32 v163, 9, v163
-   v_add_u32 v163, v163, v154
-   ds_read_b128 v[240:243], v163
-
-   v_lshlrev_b32 v165, 9, v165
-   v_add_u32 v165, v165, v154
-   ds_read_b128 v[244:247], v165
-
    s_waitcnt vmcnt(0)
    s_waitcnt lgkmcnt(0)
    v_or_b32 v155, v136, v137
    v_or_b32 v161, v138, v139
-   v_or_b32 v163, v140, v141
-   v_or_b32 v165, v142, v143
    v_add_u32 v162, v154, s54
    v_mov_b32 v156, 0
    _v_add_co_u32 v136, vcc, v136, v162
    v_addc_co_u32 v137, vcc, v137, v156, vcc
    _v_add_co_u32 v138, vcc, v138, v162
    v_addc_co_u32 v139, vcc, v139, v156, vcc
-   _v_add_co_u32 v140, vcc, v140, v162
-   v_addc_co_u32 v141, vcc, v141, v156, vcc
-   _v_add_co_u32 v142, vcc, v142, v162
-   v_addc_co_u32 v143, vcc, v143, v156, vcc
    v_cmp_ne_u32 vcc, 0, v155
    s_and_saveexec_b64 s[82:83], vcc
    global_store_dwordx4 v[136:137], v[232:235], off
@@ -509,14 +485,6 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    v_cmp_ne_u32 vcc, 0, v161
    s_and_saveexec_b64 s[82:83], vcc
    global_store_dwordx4 v[138:139], v[236:239], off
-   s_mov_b64 exec, s[82:83]
-   v_cmp_ne_u32 vcc, 0, v163
-   s_and_saveexec_b64 s[82:83], vcc
-   global_store_dwordx4 v[140:141], v[240:243], off
-   s_mov_b64 exec, s[82:83]
-   v_cmp_ne_u32 vcc, 0, v165
-   s_and_saveexec_b64 s[82:83], vcc
-   global_store_dwordx4 v[142:143], v[244:247], off
    s_mov_b64 exec, s[82:83]
    s_mov_b64 exec, s[80:81]
    v_add_u32 v150, \step, v150
@@ -601,10 +569,32 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
 .endm
 
 .macro K3_TAIL_LOAD_ACCUM_SLOT
-   global_load_dwordx4 v[232:235], v[153:154], off glc slc
+   global_load_dwordx4 v[232:235], v[153:154], off
    s_waitcnt vmcnt(0)
    K3_TAIL_ACCUM_VEC v232, v233, v234, v235
    K3_TAIL_ADDR_ADD_SLOT_STRIDE
+.endm
+
+.macro K3_TAIL_LOAD_ACCUM_SIX
+   global_load_dwordx4 v[200:203], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[204:207], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[208:211], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[212:215], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[216:219], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[220:223], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   s_waitcnt vmcnt(0)
+   K3_TAIL_ACCUM_VEC v200, v201, v202, v203
+   K3_TAIL_ACCUM_VEC v204, v205, v206, v207
+   K3_TAIL_ACCUM_VEC v208, v209, v210, v211
+   K3_TAIL_ACCUM_VEC v212, v213, v214, v215
+   K3_TAIL_ACCUM_VEC v216, v217, v218, v219
+   K3_TAIL_ACCUM_VEC v220, v221, v222, v223
 .endm
 
 .macro K3_TAIL_F32_TO_BF16 out:req, value:req
@@ -1947,20 +1937,15 @@ v_mov_b32 v186, 0
 v_mov_b32 v187, 0
 
 K3_TAIL_ADDR_FROM_BASE s74, s75
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
+K3_TAIL_LOAD_ACCUM_SIX
 K3_TAIL_PACK_REDUCE_OUT
 K3_TAIL_ADDR_FROM_BASE s72, s73
 global_store_dwordx4 v[153:154], v[232:235], off
-s_waitcnt vmcnt(0)
 s_mov_b64 exec, s[84:85]
 v_add_u32 v250, s81, v250
 s_branch .L_k3_extra_reduce_loop
 .L_k3_extra_reduce_done:
+s_waitcnt vmcnt(0)
 s_mov_b64 exec, s[84:85]
 .L_k3_extra_reduce_endpgm:
 s_endpgm
@@ -3155,14 +3140,12 @@ s_barrier
 s_cmp_le_i32 s[sgprWaveiD], 3
 s_cbranch_scc0 .L_k3_store_h0_skip
 v_mov_b32 v150, v[vgprSerial]
-K3_STORE_STAGED_HALF 0, 1024
+K3_STORE_STAGED_HALF 0, 512
 .L_k3_store_h0_skip:
 s_barrier
 
 s_cmp_le_i32 s[sgprWaveiD], 3
 s_cbranch_scc1 .L_k3_stage_h1_skip
-s_cmp_le_i32 s[sgprWaveiD], 7
-s_cbranch_scc0 .L_k3_stage_h1_skip
 v_mov_b32 v201, 128
 K3_STAGE_TILE_H1
 .L_k3_stage_h1_skip:
@@ -3171,11 +3154,9 @@ s_barrier
 
 s_cmp_le_i32 s[sgprWaveiD], 3
 s_cbranch_scc1 .L_k3_store_h1_skip
-s_cmp_le_i32 s[sgprWaveiD], 7
-s_cbranch_scc0 .L_k3_store_h1_skip
 v_mov_b32 v201, 256
 v_sub_u32 v150, v[vgprSerial], v201
-K3_STORE_STAGED_HALF 1024, 1024
+K3_STORE_STAGED_HALF 1024, 512
 .L_k3_store_h1_skip:
 s_waitcnt vmcnt(0)
 s_branch label_GW_End_20
@@ -3392,20 +3373,15 @@ v_mov_b32 v186, 0
 v_mov_b32 v187, 0
 
 K3_TAIL_ADDR_FROM_BASE s74, s75
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
-K3_TAIL_LOAD_ACCUM_SLOT
+K3_TAIL_LOAD_ACCUM_SIX
 K3_TAIL_PACK_REDUCE_OUT
 K3_TAIL_ADDR_FROM_BASE s72, s73
 global_store_dwordx4 v[153:154], v[232:235], off
-s_waitcnt vmcnt(0)
 s_mov_b64 exec, s[84:85]
 v_add_u32 v250, 64, v250
 s_branch .L_k3_tail_reduce_loop
 .L_k3_tail_reduce_done:
+s_waitcnt vmcnt(0)
 s_mov_b64 exec, s[84:85]
 s_endpgm
 
