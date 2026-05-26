@@ -597,6 +597,31 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    K3_TAIL_ACCUM_VEC v220, v221, v222, v223
 .endm
 
+.macro K3_TAIL_APPLY_GRAPH_RUNTIME_STATE
+   s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
+   s_cbranch_scc1 .L_k3_graph_runtime_done_\@
+   s_load_dword s86, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc4
+   s_waitcnt lgkmcnt(0)
+   s_cmp_eq_u32 s86, 0
+   s_cbranch_scc1 .L_k3_graph_runtime_done_\@
+   s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
+   s_waitcnt lgkmcnt(0)
+   s_cmp_eq_u64 s[90:91], 0
+   s_cbranch_scc1 .L_k3_graph_runtime_done_\@
+   s_load_dword s88, s[90:91], 0x0
+   s_add_u32 s90, s90, s86
+   s_addc_u32 s91, s91, 0
+   s_load_dword s76, s[90:91], 0x0
+   s_waitcnt lgkmcnt(0)
+   s_cmp_gt_u32 s88, 0
+   s_cbranch_scc1 .L_k3_graph_active_nonzero_\@
+   s_mov_b32 s88, 1
+.L_k3_graph_active_nonzero_\@:
+   s_lshl_b32 s60, s88, 4
+   s_lshl_b32 s76, s76, 9
+.L_k3_graph_runtime_done_\@:
+.endm
+
 .macro K3_TAIL_F32_TO_BF16 out:req, value:req
    v_lshrrev_b32 \out, 16, \value
    v_and_b32 v161, 1, \out
@@ -1864,6 +1889,7 @@ s_load_dwordx2 s[74:75], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa
 s_load_dwordx4 s[76:79], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb0
 s_load_dword s80, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc0
 s_waitcnt lgkmcnt(0)
+K3_TAIL_APPLY_GRAPH_RUNTIME_STATE
 s_cmp_eq_u32 s62, 1
 s_cbranch_scc0 .L_k3_extra_reduce_endpgm
 s_cmp_eq_u32 s79, 1
@@ -2065,6 +2091,30 @@ s_cbranch_scc0 label_NoEarlyStop_wgExceed
 label_EarlyStop_if_wg_exceed:
 s_endpgm
 label_NoEarlyStop_wgExceed:
+
+/* K3 graph bucket: skip row tiles beyond K1 compact runtime active tile count.
+ * Keep one dummy row tile alive so ranks with no local routes can still publish
+ * their tail-reduce signal. */
+s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
+s_cbranch_scc1 .L_k3_active_tile_gate_done
+s_load_dword s86, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc4
+s_waitcnt lgkmcnt(0)
+s_cmp_eq_u32 s86, 0
+s_cbranch_scc1 .L_k3_active_tile_gate_done
+s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
+s_waitcnt lgkmcnt(0)
+s_cmp_eq_u64 s[90:91], 0
+s_cbranch_scc1 .L_k3_active_tile_gate_done
+s_load_dword s88, s[90:91], 0x0
+s_waitcnt lgkmcnt(0)
+s_cmp_gt_u32 s88, 0
+s_cbranch_scc1 .L_k3_active_tile_nonzero
+s_mov_b32 s88, 1
+.L_k3_active_tile_nonzero:
+s_cmp_ge_u32 s[sgprWorkGroup1], s88
+s_cbranch_scc0 .L_k3_active_tile_gate_done
+s_endpgm
+.L_k3_active_tile_gate_done:
 
 s_sub_u32 s[sgprAddressA+0], s[sgprAddressA+0], 16 // pre-pad to make room for possible pointer shift
 s_subb_u32 s[sgprAddressA+1], s[sgprAddressA+1], 0 // pre-pad to make room for possible pointer shift
@@ -3250,6 +3300,7 @@ s_load_dwordx2 s[74:75], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa
 s_load_dwordx4 s[76:79], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb0
 s_load_dword s80, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc0
 s_waitcnt lgkmcnt(0)
+K3_TAIL_APPLY_GRAPH_RUNTIME_STATE
 s_cmp_eq_u32 s62, 1
 s_cbranch_scc0 .L_k3_tail_signal_done
 s_cmp_eq_u64 s[52:53], 0

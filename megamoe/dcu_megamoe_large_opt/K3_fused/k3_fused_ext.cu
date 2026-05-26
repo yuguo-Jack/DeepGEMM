@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -177,7 +178,8 @@ void launch_l2_deepgemm_original_asm(
     const int64_t reduce_num_topk = 0,
     const int64_t reduce_hidden = 0,
     const torch::Tensor* prob_storage_override = nullptr,
-    const torch::Tensor* active_tiles = nullptr) {
+    const torch::Tensor* active_tiles = nullptr,
+    const int64_t graph_runtime_offset_from_active_tiles = 0) {
     check_cuda_contiguous(output, "output");
     check_cuda_contiguous(act_fp8, "act_fp8");
     check_cuda_contiguous(act_scale, "act_scale");
@@ -336,6 +338,14 @@ void launch_l2_deepgemm_original_asm(
         TORCH_CHECK(active_tiles->numel() >= 1,
                     "active_tiles must contain at least one int32");
         prob.active_tiles = active_tiles->data_ptr<int32_t>();
+        if (graph_runtime_offset_from_active_tiles != 0) {
+            TORCH_CHECK(graph_runtime_offset_from_active_tiles > 0 &&
+                            graph_runtime_offset_from_active_tiles <=
+                                static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
+                        "graph runtime token offset must fit in uint32");
+            prob.graph_reserved_c4 =
+                static_cast<uint32_t>(graph_runtime_offset_from_active_tiles);
+        }
     }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -475,13 +485,23 @@ __global__ void rank_barrier_kernel(
     const int64_t k1_flags_offset,
     const int64_t k1_flags_numel,
     const int64_t k1_meta_flags_offset,
-    const int64_t k1_meta_flags_numel) {
+    const int64_t k1_meta_flags_numel,
+    const int32_t* graph_runtime_num_tokens,
+    int32_t* graph_runtime_num_tokens_out,
+    const int graph_max_tokens) {
     auto* signal_buffers =
         deep_gemm::mega::dcu_peer_signal_ptrs(local_sym_buffer, num_ranks);
     auto* my_signals = signal_buffers[rank_idx];
     const int thread_id = static_cast<int>(threadIdx.x);
     if (thread_id == 0 && asm_done_counter != nullptr) {
         *asm_done_counter = 0;
+    }
+    if (thread_id == 0 && graph_runtime_num_tokens != nullptr &&
+        graph_runtime_num_tokens_out != nullptr) {
+        int runtime_tokens = graph_runtime_num_tokens[0];
+        if (runtime_tokens < 0) runtime_tokens = 0;
+        if (runtime_tokens > graph_max_tokens) runtime_tokens = graph_max_tokens;
+        graph_runtime_num_tokens_out[0] = runtime_tokens;
     }
     if (reset_tail_signal_slots && thread_id < num_ranks) {
         __hip_atomic_store(my_signals + 8 + thread_id, 0, __ATOMIC_RELEASE,
@@ -546,7 +566,9 @@ void k3_l2_combine_asm_tail_reduce_out(
     const int64_t num_tokens,
     const int64_t num_topk,
     const int64_t hidden_arg,
-    const std::string& code_object_path) {
+    const std::string& code_object_path,
+    const std::optional<torch::Tensor>& active_tiles,
+    const int64_t graph_runtime_offset_from_active_tiles) {
     const int64_t hidden = l2_weight.size(1) * 16;
     TORCH_CHECK(hidden_arg == hidden,
                 "hidden_arg must match L2 weight hidden");
@@ -557,7 +579,9 @@ void k3_l2_combine_asm_tail_reduce_out(
         asm_signal_num_ranks, true, &asm_reduce_y, &sym_buffer,
         asm_signal_generation, num_ranks, num_experts,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden_arg,
-        &prob_storage);
+        &prob_storage,
+        active_tiles.has_value() ? &active_tiles.value() : nullptr,
+        graph_runtime_offset_from_active_tiles);
 }
 
 void reduce_local_combine(
@@ -649,7 +673,10 @@ void rank_barrier(
     const int64_t k1_flags_offset,
     const int64_t k1_flags_numel,
     const int64_t k1_meta_flags_offset,
-    const int64_t k1_meta_flags_numel) {
+    const int64_t k1_meta_flags_numel,
+    const std::optional<torch::Tensor>& graph_runtime_num_tokens,
+    const std::optional<torch::Tensor>& graph_runtime_num_tokens_out,
+    const int64_t graph_max_tokens) {
     check_cuda_contiguous(sym_buffer, "sym_buffer");
     TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8,
                 "sym_buffer must be int8");
@@ -681,6 +708,27 @@ void rank_barrier(
                     "K1 graph reset layout exceeds route_scratch");
         route_scratch_ptr = reinterpret_cast<uint8_t*>(scratch.data_ptr<int8_t>());
     }
+    const int32_t* graph_runtime_num_tokens_ptr = nullptr;
+    if (graph_runtime_num_tokens.has_value()) {
+        const auto& runtime = graph_runtime_num_tokens.value();
+        check_cuda_contiguous(runtime, "graph_runtime_num_tokens");
+        TORCH_CHECK(runtime.scalar_type() == torch::kInt &&
+                        runtime.numel() == 1,
+                    "graph_runtime_num_tokens must be a CUDA int32 scalar");
+        graph_runtime_num_tokens_ptr = runtime.data_ptr<int32_t>();
+    }
+    int32_t* graph_runtime_num_tokens_out_ptr = nullptr;
+    if (graph_runtime_num_tokens_out.has_value()) {
+        const auto& runtime_out = graph_runtime_num_tokens_out.value();
+        check_cuda_contiguous(runtime_out, "graph_runtime_num_tokens_out");
+        TORCH_CHECK(runtime_out.scalar_type() == torch::kInt &&
+                        runtime_out.numel() >= 1,
+                    "graph_runtime_num_tokens_out must be a CUDA int32 tensor");
+        graph_runtime_num_tokens_out_ptr = runtime_out.data_ptr<int32_t>();
+    }
+    TORCH_CHECK((graph_runtime_num_tokens_ptr == nullptr) ==
+                    (graph_runtime_num_tokens_out_ptr == nullptr),
+                "graph runtime token input/output must be provided together");
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     hipLaunchKernelGGL(rank_barrier_kernel, dim3(1), dim3(64), 0, stream,
                        reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
@@ -692,7 +740,10 @@ void rank_barrier(
                        k1_flags_offset,
                        k1_flags_numel,
                        k1_meta_flags_offset,
-                       k1_meta_flags_numel);
+                       k1_meta_flags_numel,
+                       graph_runtime_num_tokens_ptr,
+                       graph_runtime_num_tokens_out_ptr,
+                       static_cast<int>(graph_max_tokens));
     K3_HIP_CHECK(hipGetLastError());
 }
 
@@ -749,7 +800,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_tokens"),
           pybind11::arg("num_topk"),
           pybind11::arg("hidden"),
-          pybind11::arg("code_object_path"));
+          pybind11::arg("code_object_path"),
+          pybind11::arg("active_tiles") = std::nullopt,
+          pybind11::arg("graph_runtime_offset_from_active_tiles") = 0);
     m.def("reduce_local_combine", &reduce_local_combine,
           pybind11::arg("y"),
           pybind11::arg("sym_buffer"),
@@ -779,7 +832,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("k1_flags_offset") = 0,
           pybind11::arg("k1_flags_numel") = 0,
           pybind11::arg("k1_meta_flags_offset") = 0,
-          pybind11::arg("k1_meta_flags_numel") = 0);
+          pybind11::arg("k1_meta_flags_numel") = 0,
+          pybind11::arg("graph_runtime_num_tokens") = std::nullopt,
+          pybind11::arg("graph_runtime_num_tokens_out") = std::nullopt,
+          pybind11::arg("graph_max_tokens") = 0);
     m.def("fill_i64_tensor_from_host", &fill_i64_tensor_from_host,
           pybind11::arg("out"),
           pybind11::arg("values"));

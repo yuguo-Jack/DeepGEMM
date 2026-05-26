@@ -72,6 +72,9 @@ def rank_barrier(
     asm_done_counter: torch.Tensor | None = None,
     reset_tail_signal_slots: bool = False,
     k1_graph_reset_layout: tuple[int, int, int, int] | None = None,
+    graph_runtime_num_tokens: torch.Tensor | None = None,
+    graph_runtime_num_tokens_out: torch.Tensor | None = None,
+    graph_max_tokens: int = 0,
     verbose_build: bool = False,
 ) -> None:
     ext = load_extension(verbose=verbose_build)
@@ -94,6 +97,9 @@ def rank_barrier(
         flags_numel,
         meta_flags_offset,
         meta_flags_numel,
+        graph_runtime_num_tokens.contiguous() if graph_runtime_num_tokens is not None else None,
+        graph_runtime_num_tokens_out.contiguous() if graph_runtime_num_tokens_out is not None else None,
+        int(graph_max_tokens),
     )
 
 
@@ -169,6 +175,7 @@ def k3_l2_fused_asm_to_combine(
     output_workspace: torch.Tensor | None = None,
     prob_storage: torch.Tensor | None = None,
     active_tiles: torch.Tensor | None = None,
+    graph_runtime_offset_from_active_tiles: int = 0,
     verbose_build: bool = False,
 ) -> torch.Tensor | None:
     l2_weight, l2_scale = l2_weights
@@ -176,8 +183,6 @@ def k3_l2_fused_asm_to_combine(
     if output_workspace is None or prob_storage is None:
         raise ValueError("integrated K3 path requires output_workspace and prob_storage")
     if asm_reduce_y is not None:
-        if active_tiles is not None:
-            raise ValueError("K3 graph active-tile gate is not supported with tail-reduce asm")
         if asm_done_counter is None or asm_signal_addrs is None:
             raise ValueError("asm_done_counter and asm_signal_addrs are required with asm_reduce_y")
         if sym_buffer is None:
@@ -206,6 +211,8 @@ def k3_l2_fused_asm_to_combine(
             int(num_topk),
             int(hidden),
             str(code_object),
+            active_tiles.contiguous() if active_tiles is not None else None,
+            int(graph_runtime_offset_from_active_tiles),
         )
     else:
         if asm_done_counter is not None or asm_signal_addrs is not None:

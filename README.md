@@ -200,10 +200,12 @@ to replay.  A typical framework setup captures one big-fused graph and one
 staged graph with the same `num_max_tokens_per_rank`, then replays by token
 threshold.
 
-The staged graph bucket currently supports the non-tail-reduce K3 combine path;
-leave `K3_USE_ASM_TAIL_REDUCE` unset or `0` for graph capture.  Graph mode also
-rejects `cumulative_local_expert_recv_stats`, because graph replay should not
-accumulate per-expert statistics across variable-token requests.
+The staged graph bucket supports both K3 combine modes.  With
+`K3_USE_ASM_TAIL_REDUCE=1`, the captured K3 ASM consumes K1's device-side
+active-tile count and the graph runtime token scalar, so replay skips inactive
+K3 row tiles and reduces only the valid token prefix.  Graph mode rejects
+`cumulative_local_expert_recv_stats`, because graph replay should not accumulate
+per-expert statistics across variable-token requests.
 
 Host-side tuning knobs for the staged path do not add device kernels:
 
@@ -265,13 +267,13 @@ python tests/test_mega_moe_dcu.py \
   --skip-bench
 ```
 
-Check one captured staged K1/K2/K3 graph bucket across large-token prefixes
-with a 2048-token symmetric buffer:
+Check one captured staged K1/K2/K3 graph bucket across token prefixes with a
+2048-token symmetric buffer:
 
 ```bash
 source /opt/dtk-26.04/env.sh
 MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=auto \
-K3_USE_ASM_TAIL_REDUCE=0 \
+K3_USE_ASM_TAIL_REDUCE=1 \
 python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 2048 \
@@ -281,7 +283,7 @@ python tests/test_mega_moe_dcu.py \
   --num-experts 256 \
   --num-topk 6 \
   --stages-fused-cuda-graph \
-  --cuda-graph-test-tokens 512,1024,2048 \
+  --cuda-graph-test-tokens 32,512,1024,2048 \
   --skip-bench
 ```
 

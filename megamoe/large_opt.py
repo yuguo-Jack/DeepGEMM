@@ -40,6 +40,7 @@ class _RouteScratchViews:
     act_fp8: torch.Tensor
     act_scale: torch.Tensor
     k3_prob_storage: torch.Tensor
+    graph_runtime_num_tokens: torch.Tensor
     asm_tail_done_counter: torch.Tensor
     asm_tail_signal_addrs: torch.Tensor
 
@@ -225,6 +226,13 @@ def _route_scratch_views(
             byte_capacity=K_PROB_STORAGE_BYTES,
             dtype=torch.uint8,
             shape=(K_PROB_STORAGE_BYTES,),
+        ),
+        graph_runtime_num_tokens=_route_scratch_tensor(
+            route_scratch,
+            byte_offset=prob_offset + K_PROB_STORAGE_BYTES - K_DTYPE_SIZES[torch.int32],
+            byte_capacity=K_DTYPE_SIZES[torch.int32],
+            dtype=torch.int32,
+            shape=(1,),
         ),
         asm_tail_done_counter=_route_scratch_tensor(
             route_scratch,
@@ -514,11 +522,6 @@ def _run_large_opt_3stage_graph(
         raise RuntimeError("large-opt DCU MegaMoE graph path requires fast_math")
     if cumulative_local_expert_recv_stats is not None:
         raise ValueError("large-opt DCU MegaMoE graph path does not support stats")
-    if k3_tail_reduce_enabled():
-        raise RuntimeError(
-            "large-opt DCU MegaMoE graph prototype supports the non-tail-reduce K3 path only"
-        )
-
     l1_weight, l1_scale = l1_weights
     l2_weight, l2_scale = l2_weights
     hidden = int(y.size(1))
@@ -545,6 +548,7 @@ def _run_large_opt_3stage_graph(
 
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_LARGE_OPT_VERBOSE_BUILD", "0") == "1"
+    use_tail_reduce = k3_tail_reduce_enabled()
     state = _state(
         sym_buffer,
         rank_idx=rank_idx,
@@ -553,7 +557,7 @@ def _run_large_opt_3stage_graph(
         num_topk=num_topk,
         hidden=hidden,
         intermediate_hidden=intermediate_hidden,
-        init_tail_reduce=False,
+        init_tail_reduce=use_tail_reduce,
         verbose_build=verbose_build,
     )
 
@@ -573,12 +577,21 @@ def _run_large_opt_3stage_graph(
         sym_buffer,
         rank_idx=rank_idx,
         num_ranks=num_ranks,
+        asm_done_counter=state.scratch.asm_tail_done_counter if use_tail_reduce else None,
+        reset_tail_signal_slots=use_tail_reduce,
         k1_graph_reset_layout=(
             flags_offset,
             flags_numel,
             meta_flags_offset,
             meta_flags_numel,
         ),
+        graph_runtime_num_tokens=(
+            sym_buffer.cuda_graph_num_tokens if use_tail_reduce else None
+        ),
+        graph_runtime_num_tokens_out=(
+            state.scratch.graph_runtime_num_tokens if use_tail_reduce else None
+        ),
+        graph_max_tokens=graph_max_tokens if use_tail_reduce else 0,
         verbose_build=verbose_build,
     )
 
@@ -616,26 +629,57 @@ def _run_large_opt_3stage_graph(
         verbose_build=verbose_build,
     )
 
-    k3_l2_fused_asm_to_combine(
-        act_fp8,
-        act_scale,
-        m_indices,
-        (l2_weight, l2_scale),
-        row_combine_ptrs,
-        output_workspace=l1_out,
-        prob_storage=state.scratch.k3_prob_storage,
-        active_tiles=state.scratch.k1_active_tiles,
-        verbose_build=verbose_build,
-    )
-    rank_barrier(sym_buffer, rank_idx=rank_idx, num_ranks=num_ranks, verbose_build=verbose_build)
-    reduce_local_combine_graph(
-        y[:graph_max_tokens],
-        sym_buffer,
-        num_ranks=num_ranks,
-        num_experts=num_experts,
-        graph_num_tokens=graph_max_tokens,
-        runtime_num_tokens=runtime_num_tokens,
-        num_topk=num_topk,
-        hidden=hidden,
-        verbose_build=verbose_build,
-    )
+    if use_tail_reduce:
+        total_wgs = ((rows + 255) // 256) * ((hidden + 255) // 256)
+        graph_runtime_offset = (
+            state.scratch.graph_runtime_num_tokens.data_ptr()
+            - state.scratch.k1_active_tiles.data_ptr()
+        )
+        k3_l2_fused_asm_to_combine(
+            act_fp8,
+            act_scale,
+            m_indices,
+            (l2_weight, l2_scale),
+            row_combine_ptrs,
+            asm_done_counter=state.scratch.asm_tail_done_counter,
+            asm_signal_addrs=state.scratch.asm_tail_signal_addrs,
+            asm_done_target=total_wgs,
+            asm_signal_num_ranks=num_ranks,
+            asm_signal_generation=1,
+            asm_reduce_y=y[:graph_max_tokens],
+            sym_buffer=sym_buffer,
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_tokens=graph_max_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            output_workspace=l1_out,
+            prob_storage=state.scratch.k3_prob_storage,
+            active_tiles=state.scratch.k1_active_tiles,
+            graph_runtime_offset_from_active_tiles=graph_runtime_offset,
+            verbose_build=verbose_build,
+        )
+    else:
+        k3_l2_fused_asm_to_combine(
+            act_fp8,
+            act_scale,
+            m_indices,
+            (l2_weight, l2_scale),
+            row_combine_ptrs,
+            output_workspace=l1_out,
+            prob_storage=state.scratch.k3_prob_storage,
+            active_tiles=state.scratch.k1_active_tiles,
+            verbose_build=verbose_build,
+        )
+        rank_barrier(sym_buffer, rank_idx=rank_idx, num_ranks=num_ranks, verbose_build=verbose_build)
+        reduce_local_combine_graph(
+            y[:graph_max_tokens],
+            sym_buffer,
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            graph_num_tokens=graph_max_tokens,
+            runtime_num_tokens=runtime_num_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            verbose_build=verbose_build,
+        )
