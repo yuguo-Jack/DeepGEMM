@@ -495,7 +495,7 @@ def fp8_mega_moe_large_opt_3stage(
         )
 
 
-def fp8_mega_moe_large_opt_3stage_graph(
+def _run_large_opt_3stage_graph(
     y: torch.Tensor,
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -524,7 +524,7 @@ def fp8_mega_moe_large_opt_3stage_graph(
     hidden = int(y.size(1))
     intermediate_hidden = int(l1_scale.size(1) // 2)
     if graph_max_tokens is None:
-        graph_max_tokens = int(getattr(sym_buffer, "cuda_graph_max_tokens_per_rank", y.size(0)))
+        graph_max_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
     graph_max_tokens = int(graph_max_tokens)
     if graph_max_tokens <= 0:
         raise ValueError("graph_max_tokens must be positive")

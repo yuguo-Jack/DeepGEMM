@@ -20,10 +20,6 @@ _LARGE_OPT_FORCE_VALUES = {"1", "true", "yes", "on", "large_opt", "3stage"}
 _LARGE_OPT_AUTO_VALUES = {"auto", "threshold", "adaptive"}
 _LARGE_OPT_THRESHOLD_ENV = "MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD"
 _LARGE_OPT_DEFAULT_THRESHOLD = 128
-_CUDA_GRAPH_MAX_TOKENS_ENV = "MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK"
-_CUDA_GRAPH_DEFAULT_MAX_TOKENS = 256
-_CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_ENV = "MEGAMOE_DCU_CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_PER_RANK"
-_CUDA_GRAPH_LARGE_OPT_DEFAULT_MAX_TOKENS = 2048
 
 
 def _large_opt_3stage_mode() -> str:
@@ -45,23 +41,6 @@ def _large_opt_3stage_selected(num_tokens: int, mode: str, threshold: int) -> bo
     if mode == "auto":
         return num_tokens > threshold
     return False
-
-
-def _cuda_graph_max_tokens_per_rank() -> int:
-    value = int(os.getenv(_CUDA_GRAPH_MAX_TOKENS_ENV, str(_CUDA_GRAPH_DEFAULT_MAX_TOKENS)))
-    if value <= 0:
-        raise ValueError(f"{_CUDA_GRAPH_MAX_TOKENS_ENV} must be positive")
-    return value
-
-
-def _cuda_graph_large_opt_max_tokens_per_rank() -> int:
-    value = int(os.getenv(
-        _CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_ENV,
-        str(_CUDA_GRAPH_LARGE_OPT_DEFAULT_MAX_TOKENS),
-    ))
-    if value <= 0:
-        raise ValueError(f"{_CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_ENV} must be positive")
-    return value
 
 
 def _is_current_stream_capturing() -> bool:
@@ -126,13 +105,8 @@ def get_mega_moe_hip_build_config():
     config["large_opt_3stage_threshold_env"] = _LARGE_OPT_THRESHOLD_ENV
     config["large_opt_3stage_default_threshold"] = _LARGE_OPT_DEFAULT_THRESHOLD
     config["large_opt_3stage_shape"] = "EP8 experts=256 topk=6 hidden=4096 intermediate=2048"
-    config["cuda_graph_max_tokens_env"] = _CUDA_GRAPH_MAX_TOKENS_ENV
-    config["cuda_graph_default_max_tokens_per_rank"] = _CUDA_GRAPH_DEFAULT_MAX_TOKENS
-    config["cuda_graph_large_opt_max_tokens_env"] = _CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_ENV
-    config["cuda_graph_large_opt_default_max_tokens_per_rank"] = (
-        _CUDA_GRAPH_LARGE_OPT_DEFAULT_MAX_TOKENS
-    )
-    config["cuda_graph_execution"] = "bucketed_persistent_fused_or_large_opt_3stage"
+    config["cuda_graph_max_tokens_source"] = "requested num_max_tokens_per_rank"
+    config["cuda_graph_execution"] = "explicit_big_fused_or_large_opt_3stage"
     return config
 
 
@@ -147,6 +121,7 @@ class SymmBuffer:
         intermediate_hidden: int,
         use_fp8_dispatch: bool = True,
         activation: str = "swiglu",
+        cuda_graph_max_tokens_per_rank: Optional[int] = None,
     ):
         if not _is_hip_backend():
             raise RuntimeError("megamoe is the HIP/DCU MegaMoE package")
@@ -159,14 +134,19 @@ class SymmBuffer:
         self.intermediate_hidden = intermediate_hidden
         self._large_opt_3stage_mode = _large_opt_3stage_mode()
         self._large_opt_3stage_threshold = _large_opt_3stage_threshold()
-        self.cuda_graph_max_tokens_per_rank = _cuda_graph_max_tokens_per_rank()
-        self._cuda_graph_max_tokens_per_rank = self.cuda_graph_max_tokens_per_rank
-        self.cuda_graph_large_opt_max_tokens_per_rank = (
-            _cuda_graph_large_opt_max_tokens_per_rank()
+        self.cuda_graph_max_tokens_per_rank = int(
+            cuda_graph_max_tokens_per_rank
+            if cuda_graph_max_tokens_per_rank is not None
+            else num_max_tokens_per_rank
         )
-        self._cuda_graph_large_opt_max_tokens_per_rank = (
-            self.cuda_graph_large_opt_max_tokens_per_rank
-        )
+        if (
+            self.cuda_graph_max_tokens_per_rank <= 0
+            or self.cuda_graph_max_tokens_per_rank > self.num_max_tokens_per_rank
+        ):
+            raise ValueError(
+                "cuda_graph_max_tokens_per_rank must be in "
+                f"1..{self.num_max_tokens_per_rank}"
+            )
 
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(),
@@ -275,6 +255,7 @@ def get_symm_buffer_for_mega_moe(
     use_fp8_dispatch: bool = True,
     activation: str = "swiglu",
 ) -> SymmBuffer:
+    requested_num_max_tokens_per_rank = int(num_max_tokens_per_rank)
     num_max_tokens_per_rank = _align(
         num_max_tokens_per_rank,
         _C.get_token_alignment_for_mega_moe(),
@@ -288,6 +269,7 @@ def get_symm_buffer_for_mega_moe(
         intermediate_hidden,
         use_fp8_dispatch,
         activation,
+        cuda_graph_max_tokens_per_rank=requested_num_max_tokens_per_rank,
     )
 
 
@@ -349,57 +331,37 @@ def fp8_mega_moe(
     activation: str = "swiglu",
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
-    cuda_graph: bool = False,
+    big_fused_cuda_graph: bool = False,
+    stages_fused_cuda_graph: bool = False,
 ):
     call_y = y
-    if cuda_graph:
-        graph_max_tokens = getattr(sym_buffer, "_cuda_graph_max_tokens_per_rank", None)
-        if graph_max_tokens is None:
-            graph_max_tokens = _cuda_graph_max_tokens_per_rank()
-        large_graph_max_tokens = getattr(
-            sym_buffer,
-            "_cuda_graph_large_opt_max_tokens_per_rank",
-            None,
-        )
-        if large_graph_max_tokens is None:
-            large_graph_max_tokens = _cuda_graph_large_opt_max_tokens_per_rank()
-        if graph_max_tokens > int(sym_buffer.num_max_tokens_per_rank):
-            raise ValueError(
-                f"{_CUDA_GRAPH_MAX_TOKENS_ENV}={graph_max_tokens} exceeds "
-                f"SymmBuffer capacity {sym_buffer.num_max_tokens_per_rank}"
-            )
+    if big_fused_cuda_graph and stages_fused_cuda_graph:
+        raise ValueError("choose only one of big_fused_cuda_graph or stages_fused_cuda_graph")
+
+    graph_mode = big_fused_cuda_graph or stages_fused_cuda_graph
+    if graph_mode:
+        graph_max_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
         capture_rows = int(y.size(0))
-        if capture_rows <= graph_max_tokens and capture_rows < graph_max_tokens:
+        if capture_rows < graph_max_tokens:
             raise ValueError(
-                "cuda_graph=True requires y to have at least "
+                "CUDA graph mode requires y to have at least "
                 f"{graph_max_tokens} rows; pass a fixed graph-bucket output "
                 "buffer and consume only the valid prefix"
             )
         if cumulative_local_expert_recv_stats is not None:
-            raise ValueError("cuda_graph=True does not support cumulative_local_expert_recv_stats")
-        if capture_rows > graph_max_tokens:
-            if capture_rows > large_graph_max_tokens:
-                raise ValueError(
-                    "cuda_graph=True large-opt bucket has "
-                    f"{capture_rows} rows, exceeding "
-                    f"{_CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_ENV}={large_graph_max_tokens}"
-                )
-            if capture_rows > int(sym_buffer.num_max_tokens_per_rank):
-                raise ValueError(
-                    "cuda_graph=True large-opt bucket exceeds SymmBuffer capacity "
-                    f"{sym_buffer.num_max_tokens_per_rank}"
-                )
+            raise ValueError("CUDA graph mode does not support cumulative_local_expert_recv_stats")
+        if stages_fused_cuda_graph:
             large_opt_mode = getattr(sym_buffer, "_large_opt_3stage_mode", None)
             if large_opt_mode is None:
                 large_opt_mode = _large_opt_3stage_mode()
             if large_opt_mode == "off":
                 raise RuntimeError(
-                    "cuda_graph=True large bucket requires "
+                    "stages_fused_cuda_graph=True requires "
                     "MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=auto or 1"
                 )
-            from .large_opt import fp8_mega_moe_large_opt_3stage_graph
+            from .large_opt import _run_large_opt_3stage_graph
 
-            fp8_mega_moe_large_opt_3stage_graph(
+            _run_large_opt_3stage_graph(
                 y,
                 l1_weights,
                 l2_weights,
@@ -408,7 +370,7 @@ def fp8_mega_moe(
                 rank_idx=sym_buffer.group.rank(),
                 num_ranks=len(sym_buffer.handle.buffer_ptrs),
                 num_experts=sym_buffer.num_experts,
-                graph_max_tokens=capture_rows,
+                graph_max_tokens=graph_max_tokens,
                 num_topk=sym_buffer.num_topk,
                 activation_clamp=activation_clamp,
                 fast_math=fast_math,
@@ -425,8 +387,8 @@ def fp8_mega_moe(
             if _is_current_stream_capturing():
                 raise RuntimeError(
                     "DCU MegaMoE staged K1/K2/K3 path does not support CUDA Graph capture; "
-                    "pass cuda_graph=True with a fixed graph-bucket output buffer to capture "
-                    "the persistent fused path, or run staged path outside graph replay"
+                    "use big_fused_cuda_graph=True or stages_fused_cuda_graph=True with "
+                    "a fixed graph-bucket output buffer, or run staged path outside graph replay"
                 )
             from .large_opt import fp8_mega_moe_large_opt_3stage
 
@@ -463,7 +425,7 @@ def fp8_mega_moe(
         activation_clamp,
         fast_math,
     )
-    if cuda_graph:
+    if big_fused_cuda_graph:
         _C.fp8_mega_moe_with_graph_tokens(*common_args, sym_buffer.cuda_graph_num_tokens)
     else:
         _C.fp8_mega_moe(*common_args)

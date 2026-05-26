@@ -165,25 +165,26 @@ input copies.
 ### CUDA Graph Mode
 
 DCU MegaMoE exposes graph-bucket mode through the public
-`megamoe.fp8_w8a8_mega_moe(..., cuda_graph=True)` API.  The graph path is
-bucketed by the fixed output buffer rows used during capture:
+`megamoe.fp8_w8a8_mega_moe` API.  The graph bucket size is the symmetric
+buffer's requested `num_max_tokens_per_rank`; no separate CUDA Graph max-token
+environment variable is used.  The internal buffer capacity may be aligned up
+for kernel requirements, but graph replay uses
+`sym_buffer.cuda_graph_max_tokens_per_rank`.  Pass exactly one graph flag to
+choose the implementation captured into the graph:
 
-- `y.size(0) <= MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK` captures the
-  original persistent fused kernel.  The default small bucket is 256 tokens per
-  rank, available as `sym_buffer.cuda_graph_max_tokens_per_rank`.
-- `y.size(0) > MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK` captures the staged
-  K1/K2/K3 large-token path when `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE` is `auto`
-  or forced on.  The default large bucket cap is 2048 tokens per rank and can be
-  overridden with `MEGAMOE_DCU_CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_PER_RANK`.
+- `big_fused_cuda_graph=True` captures the original persistent fused kernel.
+- `stages_fused_cuda_graph=True` captures the staged K1/K2/K3 large-token path
+  when `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE` is `auto` or forced on.
 
 ```python
-y_graph = torch.empty((256, hidden), dtype=torch.bfloat16, device="cuda")
+y_graph = torch.empty((sym_buffer.cuda_graph_max_tokens_per_rank, hidden),
+                      dtype=torch.bfloat16, device="cuda")
 megamoe.fp8_w8a8_mega_moe(
     y_graph,
     l1_weights,
     l2_weights,
     sym_buffer,
-    cuda_graph=True,
+    big_fused_cuda_graph=True,
 )
 ```
 
@@ -195,8 +196,9 @@ replay, so route building, expert task generation, and local reduce use the
 valid prefix rather than forcing invalid tail routes through the graph bucket.
 This matches the usual static-buffer CUDA Graph usage: the graph shape is fixed,
 while the framework owns the valid-token prefix and chooses which captured graph
-to replay.  A typical framework setup captures two graphs: a 256-row persistent
-fused bucket and a 2048-row staged bucket, then replays by token threshold.
+to replay.  A typical framework setup captures one big-fused graph and one
+staged graph with the same `num_max_tokens_per_rank`, then replays by token
+threshold.
 
 The staged graph bucket currently supports the non-tail-reduce K3 combine path;
 leave `K3_USE_ASM_TAIL_REDUCE` unset or `0` for graph capture.  Graph mode also
@@ -250,28 +252,25 @@ Check one captured persistent-fused graph bucket across several token prefixes:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK=256 \
 python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
-  --num-max-tokens-per-rank 256 \
-  --num-tokens 256 \
+  --num-max-tokens-per-rank 2048 \
+  --num-tokens 2048 \
   --hidden 4096 \
   --intermediate-hidden 2048 \
   --num-experts 256 \
   --num-topk 6 \
-  --cuda-graph \
-  --cuda-graph-test-tokens 32,64,128,256 \
+  --big-fused-cuda-graph \
+  --cuda-graph-test-tokens 32,64,128 \
   --skip-bench
 ```
 
 Check one captured staged K1/K2/K3 graph bucket across large-token prefixes
-while keeping the small persistent-fused bucket at 256 rows:
+with a 2048-token symmetric buffer:
 
 ```bash
 source /opt/dtk-26.04/env.sh
 MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=auto \
-MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK=256 \
-MEGAMOE_DCU_CUDA_GRAPH_LARGE_OPT_MAX_TOKENS_PER_RANK=2048 \
 K3_USE_ASM_TAIL_REDUCE=0 \
 python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
@@ -281,9 +280,7 @@ python tests/test_mega_moe_dcu.py \
   --intermediate-hidden 2048 \
   --num-experts 256 \
   --num-topk 6 \
-  --cuda-graph \
-  --cuda-graph-max-tokens-per-rank 256 \
-  --cuda-graph-capture-tokens-per-rank 2048 \
+  --stages-fused-cuda-graph \
   --cuda-graph-test-tokens 512,1024,2048 \
   --skip-bench
 ```

@@ -414,10 +414,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
 
-    large_opt_enabled = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "0").strip().lower() in {
-        "1", "true", "yes", "on", "large_opt", "3stage"
-    }
-    fused_execution = "large_opt_3stage" if large_opt_enabled else "persistent_fused"
+    if args.stages_fused_cuda_graph:
+        fused_execution = "large_opt_3stage_graph"
+    elif args.big_fused_cuda_graph:
+        fused_execution = "persistent_fused_graph"
+    else:
+        large_opt_enabled = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "0").strip().lower() in {
+            "1", "true", "yes", "on", "large_opt", "3stage"
+        }
+        fused_execution = "large_opt_3stage" if large_opt_enabled else "persistent_fused"
     print_once(rank, "DCU MegaMoE channelwise W8A8 test:")
     print_once(rank, f" > megamoe: {getattr(megamoe, '__file__', None)}")
     print_once(rank, f" > deep_ep: {getattr(deep_ep, '__file__', None)}")
@@ -519,26 +524,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         return baseline_y, baseline_stats, meta
 
     def run_cuda_graph_bucket_check():
-        graph_max_tokens = args.cuda_graph_max_tokens_per_rank
-        if graph_max_tokens is None:
-            graph_max_tokens = int(os.getenv("MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK", "256"))
-        if graph_max_tokens <= 0:
-            raise ValueError("--cuda-graph-max-tokens-per-rank must be positive")
-        if graph_max_tokens > sym_buffer.num_max_tokens_per_rank:
-            raise ValueError(
-                f"graph max tokens {graph_max_tokens} exceeds SymmBuffer capacity "
-                f"{sym_buffer.num_max_tokens_per_rank}"
-            )
-        capture_tokens = args.cuda_graph_capture_tokens_per_rank
-        if capture_tokens is None:
-            capture_tokens = graph_max_tokens
-        if capture_tokens <= 0:
-            raise ValueError("--cuda-graph-capture-tokens-per-rank must be positive")
-        if capture_tokens > sym_buffer.num_max_tokens_per_rank:
-            raise ValueError(
-                f"graph capture tokens {capture_tokens} exceeds SymmBuffer capacity "
-                f"{sym_buffer.num_max_tokens_per_rank}"
-            )
+        capture_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
         token_list = parse_int_list(args.cuda_graph_test_tokens) if args.cuda_graph_test_tokens else [num_tokens]
         if not token_list:
             raise ValueError("--cuda-graph-test-tokens did not contain any token counts")
@@ -566,34 +552,17 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             sym_buffer.topk_weights[:token_count].copy_(graph_topk_weights[:token_count])
 
         def run_graph_bucket_once():
-            if args.cuda_graph_large_opt_3stage:
-                from megamoe.large_opt import fp8_mega_moe_large_opt_3stage_graph
-
-                fp8_mega_moe_large_opt_3stage_graph(
-                    y_graph,
-                    l1_weights,
-                    l2_weights,
-                    None,
-                    sym_buffer,
-                    rank_idx=sym_buffer.group.rank(),
-                    num_ranks=len(sym_buffer.handle.buffer_ptrs),
-                    num_experts=sym_buffer.num_experts,
-                    num_topk=sym_buffer.num_topk,
-                    activation_clamp=args.activation_clamp,
-                    fast_math=bool(args.fast_math),
-                    graph_max_tokens=capture_tokens,
-                )
-            else:
-                megamoe.fp8_w8a8_mega_moe(
-                    y_graph,
-                    l1_weights,
-                    l2_weights,
-                    sym_buffer,
-                    cumulative_local_expert_recv_stats=None,
-                    activation_clamp=args.activation_clamp,
-                    fast_math=bool(args.fast_math),
-                    cuda_graph=True,
-                )
+            megamoe.fp8_w8a8_mega_moe(
+                y_graph,
+                l1_weights,
+                l2_weights,
+                sym_buffer,
+                cumulative_local_expert_recv_stats=None,
+                activation_clamp=args.activation_clamp,
+                fast_math=bool(args.fast_math),
+                big_fused_cuda_graph=args.big_fused_cuda_graph,
+                stages_fused_cuda_graph=args.stages_fused_cuda_graph,
+            )
 
         fill_graph_inputs(capture_tokens)
         torch.cuda.synchronize()
@@ -710,7 +679,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             f"max_abs={max_abs:.6g}, mean_abs={mean_abs:.6g}",
         )
 
-    cuda_graph_timing_rows = run_cuda_graph_bucket_check() if args.cuda_graph else []
+    cuda_graph_timing_rows = (
+        run_cuda_graph_bucket_check()
+        if (args.big_fused_cuda_graph or args.stages_fused_cuda_graph)
+        else []
+    )
 
     if args.skip_bench:
         if rank == 0:
@@ -901,14 +874,10 @@ def parse_args():
     parser.add_argument("--skip-bench", action="store_true")
     parser.add_argument("--large-opt-3stage", action="store_true",
                         help="route megamoe.fp8_w8a8_mega_moe through K1/K2/K3 staged large-shape path")
-    parser.add_argument("--cuda-graph", action="store_true",
-                        help="capture the persistent fused path once with a fixed graph max token bucket")
-    parser.add_argument("--cuda-graph-large-opt-3stage", action="store_true",
-                        help="capture the standalone K1/K2/K3 staged large-opt graph prototype")
-    parser.add_argument("--cuda-graph-max-tokens-per-rank", type=int, default=None,
-                        help="fixed graph bucket rows; defaults to MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK or 256")
-    parser.add_argument("--cuda-graph-capture-tokens-per-rank", type=int, default=None,
-                        help="output rows used for graph capture; defaults to --cuda-graph-max-tokens-per-rank")
+    parser.add_argument("--big-fused-cuda-graph", action="store_true",
+                        help="capture the public API big fused graph path")
+    parser.add_argument("--stages-fused-cuda-graph", action="store_true",
+                        help="capture the public API staged K1/K2/K3 graph path")
     parser.add_argument("--cuda-graph-test-tokens", type=str, default="",
                         help="comma/space separated token counts to replay against one captured graph")
     parser.add_argument("--cuda-graph-warmup", type=int, default=1)
@@ -921,8 +890,8 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.cuda_graph_max_tokens_per_rank is not None:
-        os.environ["MEGAMOE_DCU_CUDA_GRAPH_MAX_TOKENS_PER_RANK"] = str(args.cuda_graph_max_tokens_per_rank)
+    if args.big_fused_cuda_graph and args.stages_fused_cuda_graph:
+        raise ValueError("choose only one of --big-fused-cuda-graph and --stages-fused-cuda-graph")
     if args.large_opt_3stage:
         os.environ["MEGAMOE_DCU_USE_LARGE_OPT_3STAGE"] = "1"
     if args.local_rank_idx is not None:
