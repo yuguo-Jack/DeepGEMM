@@ -1776,10 +1776,38 @@ s_mov_b64 s[52:53], s[88:89]                    // row_combine_ptrs
 s_mov_b32 s54, BufferLimit
 s_mov_b32 s55, Srd127_96
 buffer_store_dwordx2 v[252:253], v254, s[52:55], 0, offen, offset:0 glc
+v_mov_b32 v252, 0
+s_mov_b64 s[52:53], s[98:99]                    // m_indices
+s_mov_b32 s54, BufferLimit
+s_mov_b32 s55, Srd127_96
+v_lshlrev_b32 v254, 2, v251
+buffer_store_dword v252, v254, s[52:55], 0, offen, offset:0 glc
 s_mov_b64 exec, s[80:81]
 v_add_u32 v250, 0x300, v250
 s_branch label_SymmRouteInitLoop
 label_SymmRouteInitDone:
+s_mov_b64 exec, s[80:81]
+s_waitcnt vmcnt(0)
+
+/* Clear the row_combine_ptrs padding used by vectorized K3 stores. */
+v_mov_b32 v250, v[vgprSerial]
+s_mov_b32 s61, 512
+label_SymmRouteCombinePaddingInitLoop:
+v_cmp_lt_u32 vcc, v250, s61
+s_and_saveexec_b64 s[80:81], vcc
+s_cbranch_execz label_SymmRouteCombinePaddingInitDone
+v_add_u32 v251, s60, v250
+v_mov_b32 v252, 0
+v_mov_b32 v253, 0
+s_mov_b64 s[52:53], s[88:89]                    // row_combine_ptrs
+s_mov_b32 s54, BufferLimit
+s_mov_b32 s55, Srd127_96
+v_lshlrev_b32 v254, 3, v251
+buffer_store_dwordx2 v[252:253], v254, s[52:55], 0, offen, offset:0 glc
+s_mov_b64 exec, s[80:81]
+v_add_u32 v250, 0x300, v250
+s_branch label_SymmRouteCombinePaddingInitLoop
+label_SymmRouteCombinePaddingInitDone:
 s_mov_b64 exec, s[80:81]
 s_waitcnt vmcnt(0)
 

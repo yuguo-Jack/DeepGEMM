@@ -441,7 +441,7 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    K3_STAGE_C4_H1 v124, v125, v126, v127, 16, 20, 24, 28, 480
 .endm
 
-.macro K3_STORE_STAGED_HALF rowbase:req
+.macro K3_STORE_STAGED_HALF rowptr_offset:req, step:req
    v_mov_b32 v149, 4096
 .L_k3_staged_loop_\@:
    v_cmp_lt_u32 vcc, v150, v149
@@ -449,14 +449,24 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    s_cbranch_execz .L_k3_staged_done_\@
 
    v_lshrrev_b32 v151, 5, v150
-   v_add_u32 v152, \rowbase, v151
-   _v_add_co_u32 v152, vcc, v152, s56
+   _v_add_co_u32 v152, vcc, v151, s56
    v_lshlrev_b32 v153, 3, v152
-   v_mov_b32 v154, s93
-   v_mov_b32 v156, 0
-   _v_add_co_u32 v153, vcc, v153, s92
-   v_addc_co_u32 v154, vcc, v154, v156, vcc
-   global_load_dwordx2 v[136:137], v[153:154], off
+   buffer_load_dwordx2 v[136:137], v153, s[92:95], 0, offen, offset:\rowptr_offset
+
+   v_add_u32 v157, 8, v151
+   _v_add_co_u32 v158, vcc, v157, s56
+   v_lshlrev_b32 v159, 3, v158
+   buffer_load_dwordx2 v[138:139], v159, s[92:95], 0, offen, offset:\rowptr_offset
+
+   v_add_u32 v163, 16, v151
+   _v_add_co_u32 v164, vcc, v163, s56
+   v_lshlrev_b32 v164, 3, v164
+   buffer_load_dwordx2 v[140:141], v164, s[92:95], 0, offen, offset:\rowptr_offset
+
+   v_add_u32 v165, 24, v151
+   _v_add_co_u32 v166, vcc, v165, s56
+   v_lshlrev_b32 v166, 3, v166
+   buffer_load_dwordx2 v[142:143], v166, s[92:95], 0, offen, offset:\rowptr_offset
 
    v_lshlrev_b32 v148, 9, v151
    v_and_b32 v154, 31, v150
@@ -464,20 +474,52 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    v_add_u32 v148, v148, v154
    ds_read_b128 v[232:235], v148
 
+   v_lshlrev_b32 v161, 9, v157
+   v_add_u32 v161, v161, v154
+   ds_read_b128 v[236:239], v161
+
+   v_lshlrev_b32 v163, 9, v163
+   v_add_u32 v163, v163, v154
+   ds_read_b128 v[240:243], v163
+
+   v_lshlrev_b32 v165, 9, v165
+   v_add_u32 v165, v165, v154
+   ds_read_b128 v[244:247], v165
+
    s_waitcnt vmcnt(0)
    s_waitcnt lgkmcnt(0)
    v_or_b32 v155, v136, v137
-   v_add_u32 v154, v154, s54
-   _v_add_co_u32 v136, vcc, v136, v154
+   v_or_b32 v161, v138, v139
+   v_or_b32 v163, v140, v141
+   v_or_b32 v165, v142, v143
+   v_add_u32 v162, v154, s54
+   v_mov_b32 v156, 0
+   _v_add_co_u32 v136, vcc, v136, v162
    v_addc_co_u32 v137, vcc, v137, v156, vcc
+   _v_add_co_u32 v138, vcc, v138, v162
+   v_addc_co_u32 v139, vcc, v139, v156, vcc
+   _v_add_co_u32 v140, vcc, v140, v162
+   v_addc_co_u32 v141, vcc, v141, v156, vcc
+   _v_add_co_u32 v142, vcc, v142, v162
+   v_addc_co_u32 v143, vcc, v143, v156, vcc
    v_cmp_ne_u32 vcc, 0, v155
    s_and_saveexec_b64 s[82:83], vcc
-   s_cbranch_execz .L_k3_staged_skip_\@
    global_store_dwordx4 v[136:137], v[232:235], off
-.L_k3_staged_skip_\@:
+   s_mov_b64 exec, s[82:83]
+   v_cmp_ne_u32 vcc, 0, v161
+   s_and_saveexec_b64 s[82:83], vcc
+   global_store_dwordx4 v[138:139], v[236:239], off
+   s_mov_b64 exec, s[82:83]
+   v_cmp_ne_u32 vcc, 0, v163
+   s_and_saveexec_b64 s[82:83], vcc
+   global_store_dwordx4 v[140:141], v[240:243], off
+   s_mov_b64 exec, s[82:83]
+   v_cmp_ne_u32 vcc, 0, v165
+   s_and_saveexec_b64 s[82:83], vcc
+   global_store_dwordx4 v[142:143], v[244:247], off
    s_mov_b64 exec, s[82:83]
    s_mov_b64 exec, s[80:81]
-   v_add_u32 v150, 256, v150
+   v_add_u32 v150, \step, v150
    s_branch .L_k3_staged_loop_\@
 
 .L_k3_staged_done_\@:
@@ -3081,6 +3123,8 @@ v_lshlrev_b32 v129, 0, v133                        // v129 = (v[vgprSerial] % 64
 _v_add_co_u32 v129, vcc, v129, v134                // col, v129 + v134
 /* K3COMBINE: keep D row_combine_ptrs before sgprAddressD is reused for stride offsets. */
 s_mov_b64 s[92:93], s[sgprAddressD:sgprAddressD+1]
+s_mov_b32 s94, BufferLimit
+s_mov_b32 s95, Srd127_96
 s_mul_i32 s[sgprStrideoffC+0], 8, s[sgprStridesC] //
 s_mul_i32 s[sgprStrideoffC+1], 16, s[sgprStridesC] //
 s_mul_i32 s[sgprStrideoffC+2], 24, s[sgprStridesC] //
@@ -3111,12 +3155,14 @@ s_barrier
 s_cmp_le_i32 s[sgprWaveiD], 3
 s_cbranch_scc0 .L_k3_store_h0_skip
 v_mov_b32 v150, v[vgprSerial]
-K3_STORE_STAGED_HALF 0
+K3_STORE_STAGED_HALF 0, 1024
 .L_k3_store_h0_skip:
 s_barrier
 
 s_cmp_le_i32 s[sgprWaveiD], 3
 s_cbranch_scc1 .L_k3_stage_h1_skip
+s_cmp_le_i32 s[sgprWaveiD], 7
+s_cbranch_scc0 .L_k3_stage_h1_skip
 v_mov_b32 v201, 128
 K3_STAGE_TILE_H1
 .L_k3_stage_h1_skip:
@@ -3125,9 +3171,11 @@ s_barrier
 
 s_cmp_le_i32 s[sgprWaveiD], 3
 s_cbranch_scc1 .L_k3_store_h1_skip
+s_cmp_le_i32 s[sgprWaveiD], 7
+s_cbranch_scc0 .L_k3_store_h1_skip
 v_mov_b32 v201, 256
 v_sub_u32 v150, v[vgprSerial], v201
-K3_STORE_STAGED_HALF 128
+K3_STORE_STAGED_HALF 1024, 1024
 .L_k3_store_h1_skip:
 s_waitcnt vmcnt(0)
 s_branch label_GW_End_20
