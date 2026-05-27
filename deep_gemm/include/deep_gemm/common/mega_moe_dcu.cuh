@@ -47,7 +47,11 @@ __device__ static inline float bf16_bits_to_float(const uint16_t x) {
 __device__ static inline uint32_t pack2_f32_to_bf16_bits(const float x,
                                                          const float y) {
 #if defined(__gfx938__)
+#if defined(__clang_major__) && __clang_major__ >= 18
+    auto packed = __builtin_hcu_cvt_pk_bf16_f32(x, y, 0);
+#else
     auto packed = __builtin_hcu_cvt_pk_bf16_f32(0, x, 0, y, 0);
+#endif
     return *reinterpret_cast<uint32_t*>(&packed);
 #else
     return static_cast<uint32_t>(float_to_bf16_bits(x)) |

@@ -132,7 +132,7 @@ using DcuMegaMoeDefaultPolicy =
         kDcuRouteTileMDefaultLog2,
         DcuMegaMoeL1ExpertChunkMajorSchedule,
         DcuMegaMoeL2ExpertHiddenMajorSchedule<16>,
-        256, 192>;
+        256, 144>;
 using DcuMegaMoeEp8Config =
     DcuMegaMoeKernelConfig<DcuMegaMoeEp8Shape, DcuMegaMoeDefaultPolicy>;
 

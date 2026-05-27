@@ -29,3 +29,4 @@ megamoe/dcu_megamoe_large_opt/**/*.o
 megamoe/dcu_megamoe_large_opt/**/*.hip
 hygon_tmp/
 .playwright-cli/
+.planning/
