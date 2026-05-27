@@ -147,12 +147,12 @@ views into the same `route_scratch` storage; no extra device kernels, D2H
 synchronization, or duplicate activation buffers are introduced for the later
 first large-token call.
 
-By default K3 uses the integrated `ASM combine -> barrier -> reduce` path.
-Set `K3_USE_ASM_TAIL_REDUCE=1` together with
-`MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1`, or run the sweep script with
-`K3_PATH=tail-reduce`, to test the K3 tail-reduce variant.  For
-`num_max_tokens_per_rank <= 2048`, the tail reducer defaults to 64 reducer
-workgroups; larger max-token buffers keep the previous 128-workgroup default.
+By default K3 uses the integrated ASM tail-reduce path for both eager and graph
+staged execution, so it avoids the separate `rank_barrier + reduce` tail that
+can show large latency swings.  Set `K3_USE_ASM_TAIL_REDUCE=0` only when
+debugging the older barrier/reduce path.  For `num_max_tokens_per_rank <= 2048`,
+the tail reducer defaults to 64 reducer workgroups; larger max-token buffers
+keep the previous 128-workgroup default.
 
 The staged path keeps the tail-reduce signal state in `route_scratch`; when the
 large-opt environment is enabled before creating the symmetric buffer, this
@@ -200,10 +200,10 @@ to replay.  A typical framework setup captures one big-fused graph and one
 staged graph with the same `num_max_tokens_per_rank`, then replays by token
 threshold.
 
-The staged graph bucket supports both K3 combine modes.  With
-`K3_USE_ASM_TAIL_REDUCE=1`, the captured K3 ASM consumes K1's device-side
-active-tile count and the graph runtime token scalar, so replay skips inactive
-K3 row tiles and reduces only the valid token prefix.  Graph mode rejects
+The staged graph bucket supports both K3 combine modes.  By default, the
+captured K3 ASM uses tail-reduce and consumes K1's device-side active-tile count
+plus the graph runtime token scalar, so replay skips inactive K3 row tiles and
+reduces only the valid token prefix.  Graph mode rejects
 `cumulative_local_expert_recv_stats`, because graph replay should not accumulate
 per-expert statistics across variable-token requests.
 
@@ -273,7 +273,6 @@ Check one captured staged K1/K2/K3 graph bucket across token prefixes with a
 ```bash
 source /opt/dtk-26.04/env.sh
 MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=auto \
-K3_USE_ASM_TAIL_REDUCE=1 \
 python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 2048 \

@@ -19,8 +19,11 @@ case "${K3_PATH:-default}" in
     tail-reduce)
         export K3_USE_ASM_TAIL_REDUCE=1
         ;;
+    barrier|rank-barrier|reduce)
+        export K3_USE_ASM_TAIL_REDUCE=0
+        ;;
     *)
-        echo "unknown K3_PATH=${K3_PATH}; expected default or tail-reduce" >&2
+        echo "unknown K3_PATH=${K3_PATH}; expected default, tail-reduce, or barrier" >&2
         exit 2
         ;;
 esac

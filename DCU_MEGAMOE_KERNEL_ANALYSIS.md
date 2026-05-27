@@ -33,8 +33,9 @@ token 延迟更低，内部通过跨 rank barrier 和本地 block barrier 做通
   `m_indices`、`output_index` 和 `row_combine_ptrs`。
 - K2: 融合 SwiGLU + channelwise FP8 quant，baseline 也复用同一个优化过的 K2，以保证
   swiglu/quant 口径公平。
-- K3: 融合 L2 FP8 grouped GEMM + combine partial 写入。可选 `K3_USE_ASM_TAIL_REDUCE=1`
-  时，K3 汇编尾部直接做本地 topk reduce 并写 `y`；否则 K3 后跟 rank barrier 和一个
+- K3: 融合 L2 FP8 grouped GEMM + combine partial 写入。默认走 ASM tail-reduce，
+  K3 汇编尾部直接做本地 topk reduce 并写 `y`；只有显式设置
+  `K3_USE_ASM_TAIL_REDUCE=0` 时，K3 后才跟 rank barrier 和一个
   `reduce_local_combine` kernel。
 
 从目前 sweep 结果看，32/64/128 token 更适合 big fused，256 及以上 3-stage 优势明显。
@@ -540,10 +541,10 @@ _RouteScratchViews:
 runtime token 数。这样第一次大 token 调用不会在执行路径里再申请大 tensor，也不需要根据
 当前 token 动态变更图结构。
 
-如果 `K3_USE_ASM_TAIL_REDUCE=1`，`_state(..., init_tail_reduce=True)` 会通过
+默认启用 tail reduce 时，`_state(..., init_tail_reduce=True)` 会通过
 `build_asm_tail_signal_addrs(...)` 把 signal slot 地址写入
 `asm_tail_signal_addrs`。这个动作内部使用 `fill_i64_tensor_from_host(...)`，本质是 host 到 device
-的异步小拷贝，已经被提前移动到 buffer 初始化路径。未开启 tail reduce 时不会做这一步。
+的异步小拷贝，已经被提前移动到 buffer 初始化路径。只有显式关闭 tail reduce 时不会做这一步。
 
 ### 4.2 3-stage 主流程
 
@@ -754,7 +755,7 @@ partial layout。
 
 #### 非 tail-reduce 路径
 
-默认 `K3_USE_ASM_TAIL_REDUCE=0` 时：
+显式设置 `K3_USE_ASM_TAIL_REDUCE=0` 时：
 
 ```text
 K3 asm writes combine partials
@@ -767,7 +768,7 @@ reduce_local_combine_vec_kernel writes y
 
 #### ASM tail-reduce 路径
 
-开启 `K3_USE_ASM_TAIL_REDUCE=1` 时：
+默认 ASM tail-reduce 路径：
 
 ```text
 K3 asm GEMM workgroups write combine partials
@@ -956,11 +957,12 @@ K2_SKIP_INACTIVE_ROWS_MIN_TOKENS=1536
 K3：
 
 ```text
-K3_USE_ASM_TAIL_REDUCE=1
+K3_USE_ASM_TAIL_REDUCE=1  # default
 K3_REDUCE_THREADS=128
 ```
 
-`K3_USE_ASM_TAIL_REDUCE=1` 使用 K3 tail-reduce 汇编。未开启时，`K3_REDUCE_THREADS` 控制
+`K3_USE_ASM_TAIL_REDUCE` 默认启用 K3 tail-reduce 汇编。显式设置为 `0` 时，
+`K3_REDUCE_THREADS` 控制
 独立 `reduce_local_combine` kernel 的线程数，默认 128，并被限制在 64 到 256 之间。
 
 构建/调试：
@@ -1084,7 +1086,7 @@ TOKENS_LIST="512 1024 1025 1280 1441 1442 2048"
 MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1
 ```
 
-通过 `K3_PATH=tail-reduce` 可以设置 `K3_USE_ASM_TAIL_REDUCE=1`。
+`K3_PATH=barrier` 可用于脚本内显式关闭默认 tail-reduce、回到旧的 barrier/reduce 路径。
 
 ### 9.3 当前代表性能结论
 
@@ -1133,8 +1135,9 @@ tokens  winner
 
 - K1 compact 路径本身会有 compact metadata prebuild kernels，这是 K1 auto 策略的一部分。
   如果要严格比较纯 asm-route 和 compact，需要显式设置 `K1_PREBUILD_MODE`。
-- 未开启 ASM tail reduce 时，K3 后仍有独立 `rank_barrier` 和 `reduce_local_combine` kernel。
-  开启 tail reduce 可以把本地 reduce 收进 K3 汇编尾部，但会依赖 signal address table。
+- 默认 ASM tail reduce 会把本地 reduce 收进 K3 汇编尾部，避免 K3 后独立
+  `rank_barrier` 和 `reduce_local_combine` kernel 带来的波动；显式关闭时仍可回到旧路径。
+  tail reduce 依赖 signal address table。
 - `fill_i64_tensor_from_host` 只应在 tail reduce 初始化状态未 ready 时发生。当前 auto/force 的
   `SymmBuffer` 初始化会提前 prepare，避免第一次执行大 token 才写 signal address table。
 
@@ -1278,8 +1281,9 @@ K2 当前通过 `row_combine_ptrs[row] == 0` 跳过 inactive row。这个策略�
 - reduce workgroups 需要看到所有 rank 的 combine partial 已经可见。
 - signal slots 8..15 需要在每次调用前按 generation 清理/区分。
 
-当前实现把 signal address table 放在 `route_scratch`，并把初始化前移到 `SymmBuffer`。后续如果
-要默认开启 tail reduce，需要继续压测不同 token、不同 rank 偏斜路由和重复 graph replay。
+当前实现把 signal address table 放在 `route_scratch`，并把初始化前移到 `SymmBuffer`。
+tail reduce 已作为 eager 和 graph staged 路径默认分支；后续继续压测不同 token、
+不同 rank 偏斜路由和重复 graph replay 即可。
 
 ### 12.4 big fused 64 token 精度
 

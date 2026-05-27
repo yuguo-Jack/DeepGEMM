@@ -62,7 +62,7 @@ def env_enabled() -> bool:
 
 
 def k3_tail_reduce_enabled() -> bool:
-    value = os.getenv("K3_USE_ASM_TAIL_REDUCE", "0").strip().lower()
+    value = os.getenv("K3_USE_ASM_TAIL_REDUCE", "1").strip().lower()
     return value in {"1", "true", "yes", "on", "tail-reduce"}
 
 
