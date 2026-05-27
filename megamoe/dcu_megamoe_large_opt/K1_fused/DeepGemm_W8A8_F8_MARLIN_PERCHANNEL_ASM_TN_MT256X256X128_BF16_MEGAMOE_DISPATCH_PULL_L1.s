@@ -1886,13 +1886,20 @@ label_SymmRouteInitReady:
 s_load_dword s90, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb8 // num_tokens
 s_load_dword s91, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb4 // max tokens/rank
 s_load_dwordx2 s[68:69], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x90
+s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x98 // local_sym_buffer
 s_load_dword s70, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa8 // rank
 s_waitcnt lgkmcnt(0)
+s_mov_b32 s54, BufferLimit
+s_mov_b32 s55, Srd127_96
+v_mov_b32 v253, 0x84
+buffer_load_dword v236, v253, s[52:55], 0, offen, offset:0 glc
+s_waitcnt vmcnt(0)
+v_readfirstlane_b32 s13, v236                     // uniform runtime num_tokens flag
 s_mov_b32 s14, s91                                // preserve max tokens; s[90:91] is reused for exec masks below
 s_lshl_b32 s70, s70, 5                            // global expert base for rank
 s_add_u32 s74, s70, s[sgprScaleFlag]              // target global expert
 s_mul_i32 s71, s91, 0x1000
-s_add_u32 s71, s71, 0x80                          // x_sf offset
+s_add_u32 s71, s71, 0x90                          // x_sf offset
 s_lshl_b32 s72, s91, 2
 s_add_u32 s72, s71, s72                           // topk_idx offset
 s_mul_i32 s73, s91, 6
@@ -1916,7 +1923,17 @@ v_readfirstlane_b32 s64, v236
 v_readfirstlane_b32 s65, v237
 s_mov_b32 s66, BufferLimit
 s_mov_b32 s67, Srd127_96
+s_cmp_eq_u32 s13, 0
+s_cbranch_scc1 label_SymmRouteLoadSourceNumTokens
 s_mul_i32 s63, s60, s90
+s_branch label_SymmRouteSourceTaskBaseReady
+label_SymmRouteLoadSourceNumTokens:
+v_mov_b32 v253, 0x80
+buffer_load_dword v236, v253, s[64:67], 0, offen, offset:0 glc
+s_waitcnt vmcnt(0)
+v_readfirstlane_b32 s90, v236                     // source rank runtime num_tokens
+s_mul_i32 s63, s60, s14
+label_SymmRouteSourceTaskBaseReady:
 s_mul_i32 s63, s63, 6                             // task base for source rank
 
 s_mul_i32 s62, s90, 6                              // routes per source rank
@@ -1992,7 +2009,7 @@ buffer_store_dword v252, v253, s[76:79], 0, offen, offset:0
 s_cmp_ge_u32 s12, 2
 s_cbranch_scc1 label_SymmRouteStoreWidePtr
 v_lshlrev_b32 v252, 12, v251
-s_add_u32 s76, s64, 0x80
+s_add_u32 s76, s64, 0x90
 s_addc_u32 s77, s65, 0
 s_sub_u32 s76, s76, s68
 s_subb_u32 s77, s77, s69
@@ -2005,7 +2022,7 @@ s_cmp_eq_u32 s78, 4
 s_cbranch_scc1 label_SymmRouteStoreRankLocalPtr
 label_SymmRouteStoreAbsolutePtr:
 v_lshlrev_b32 v252, 12, v251
-s_add_u32 s76, s64, 0x80
+s_add_u32 s76, s64, 0x90
 s_addc_u32 s77, s65, 0
 v_add_co_u32 v252, vcc, s76, v252
 v_mov_b32 v253, s77
@@ -2013,7 +2030,7 @@ v_addc_co_u32 v253, vcc, v253, 0, vcc
 s_branch label_SymmRouteStorePtrReady
 label_SymmRouteStoreRankLocalPtr:
 v_lshlrev_b32 v252, 12, v251
-v_add_u32 v252, 0x80, v252
+v_add_u32 v252, 0x90, v252
 v_mov_b32 v253, s60
 label_SymmRouteStorePtrReady:
 v_lshlrev_b32 v254, 3, v241
@@ -2040,7 +2057,7 @@ v_mul_lo_u32 v238, v245, s14
 v_add_u32 v238, v238, v251
 v_lshlrev_b32 v238, 13, v238
 s_mul_i32 s76, s14, 0x104c
-s_add_u32 s76, s76, 0x80
+s_add_u32 s76, s76, 0x90
 v_add_u32 v238, s76, v238
 v_add_u32 v252, s64, v238
 v_cmp_lt_u32 s[50:51], v252, v238

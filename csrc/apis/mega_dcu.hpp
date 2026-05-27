@@ -85,7 +85,12 @@ void launch_mega_moe_deepep_gather_channelwise_hip(
     bool topk_ids_i64,
     bool apply_topk_weights);
 
-static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+using MegaMoeSymmBufferSlices = std::tuple<
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor>;
+
+static std::tuple<int64_t, std::function<MegaMoeSymmBufferSlices(const torch::Tensor&)>>
 get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
@@ -96,6 +101,7 @@ get_symm_buffer_size_for_mega_moe(
     TORCH_CHECK(hidden > 0 && intermediate_hidden > 0, "hidden sizes must be positive");
 
     const int64_t input_token_offset = workspace_bytes(num_ranks, num_experts, num_max_tokens_per_rank);
+    const int64_t runtime_num_tokens_offset = dcu_runtime_num_tokens_offset(num_ranks);
     const int64_t input_sf_offset =
         input_token_offset + static_cast<int64_t>(num_max_tokens_per_rank) * hidden;
     const int64_t topk_idx_offset =
@@ -116,7 +122,12 @@ get_symm_buffer_size_for_mega_moe(
         const auto fp8_options = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(device);
         const auto f32_options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
         const auto i64_options = torch::TensorOptions().dtype(torch::kInt64).device(device);
+        const auto i32_options = torch::TensorOptions().dtype(torch::kInt).device(device);
 
+        auto runtime_num_tokens = torch::from_blob(
+            byte_base + runtime_num_tokens_offset,
+            {1},
+            i32_options);
         auto x = torch::from_blob(
             byte_base + input_token_offset,
             {num_max_tokens_per_rank, hidden},
@@ -136,7 +147,8 @@ get_symm_buffer_size_for_mega_moe(
         auto empty_fp8 = torch::from_blob(byte_base + combine_offset, {0}, fp8_options);
         auto empty_f32 = torch::from_blob(byte_base + combine_offset, {0}, f32_options);
         return std::make_tuple(x, x_sf, topk_idx, topk_weights,
-                               empty_fp8, empty_f32, empty_fp8, empty_f32);
+                               empty_fp8, empty_f32, empty_fp8, empty_f32,
+                               runtime_num_tokens);
     };
     return {total_bytes, slice_input_buffers};
 }

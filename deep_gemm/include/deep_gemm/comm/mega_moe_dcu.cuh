@@ -15,6 +15,8 @@ static constexpr uint64_t kFullWaveMask = ~0ull;
 static constexpr long long kBarrierTimeoutCycles = 60000000000ll;
 
 struct SymBufferSections {
+    int32_t* num_tokens;
+    int32_t* uniform_num_tokens;
     const uint8_t* x;
     const float* x_sf;
     const int64_t* topk_idx;
@@ -38,6 +40,8 @@ __device__ static inline SymBufferSections get_sections(uint8_t* sym_buffer,
     const int64_t combine_offset =
         topk_weights_offset + static_cast<int64_t>(num_max_tokens_per_rank) * num_topk * sizeof(float);
     return {
+        dcu_runtime_num_tokens_ptr(sym_buffer, num_ranks),
+        dcu_uniform_num_tokens_ptr(sym_buffer, num_ranks),
         sym_buffer + input_token_offset,
         reinterpret_cast<const float*>(sym_buffer + input_sf_offset),
         reinterpret_cast<const int64_t*>(sym_buffer + topk_idx_offset),

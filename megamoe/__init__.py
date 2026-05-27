@@ -175,8 +175,6 @@ class SymmBuffer:
             dtype=torch.int8,
             device="cuda",
         )
-        self.cuda_graph_num_tokens = torch.empty((1,), dtype=torch.int32, device="cuda")
-        self.cuda_graph_num_tokens.fill_(self.cuda_graph_max_tokens_per_rank)
         ipc_handles = [None] * group.size()
         dist.all_gather_object(ipc_handles, local_handle, group)
         buffer_ptrs = _C.open_hip_ipc_handles(ipc_handles, group.rank())
@@ -200,6 +198,7 @@ class SymmBuffer:
         torch.cuda.synchronize()
         self.group.barrier()
 
+        slices = slice_input_buffers(self.buffer)
         (
             self.x,
             self.x_sf,
@@ -209,7 +208,9 @@ class SymmBuffer:
             self.l1_acts_sf,
             self.l2_acts,
             self.l2_acts_sf,
-        ) = slice_input_buffers(self.buffer)
+        ) = slices[:8]
+        self.cuda_graph_num_tokens = slices[8]
+        self.cuda_graph_num_tokens.fill_(self.cuda_graph_max_tokens_per_rank)
 
         if self._large_opt_3stage_mode in {"force", "auto"}:
             from .large_opt import prepare_large_opt_3stage

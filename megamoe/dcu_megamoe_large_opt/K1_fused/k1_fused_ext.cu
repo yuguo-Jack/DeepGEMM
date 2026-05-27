@@ -47,7 +47,7 @@ static constexpr const char* kK1ShapeContract =
     "K1_fused dispatch-pull L1 asm is currently specialized for ranks=8, "
     "experts=256, local_experts=32, topk=6, hidden=4096, "
     "L1 output features=4096 (intermediate=2048), route_tile_m=256, "
-    "alignment=256, and 0<num_tokens_per_rank<=num_max_tokens_per_rank";
+    "alignment=256, and 0<=num_tokens_per_rank<=num_max_tokens_per_rank";
 
 int64_t ceil_div_i64(const int64_t a, const int64_t b) {
     return (a + b - 1) / b;
@@ -276,12 +276,6 @@ __global__ void k1_count_compact_routes_kernel(
     const int tid = static_cast<int>(threadIdx.x);
     const int source_rank = static_cast<int>(blockIdx.y);
     int effective_num_tokens = num_tokens;
-    if (runtime_num_tokens != nullptr) {
-        effective_num_tokens = runtime_num_tokens[0];
-        if (effective_num_tokens < 0) effective_num_tokens = 0;
-        if (effective_num_tokens > num_tokens) effective_num_tokens = num_tokens;
-    }
-    const int routes_per_rank = effective_num_tokens * num_topk;
     const int local_experts = num_experts / num_ranks;
     const int first_expert = rank_idx * local_experts;
     const int last_expert = first_expert + local_experts;
@@ -290,6 +284,12 @@ __global__ void k1_count_compact_routes_kernel(
     auto sections = deep_gemm::mega::get_sections(
         sym_buffers[source_rank], num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk, hidden);
+    effective_num_tokens = sections.num_tokens[0];
+    if (effective_num_tokens < 0) effective_num_tokens = 0;
+    if (effective_num_tokens > num_max_tokens_per_rank) {
+        effective_num_tokens = num_max_tokens_per_rank;
+    }
+    const int routes_per_rank = effective_num_tokens * num_topk;
     const int64_t* topk_idx = sections.topk_idx;
     for (int route_offset =
              static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
@@ -378,13 +378,6 @@ __global__ void k1_emit_compact_routes_kernel(
     const int tid = static_cast<int>(threadIdx.x);
     const int source_rank = static_cast<int>(blockIdx.y);
     int effective_num_tokens = num_tokens;
-    if (runtime_num_tokens != nullptr) {
-        effective_num_tokens = runtime_num_tokens[0];
-        if (effective_num_tokens < 0) effective_num_tokens = 0;
-        if (effective_num_tokens > num_tokens) effective_num_tokens = num_tokens;
-    }
-    const int routes_per_rank = effective_num_tokens * num_topk;
-    const int task_base = source_rank * routes_per_rank;
     const int local_experts = num_experts / num_ranks;
     const int first_expert = rank_idx * local_experts;
     const int last_expert = first_expert + local_experts;
@@ -395,6 +388,13 @@ __global__ void k1_emit_compact_routes_kernel(
     auto sections = deep_gemm::mega::get_sections(
         sym_buffers[source_rank], num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk, hidden);
+    effective_num_tokens = sections.num_tokens[0];
+    if (effective_num_tokens < 0) effective_num_tokens = 0;
+    if (effective_num_tokens > num_max_tokens_per_rank) {
+        effective_num_tokens = num_max_tokens_per_rank;
+    }
+    const int routes_per_rank = effective_num_tokens * num_topk;
+    const int task_base = source_rank * num_max_tokens_per_rank * num_topk;
     const uint8_t* x = sections.x;
     const float* x_sf = sections.x_sf;
     const int64_t* topk_idx = sections.topk_idx;
@@ -512,7 +512,7 @@ void launch_l1_deepgemm_fused_asm(
                     num_experts == kK1SupportedExperts &&
                     num_topk == kK1SupportedTopk,
                 kK1ShapeContract);
-    TORCH_CHECK(num_tokens > 0 && num_tokens <= num_max_tokens_per_rank,
+    TORCH_CHECK(num_tokens >= 0 && num_tokens <= num_max_tokens_per_rank,
                 kK1ShapeContract);
     TORCH_CHECK(total_rows > 0 && total_rows % kK1RouteTileM == 0,
                 "fused L1 asm expects total_rows padded to a 256-row tile");
@@ -790,7 +790,7 @@ k1_symm_fused_l1(
                     hidden == kK1SupportedHidden,
                 kK1ShapeContract);
     TORCH_CHECK(rank_idx >= 0 && rank_idx < num_ranks, "invalid rank_idx");
-    TORCH_CHECK(num_tokens > 0 && num_tokens <= num_max_tokens_per_rank,
+    TORCH_CHECK(num_tokens >= 0 && num_tokens <= num_max_tokens_per_rank,
                 kK1ShapeContract);
     TORCH_CHECK(symm_base_addr_value > 0 && symm_x_span_value > 0,
                 "invalid symm x address range");
@@ -815,9 +815,13 @@ k1_symm_fused_l1(
         torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(device);
 
     const int64_t total_tasks = num_ranks * num_tokens * num_topk;
+    const int64_t max_stride_tasks =
+        num_ranks * num_max_tokens_per_rank * num_topk;
+    const int64_t capacity_total_tasks =
+        force_compact_prebuild ? max_stride_tasks : total_tasks;
 
     const int64_t expected_per_expert =
-        (total_tasks + num_experts - 1) / num_experts;
+        (capacity_total_tasks + num_experts - 1) / num_experts;
     const int64_t rows_per_expert_target =
         std::max<int64_t>(
             alignment,
@@ -843,13 +847,13 @@ k1_symm_fused_l1(
     }
     if (!use_compact_prebuild && !force_asm_route) {
         use_compact_prebuild = should_auto_compact_routes(
-            total_tasks, num_experts, fixed_capacity_tiles_per_expert);
+            capacity_total_tasks, num_experts, fixed_capacity_tiles_per_expert);
     }
     const int64_t fixed_capacity_tiles =
         local_experts * fixed_capacity_tiles_per_expert;
     const int64_t capacity_tiles = use_compact_prebuild
                                        ? compact_capacity_tiles(
-                                             total_tasks, num_experts,
+                                             capacity_total_tasks, num_experts,
                                              local_experts,
                                              fixed_capacity_tiles_per_expert)
                                        : fixed_capacity_tiles;
@@ -883,8 +887,9 @@ k1_symm_fused_l1(
         reserve_scratch(capacity_rows * static_cast<int64_t>(sizeof(float)));
     const int64_t m_indices_offset =
         reserve_scratch(capacity_rows * static_cast<int64_t>(sizeof(int32_t)));
+    const int64_t output_index_tasks = max_stride_tasks;
     const int64_t output_index_offset =
-        reserve_scratch(total_tasks * static_cast<int64_t>(sizeof(int32_t)));
+        reserve_scratch(output_index_tasks * static_cast<int64_t>(sizeof(int32_t)));
     scratch_offset = deep_gemm::mega::align_i64(scratch_offset, 16);
     TORCH_CHECK(scratch_offset <= route_workspace_bytes,
                 "route_scratch task workspace is too small for K1 metadata views");
@@ -906,7 +911,7 @@ k1_symm_fused_l1(
         make_i64_view(row_combine_ptrs_offset,
                       {capacity_rows + kK1RowPointerPadding});
     auto output_index =
-        make_i32_view(output_index_offset, {num_ranks * num_tokens, num_topk});
+        make_i32_view(output_index_offset, {output_index_tasks / num_topk, num_topk});
     const torch::Tensor* local_expert_stats = nullptr;
     if (cumulative_local_expert_recv_stats.has_value()) {
         const auto& stats = cumulative_local_expert_recv_stats.value();
@@ -1001,10 +1006,10 @@ k1_graph_flag_reset_layout(
                     hidden == kK1SupportedHidden &&
                     l1_rows == kK1SupportedL1Rows &&
                     alignment == kK1SupportedAlignment &&
-                    num_tokens > 0 && num_tokens <= num_max_tokens_per_rank,
+                    num_tokens >= 0 && num_tokens <= num_max_tokens_per_rank,
                 kK1ShapeContract);
     const int64_t local_experts = num_experts / num_ranks;
-    const int64_t total_tasks = num_ranks * num_tokens * num_topk;
+    const int64_t total_tasks = num_ranks * num_max_tokens_per_rank * num_topk;
     const int64_t expected_per_expert =
         (total_tasks + num_experts - 1) / num_experts;
     const int64_t rows_per_expert_target =

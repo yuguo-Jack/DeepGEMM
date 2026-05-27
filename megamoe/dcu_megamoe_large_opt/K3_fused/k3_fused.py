@@ -74,7 +74,7 @@ def rank_barrier(
     k1_graph_reset_layout: tuple[int, int, int, int] | None = None,
     graph_runtime_num_tokens: torch.Tensor | None = None,
     graph_runtime_num_tokens_out: torch.Tensor | None = None,
-    graph_max_tokens: int = 0,
+    graph_max_tokens: int = -1,
     verbose_build: bool = False,
 ) -> None:
     ext = load_extension(verbose=verbose_build)

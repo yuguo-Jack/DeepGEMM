@@ -23,7 +23,7 @@ K1_SUPPORTED_ALIGNMENT = 256
 K1_SHAPE_CONTRACT = (
     "K1_fused dispatch-pull L1 asm currently supports only ranks=8, "
     "experts=256, local_experts=32, topk=6, hidden=4096, alignment=256, "
-    "and 0<num_tokens_per_rank<=num_max_tokens_per_rank"
+    "and 0<=num_tokens_per_rank<=num_max_tokens_per_rank"
 )
 
 
@@ -43,7 +43,7 @@ def _check_fused_l1_shape(
         or int(num_topk) != K1_SUPPORTED_TOPK
         or int(hidden) != K1_SUPPORTED_HIDDEN
         or int(alignment) != K1_SUPPORTED_ALIGNMENT
-        or int(num_tokens) <= 0
+        or int(num_tokens) < 0
         or int(num_tokens) > int(num_max_tokens_per_rank)
     ):
         raise ValueError(K1_SHAPE_CONTRACT)
@@ -68,7 +68,8 @@ def _align(value: int, alignment: int) -> int:
 
 def _dcu_workspace_offset(num_ranks: int) -> int:
     signal_ptrs_offset = _align(num_ranks * 8, 16)
-    return _align(signal_ptrs_offset + num_ranks * 8, 16)
+    runtime_tokens_offset = _align(signal_ptrs_offset + num_ranks * 8, 16)
+    return _align(runtime_tokens_offset + 4, 16)
 
 
 def _symm_x_addr_range(sym_buffer, num_ranks: int, hidden: int) -> tuple[int, int]:
@@ -113,6 +114,7 @@ def k1_symm_fused_l1_asm(
     alignment: int = 256,
     l1_out_workspace: torch.Tensor | None = None,
     cumulative_local_expert_recv_stats: torch.Tensor | None = None,
+    force_compact_prebuild: bool = False,
     verbose_build: bool = False,
 ):
     _check_fused_l1_shape(
@@ -148,6 +150,8 @@ def k1_symm_fused_l1_asm(
         str(code_object),
         l1_out_workspace,
         cumulative_local_expert_recv_stats,
+        None,
+        bool(force_compact_prebuild),
     )
 
 

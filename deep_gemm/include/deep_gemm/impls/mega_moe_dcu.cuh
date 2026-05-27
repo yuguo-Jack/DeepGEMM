@@ -284,6 +284,9 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
     constexpr int hidden = Shape::kHidden;
     constexpr int intermediate_hidden = Shape::kIntermediate;
     constexpr int num_experts = Shape::kNumExperts;
+    auto local_sections = get_sections(
+        sym_buffers[rank_idx], num_ranks_static, num_experts,
+        num_max_tokens_per_rank, num_topk_static, hidden);
     int num_tokens = launch_num_tokens;
     if constexpr (kUseRuntimeNumTokens) {
         num_tokens = min(max(*runtime_num_tokens, 0), launch_num_tokens);
@@ -296,6 +299,10 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
     const int64_t max_tasks_per_expert =
         workspace_task_capacity_per_expert(num_ranks_static, num_max_tokens_per_rank);
 
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *local_sections.num_tokens = num_tokens;
+    }
+
     for (int expert_idx = blockIdx.x * blockDim.x + threadIdx.x;
          expert_idx < num_experts_per_rank_static;
          expert_idx += num_local_blocks * blockDim.x) {
@@ -306,39 +313,103 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
         mega_moe_rank_barrier(signal_buffers, rank_idx, num_ranks_static);
     mega_moe_local_blocks_barrier(local_signals, rank_idx, num_local_blocks);
 
-    const int64_t total_route_tasks =
-        static_cast<int64_t>(num_ranks_static) * num_tokens * num_topk_static;
-    for (int64_t task = blockIdx.x * blockDim.x + threadIdx.x;
-         task < total_route_tasks;
-         task += static_cast<int64_t>(num_local_blocks) * blockDim.x) {
-        const int topk_slot = static_cast<int>(task % num_topk_static);
-        const int token_idx = static_cast<int>((task / num_topk_static) % num_tokens);
-        const int source_rank =
-            static_cast<int>(task / (static_cast<int64_t>(num_topk_static) * num_tokens));
-        auto sections = get_sections(
-            sym_buffers[source_rank], num_ranks_static, num_experts,
-            num_max_tokens_per_rank, num_topk_static, hidden);
-
-        const int64_t route_offset = static_cast<int64_t>(token_idx) * num_topk_static + topk_slot;
-        const int64_t expert = sections.topk_idx[route_offset];
-        const float route_weight = sections.topk_weights[route_offset];
-        const bool valid = expert >= 0 && expert < num_experts && route_weight != 0.0f;
-        const int owner_rank = valid ? static_cast<int>(expert / num_experts_per_rank_static) : -1;
-        const bool owned_by_this_rank = valid && owner_rank == rank_idx;
-
-        if (owned_by_this_rank) {
-            const int local_expert =
-                static_cast<int>(expert - static_cast<int64_t>(rank_idx) * num_experts_per_rank_static);
-            const int pool_idx = atomicAdd(expert_counts + local_expert, 1);
-            if (pool_idx < max_tasks_per_expert) {
-                expert_task_pool[static_cast<int64_t>(local_expert) * max_tasks_per_expert + pool_idx] =
-                    static_cast<int>(task);
+    __shared__ int block_uniform_num_tokens;
+    if (threadIdx.x == 0) {
+        int uniform = 1;
+        for (int source_rank = 0; source_rank < num_ranks_static; ++source_rank) {
+            auto sections = get_sections(
+                sym_buffers[source_rank], num_ranks_static, num_experts,
+                num_max_tokens_per_rank, num_topk_static, hidden);
+            int source_num_tokens = *sections.num_tokens;
+            source_num_tokens = min(max(source_num_tokens, 0), num_max_tokens_per_rank);
+            if (source_num_tokens != num_tokens) {
+                uniform = 0;
             }
-        } else if (!valid) {
-            for (int h_idx = 0; h_idx < hidden; ++h_idx) {
-                const int64_t partial_idx =
-                    (static_cast<int64_t>(topk_slot) * num_max_tokens_per_rank + token_idx) * hidden + h_idx;
-                sections.combine[partial_idx] = 0;
+        }
+        block_uniform_num_tokens = uniform;
+    }
+    __syncthreads();
+    const bool uniform_num_tokens = block_uniform_num_tokens != 0;
+    const int task_num_tokens_stride =
+        uniform_num_tokens ? num_tokens : num_max_tokens_per_rank;
+    if (uniform_num_tokens) {
+        const int64_t total_route_tasks =
+            static_cast<int64_t>(num_ranks_static) * num_tokens * num_topk_static;
+        for (int64_t task = blockIdx.x * blockDim.x + threadIdx.x;
+             task < total_route_tasks;
+             task += static_cast<int64_t>(num_local_blocks) * blockDim.x) {
+            const int topk_slot = static_cast<int>(task % num_topk_static);
+            const int token_idx = static_cast<int>((task / num_topk_static) % num_tokens);
+            const int source_rank =
+                static_cast<int>(task / (static_cast<int64_t>(num_topk_static) * num_tokens));
+            auto sections = get_sections(
+                sym_buffers[source_rank], num_ranks_static, num_experts,
+                num_max_tokens_per_rank, num_topk_static, hidden);
+
+            const int64_t route_offset = static_cast<int64_t>(token_idx) * num_topk_static + topk_slot;
+            const int64_t expert = sections.topk_idx[route_offset];
+            const float route_weight = sections.topk_weights[route_offset];
+            const bool valid = expert >= 0 && expert < num_experts && route_weight != 0.0f;
+            const int owner_rank = valid ? static_cast<int>(expert / num_experts_per_rank_static) : -1;
+            const bool owned_by_this_rank = valid && owner_rank == rank_idx;
+
+            if (owned_by_this_rank) {
+                const int local_expert =
+                    static_cast<int>(expert - static_cast<int64_t>(rank_idx) * num_experts_per_rank_static);
+                const int pool_idx = atomicAdd(expert_counts + local_expert, 1);
+                if (pool_idx < max_tasks_per_expert) {
+                    expert_task_pool[static_cast<int64_t>(local_expert) * max_tasks_per_expert + pool_idx] =
+                        static_cast<int>(task);
+                }
+            } else if (!valid) {
+                for (int h_idx = 0; h_idx < hidden; ++h_idx) {
+                    const int64_t partial_idx =
+                        (static_cast<int64_t>(topk_slot) * num_max_tokens_per_rank + token_idx) * hidden + h_idx;
+                    sections.combine[partial_idx] = 0;
+                }
+            }
+        }
+    } else {
+        const int64_t total_route_tasks =
+            static_cast<int64_t>(num_ranks_static) * num_max_tokens_per_rank * num_topk_static;
+        for (int64_t task = blockIdx.x * blockDim.x + threadIdx.x;
+             task < total_route_tasks;
+             task += static_cast<int64_t>(num_local_blocks) * blockDim.x) {
+            const int topk_slot = static_cast<int>(task % num_topk_static);
+            const int token_idx =
+                static_cast<int>((task / num_topk_static) % num_max_tokens_per_rank);
+            const int source_rank = static_cast<int>(
+                task / (static_cast<int64_t>(num_topk_static) * num_max_tokens_per_rank));
+            auto sections = get_sections(
+                sym_buffers[source_rank], num_ranks_static, num_experts,
+                num_max_tokens_per_rank, num_topk_static, hidden);
+            int source_num_tokens = *sections.num_tokens;
+            source_num_tokens = min(max(source_num_tokens, 0), num_max_tokens_per_rank);
+            if (token_idx >= source_num_tokens) {
+                continue;
+            }
+
+            const int64_t route_offset = static_cast<int64_t>(token_idx) * num_topk_static + topk_slot;
+            const int64_t expert = sections.topk_idx[route_offset];
+            const float route_weight = sections.topk_weights[route_offset];
+            const bool valid = expert >= 0 && expert < num_experts && route_weight != 0.0f;
+            const int owner_rank = valid ? static_cast<int>(expert / num_experts_per_rank_static) : -1;
+            const bool owned_by_this_rank = valid && owner_rank == rank_idx;
+
+            if (owned_by_this_rank) {
+                const int local_expert =
+                    static_cast<int>(expert - static_cast<int64_t>(rank_idx) * num_experts_per_rank_static);
+                const int pool_idx = atomicAdd(expert_counts + local_expert, 1);
+                if (pool_idx < max_tasks_per_expert) {
+                    expert_task_pool[static_cast<int64_t>(local_expert) * max_tasks_per_expert + pool_idx] =
+                        static_cast<int>(task);
+                }
+            } else if (!valid) {
+                for (int h_idx = 0; h_idx < hidden; ++h_idx) {
+                    const int64_t partial_idx =
+                        (static_cast<int64_t>(topk_slot) * num_max_tokens_per_rank + token_idx) * hidden + h_idx;
+                    sections.combine[partial_idx] = 0;
+                }
             }
         }
     }
@@ -458,7 +529,7 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
             sym_buffers, expert_task_pool, max_tasks_per_expert,
             total_tiles, route_tile_log2_m, tile_experts, tile_pool_bases, tile_counts,
             num_ranks_static, num_experts, num_max_tokens_per_rank,
-            num_tokens, num_topk_static, hidden,
+            task_num_tokens_stride, num_topk_static, hidden,
             num_local_blocks * blockDim.x,
             blockIdx.x * blockDim.x + threadIdx.x,
             tile_x_row_ptrs, tile_combine_row_ptrs,
@@ -632,9 +703,6 @@ __global__ __launch_bounds__(512) void mega_moe_multirank_persistent_w8a8_channe
         mega_moe_rank_barrier(signal_buffers, rank_idx, num_ranks_static);
     mega_moe_local_blocks_barrier(local_signals, rank_idx, num_local_blocks);
 
-    auto local_sections = get_sections(
-        sym_buffers[rank_idx], num_ranks_static, num_experts,
-        num_max_tokens_per_rank, num_topk_static, hidden);
     if ((hidden & 7) == 0) {
         constexpr int kBf16PerVec = 8;
         const int vecs_per_token = hidden / kBf16PerVec;

@@ -267,7 +267,7 @@ void launch_l2_deepgemm_original_asm(
                         asm_reduce_y->size(0) == reduce_num_tokens &&
                         asm_reduce_y->size(1) == reduce_hidden,
                     "asm_reduce_y shape mismatch");
-        TORCH_CHECK(reduce_num_tokens > 0 &&
+        TORCH_CHECK(reduce_num_tokens >= 0 &&
                         reduce_num_max_tokens_per_rank >= reduce_num_tokens,
                     "invalid reduce token counts");
         const int64_t total_reduce_vecs =
@@ -492,6 +492,8 @@ __global__ void rank_barrier_kernel(
     auto* signal_buffers =
         deep_gemm::mega::dcu_peer_signal_ptrs(local_sym_buffer, num_ranks);
     auto* my_signals = signal_buffers[rank_idx];
+    auto* runtime_num_tokens =
+        deep_gemm::mega::dcu_runtime_num_tokens_ptr(local_sym_buffer, num_ranks);
     const int thread_id = static_cast<int>(threadIdx.x);
     if (thread_id == 0 && asm_done_counter != nullptr) {
         *asm_done_counter = 0;
@@ -501,7 +503,10 @@ __global__ void rank_barrier_kernel(
         int runtime_tokens = graph_runtime_num_tokens[0];
         if (runtime_tokens < 0) runtime_tokens = 0;
         if (runtime_tokens > graph_max_tokens) runtime_tokens = graph_max_tokens;
+        runtime_num_tokens[0] = runtime_tokens;
         graph_runtime_num_tokens_out[0] = runtime_tokens;
+    } else if (thread_id == 0 && graph_max_tokens >= 0) {
+        runtime_num_tokens[0] = graph_max_tokens;
     }
     if (reset_tail_signal_slots && thread_id < num_ranks) {
         __hip_atomic_store(my_signals + 8 + thread_id, 0, __ATOMIC_RELEASE,
@@ -523,6 +528,23 @@ __global__ void rank_barrier_kernel(
         }
     }
     deep_gemm::mega::mega_moe_rank_barrier(signal_buffers, rank_idx, num_ranks);
+    if (thread_id == 0) {
+        auto* sym_buffers =
+            deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
+        int local_tokens = runtime_num_tokens[0];
+        int uniform = 1;
+        for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
+            auto* peer_runtime_num_tokens =
+                deep_gemm::mega::dcu_runtime_num_tokens_ptr(
+                    sym_buffers[peer_rank], num_ranks);
+            if (peer_runtime_num_tokens[0] != local_tokens) {
+                uniform = 0;
+                break;
+            }
+        }
+        *deep_gemm::mega::dcu_uniform_num_tokens_ptr(local_sym_buffer,
+                                                     num_ranks) = uniform;
+    }
 }
 
 void k3_l2_combine_asm_out(

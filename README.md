@@ -194,11 +194,26 @@ For a smaller request, write the actual token count into
 `y_graph[:token_count]`.  The kernel reads the device-side token count during
 replay, so route building, expert task generation, and local reduce use the
 valid prefix rather than forcing invalid tail routes through the graph bucket.
+Each rank owns its local `sym_buffer.cuda_graph_num_tokens` scalar, so graph
+replay supports uneven per-rank local token counts.  A rank may set this value
+to 0; kernels publish the count through peer-visible symmetric memory and skip
+that rank's local output prefix while still serving remote expert work.
 This matches the usual static-buffer CUDA Graph usage: the graph shape is fixed,
 while the framework owns the valid-token prefix and chooses which captured graph
 to replay.  A typical framework setup captures one big-fused graph and one
 staged graph with the same `num_max_tokens_per_rank`, then replays by token
 threshold.
+
+In `tests/test_mega_moe_dcu.py`, the CUDA Graph test options separate capacity,
+ordinary correctness input, and replay buckets:
+
+- `--num-max-tokens-per-rank` is the symmetric-buffer capacity and graph capture
+  bucket size.
+- `--num-tokens` is the normal fused-vs-baseline correctness input size.  When
+  set to `0`, the test enables uneven per-rank local tokens with
+  `--num-max-removed-tokens`.
+- `--cuda-graph-test-tokens` is only the list of runtime token counts replayed
+  against the captured graph, for example `32,64,128`.
 
 The staged graph bucket supports both K3 combine modes.  By default, the
 captured K3 ASM uses tail-reduce and consumes K1's device-side active-tile count
@@ -235,6 +250,29 @@ python tests/test_mega_moe_dcu.py \
   --warmup 3 \
   --repeat 8 \
   --out hygon_tmp/megamoe_dcu_dsv4_flash_512.json
+```
+
+To exercise CUDA-compatible uneven per-rank local token counts, set
+`--num-tokens 0 --num-max-removed-tokens N`.  The DCU test follows the CUDA
+MegaMoE convention `local_tokens=max(0, max_tokens-random_remove)`, so this also
+covers ranks with zero local tokens:
+
+```bash
+source /opt/dtk-26.04/env.sh
+MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1 python tests/test_mega_moe_dcu.py \
+  --num-processes 8 \
+  --num-max-tokens-per-rank 512 \
+  --num-tokens 0 \
+  --num-max-removed-tokens 768 \
+  --hidden 4096 \
+  --intermediate-hidden 2048 \
+  --num-experts 256 \
+  --num-topk 6 \
+  --correctness-iters 1 \
+  --skip-bench \
+  --large-opt-3stage \
+  --stages-fused-cuda-graph \
+  --cuda-graph-test-tokens 7,32,128,512
 ```
 
 Run the requested token-per-rank sweep.  The default list includes compact-window

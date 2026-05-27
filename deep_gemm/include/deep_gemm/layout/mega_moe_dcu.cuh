@@ -35,6 +35,18 @@ __host__ __device__ static inline int64_t dcu_workspace_offset(const int num_ran
         16);
 }
 
+__host__ __device__ static inline int64_t dcu_runtime_num_tokens_offset(const int num_ranks) {
+    return dcu_workspace_offset(num_ranks);
+}
+
+__host__ __device__ static inline int64_t dcu_uniform_num_tokens_offset(const int num_ranks) {
+    return dcu_runtime_num_tokens_offset(num_ranks) + sizeof(int32_t);
+}
+
+__host__ __device__ static inline int64_t dcu_input_token_offset(const int num_ranks) {
+    return align_i64(dcu_uniform_num_tokens_offset(num_ranks) + sizeof(int32_t), 16);
+}
+
 __host__ __device__ static inline int64_t marlin_nt_kpack2_offset(
     const int expert_idx,
     const int row_idx,
@@ -82,9 +94,9 @@ __host__ __device__ static inline int64_t workspace_task_capacity_per_expert(
 }
 
 __host__ __device__ static inline int64_t workspace_bytes(const int num_ranks,
-                                                         const int,
-                                                         const int) {
-    return dcu_workspace_offset(num_ranks);
+                                                          const int,
+                                                          const int) {
+    return dcu_input_token_offset(num_ranks);
 }
 
 __host__ __device__ static inline int64_t route_task_workspace_bytes(
@@ -259,6 +271,16 @@ __host__ __device__ static inline uint8_t** dcu_peer_sym_buffer_ptrs(uint8_t* sy
 __host__ __device__ static inline int** dcu_peer_signal_ptrs(uint8_t* sym_buffer,
                                                             const int num_ranks) {
     return reinterpret_cast<int**>(sym_buffer + dcu_signal_ptrs_offset(num_ranks));
+}
+
+__host__ __device__ static inline int32_t* dcu_runtime_num_tokens_ptr(uint8_t* sym_buffer,
+                                                                      const int num_ranks) {
+    return reinterpret_cast<int32_t*>(sym_buffer + dcu_runtime_num_tokens_offset(num_ranks));
+}
+
+__host__ __device__ static inline int32_t* dcu_uniform_num_tokens_ptr(uint8_t* sym_buffer,
+                                                                      const int num_ranks) {
+    return reinterpret_cast<int32_t*>(sym_buffer + dcu_uniform_num_tokens_offset(num_ranks));
 }
 
 __device__ static inline int* route_scratch_expert_counts(uint8_t* route_scratch) {

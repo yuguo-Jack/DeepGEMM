@@ -354,13 +354,13 @@ def _check_shape(
         or num_topk != 6
         or hidden != 4096
         or intermediate_hidden != 2048
-        or num_tokens <= 0
+        or num_tokens < 0
         or num_tokens > num_max_tokens_per_rank
     ):
         raise ValueError(
             "MEGAMOE_DCU_USE_LARGE_OPT_3STAGE supports only DeepSeek-V4-Flash "
             "EP8 shape: experts=256, topk=6, hidden=4096, intermediate=2048, "
-            "and 0<num_tokens_per_rank<=num_max_tokens_per_rank"
+            "and 0<=num_tokens_per_rank<=num_max_tokens_per_rank"
         )
 
 
@@ -419,9 +419,11 @@ def fp8_mega_moe_large_opt_3stage(
         num_ranks=num_ranks,
         asm_done_counter=state.scratch.asm_tail_done_counter if use_tail_reduce else None,
         reset_tail_signal_slots=use_tail_reduce,
+        graph_max_tokens=num_tokens,
         verbose_build=verbose_build,
     )
 
+    force_safe_compact = num_tokens == 0
     l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_symm_fused_l1_asm(
         sym_buffer,
         (l1_weight, l1_scale),
@@ -434,6 +436,7 @@ def fp8_mega_moe_large_opt_3stage(
         alignment=alignment,
         l1_out_workspace=state.scratch.l1_out,
         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+        force_compact_prebuild=force_safe_compact,
         verbose_build=verbose_build,
     )
     rows = int(l1_out.size(0))
@@ -450,7 +453,9 @@ def fp8_mega_moe_large_opt_3stage(
         output_bf16=False,
         clamp_value=activation_clamp,
         row_combine_ptrs=(
-            row_combine_ptrs if k2_skip_inactive_rows_enabled(num_tokens) else None
+            row_combine_ptrs
+            if (force_safe_compact or k2_skip_inactive_rows_enabled(num_tokens))
+            else None
         ),
         verbose_build=verbose_build,
     )
@@ -585,13 +590,9 @@ def _run_large_opt_3stage_graph(
             meta_flags_offset,
             meta_flags_numel,
         ),
-        graph_runtime_num_tokens=(
-            sym_buffer.cuda_graph_num_tokens if use_tail_reduce else None
-        ),
-        graph_runtime_num_tokens_out=(
-            state.scratch.graph_runtime_num_tokens if use_tail_reduce else None
-        ),
-        graph_max_tokens=graph_max_tokens if use_tail_reduce else 0,
+        graph_runtime_num_tokens=sym_buffer.cuda_graph_num_tokens,
+        graph_runtime_num_tokens_out=state.scratch.graph_runtime_num_tokens,
+        graph_max_tokens=graph_max_tokens,
         verbose_build=verbose_build,
     )
 

@@ -64,7 +64,7 @@ __device__ static inline void prepare_dcu_route_tile_metadata(
     const int num_ranks,
     const int num_experts,
     const int num_max_tokens_per_rank,
-    const int num_tokens,
+    const int task_num_tokens_stride,
     const int num_topk,
     const int hidden,
     const int block_stride,
@@ -95,9 +95,9 @@ __device__ static inline void prepare_dcu_route_tile_metadata(
             const int task =
                 expert_task_pool[static_cast<int64_t>(local_expert) * max_tasks_per_expert + pool_idx];
             const int topk_slot = task % num_topk;
-            const int token_idx = static_cast<int>((task / num_topk) % num_tokens);
+            const int token_idx = static_cast<int>((task / num_topk) % task_num_tokens_stride);
             const int source_rank =
-                static_cast<int>(task / (static_cast<int64_t>(num_topk) * num_tokens));
+                static_cast<int>(task / (static_cast<int64_t>(num_topk) * task_num_tokens_stride));
             auto sections = get_sections(
                 sym_buffers[source_rank], num_ranks, num_experts,
                 num_max_tokens_per_rank, num_topk, hidden);

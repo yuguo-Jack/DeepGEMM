@@ -48,7 +48,7 @@ static void launch_mega_moe_dcu_template(
     constexpr int route_tile_m = 1 << KernelConfig::kRouteTileLog2M;
 
     const int64_t total_route_tasks =
-        static_cast<int64_t>(Shape::kNumRanks) * num_tokens * Shape::kTopK;
+        static_cast<int64_t>(Shape::kNumRanks) * num_max_tokens_per_rank * Shape::kTopK;
     const int64_t route_scratch_tiles =
         Shape::kExpertsPerRank + (total_route_tasks + route_tile_m - 1) / route_tile_m;
     auto* local_sym_buffer = reinterpret_cast<uint8_t*>(sym_buffer_ptrs[rank_idx]);
