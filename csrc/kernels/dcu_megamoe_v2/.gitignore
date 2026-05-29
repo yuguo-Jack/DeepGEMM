@@ -1,0 +1,8 @@
+/k1_groupgemm_v2_hipcc
+/k1_groupgemm_v2_aicc
+/pack5_layout_check
+/*.o
+/*.s
+/*.bc
+/*.cui
+/*.dump
