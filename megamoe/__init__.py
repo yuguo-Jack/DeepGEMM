@@ -334,6 +334,7 @@ def fp8_mega_moe(
     fast_math: bool = True,
     big_fused_cuda_graph: bool = False,
     stages_fused_cuda_graph: bool = False,
+    dispatch_num_tokens: Optional[int] = None,
 ):
     call_y = y
     if big_fused_cuda_graph and stages_fused_cuda_graph:
@@ -379,12 +380,25 @@ def fp8_mega_moe(
             return
         call_y = y[:graph_max_tokens] if capture_rows != graph_max_tokens else y
     else:
+        if _is_current_stream_capturing():
+            raise RuntimeError(
+                "DCU MegaMoE CUDA Graph capture requires an explicit graph mode: "
+                "pass big_fused_cuda_graph=True for the persistent fused path or "
+                "stages_fused_cuda_graph=True for the staged K1/K2/K3 path. "
+                "Capturing the eager auto-dispatch path is not graph-bucket safe."
+            )
         large_opt_mode = getattr(sym_buffer, "_large_opt_3stage_mode", None)
         large_opt_threshold = getattr(sym_buffer, "_large_opt_3stage_threshold", None)
         if large_opt_mode is None or large_opt_threshold is None:
             large_opt_mode = _large_opt_3stage_mode()
             large_opt_threshold = _large_opt_3stage_threshold()
-        if _large_opt_3stage_selected(int(y.size(0)), large_opt_mode, large_opt_threshold):
+        dispatch_tokens = int(y.size(0)) if dispatch_num_tokens is None else int(dispatch_num_tokens)
+        if dispatch_tokens < 0 or dispatch_tokens > int(sym_buffer.num_max_tokens_per_rank):
+            raise ValueError(
+                "dispatch_num_tokens must be in "
+                f"0..{int(sym_buffer.num_max_tokens_per_rank)}"
+            )
+        if _large_opt_3stage_selected(dispatch_tokens, large_opt_mode, large_opt_threshold):
             if _is_current_stream_capturing():
                 raise RuntimeError(
                     "DCU MegaMoE staged K1/K2/K3 path does not support CUDA Graph capture; "
