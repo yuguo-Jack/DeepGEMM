@@ -403,7 +403,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     random.seed(args.seed + rank)
 
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
-    if args.num_tokens == 0:
+    exact_num_tokens_per_rank = None
+    if args.num_tokens_per_rank_list:
+        exact_num_tokens_per_rank = parse_int_list(args.num_tokens_per_rank_list)
+        if len(exact_num_tokens_per_rank) != num_ranks:
+            raise ValueError(
+                f"--num-tokens-per-rank-list needs {num_ranks} entries, "
+                f"got {len(exact_num_tokens_per_rank)}"
+            )
+        num_tokens = exact_num_tokens_per_rank[rank]
+    elif args.num_tokens == 0:
         remove = random.randint(0, args.num_max_removed_tokens)
         num_tokens = max(0, num_max_tokens_per_rank - remove)
     else:
@@ -414,7 +423,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_topk = args.num_topk
     num_experts_per_rank = num_experts // num_ranks
     assert num_experts % num_ranks == 0
-    assert num_tokens <= num_max_tokens_per_rank
+    assert 0 <= num_tokens <= num_max_tokens_per_rank
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
 
@@ -423,9 +432,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     elif args.big_fused_cuda_graph:
         fused_execution = "persistent_fused_graph"
     else:
-        large_opt_enabled = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "0").strip().lower() in {
-            "1", "true", "yes", "on", "large_opt", "3stage"
-        }
+        dispatch_num_tokens_for_display = (
+            args.dispatch_num_tokens if args.dispatch_num_tokens >= 0 else num_tokens
+        )
+        large_opt_value = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "auto").strip().lower()
+        large_opt_threshold = int(
+            os.getenv("MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD", "128")
+        )
+        large_opt_enabled = (
+            large_opt_value in {"1", "true", "yes", "on", "large_opt", "3stage"}
+            or (
+                large_opt_value in {"auto", "threshold", "adaptive"}
+                and dispatch_num_tokens_for_display > large_opt_threshold
+            )
+        )
         fused_execution = "large_opt_3stage" if large_opt_enabled else "persistent_fused"
     print_once(rank, "DCU MegaMoE channelwise W8A8 test:")
     print_once(rank, f" > megamoe: {getattr(megamoe, '__file__', None)}")
@@ -442,13 +462,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         hidden,
         intermediate_hidden,
     )
-    ep_buffer = deep_ep.Buffer(
-        group,
-        DEEPEP_BUFFER_BYTES,
-        0,
-        explicitly_destroy=True,
+    needs_deepep_baseline = (
+        args.correctness_iters > 0
+        or not args.skip_bench
+        or (
+            (args.big_fused_cuda_graph or args.stages_fused_cuda_graph)
+            and not args.cuda_graph_skip_baseline
+        )
     )
-    ep_config = deep_ep.Config(*DEEPEP_CONFIG)
+    ep_buffer = None
+    ep_config = None
+    if needs_deepep_baseline:
+        ep_buffer = deep_ep.Buffer(
+            group,
+            DEEPEP_BUFFER_BYTES,
+            0,
+            explicitly_destroy=True,
+        )
+        ep_config = deep_ep.Config(*DEEPEP_CONFIG)
 
     x_bf16 = (torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * args.input_scale)
     l1_bf16 = (
@@ -480,6 +511,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if reset_stats:
             stats_fused.copy_(stats_initial)
         copy_inputs_to_sym_buffer()
+        dispatch_num_tokens = args.dispatch_num_tokens if args.dispatch_num_tokens >= 0 else None
         megamoe.fp8_w8a8_mega_moe(
             y_fused,
             l1_weights,
@@ -488,6 +520,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             cumulative_local_expert_recv_stats=stats_fused,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math),
+            dispatch_num_tokens=dispatch_num_tokens,
         )
         return y_fused, stats_fused
 
@@ -552,6 +585,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         y_graph = torch.empty((capture_tokens, hidden), dtype=torch.bfloat16, device="cuda")
 
         def local_graph_token_count(token_count: int) -> int:
+            if exact_num_tokens_per_rank is not None:
+                return min(max(exact_num_tokens_per_rank[rank], 0), token_count)
             if not (args.num_tokens == 0 and args.num_max_removed_tokens > 0):
                 return token_count
             span = min(args.num_max_removed_tokens, token_count)
@@ -601,6 +636,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             for _ in range(args.cuda_graph_replays):
                 graph.replay()
             torch.cuda.synchronize()
+            if args.cuda_graph_skip_baseline:
+                print_once(
+                    rank,
+                    f"CUDA graph bucket token={token}/{capture_tokens}, local={local_token}: "
+                    f"replays={args.cuda_graph_replays}, baseline_skipped=True",
+                )
+                continue
             baseline_y, _, _ = run_deepgemm_megamoe_baseline(
                 ep_buffer,
                 ep_config,
@@ -674,6 +716,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     print_once(rank, "Config:")
     print_once(rank, f" > ranks={num_ranks}, tokens={num_tokens}/{sym_buffer.num_max_tokens_per_rank}")
+    if args.dispatch_num_tokens >= 0:
+        print_once(rank, f" > eager dispatch_num_tokens={args.dispatch_num_tokens}")
     print_once(rank, f" > hidden={hidden}, intermediate={intermediate_hidden}")
     print_once(rank, f" > experts={num_experts}, topk={num_topk}, local_experts={num_experts_per_rank}")
     print_once(rank, f" > scale modes=input/weight/l2_act channelwise fp32")
@@ -713,6 +757,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "reason": "--skip-bench",
                 "num_ranks": num_ranks,
                 "num_tokens_per_rank": num_tokens,
+                "dispatch_num_tokens": args.dispatch_num_tokens if args.dispatch_num_tokens >= 0 else None,
                 "hidden": hidden,
                 "intermediate_hidden": intermediate_hidden,
                 "num_experts": num_experts,
@@ -730,7 +775,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         sym_buffer.destroy()
-        ep_buffer.destroy()
+        if ep_buffer is not None:
+            ep_buffer.destroy()
         dist.barrier(group=group)
         dist.destroy_process_group()
         return
@@ -811,6 +857,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "metric_scope": "per-card rank average",
             "num_ranks": num_ranks,
             "num_tokens_per_rank": num_tokens,
+            "dispatch_num_tokens": args.dispatch_num_tokens if args.dispatch_num_tokens >= 0 else None,
             "hidden": hidden,
             "intermediate_hidden": intermediate_hidden,
             "num_experts": num_experts,
@@ -866,7 +913,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     sym_buffer.destroy()
-    ep_buffer.destroy()
+    if ep_buffer is not None:
+        ep_buffer.destroy()
     dist.barrier(group=group)
     dist.destroy_process_group()
 
@@ -878,6 +926,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--num-max-tokens-per-rank", type=int, default=32)
     parser.add_argument("--num-tokens", type=int, default=32)
+    parser.add_argument("--num-tokens-per-rank-list", type=str, default="",
+                        help="comma/space separated exact local token count per rank")
+    parser.add_argument("--dispatch-num-tokens", type=int, default=-1,
+                        help="uniform token count used only for eager auto big-vs-staged dispatch; "
+                             "set to EP-group max local tokens for uneven-rank framework cases")
     parser.add_argument("--num-max-removed-tokens", type=int, default=0,
                         help="when --num-tokens=0, each rank uses max_tokens-random(0, this), clamped to at least 0")
     parser.add_argument("--hidden", type=int, default=128)
@@ -906,6 +959,8 @@ def parse_args():
     parser.add_argument("--cuda-graph-replays", type=int, default=3)
     parser.add_argument("--cuda-graph-bench", action="store_true",
                         help="benchmark graph.replay() for each --cuda-graph-test-tokens entry")
+    parser.add_argument("--cuda-graph-skip-baseline", action="store_true",
+                        help="smoke-test graph capture/replay without the DeepEP baseline check")
     parser.add_argument("--out", type=str, default="hygon_tmp/megamoe_dcu_baseline/default_perf.json")
     return parser.parse_args()
 

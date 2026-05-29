@@ -162,6 +162,20 @@ input slices in the symmetric buffer (`x`, `x_sf`, `topk_idx`, and
 `topk_weights`), so switching by token threshold does not require duplicate
 input copies.
 
+For EP runs with uneven per-rank local token counts, the eager auto threshold
+decision must be identical on every rank.  Frameworks should pass a uniform
+`dispatch_num_tokens` to `megamoe.fp8_w8a8_mega_moe`, typically the EP-group
+maximum local token count for the current request.  If it is omitted, eager
+auto mode falls back to the local `y.size(0)` on each rank, which is safe only
+when every rank has the same token count or when the path is forced by
+`MEGAMOE_DCU_USE_LARGE_OPT_3STAGE`.  The `dispatch_num_tokens` value is only a
+host-side branch selector for big-fused versus staged execution; it does not pad
+inputs, does not change the valid row count, and does not make a rank compute
+more than its local `y.size(0)` rows.  Keep it in
+`[0, sym_buffer.num_max_tokens_per_rank]`.  Without a uniform dispatch value,
+one rank can enter the persistent fused kernel while another enters staged
+K1/K2/K3, and their cross-rank barriers will not match.
+
 ### CUDA Graph Mode
 
 DCU MegaMoE exposes graph-bucket mode through the public
@@ -175,6 +189,11 @@ choose the implementation captured into the graph:
 - `big_fused_cuda_graph=True` captures the original persistent fused kernel.
 - `stages_fused_cuda_graph=True` captures the staged K1/K2/K3 large-token path
   when `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE` is `auto` or forced on.
+
+When the current stream is being captured, the eager auto-dispatch path is
+rejected.  Framework integrations should pass one of the graph flags during
+capture; otherwise a fixed eager launch could be captured with the wrong token
+count or implementation choice for later replays.
 
 ```python
 y_graph = torch.empty((sym_buffer.cuda_graph_max_tokens_per_rank, hidden),
@@ -202,7 +221,8 @@ This matches the usual static-buffer CUDA Graph usage: the graph shape is fixed,
 while the framework owns the valid-token prefix and chooses which captured graph
 to replay.  A typical framework setup captures one big-fused graph and one
 staged graph with the same `num_max_tokens_per_rank`, then replays by token
-threshold.
+threshold.  The replay choice must also be uniform across the EP group, using
+the same global dispatch token rule as eager mode.
 
 In `tests/test_mega_moe_dcu.py`, the CUDA Graph test options separate capacity,
 ordinary correctness input, and replay buckets:
@@ -212,8 +232,36 @@ ordinary correctness input, and replay buckets:
 - `--num-tokens` is the normal fused-vs-baseline correctness input size.  When
   set to `0`, the test enables uneven per-rank local tokens with
   `--num-max-removed-tokens`.
+- `--num-tokens-per-rank-list` overrides `--num-tokens` with an exact local
+  token count per rank, useful for reproducing framework cases such as
+  `0,133,0,0,0,0,0,0`.
+- `--dispatch-num-tokens` passes the API-level `dispatch_num_tokens` argument.
+  It is used only by eager auto-dispatch to choose the implementation
+  uniformly across ranks.  For uneven-rank tests, set it to the EP-group max
+  local token count, for example `133` for `0,133,0,0,0,0,0,0`.  The actual
+  per-rank work still comes from each rank's local token count.
 - `--cuda-graph-test-tokens` is only the list of runtime token counts replayed
   against the captured graph, for example `32,64,128`.
+- `--cuda-graph-skip-baseline` smoke-tests graph capture/replay without running
+  the DeepEP baseline checker, which is useful when isolating graph
+  compatibility from baseline communication behavior.
+
+Example eager uneven-rank check with a uniform auto-dispatch decision:
+
+```bash
+source /opt/dtk-26.04/env.sh
+python tests/test_mega_moe_dcu.py \
+  --num-processes 8 \
+  --num-max-tokens-per-rank 256 \
+  --num-tokens-per-rank-list 0,133,0,0,0,0,0,0 \
+  --dispatch-num-tokens 133 \
+  --hidden 4096 \
+  --intermediate-hidden 2048 \
+  --num-experts 256 \
+  --num-topk 6 \
+  --correctness-iters 1 \
+  --skip-bench
+```
 
 The staged graph bucket supports both K3 combine modes.  By default, the
 captured K3 ASM uses tail-reduce and consumes K1's device-side active-tile count
