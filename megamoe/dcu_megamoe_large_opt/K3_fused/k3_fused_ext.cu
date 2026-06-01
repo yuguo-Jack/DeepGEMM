@@ -489,12 +489,15 @@ __global__ void rank_barrier_kernel(
     const int32_t* graph_runtime_num_tokens,
     int32_t* graph_runtime_num_tokens_out,
     const int graph_max_tokens) {
+    constexpr int kStagedBarrierPeerBaseSlot = 18;
+    constexpr int kStagedBarrierGenerationSlot = 26;
     auto* signal_buffers =
         deep_gemm::mega::dcu_peer_signal_ptrs(local_sym_buffer, num_ranks);
     auto* my_signals = signal_buffers[rank_idx];
     auto* runtime_num_tokens =
         deep_gemm::mega::dcu_runtime_num_tokens_ptr(local_sym_buffer, num_ranks);
     const int thread_id = static_cast<int>(threadIdx.x);
+    __shared__ int barrier_generation;
     if (thread_id == 0 && asm_done_counter != nullptr) {
         *asm_done_counter = 0;
     }
@@ -527,7 +530,44 @@ __global__ void rank_barrier_kernel(
             }
         }
     }
-    deep_gemm::mega::mega_moe_rank_barrier(signal_buffers, rank_idx, num_ranks);
+
+    __threadfence_system();
+    __syncthreads();
+
+    if (thread_id == 0) {
+        barrier_generation =
+            atomicAdd_system(my_signals + kStagedBarrierGenerationSlot, 1) + 1;
+    }
+    __syncthreads();
+
+    if (thread_id < num_ranks) {
+        auto* peer_signals = signal_buffers[thread_id];
+        __hip_atomic_store(peer_signals + kStagedBarrierPeerBaseSlot + rank_idx,
+                           barrier_generation, __ATOMIC_RELEASE,
+                           __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+
+    const auto start_time = clock64();
+    while (true) {
+        int value = barrier_generation;
+        if (thread_id < num_ranks) {
+            volatile int* signal = reinterpret_cast<volatile int*>(
+                my_signals + kStagedBarrierPeerBaseSlot + thread_id);
+            value = deep_gemm::mega::load_signal_system(signal);
+        }
+        if (deep_gemm::mega::wave_all_sync(
+                deep_gemm::mega::kFullWaveMask, value >= barrier_generation))
+            break;
+        if (clock64() - start_time > deep_gemm::mega::kBarrierTimeoutCycles &&
+            thread_id < num_ranks) {
+            printf("MegaMoE HIP staged rank barrier timeout: rank=%d thread=%d "
+                   "value=%d generation=%d\n",
+                   rank_idx, thread_id, value, barrier_generation);
+            abort();
+        }
+    }
+    __syncthreads();
+
     if (thread_id == 0) {
         auto* sym_buffers =
             deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
