@@ -1,5 +1,9 @@
 # DCU MegaMoE V2
 
+This file was moved from `docs/DCU_MEGAMOE_V2.md` during planning
+consolidation. The single maintained location for V2 planning, progress,
+findings, and overview material is now `.planning/dcu_megamoe_v2/`.
+
 DCU MegaMoE V2 is an isolated prototype for the three-stage fused path:
 
 1. K1: dispatch pull plus L1 FP8 groupgemm in one large kernel.

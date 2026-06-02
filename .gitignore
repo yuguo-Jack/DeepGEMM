@@ -29,4 +29,6 @@ megamoe/dcu_megamoe_large_opt/**/*.o
 megamoe/dcu_megamoe_large_opt/**/*.hip
 hygon_tmp/
 .playwright-cli/
-.planning/
+.planning/*
+!.planning/dcu_megamoe_v2/
+!.planning/dcu_megamoe_v2/**
