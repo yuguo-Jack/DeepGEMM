@@ -498,6 +498,10 @@ __global__ void rank_barrier_kernel(
         deep_gemm::mega::dcu_runtime_num_tokens_ptr(local_sym_buffer, num_ranks);
     const int thread_id = static_cast<int>(threadIdx.x);
     __shared__ int barrier_generation;
+    // Debug timeout for the staged external rank barrier. The current DCU
+    // clock64 rate is about 1.30 GHz, so 2.6B cycles is approximately 2s.
+    // Keep the persistent fused kernel's legacy barrier timeout unchanged.
+    constexpr long long kStagedBarrierTimeoutCycles = 2600000000ll;
     if (thread_id == 0 && asm_done_counter != nullptr) {
         *asm_done_counter = 0;
     }
@@ -558,7 +562,7 @@ __global__ void rank_barrier_kernel(
         if (deep_gemm::mega::wave_all_sync(
                 deep_gemm::mega::kFullWaveMask, value >= barrier_generation))
             break;
-        if (clock64() - start_time > deep_gemm::mega::kBarrierTimeoutCycles &&
+        if (clock64() - start_time > kStagedBarrierTimeoutCycles &&
             thread_id < num_ranks) {
             printf("MegaMoE HIP staged rank barrier timeout: rank=%d thread=%d "
                    "value=%d generation=%d\n",
