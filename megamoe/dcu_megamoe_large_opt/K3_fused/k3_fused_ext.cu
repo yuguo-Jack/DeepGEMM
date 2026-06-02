@@ -489,12 +489,20 @@ __global__ void rank_barrier_kernel(
     const int32_t* graph_runtime_num_tokens,
     int32_t* graph_runtime_num_tokens_out,
     const int graph_max_tokens) {
+    constexpr int kStagedBarrierArrivalSlot = 18;
+    constexpr int kStagedBarrierReleaseSlot = 19;
     auto* signal_buffers =
         deep_gemm::mega::dcu_peer_signal_ptrs(local_sym_buffer, num_ranks);
     auto* my_signals = signal_buffers[rank_idx];
     auto* runtime_num_tokens =
         deep_gemm::mega::dcu_runtime_num_tokens_ptr(local_sym_buffer, num_ranks);
     const int thread_id = static_cast<int>(threadIdx.x);
+    __shared__ int barrier_generation;
+    __shared__ int barrier_ticket;
+    // Debug timeout for the staged external rank barrier. The current DCU
+    // clock64 rate is about 1.30 GHz, so 2.6B cycles is approximately 2s.
+    // Keep the persistent fused kernel's legacy barrier timeout unchanged.
+    constexpr long long kStagedBarrierTimeoutCycles = 2600000000ll;
     if (thread_id == 0 && asm_done_counter != nullptr) {
         *asm_done_counter = 0;
     }
@@ -527,7 +535,43 @@ __global__ void rank_barrier_kernel(
             }
         }
     }
-    deep_gemm::mega::mega_moe_rank_barrier(signal_buffers, rank_idx, num_ranks);
+
+    __threadfence_system();
+    __syncthreads();
+
+    auto* barrier_signals = signal_buffers[0];
+    if (thread_id == 0) {
+        barrier_ticket =
+            atomicAdd_system(barrier_signals + kStagedBarrierArrivalSlot, 1);
+        barrier_generation = barrier_ticket / num_ranks + 1;
+        if (barrier_ticket % num_ranks == num_ranks - 1) {
+            __threadfence_system();
+            __hip_atomic_store(barrier_signals + kStagedBarrierReleaseSlot,
+                               barrier_generation, __ATOMIC_RELEASE,
+                               __HIP_MEMORY_SCOPE_SYSTEM);
+        } else {
+            const auto start_time = clock64();
+            volatile int* release_ptr = reinterpret_cast<volatile int*>(
+                barrier_signals + kStagedBarrierReleaseSlot);
+            while (deep_gemm::mega::load_signal_system(release_ptr) <
+                   barrier_generation) {
+                if (clock64() - start_time > kStagedBarrierTimeoutCycles) {
+                    const int arrival = deep_gemm::mega::load_signal_system(
+                        reinterpret_cast<volatile int*>(
+                            barrier_signals + kStagedBarrierArrivalSlot));
+                    const int release =
+                        deep_gemm::mega::load_signal_system(release_ptr);
+                    printf("MegaMoE HIP staged rank barrier timeout: rank=%d "
+                           "ticket=%d generation=%d arrival=%d release=%d\n",
+                           rank_idx, barrier_ticket, barrier_generation,
+                           arrival, release);
+                    abort();
+                }
+            }
+        }
+    }
+    __syncthreads();
+
     if (thread_id == 0) {
         auto* sym_buffers =
             deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
