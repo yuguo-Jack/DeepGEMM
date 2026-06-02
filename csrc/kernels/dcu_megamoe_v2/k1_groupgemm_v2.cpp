@@ -1010,7 +1010,11 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
     int num_topk,
     const int64_t* row_output_ptrs,
     int k3_copy_workers = 0,
-    int k3_tail_reduce = 0) {
+    int k3_tail_reduce = 0,
+    const uint8_t* k3_local_topk_mask = nullptr,
+    hip_bfloat16* k3_tail_out = nullptr,
+    const int32_t* k3_tail_tokens = nullptr,
+    int k3_tail_token_count = 0) {
     static_assert(kTileRows == 64 || kTileRows == 256, "unsupported row tile");
     static_assert(kTileN == 64 || kTileN == 256, "unsupported tile N");
     static_assert(kNGroup == 1 || kNGroup == 2 || kNGroup == 4 ||
@@ -1164,6 +1168,7 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                 }
             }
             if (k3_tail_reduce != 0) {
+                wait_vmem_lds_store_device();
                 block_barrier_device();
                 if (threadIdx.x == 0) {
                     __threadfence_system();
@@ -1177,26 +1182,79 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                     local_sym_buffer, num_ranks, num_global_experts,
                     num_max_tokens_per_rank, num_topk, kProblemN);
                 const int vecs_per_token = kProblemN / kReduceBf16PerVec;
-                const int local_experts = num_global_experts / num_ranks;
-                const int first_expert = rank_idx * local_experts;
-                const int last_expert = first_expert + local_experts;
                 const int64_t total_reduce_vecs =
-                    static_cast<int64_t>(num_max_tokens_per_rank) *
+                    static_cast<int64_t>(
+                        k3_tail_tokens != nullptr ? k3_tail_token_count
+                                                  : num_max_tokens_per_rank) *
                     vecs_per_token;
-                auto* out_vec = reinterpret_cast<uint4*>(out);
+                auto* out_vec = reinterpret_cast<uint4*>(
+                    k3_tail_out != nullptr ? k3_tail_out : out);
                 for (int64_t task =
                          (static_cast<int64_t>(worker_id) * blockDim.x) +
                          threadIdx.x;
                      task < total_reduce_vecs;
                      task += static_cast<int64_t>(worker_count) *
                              blockDim.x) {
-                    const int token_idx =
+                    const int reduce_token_idx =
                         static_cast<int>(task / vecs_per_token);
                     const int vec_idx =
                         static_cast<int>(
                             task -
-                            static_cast<int64_t>(token_idx) *
+                            static_cast<int64_t>(reduce_token_idx) *
                                 vecs_per_token);
+                    const int token_idx =
+                        k3_tail_tokens != nullptr
+                            ? k3_tail_tokens[reduce_token_idx]
+                            : reduce_token_idx;
+                    const int64_t out_task =
+                        static_cast<int64_t>(token_idx) * vecs_per_token +
+                        vec_idx;
+                    uint32_t slot_mask = 0;
+                    if (k3_local_topk_mask != nullptr) {
+                        slot_mask = static_cast<uint32_t>(
+                            k3_local_topk_mask[token_idx]);
+                    } else {
+                        const int local_experts =
+                            num_global_experts / num_ranks;
+                        const int first_expert = rank_idx * local_experts;
+                        const int last_expert = first_expert + local_experts;
+                        for (int topk_slot = 0; topk_slot < num_topk;
+                             ++topk_slot) {
+                            const int64_t global_expert =
+                                local_sections.topk_idx[
+                                    static_cast<int64_t>(token_idx) *
+                                        num_topk +
+                                    topk_slot];
+                            if (global_expert >= first_expert &&
+                                global_expert < last_expert) {
+                                slot_mask |= (1u << topk_slot);
+                            }
+                        }
+                    }
+                    if (slot_mask == 0) {
+                        if (k3_tail_out != nullptr)
+                            continue;
+                        uint4 zero;
+                        zero.x = 0;
+                        zero.y = 0;
+                        zero.z = 0;
+                        zero.w = 0;
+                        out_vec[out_task] = zero;
+                        continue;
+                    }
+                    if ((slot_mask & (slot_mask - 1u)) == 0) {
+                        int topk_slot = 0;
+                        while ((slot_mask & (1u << topk_slot)) == 0)
+                            ++topk_slot;
+                        const int64_t partial_row =
+                            static_cast<int64_t>(topk_slot) *
+                                num_max_tokens_per_rank +
+                            token_idx;
+                        out_vec[out_task] = reinterpret_cast<const uint4*>(
+                            local_sections.combine +
+                            partial_row * kProblemN)[vec_idx];
+                        continue;
+                    }
                     float sum0 = 0.0f;
                     float sum1 = 0.0f;
                     float sum2 = 0.0f;
@@ -1207,13 +1265,7 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                     float sum7 = 0.0f;
                     for (int topk_slot = 0; topk_slot < num_topk;
                          ++topk_slot) {
-                        const int64_t global_expert =
-                            local_sections.topk_idx[
-                                static_cast<int64_t>(token_idx) *
-                                    num_topk +
-                                topk_slot];
-                        if (global_expert < first_expert ||
-                            global_expert >= last_expert)
+                        if ((slot_mask & (1u << topk_slot)) == 0)
                             continue;
                         const int64_t partial_row =
                             static_cast<int64_t>(topk_slot) *
@@ -1253,7 +1305,7 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                     reduced.w = pack2_bf16_bits_device(
                         f32_to_bf16_bits_device(sum6),
                         f32_to_bf16_bits_device(sum7));
-                    out_vec[task] = reduced;
+                    out_vec[out_task] = reduced;
                 }
             }
             return;
@@ -1982,9 +2034,9 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
 #undef K1_STORE_ROW_MASKED
 #undef K1_STORE_ROW_UNMASKED
     if constexpr (kUseK3CopyStage) {
+        wait_vmem_lds_store_device();
         block_barrier_device();
         if (threadIdx.x == 0) {
-            wait_vmem_lds_store_device();
             __threadfence_system();
             grid_barrier[compute_block_y * static_cast<int>(gridDim.x) +
                          static_cast<int>(blockIdx.x)] = launch_epoch;
@@ -2663,6 +2715,8 @@ int main(int argc, char** argv) {
         use_k3_symm_combine && opt.k3_copy_stage != 0;
     const bool use_k3_tail_reduce =
         use_k3_symm_combine && opt.k3_tail_reduce != 0;
+    const bool use_k3_tail_out =
+        use_k3_tail_reduce && use_k3_copy_stage;
     const bool use_symm_comm =
         use_lowlat_symm_stage_c || use_c_symm_stage;
     const bool use_symm_buffers = use_symm_comm || use_k3_symm_combine;
@@ -2807,6 +2861,8 @@ int main(int argc, char** argv) {
     std::vector<int32_t> h_k3_row_source_token;
     std::vector<int32_t> h_k3_row_topk_slot;
     std::vector<int32_t> h_k3_row_combine_row;
+    std::vector<uint8_t> h_k3_local_topk_mask;
+    std::vector<int32_t> h_k3_tail_tokens;
     int64_t symm_buffer_bytes = 0;
     if (opt.n_pattern) {
         std::fill(h_x.begin(), h_x.end(), static_cast<uint8_t>(0x38));
@@ -2948,7 +3004,7 @@ int main(int argc, char** argv) {
             for (int local_expert = 0; local_expert < opt.experts;
                  ++local_expert) {
                 auto& tasks = k3_tasks[local_expert];
-                if (opt.k3_combine_linear != 0) {
+                if (opt.k3_combine_linear != 0 || use_k3_copy_stage) {
                     std::sort(
                         tasks.begin(), tasks.end(),
                         [](const K3RouteTask& a, const K3RouteTask& b) {
@@ -2985,6 +3041,31 @@ int main(int argc, char** argv) {
                             ? source_rank_counts[task.source_rank]++
                             : static_cast<int32_t>(task.partial_row);
                 }
+            }
+        }
+        if (use_k3_tail_reduce) {
+            h_k3_local_topk_mask.assign(opt.tokens, 0);
+            const int local_experts = num_global_experts / opt.symm_ranks;
+            const int first_expert = opt.rank_idx * local_experts;
+            const int last_expert = first_expert + local_experts;
+            for (int token = 0; token < opt.tokens; ++token) {
+                uint8_t mask = 0;
+                for (int topk_slot = 0; topk_slot < opt.topk; ++topk_slot) {
+                    const int64_t topk_offset =
+                        (static_cast<int64_t>(opt.rank_idx) * opt.tokens +
+                         token) *
+                            opt.topk +
+                        topk_slot;
+                    const int64_t global_expert =
+                        h_symm_topk_idx[topk_offset];
+                    if (global_expert >= first_expert &&
+                        global_expert < last_expert) {
+                        mask |= static_cast<uint8_t>(1u << topk_slot);
+                    }
+                }
+                h_k3_local_topk_mask[token] = mask;
+                if (mask != 0)
+                    h_k3_tail_tokens.push_back(token);
             }
         }
         for (int expert = 0; expert < opt.experts; ++expert) {
@@ -3058,12 +3139,15 @@ int main(int argc, char** argv) {
     float* d_w_scale = nullptr;
     hip_bfloat16* d_out = nullptr;
     hip_bfloat16* d_rowptr_out = nullptr;
+    hip_bfloat16* d_k3_tail_out = nullptr;
     hip_bfloat16* d_ref = nullptr;
     int32_t* d_row_expert = nullptr;
     int32_t* d_problem_size = nullptr;
     int32_t* d_symm_route_scratch = nullptr;
     int32_t* d_symm_grid_barrier = nullptr;
     int64_t* d_row_output_ptrs = nullptr;
+    uint8_t* d_k3_local_topk_mask = nullptr;
+    int32_t* d_k3_tail_tokens = nullptr;
 
     int target_device = 0;
     if (use_symm_buffers) {
@@ -3166,6 +3250,22 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipMalloc(
             &d_row_output_ptrs, h_row_expert.size() * sizeof(int64_t)));
     }
+    if (use_k3_tail_reduce) {
+        HIP_CHECK(hipMalloc(
+            &d_k3_local_topk_mask,
+            h_k3_local_topk_mask.size() * sizeof(uint8_t)));
+    }
+    const int64_t k3_tail_out_elems =
+        static_cast<int64_t>(opt.tokens) * opt.n;
+    const size_t k3_tail_out_bytes =
+        static_cast<size_t>(k3_tail_out_elems) * sizeof(hip_bfloat16);
+    if (use_k3_tail_out) {
+        HIP_CHECK(hipMalloc(&d_k3_tail_out, k3_tail_out_bytes));
+        HIP_CHECK(hipMalloc(
+            &d_k3_tail_tokens,
+            std::max<size_t>(1, h_k3_tail_tokens.size()) *
+                sizeof(int32_t)));
+    }
     HIP_CHECK(hipMalloc(&d_ref, h_zero.size() * sizeof(hip_bfloat16)));
     HIP_CHECK(hipMalloc(&d_row_expert, h_row_expert.size() * sizeof(int32_t)));
     if (use_lowlat_c || use_lowlat_symm_stage_c)
@@ -3211,6 +3311,9 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipMemcpy(d_x_scale, h_x_scale.data(), h_x_scale.size() * sizeof(float), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_w_scale, h_w_scale.data(), h_w_scale.size() * sizeof(float), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_out, h_zero.data(), h_zero.size() * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
+    if (d_k3_tail_out != nullptr) {
+        HIP_CHECK(hipMemset(d_k3_tail_out, 0, k3_tail_out_bytes));
+    }
     if (use_k3_rowptr) {
         HIP_CHECK(hipMemcpy(
             d_rowptr_out, h_zero.data(),
@@ -3254,6 +3357,18 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipMemcpy(
             d_row_output_ptrs, h_row_output_ptrs.data(),
             h_row_output_ptrs.size() * sizeof(int64_t),
+            hipMemcpyHostToDevice));
+    }
+    if (use_k3_tail_reduce) {
+        HIP_CHECK(hipMemcpy(
+            d_k3_local_topk_mask, h_k3_local_topk_mask.data(),
+            h_k3_local_topk_mask.size() * sizeof(uint8_t),
+            hipMemcpyHostToDevice));
+    }
+    if (d_k3_tail_tokens != nullptr && !h_k3_tail_tokens.empty()) {
+        HIP_CHECK(hipMemcpy(
+            d_k3_tail_tokens, h_k3_tail_tokens.data(),
+            h_k3_tail_tokens.size() * sizeof(int32_t),
             hipMemcpyHostToDevice));
     }
     HIP_CHECK(hipMemcpy(d_ref, h_zero.data(), h_zero.size() * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
@@ -3338,7 +3453,9 @@ int main(int argc, char** argv) {
                     opt.rank_idx, opt.symm_ranks,
                     opt.experts * opt.symm_ranks, opt.tokens, opt.topk,
                     d_row_output_ptrs, opt.k3_copy_workers,
-                    opt.k3_tail_reduce);
+                    opt.k3_tail_reduce, d_k3_local_topk_mask,
+                    d_k3_tail_out, d_k3_tail_tokens,
+                    static_cast<int>(h_k3_tail_tokens.size()));
             } else if (use_k3_rowptr) {
                 V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16<
                     256, 256, true, false, 1, 4096, 2048, true>
@@ -3550,6 +3667,21 @@ int main(int argc, char** argv) {
             }
         };
 
+    auto copy_k3_tail_reduce_to_host =
+        [&](std::vector<hip_bfloat16>& dst) {
+            std::memset(dst.data(), 0, dst.size() * sizeof(hip_bfloat16));
+            if (d_k3_tail_out != nullptr) {
+                HIP_CHECK(hipMemcpy(
+                    dst.data(), d_k3_tail_out, k3_tail_out_bytes,
+                    hipMemcpyDeviceToHost));
+            } else {
+                HIP_CHECK(hipMemcpy(
+                    dst.data(), d_out,
+                    dst.size() * sizeof(hip_bfloat16),
+                    hipMemcpyDeviceToHost));
+            }
+        };
+
     if (opt.touch_check) {
         std::vector<hip_bfloat16> h_touch(h_zero.size());
         if (use_k3_symm_combine) {
@@ -3686,10 +3818,7 @@ int main(int argc, char** argv) {
         std::vector<hip_bfloat16> h_out(h_zero.size());
         std::vector<hip_bfloat16> h_ref_compact(h_zero_ref.size());
         if (use_k3_tail_reduce) {
-            HIP_CHECK(hipMemcpy(
-                h_out.data(), d_out,
-                h_out.size() * sizeof(hip_bfloat16),
-                hipMemcpyDeviceToHost));
+            copy_k3_tail_reduce_to_host(h_out);
         } else if (use_k3_symm_combine) {
             copy_k3_combine_to_host_rows(h_out);
         } else {
@@ -3946,10 +4075,7 @@ int main(int argc, char** argv) {
         std::vector<hip_bfloat16> h_out(h_zero.size());
         std::vector<hip_bfloat16> h_ref(h_zero.size());
         if (use_k3_tail_reduce) {
-            HIP_CHECK(hipMemcpy(
-                h_out.data(), d_out,
-                h_out.size() * sizeof(hip_bfloat16),
-                hipMemcpyDeviceToHost));
+            copy_k3_tail_reduce_to_host(h_out);
         } else if (use_k3_symm_combine) {
             copy_k3_combine_to_host_rows(h_out);
         } else {
@@ -4117,6 +4243,10 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipFree(d_out));
     if (d_rowptr_out != nullptr)
         HIP_CHECK(hipFree(d_rowptr_out));
+    if (d_k3_tail_out != nullptr)
+        HIP_CHECK(hipFree(d_k3_tail_out));
+    if (d_k3_tail_tokens != nullptr)
+        HIP_CHECK(hipFree(d_k3_tail_tokens));
     HIP_CHECK(hipFree(d_ref));
     HIP_CHECK(hipFree(d_row_expert));
     if (d_problem_size != nullptr)
@@ -4127,5 +4257,7 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipFree(d_symm_grid_barrier));
     if (d_row_output_ptrs != nullptr)
         HIP_CHECK(hipFree(d_row_output_ptrs));
+    if (d_k3_local_topk_mask != nullptr)
+        HIP_CHECK(hipFree(d_k3_local_topk_mask));
     return 0;
 }

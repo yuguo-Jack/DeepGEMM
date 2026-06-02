@@ -127,3 +127,54 @@ Key current findings:
   standalone harness to place those logical rank buffers. They match in normal
   8-rank/8-HCU acceptance, but can differ for local simulations such as 8
   logical ranks over 4 visible devices.
+- K3 large copy-stage tile-ready publication must wait for every compute
+  thread's output stores, not only thread 0's stores. A thread-0-only VMEM wait
+  before `__threadfence_system()` allowed copy workers to observe ready flags
+  before all lanes' `out` stores were visible, causing sparse 4096-token
+  mismatches on 8 ranks. The corrected all-thread wait restores correctness but
+  raises overhead to about +41%, so optimization should continue from this
+  correctness-safe baseline.
+- K3 large corrected copy-stage profiling shows the current gap is memory-side:
+  VMEM reads rise about 1.73x and TCP data stalls about 1.83x versus pure K3 at
+  1024 tokens, while LDS wait is unchanged and LDS bank conflicts remain zero.
+  Pair-copy coarsening of copy-worker tasks passed correctness but slowed 1024
+  and 4096, so rowptr-load frequency alone is not the dominant bottleneck.
+- A self-copy epilogue, where compute blocks copy their own `out` tile into
+  combine targets instead of using copy-worker blocks, is rejected. It was
+  faster on invalid timing but produced many zero rows in the combine buffer,
+  and adding a device-scope fence before the self-copy did not fix correctness.
+- Device-scope ready fencing after the all-thread VMEM wait is correctness-clean
+  in one 1024/4096 8-rank run, but it only moved 1024 by about 1 us and slightly
+  regressed 4096, so it was reverted to the safer system-scope publication.
+- K3 large direct remote-store remains open but not accepted. The normal direct
+  rowptr path is correctness-clean but slower than corrected copy-stage; sorting
+  tasks by combine row (`--k3-sort-rows 1`) gives a small 4096-token win while
+  preserving correctness. Linear combine-row remapping is rejected because 4096
+  correctness fails, and row-resource / buffer-store variants are rejected
+  because they pass correctness but are materially slower.
+- After the all-thread wait fix, sorted routing is also mildly beneficial
+  for corrected copy-stage large tokens and remains correctness-clean in real
+  8-rank tests. It is not enough to meet target. The temporary `K3_SORT_ROWS`
+  script switch was removed during cleanup; copy-stage uses sorted routing by
+  default in the active V2 source.
+- Direct rowptr 4096 without sorting can still show sparse correctness failures,
+  so future direct remote-store experiments should use sorted rows unless they
+  explicitly prove a new ordering is correct.
+- `global_store_short ... glc slc` is compile-proven on gfx938 but rejected for
+  K3 direct remote rowptr stores: correctness passed, yet 1024 and 4096 timing
+  regressed dramatically. Do not use cache-bypass global short stores for this
+  combine path without a new microbenchmark reason.
+## 2026-06-02 - K3 Large Tail Reduce Findings
+
+- Accepted K3 large tail-reduce experiments remain on the C pack5 implementation. No ASM/kpack2 path is used.
+- Host-side mask/list preparation is outside the timed benchmark path and feeds the same fused compute/copy/reduce kernel.
+- The useful local-rank tail-reduce optimizations are:
+  - topk slot mask precomputation;
+  - separate final tail output to skip zero-mask token stores;
+  - active token list to skip reduce work for tokens with no local contribution.
+- A local tail-row copy list was correctness-clean but only a micro-optimization; it was removed during cleanup because its repeated ready-flag waits offset most row-scan savings.
+- Current 8-rank K3 large tail-reduce result:
+  - 1024 tokens: fused `0.636959 ms` versus pure `0.444784 ms`, `+43.21%`, correctness `max_abs=0`.
+  - 4096 tokens: fused `1.88045 ms` versus pure `1.30267 ms`, `+44.35%`, correctness `max_abs=0`.
+- hipprof for `hygon_tmp/dcu_megamoe_v2/hipprof_k3_large_tail_reduce_active4096` shows only the V2 large C fused kernel in the timed HIPOPS path. There is no standalone reduce kernel.
+- Remaining K3 large gap is dominated by copy-stage/synchronization/communication scheduling rather than the local-rank reduce math alone.
