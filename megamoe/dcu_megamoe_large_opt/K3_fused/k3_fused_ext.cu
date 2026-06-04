@@ -499,10 +499,6 @@ __global__ void rank_barrier_kernel(
     const int thread_id = static_cast<int>(threadIdx.x);
     __shared__ int barrier_generation;
     __shared__ int barrier_ticket;
-    // Debug timeout for the staged external rank barrier. The current DCU
-    // clock64 rate is about 1.30 GHz, so 2.6B cycles is approximately 2s.
-    // Keep the persistent fused kernel's legacy barrier timeout unchanged.
-    constexpr long long kStagedBarrierTimeoutCycles = 2600000000ll;
     if (thread_id == 0 && asm_done_counter != nullptr) {
         *asm_done_counter = 0;
     }
@@ -555,7 +551,8 @@ __global__ void rank_barrier_kernel(
                 barrier_signals + kStagedBarrierReleaseSlot);
             while (deep_gemm::mega::load_signal_system(release_ptr) <
                    barrier_generation) {
-                if (clock64() - start_time > kStagedBarrierTimeoutCycles) {
+                if (clock64() - start_time >
+                    deep_gemm::mega::kBarrierTimeoutCycles) {
                     const int arrival = deep_gemm::mega::load_signal_system(
                         reinterpret_cast<volatile int*>(
                             barrier_signals + kStagedBarrierArrivalSlot));
