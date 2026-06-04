@@ -149,6 +149,7 @@ def get_ext_modules():
                              extra_compile_args={'cxx': cxx_flags, 'nvcc': hipcc_flags})]
     if IS_HIP_EXTENSION and package_name == 'megamoe':
         large_opt_root = project_path('megamoe', 'dcu_megamoe_large_opt')
+        v2_root = project_path('megamoe', 'dcu_megamoe_v2')
         modules.extend([
             CUDAExtension(
                 name='megamoe.dcu_megamoe_large_opt.K1_fused.k1_fused_ext',
@@ -183,6 +184,42 @@ def get_ext_modules():
                     'nvcc': hipcc_flags + ['-DNDEBUG'],
                 },
             ),
+            CUDAExtension(
+                name='megamoe.dcu_megamoe_v2.K1_fused.k1_fused_ext',
+                sources=[
+                    os.path.join(v2_root, 'K1_fused', 'k1_fused_pybind.cpp'),
+                    os.path.join(v2_root, 'K1_fused', 'k1_fused_ext.cu'),
+                ],
+                include_dirs=build_include_dirs,
+                libraries=build_libraries,
+                library_dirs=build_library_dirs,
+                extra_compile_args={
+                    'cxx': cxx_flags,
+                    'nvcc': hipcc_flags + [
+                        '-DNDEBUG',
+                        '-mllvm',
+                        '-enable-num-vgprs-768=true',
+                    ],
+                },
+            ),
+            CUDAExtension(
+                name='megamoe.dcu_megamoe_v2.K3_fused.k3_fused_ext',
+                sources=[
+                    os.path.join(v2_root, 'K3_fused', 'k3_fused_pybind.cpp'),
+                    os.path.join(v2_root, 'K3_fused', 'k3_fused_ext.cu'),
+                ],
+                include_dirs=build_include_dirs,
+                libraries=build_libraries,
+                library_dirs=build_library_dirs,
+                extra_compile_args={
+                    'cxx': cxx_flags,
+                    'nvcc': hipcc_flags + [
+                        '-DNDEBUG',
+                        '-mllvm',
+                        '-enable-num-vgprs-768=true',
+                    ],
+                },
+            ),
         ])
     return modules
 
@@ -195,6 +232,10 @@ def get_python_packages():
             'megamoe.dcu_megamoe_large_opt.K1_fused',
             'megamoe.dcu_megamoe_large_opt.K2_fused',
             'megamoe.dcu_megamoe_large_opt.K3_fused',
+            'megamoe.dcu_megamoe_v2',
+            'megamoe.dcu_megamoe_v2.K1_fused',
+            'megamoe.dcu_megamoe_v2.K2_fused',
+            'megamoe.dcu_megamoe_v2.K3_fused',
         ]
     return find_packages('.')
 
@@ -212,6 +253,8 @@ def get_package_data():
             'megamoe.dcu_megamoe_large_opt.K1_fused': ['*.cu', '*.s', '*.co'],
             'megamoe.dcu_megamoe_large_opt.K2_fused': ['*.cu'],
             'megamoe.dcu_megamoe_large_opt.K3_fused': ['*.cu', '*.s', '*.co'],
+            'megamoe.dcu_megamoe_v2.K1_fused': ['*.cu', '*.cpp'],
+            'megamoe.dcu_megamoe_v2.K3_fused': ['*.cu', '*.cpp'],
         })
     return data
 

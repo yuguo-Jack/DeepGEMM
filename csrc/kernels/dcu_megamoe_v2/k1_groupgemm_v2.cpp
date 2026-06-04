@@ -15,6 +15,7 @@
 #include <deep_gemm/comm/mega_moe_dcu.cuh>
 #include <deep_gemm/layout/mega_moe_dcu.cuh>
 
+#ifndef DCU_MEGAMOE_V2_KERNEL_ONLY
 #define HIP_CHECK(expr)                                                          \
     do {                                                                        \
         hipError_t _err = (expr);                                                \
@@ -235,6 +236,7 @@ static std::vector<T> marlin2_k64_n256_n16_transposed_weight(
                         }
     return out;
 }
+#endif  // DCU_MEGAMOE_V2_KERNEL_ONLY
 
 using int32x2_t = int __attribute__((ext_vector_type(2)));
 using int32x4_t = int32_t __attribute__((ext_vector_type(4)));
@@ -291,6 +293,71 @@ __device__ static inline uint32_t pack2_bf16_bits_device(
     uint16_t hi) {
     return static_cast<uint32_t>(lo) |
            (static_cast<uint32_t>(hi) << 16);
+}
+
+__device__ static inline uint32_t pack2_bf16_f32_device(
+    float lo,
+    float hi) {
+#if defined(__gfx938__)
+    auto packed = __builtin_hcu_cvt_pk_bf16_f32(0, lo, 0, hi, 0);
+    union {
+        decltype(packed) value;
+        uint32_t bits;
+    } caster;
+    caster.value = packed;
+    return caster.bits;
+#else
+    return pack2_bf16_bits_device(
+        f32_to_bf16_bits_device(lo), f32_to_bf16_bits_device(hi));
+#endif
+}
+
+__device__ static inline void accumulate_bf16x8_device(
+    const uint4 packed,
+    float& sum0,
+    float& sum1,
+    float& sum2,
+    float& sum3,
+    float& sum4,
+    float& sum5,
+    float& sum6,
+    float& sum7) {
+    sum0 += bf16_bits_to_f32_device(static_cast<uint16_t>(packed.x));
+    sum1 += bf16_bits_to_f32_device(static_cast<uint16_t>(packed.x >> 16));
+    sum2 += bf16_bits_to_f32_device(static_cast<uint16_t>(packed.y));
+    sum3 += bf16_bits_to_f32_device(static_cast<uint16_t>(packed.y >> 16));
+    sum4 += bf16_bits_to_f32_device(static_cast<uint16_t>(packed.z));
+    sum5 += bf16_bits_to_f32_device(static_cast<uint16_t>(packed.z >> 16));
+    sum6 += bf16_bits_to_f32_device(static_cast<uint16_t>(packed.w));
+    sum7 += bf16_bits_to_f32_device(static_cast<uint16_t>(packed.w >> 16));
+}
+
+__device__ static inline uint4 reduce_full_topk6_bf16x8_device(
+    const uint4* combine_vecs,
+    const int64_t token_vec_base,
+    const int64_t slot_stride_vecs) {
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    float sum4 = 0.0f;
+    float sum5 = 0.0f;
+    float sum6 = 0.0f;
+    float sum7 = 0.0f;
+#pragma unroll
+    for (int topk_slot = 0; topk_slot < 6; ++topk_slot) {
+        const uint4 packed =
+            combine_vecs[token_vec_base +
+                         static_cast<int64_t>(topk_slot) * slot_stride_vecs];
+        accumulate_bf16x8_device(
+            packed, sum0, sum1, sum2, sum3, sum4, sum5, sum6, sum7);
+    }
+    uint4 reduced;
+    reduced.x = pack2_bf16_f32_device(sum0, sum1);
+    reduced.y = pack2_bf16_f32_device(sum2, sum3);
+    reduced.z = pack2_bf16_f32_device(sum4, sum5);
+    reduced.w = pack2_bf16_f32_device(sum6, sum7);
+    return reduced;
 }
 
 __device__ static inline int64_t marlin_row_base_offset_device(
@@ -983,10 +1050,25 @@ __device__ static inline void v2_device_grid_barrier(
     int32_t* barrier,
     int expected_blocks);
 
+__device__ static inline int v2_effective_num_tokens(
+    const int32_t* runtime_num_tokens_ptr,
+    int runtime_num_tokens,
+    int num_max_tokens_per_rank) {
+    int value = runtime_num_tokens >= 0
+                    ? runtime_num_tokens
+                    : runtime_num_tokens_ptr[0];
+    if (value < 0)
+        value = 0;
+    if (value > num_max_tokens_per_rank)
+        value = num_max_tokens_per_rank;
+    return value;
+}
+
 template <int kTileRows, int kTileN, bool kLowlatWeightLayout = false,
           bool kUseSymmRowStage = false,
           int kNGroup = 1, int kProblemN = 4096, int kProblemK = 4096,
-          bool kUseRowPtrs = false, bool kUseK3CopyStage = false>
+          bool kUseRowPtrs = false, bool kUseK3CopyStage = false,
+          bool kUseDirectSymmLoad = false>
 __global__ __launch_bounds__(768, 1) void
 V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
     hip_bfloat16* out,
@@ -1008,13 +1090,22 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
     int num_global_experts,
     int num_max_tokens_per_rank,
     int num_topk,
+    int runtime_num_tokens,
     const int64_t* row_output_ptrs,
     int k3_copy_workers = 0,
     int k3_tail_reduce = 0,
     const uint8_t* k3_local_topk_mask = nullptr,
     hip_bfloat16* k3_tail_out = nullptr,
     const int32_t* k3_tail_tokens = nullptr,
-    int k3_tail_token_count = 0) {
+    int k3_tail_token_count = 0,
+    int32_t* route_scratch_i32 = nullptr,
+    float* route_weights_out = nullptr,
+    int32_t* row_expert_out = nullptr,
+    int32_t* output_index = nullptr,
+    int64_t* row_combine_ptrs_out = nullptr,
+    uint8_t* local_topk_mask = nullptr,
+    int32_t* tail_tokens = nullptr,
+    int32_t* cumulative_local_expert_recv_stats = nullptr) {
     static_assert(kTileRows == 64 || kTileRows == 256, "unsupported row tile");
     static_assert(kTileN == 64 || kTileN == 256, "unsupported tile N");
     static_assert(kNGroup == 1 || kNGroup == 2 || kNGroup == 4 ||
@@ -1182,13 +1273,32 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                     local_sym_buffer, num_ranks, num_global_experts,
                     num_max_tokens_per_rank, num_topk, kProblemN);
                 const int vecs_per_token = kProblemN / kReduceBf16PerVec;
+                int tail_reduce_tokens = k3_tail_token_count;
+                if (tail_reduce_tokens < 0) {
+                    tail_reduce_tokens = v2_effective_num_tokens(
+                        local_sections.num_tokens, runtime_num_tokens,
+                        num_max_tokens_per_rank);
+                }
                 const int64_t total_reduce_vecs =
                     static_cast<int64_t>(
-                        k3_tail_tokens != nullptr ? k3_tail_token_count
+                        k3_tail_tokens != nullptr ? tail_reduce_tokens
                                                   : num_max_tokens_per_rank) *
                     vecs_per_token;
                 auto* out_vec = reinterpret_cast<uint4*>(
                     k3_tail_out != nullptr ? k3_tail_out : out);
+                const auto* combine_vecs =
+                    reinterpret_cast<const uint4*>(local_sections.combine);
+                const int64_t slot_stride_vecs =
+                    static_cast<int64_t>(num_max_tokens_per_rank) *
+                    vecs_per_token;
+                const bool dense_identity_tail_tokens =
+                    (k3_tail_tokens == nullptr) ||
+                    (k3_tail_token_count >= 0 &&
+                     runtime_num_tokens == k3_tail_token_count);
+                const bool fixed_full_topk6_tail_reduce =
+                    (k3_tail_tokens != nullptr) && (num_topk == 6) &&
+                    (k3_tail_token_count >= 0) &&
+                    (runtime_num_tokens == k3_tail_token_count);
                 for (int64_t task =
                          (static_cast<int64_t>(worker_id) * blockDim.x) +
                          threadIdx.x;
@@ -1203,12 +1313,23 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                             static_cast<int64_t>(reduce_token_idx) *
                                 vecs_per_token);
                     const int token_idx =
-                        k3_tail_tokens != nullptr
-                            ? k3_tail_tokens[reduce_token_idx]
-                            : reduce_token_idx;
-                    const int64_t out_task =
-                        static_cast<int64_t>(token_idx) * vecs_per_token +
-                        vec_idx;
+                        dense_identity_tail_tokens
+                            ? reduce_token_idx
+                            : (k3_tail_tokens != nullptr
+                                   ? k3_tail_tokens[reduce_token_idx]
+                                   : reduce_token_idx);
+                    const int64_t token_vec_base =
+                        dense_identity_tail_tokens
+                            ? task
+                            : static_cast<int64_t>(token_idx) *
+                                      vecs_per_token +
+                                  vec_idx;
+                    const int64_t out_task = token_vec_base;
+                    if (fixed_full_topk6_tail_reduce) {
+                        out_vec[out_task] = reduce_full_topk6_bf16x8_device(
+                            combine_vecs, token_vec_base, slot_stride_vecs);
+                        continue;
+                    }
                     uint32_t slot_mask = 0;
                     if (k3_local_topk_mask != nullptr) {
                         slot_mask = static_cast<uint32_t>(
@@ -1246,13 +1367,15 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                         int topk_slot = 0;
                         while ((slot_mask & (1u << topk_slot)) == 0)
                             ++topk_slot;
-                        const int64_t partial_row =
-                            static_cast<int64_t>(topk_slot) *
-                                num_max_tokens_per_rank +
-                            token_idx;
-                        out_vec[out_task] = reinterpret_cast<const uint4*>(
-                            local_sections.combine +
-                            partial_row * kProblemN)[vec_idx];
+                        out_vec[out_task] =
+                            combine_vecs[token_vec_base +
+                                         static_cast<int64_t>(topk_slot) *
+                                             slot_stride_vecs];
+                        continue;
+                    }
+                    if (num_topk == 6 && slot_mask == 0x3fu) {
+                        out_vec[out_task] = reduce_full_topk6_bf16x8_device(
+                            combine_vecs, token_vec_base, slot_stride_vecs);
                         continue;
                     }
                     float sum0 = 0.0f;
@@ -1267,44 +1390,20 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                          ++topk_slot) {
                         if ((slot_mask & (1u << topk_slot)) == 0)
                             continue;
-                        const int64_t partial_row =
-                            static_cast<int64_t>(topk_slot) *
-                                num_max_tokens_per_rank +
-                            token_idx;
                         const uint4 packed =
-                            reinterpret_cast<const uint4*>(
-                                local_sections.combine +
-                                partial_row * kProblemN)[vec_idx];
-                        sum0 += bf16_bits_to_f32_device(
-                            static_cast<uint16_t>(packed.x));
-                        sum1 += bf16_bits_to_f32_device(
-                            static_cast<uint16_t>(packed.x >> 16));
-                        sum2 += bf16_bits_to_f32_device(
-                            static_cast<uint16_t>(packed.y));
-                        sum3 += bf16_bits_to_f32_device(
-                            static_cast<uint16_t>(packed.y >> 16));
-                        sum4 += bf16_bits_to_f32_device(
-                            static_cast<uint16_t>(packed.z));
-                        sum5 += bf16_bits_to_f32_device(
-                            static_cast<uint16_t>(packed.z >> 16));
-                        sum6 += bf16_bits_to_f32_device(
-                            static_cast<uint16_t>(packed.w));
-                        sum7 += bf16_bits_to_f32_device(
-                            static_cast<uint16_t>(packed.w >> 16));
+                            combine_vecs
+                                [token_vec_base +
+                                 static_cast<int64_t>(topk_slot) *
+                                     slot_stride_vecs];
+                        accumulate_bf16x8_device(
+                            packed, sum0, sum1, sum2, sum3, sum4, sum5, sum6,
+                            sum7);
                     }
                     uint4 reduced;
-                    reduced.x = pack2_bf16_bits_device(
-                        f32_to_bf16_bits_device(sum0),
-                        f32_to_bf16_bits_device(sum1));
-                    reduced.y = pack2_bf16_bits_device(
-                        f32_to_bf16_bits_device(sum2),
-                        f32_to_bf16_bits_device(sum3));
-                    reduced.z = pack2_bf16_bits_device(
-                        f32_to_bf16_bits_device(sum4),
-                        f32_to_bf16_bits_device(sum5));
-                    reduced.w = pack2_bf16_bits_device(
-                        f32_to_bf16_bits_device(sum6),
-                        f32_to_bf16_bits_device(sum7));
+                    reduced.x = pack2_bf16_f32_device(sum0, sum1);
+                    reduced.y = pack2_bf16_f32_device(sum2, sum3);
+                    reduced.z = pack2_bf16_f32_device(sum4, sum5);
+                    reduced.w = pack2_bf16_f32_device(sum6, sum7);
                     out_vec[out_task] = reduced;
                 }
             }
@@ -1327,73 +1426,369 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
     (void)m;
     (void)row_expert;
 
+    int32_t* row_stage_barrier = grid_barrier;
+    int32_t* metadata_stage_count = nullptr;
+    int32_t* metadata_stage_epoch = nullptr;
+    if constexpr (kUseSymmRowStage) {
+        row_stage_barrier = grid_barrier + 2;
+        metadata_stage_count =
+            row_stage_barrier + 2 * static_cast<int>(gridDim.y);
+        metadata_stage_epoch =
+            row_stage_barrier + 3 * static_cast<int>(gridDim.y);
+    }
+
+    int32_t* symm_src_ranks = nullptr;
+    int32_t* symm_src_tokens = nullptr;
+    if constexpr (kUseSymmRowStage) {
+        if (route_scratch_i32 != nullptr) {
+            constexpr int kMetadataExperts = 32;
+            int32_t* symm_counts = route_scratch_i32;
+            symm_src_ranks = route_scratch_i32 + kMetadataExperts;
+            symm_src_tokens =
+                symm_src_ranks +
+                static_cast<int64_t>(kMetadataExperts) *
+                    rows_aligned_per_expert;
+
+            uint8_t** peer_sym_buffers =
+                deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
+            const int local_experts = num_global_experts / num_ranks;
+            const int first_expert = rank_idx * local_experts;
+            const int last_expert = first_expert + local_experts;
+            const int routes_per_rank = num_max_tokens_per_rank * num_topk;
+            const bool metadata_tile_block = tile_row_in_expert == 0;
+            const bool metadata_owner_block =
+                metadata_tile_block && static_cast<int>(blockIdx.x) == 0;
+            if (metadata_owner_block && tile_expert < kMetadataExperts &&
+                local_sym_buffer != nullptr && grid_barrier != nullptr &&
+                num_ranks > 1) {
+                if (tile_expert == 0) {
+                    int** peer_signal_buffers =
+                        deep_gemm::mega::dcu_peer_signal_ptrs(
+                            local_sym_buffer, num_ranks);
+                    deep_gemm::mega::mega_moe_rank_barrier(
+                        peer_signal_buffers, rank_idx, num_ranks);
+                    if (threadIdx.x == 0) {
+                        __threadfence();
+                        grid_barrier[0] = launch_epoch;
+                    }
+                } else {
+                    volatile int32_t* sync_flag =
+                        reinterpret_cast<volatile int32_t*>(grid_barrier);
+                    while (*sync_flag != launch_epoch) {
+                    }
+                }
+                block_barrier_device();
+            }
+            if (metadata_tile_block) {
+                const int metadata_expert = tile_expert;
+                if (metadata_owner_block &&
+                    metadata_expert < kMetadataExperts) {
+                    if (threadIdx.x == 0) {
+                        symm_counts[metadata_expert] = 0;
+                    }
+                    for (int row_in_expert = static_cast<int>(threadIdx.x);
+                         row_in_expert < rows_aligned_per_expert;
+                         row_in_expert += static_cast<int>(blockDim.x)) {
+                        const int row =
+                            metadata_expert * rows_aligned_per_expert +
+                            row_in_expert;
+                        symm_src_ranks[row] = -1;
+                        symm_src_tokens[row] = 0;
+                        if (route_weights_out != nullptr)
+                            route_weights_out[row] = 0.0f;
+                        if (row_expert_out != nullptr)
+                            row_expert_out[row] = metadata_expert;
+                        if (row_combine_ptrs_out != nullptr)
+                            row_combine_ptrs_out[row] = 0;
+                    }
+                }
+                if (metadata_owner_block && metadata_expert == 0 &&
+                    (local_topk_mask != nullptr || tail_tokens != nullptr)) {
+                    auto local_sections = deep_gemm::mega::get_sections(
+                        peer_sym_buffers[rank_idx], num_ranks,
+                        num_global_experts, num_max_tokens_per_rank, num_topk,
+                        kProblemK);
+                    int local_effective_tokens = v2_effective_num_tokens(
+                        local_sections.num_tokens, runtime_num_tokens,
+                        num_max_tokens_per_rank);
+                    for (int token_idx = static_cast<int>(threadIdx.x);
+                         token_idx < num_max_tokens_per_rank;
+                         token_idx += static_cast<int>(blockDim.x)) {
+                        uint8_t mask = 0;
+                        if (token_idx < local_effective_tokens) {
+                            for (int topk_slot = 0; topk_slot < num_topk;
+                                 ++topk_slot) {
+                                const int64_t route_offset =
+                                    static_cast<int64_t>(token_idx) * num_topk +
+                                    topk_slot;
+                                const int64_t expert =
+                                    local_sections.topk_idx[route_offset];
+                                const float route_weight =
+                                    local_sections.topk_weights[route_offset];
+                                if (expert >= 0 &&
+                                    expert < num_global_experts &&
+                                    route_weight != 0.0f) {
+                                    mask |=
+                                        static_cast<uint8_t>(1u << topk_slot);
+                                }
+                            }
+                        }
+                        if (local_topk_mask != nullptr)
+                            local_topk_mask[token_idx] = mask;
+                        if (tail_tokens != nullptr)
+                            tail_tokens[token_idx] = token_idx;
+                    }
+                }
+                if (metadata_owner_block &&
+                    metadata_expert < kMetadataExperts &&
+                    threadIdx.x == 0) {
+                    metadata_stage_count[static_cast<int>(blockIdx.y)] = 0;
+                    __threadfence();
+                    metadata_stage_epoch[static_cast<int>(blockIdx.y)] =
+                        launch_epoch;
+                }
+                block_barrier_device();
+                if (!metadata_owner_block &&
+                    metadata_expert < kMetadataExperts) {
+                    volatile int32_t* metadata_ready =
+                        reinterpret_cast<volatile int32_t*>(
+                            metadata_stage_epoch +
+                            static_cast<int>(blockIdx.y));
+                    while (*metadata_ready != launch_epoch) {
+                    }
+                }
+                block_barrier_device();
+
+                if (metadata_expert < kMetadataExperts) {
+                    for (int source_rank = 0; source_rank < num_ranks;
+                         ++source_rank) {
+                        auto sections = deep_gemm::mega::get_sections(
+                            peer_sym_buffers[source_rank], num_ranks,
+                            num_global_experts, num_max_tokens_per_rank,
+                            num_topk, kProblemK);
+                        const int effective_tokens = v2_effective_num_tokens(
+                            sections.num_tokens, runtime_num_tokens,
+                            num_max_tokens_per_rank);
+                        const int valid_routes = effective_tokens * num_topk;
+                        for (int local_route =
+                                 static_cast<int>(blockIdx.x) *
+                                     static_cast<int>(blockDim.x) +
+                                 static_cast<int>(threadIdx.x);
+                             local_route < valid_routes;
+                             local_route += static_cast<int>(gridDim.x) *
+                                            static_cast<int>(blockDim.x)) {
+                            const int token_idx = local_route / num_topk;
+                            const int topk_slot =
+                                local_route - token_idx * num_topk;
+                            const int64_t expert =
+                                sections.topk_idx
+                                    [static_cast<int64_t>(token_idx) *
+                                         num_topk +
+                                     topk_slot];
+                            const float route_weight =
+                                sections.topk_weights
+                                    [static_cast<int64_t>(token_idx) *
+                                         num_topk +
+                                     topk_slot];
+                            const bool accepted =
+                                expert >= first_expert &&
+                                expert < last_expert &&
+                                route_weight != 0.0f;
+                            if (!accepted) {
+                                if (metadata_expert == 0 &&
+                                    output_index != nullptr) {
+                                    output_index
+                                        [static_cast<int64_t>(source_rank) *
+                                             routes_per_rank +
+                                         local_route] = -1;
+                                }
+                                continue;
+                            }
+                            const int route_local_expert =
+                                static_cast<int>(expert) - first_expert;
+                            if (route_local_expert != metadata_expert)
+                                continue;
+                            const int row_in_expert =
+                                atomicAdd(symm_counts + metadata_expert, 1);
+                            const int64_t route_linear =
+                                static_cast<int64_t>(source_rank) *
+                                    routes_per_rank +
+                                local_route;
+                            if (row_in_expert >= rows_aligned_per_expert) {
+                                if (output_index != nullptr)
+                                    output_index[route_linear] = -1;
+                                continue;
+                            }
+                            const int64_t row =
+                                static_cast<int64_t>(metadata_expert) *
+                                    rows_aligned_per_expert +
+                                row_in_expert;
+                            symm_src_ranks[row] = source_rank;
+                            symm_src_tokens[row] = token_idx;
+                            if (route_weights_out != nullptr)
+                                route_weights_out[row] = route_weight;
+                            if (row_expert_out != nullptr)
+                                row_expert_out[row] = metadata_expert;
+                            if (output_index != nullptr)
+                                output_index[route_linear] =
+                                    static_cast<int32_t>(row);
+                            if (row_combine_ptrs_out != nullptr) {
+                                const int64_t partial_row =
+                                    static_cast<int64_t>(topk_slot) *
+                                        num_max_tokens_per_rank +
+                                    token_idx;
+                                row_combine_ptrs_out[row] =
+                                    static_cast<int64_t>(
+                                        reinterpret_cast<uintptr_t>(
+                                            sections.combine +
+                                            partial_row * kProblemN));
+                            }
+                        }
+                        if (metadata_expert == 0 && output_index != nullptr) {
+                            for (int local_route =
+                                     valid_routes +
+                                     static_cast<int>(threadIdx.x);
+                                 local_route < routes_per_rank;
+                                 local_route += static_cast<int>(blockDim.x)) {
+                                output_index
+                                    [static_cast<int64_t>(source_rank) *
+                                         routes_per_rank +
+                                     local_route] = -1;
+                            }
+                        }
+                    }
+                    block_barrier_device();
+                    __threadfence();
+                    if (threadIdx.x == 0)
+                        atomicAdd(metadata_stage_count +
+                                      static_cast<int>(blockIdx.y),
+                                  1);
+                    volatile int32_t* metadata_count =
+                        reinterpret_cast<volatile int32_t*>(
+                            metadata_stage_count +
+                            static_cast<int>(blockIdx.y));
+                    while (*metadata_count < static_cast<int>(gridDim.x)) {
+                    }
+                    block_barrier_device();
+                    if (metadata_owner_block && threadIdx.x == 0 &&
+                        symm_counts[metadata_expert] >
+                            rows_aligned_per_expert) {
+                        symm_counts[metadata_expert] =
+                            rows_aligned_per_expert;
+                    }
+                    block_barrier_device();
+                    if (metadata_owner_block && threadIdx.x == 0 &&
+                        cumulative_local_expert_recv_stats != nullptr) {
+                        atomicAdd(cumulative_local_expert_recv_stats +
+                                      metadata_expert,
+                                  symm_counts[metadata_expert]);
+                    }
+                }
+                if (metadata_owner_block &&
+                    metadata_expert < kMetadataExperts && threadIdx.x == 0) {
+                    __threadfence();
+                    const int first_tile_y =
+                        (metadata_expert * rows_aligned_per_expert) / kTileM;
+                    const int tile_count =
+                        (rows_aligned_per_expert + kTileM - 1) / kTileM;
+                    for (int tile_iter = 0; tile_iter < tile_count;
+                         ++tile_iter) {
+                        const int target_y = first_tile_y + tile_iter;
+                        if (target_y < static_cast<int>(gridDim.y)) {
+                            row_stage_barrier[target_y] = 0;
+                        }
+                    }
+                    __threadfence();
+                    for (int tile_iter = 0; tile_iter < tile_count;
+                         ++tile_iter) {
+                        const int target_y = first_tile_y + tile_iter;
+                        if (target_y < static_cast<int>(gridDim.y)) {
+                            row_stage_barrier[static_cast<int>(gridDim.y) +
+                                              target_y] = launch_epoch;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     const int token_col0 = token_base + lane_n;
     const int token_col1 = token_col0 + 16;
     if constexpr (kUseSymmRowStage) {
         constexpr int kStageVecBytes = 16;
         constexpr int kStageVecsPerRow = kProblemK / kStageVecBytes;
         constexpr int kStageRows = kTileM;
-        auto* staged_vecs =
-            reinterpret_cast<int32x4_t*>(const_cast<uint8_t*>(x));
         const int32x4_t zero_vec{0, 0, 0, 0};
         uint8_t** peer_sym_buffers =
             deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
 
         if constexpr (kUseSymmRowStage) {
-            if (static_cast<int>(blockIdx.x) == 0 && threadIdx.x == 0) {
-                grid_barrier[static_cast<int>(blockIdx.y)] = 0;
+            if (route_scratch_i32 == nullptr &&
+                static_cast<int>(blockIdx.x) == 0 && threadIdx.x == 0) {
+                row_stage_barrier[static_cast<int>(blockIdx.y)] = 0;
                 __threadfence();
-                grid_barrier[static_cast<int>(gridDim.y) +
-                             static_cast<int>(blockIdx.y)] =
+                row_stage_barrier[static_cast<int>(gridDim.y) +
+                                  static_cast<int>(blockIdx.y)] =
                     launch_epoch;
             }
             volatile int32_t* row_epoch =
                 reinterpret_cast<volatile int32_t*>(
-                    grid_barrier + static_cast<int>(gridDim.y) +
+                row_stage_barrier + static_cast<int>(gridDim.y) +
                     static_cast<int>(blockIdx.y));
             while (*row_epoch != launch_epoch) {
             }
         }
 
-        const int stage_linear_begin =
-            kUseSymmRowStage
-                ? static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
-                      static_cast<int>(threadIdx.x)
-                : static_cast<int>(threadIdx.x);
-        const int stage_linear_stride =
-            kUseSymmRowStage
-                ? static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x)
-                : static_cast<int>(blockDim.x);
-        for (int linear = stage_linear_begin;
+        if constexpr (!kUseDirectSymmLoad) {
+            auto* staged_vecs =
+                reinterpret_cast<int32x4_t*>(const_cast<uint8_t*>(x));
+            const int stage_linear_begin =
+                static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                static_cast<int>(threadIdx.x);
+            const int stage_linear_stride =
+                static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+            for (int linear = stage_linear_begin;
                  linear < kStageRows * kStageVecsPerRow;
-             linear += stage_linear_stride) {
+                 linear += stage_linear_stride) {
                 const int local_row = linear / kStageVecsPerRow;
                 const int vec_col = linear - local_row * kStageVecsPerRow;
                 const int grouped_row = tile_token + local_row;
                 const int row_in_expert =
                     grouped_row - tile_expert * rows_aligned_per_expert;
                 if (row_in_expert < 0 ||
-                    row_in_expert >= valid_rows_per_expert)
+                    row_in_expert >= rows_aligned_per_expert)
                     continue;
                 int32x4_t value = zero_vec;
-                int source_rank = 0;
-                int source_token = 0;
-                if (v2_symm_source_for_grouped_row(
-                        grouped_row, rows_aligned_per_expert,
-                        valid_rows_per_expert, rank_idx, num_ranks,
-                        num_global_experts, num_max_tokens_per_rank, num_topk,
-                        source_rank, source_token)) {
-                    auto sections = deep_gemm::mega::get_sections(
-                        peer_sym_buffers[source_rank], num_ranks,
-                        num_global_experts, num_max_tokens_per_rank, num_topk,
-                        kProblemK);
-                    value = reinterpret_cast<const int32x4_t*>(
-                        sections.x +
-                        static_cast<int64_t>(source_token) * kProblemK)[vec_col];
+                if (row_in_expert < valid_rows_per_expert) {
+                    int source_rank = 0;
+                    int source_token = 0;
+                    bool has_source = false;
+                    if (route_scratch_i32 != nullptr) {
+                        source_rank = symm_src_ranks[grouped_row];
+                        source_token = symm_src_tokens[grouped_row];
+                        has_source = source_rank >= 0;
+                    } else {
+                        has_source = v2_symm_source_for_grouped_row(
+                            grouped_row, rows_aligned_per_expert,
+                            valid_rows_per_expert, rank_idx, num_ranks,
+                            num_global_experts, num_max_tokens_per_rank,
+                            num_topk, source_rank, source_token);
+                    }
+                    if (has_source) {
+                        auto sections = deep_gemm::mega::get_sections(
+                            peer_sym_buffers[source_rank], num_ranks,
+                            num_global_experts, num_max_tokens_per_rank,
+                            num_topk, kProblemK);
+                        value = reinterpret_cast<const int32x4_t*>(
+                            sections.x +
+                            static_cast<int64_t>(source_token) *
+                                kProblemK)[vec_col];
+                    }
                 }
                 staged_vecs[static_cast<int64_t>(grouped_row) *
                                 kStageVecsPerRow +
                             vec_col] = value;
+            }
         }
         if (!kUseSymmRowStage || static_cast<int>(blockIdx.x) == 0) {
             for (int local_row = static_cast<int>(threadIdx.x);
@@ -1403,35 +1798,45 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                 const int row_in_expert =
                     grouped_row - tile_expert * rows_aligned_per_expert;
                 if (row_in_expert < 0 ||
-                    row_in_expert >= valid_rows_per_expert)
+                    row_in_expert >= rows_aligned_per_expert)
                     continue;
                 float scale = 1.0e-4f / 448.0f;
-                int source_rank = 0;
-                int source_token = 0;
-                if (v2_symm_source_for_grouped_row(
-                        grouped_row, rows_aligned_per_expert,
-                        valid_rows_per_expert, rank_idx, num_ranks,
-                        num_global_experts, num_max_tokens_per_rank, num_topk,
-                        source_rank, source_token)) {
-                    auto sections = deep_gemm::mega::get_sections(
-                        peer_sym_buffers[source_rank], num_ranks,
-                        num_global_experts, num_max_tokens_per_rank, num_topk,
-                        kProblemK);
-                    scale = sections.x_sf[source_token];
+                if (row_in_expert < valid_rows_per_expert) {
+                    int source_rank = 0;
+                    int source_token = 0;
+                    bool has_source = false;
+                    if (route_scratch_i32 != nullptr) {
+                        source_rank = symm_src_ranks[grouped_row];
+                        source_token = symm_src_tokens[grouped_row];
+                        has_source = source_rank >= 0;
+                    } else {
+                        has_source = v2_symm_source_for_grouped_row(
+                            grouped_row, rows_aligned_per_expert,
+                            valid_rows_per_expert, rank_idx, num_ranks,
+                            num_global_experts, num_max_tokens_per_rank,
+                            num_topk, source_rank, source_token);
+                    }
+                    if (has_source) {
+                        auto sections = deep_gemm::mega::get_sections(
+                            peer_sym_buffers[source_rank], num_ranks,
+                            num_global_experts, num_max_tokens_per_rank,
+                            num_topk, kProblemK);
+                        scale = sections.x_sf[source_token];
+                    }
                 }
                 const_cast<float*>(x_scale)[grouped_row] = scale;
             }
         }
         block_barrier_device();
         wait_vmem_lds_store_device();
-        __threadfence();
+        __threadfence_system();
         block_barrier_device();
         if constexpr (kUseSymmRowStage) {
             if (threadIdx.x == 0)
-                atomicAdd(grid_barrier + static_cast<int>(blockIdx.y), 1);
+                atomicAdd(row_stage_barrier + static_cast<int>(blockIdx.y), 1);
             volatile int32_t* row_count =
                 reinterpret_cast<volatile int32_t*>(
-                    grid_barrier + static_cast<int>(blockIdx.y));
+                    row_stage_barrier + static_cast<int>(blockIdx.y));
             while (*row_count < static_cast<int>(gridDim.x)) {
             }
         }
@@ -1483,6 +1888,61 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
 #undef K1_ACC_ZERO
     const int32x4_t x_resource = make_buffer_resource_device(x);
     const int32x4_t weight_resource = make_buffer_resource_device(weight_marlin);
+    const uint8_t* direct_x0 = nullptr;
+    const uint8_t* direct_x1 = nullptr;
+    if constexpr (kUseDirectSymmLoad) {
+        uint8_t** peer_sym_buffers =
+            deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
+        auto resolve_direct_x = [&](int grouped_row) -> const uint8_t* {
+            const int row_in_expert =
+                grouped_row - tile_expert * rows_aligned_per_expert;
+            if (row_in_expert < 0 ||
+                row_in_expert >= valid_rows_per_expert)
+                return nullptr;
+            int source_rank = 0;
+            int source_token = 0;
+            bool has_source = false;
+            if (route_scratch_i32 != nullptr) {
+                source_rank = symm_src_ranks[grouped_row];
+                source_token = symm_src_tokens[grouped_row];
+                has_source = source_rank >= 0;
+            } else {
+                has_source = v2_symm_source_for_grouped_row(
+                    grouped_row, rows_aligned_per_expert,
+                    valid_rows_per_expert, rank_idx, num_ranks,
+                    num_global_experts, num_max_tokens_per_rank, num_topk,
+                    source_rank, source_token);
+            }
+            if (!has_source)
+                return nullptr;
+            auto sections = deep_gemm::mega::get_sections(
+                peer_sym_buffers[source_rank], num_ranks, num_global_experts,
+                num_max_tokens_per_rank, num_topk, kProblemK);
+            return sections.x + static_cast<int64_t>(source_token) * kProblemK;
+        };
+        direct_x0 = resolve_direct_x(token_col0);
+        direct_x1 = resolve_direct_x(token_col1);
+    }
+    auto load_x_pack = [&](const uint8_t* direct_ptr,
+                           int grouped_row,
+                           int phase_k) -> Pack128 {
+        Pack128 value;
+        if constexpr (kUseDirectSymmLoad) {
+            if (direct_ptr == nullptr) {
+                value.v4 = int32x4_t{0, 0, 0, 0};
+            } else {
+                value.v4 = reinterpret_cast<const int32x4_t*>(
+                    direct_ptr + phase_k)[0];
+            }
+        } else {
+            value = buffer_load_fp8_b128_pack_device(
+                x_resource,
+                static_cast<int>(static_cast<int64_t>(grouped_row) *
+                                     kProblemK +
+                                 phase_k));
+        }
+        return value;
+    };
 #define K1_PREFETCH_A_STAGE(STAGE_BASE, K_STAGE)                                \
         do {                                                                    \
             const int loader_linear = (wave_id - kComputeWaves) * 64 + lane;    \
@@ -1751,8 +2211,15 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                     ds_read16_b128_wait6_device(lds_bytes, lds_read_base,       \
                                                 a0, a1, a2, a3, a4, a5, a6, a7, \
                                                 a8, a9, a10, a11, a12, a13, a14, a15); \
-                    K1_MMAC_16_ROWS(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, 0, (B0_PACK).v2[0], (B1_PACK).v2[0]); \
-                    K1_MMAC_16_ROWS(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, 1, (B0_PACK).v2[1], (B1_PACK).v2[1]); \
+                    K1_MMAC_ROWS_0_7_B0(a0, a1, a2, a3, a4, a5, a6, a7, 0, (B0_PACK).v2[0]); \
+                    K1_MMAC_ROWS_0_7_B1(a0, a1, a2, a3, a4, a5, a6, a7, 0, (B1_PACK).v2[0]); \
+                    K1_MMAC_ROWS_0_7_B0(a0, a1, a2, a3, a4, a5, a6, a7, 1, (B0_PACK).v2[1]); \
+                    K1_MMAC_ROWS_0_7_B1(a0, a1, a2, a3, a4, a5, a6, a7, 1, (B1_PACK).v2[1]); \
+                    wait_lds_read_device();                                     \
+                    K1_MMAC_ROWS_8_15_B0(a8, a9, a10, a11, a12, a13, a14, a15, 0, (B0_PACK).v2[0]); \
+                    K1_MMAC_ROWS_8_15_B1(a8, a9, a10, a11, a12, a13, a14, a15, 0, (B1_PACK).v2[0]); \
+                    K1_MMAC_ROWS_8_15_B0(a8, a9, a10, a11, a12, a13, a14, a15, 1, (B0_PACK).v2[1]); \
+                    K1_MMAC_ROWS_8_15_B1(a8, a9, a10, a11, a12, a13, a14, a15, 1, (B1_PACK).v2[1]); \
                 }                                                               \
             } while (0)
 #define K1_DEEPGEMM_PHASE_LOAD_B(PHASE_KTILE)                                   \
@@ -1760,14 +2227,8 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                 const int phase_k = k_stage + ((PHASE_KTILE) + lane_group) * 16;\
                 Pack128 b0_pack;                                                \
                 Pack128 b1_pack;                                                \
-                b0_pack = buffer_load_fp8_b128_pack_device(                     \
-                    x_resource,                                                 \
-                    static_cast<int>(static_cast<int64_t>(token_col0) *         \
-                                    kProblemK + phase_k));                      \
-                b1_pack = buffer_load_fp8_b128_pack_device(                     \
-                    x_resource,                                                 \
-                    static_cast<int>(static_cast<int64_t>(token_col1) *         \
-                                    kProblemK + phase_k));                      \
+                b0_pack = load_x_pack(direct_x0, token_col0, phase_k);          \
+                b1_pack = load_x_pack(direct_x1, token_col1, phase_k);          \
                 K1_DEEPGEMM_PHASE_WITH_B((PHASE_KTILE), b0_pack, b1_pack);      \
             } while (0)
 #define K1_ACC_ORDER_BARRIER()                                                  \
@@ -1797,14 +2258,8 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
                     const int phase0_k = k_stage + lane_group * 16;             \
                     Pack128 b0_phase0;                                          \
                     Pack128 b1_phase0;                                          \
-                    b0_phase0 = buffer_load_fp8_b128_pack_device(               \
-                        x_resource,                                             \
-                        static_cast<int>(static_cast<int64_t>(token_col0) *     \
-                                        kProblemK + phase0_k));                 \
-                    b1_phase0 = buffer_load_fp8_b128_pack_device(               \
-                        x_resource,                                             \
-                        static_cast<int>(static_cast<int64_t>(token_col1) *     \
-                                        kProblemK + phase0_k));                 \
+                    b0_phase0 = load_x_pack(direct_x0, token_col0, phase0_k);   \
+                    b1_phase0 = load_x_pack(direct_x1, token_col1, phase0_k);   \
                     set_mmac_priority_high_device();                            \
                     K1_DEEPGEMM_PHASE_WITH_B(0, b0_phase0, b1_phase0);          \
                     K1_ACC_ORDER_BARRIER();                                      \
@@ -2049,6 +2504,7 @@ V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16(
     return;
 }
 
+#ifndef DCU_MEGAMOE_V2_KERNEL_ONLY
 static float bf16_to_float(hip_bfloat16 value) {
     uint16_t bits16;
     std::memcpy(&bits16, &value, sizeof(bits16));
@@ -2181,6 +2637,7 @@ static void fill_scales(std::vector<float>& data, float base) {
 static double valid_tflops(int valid_rows, int n, int k, double avg_ms) {
     return 2.0 * static_cast<double>(valid_rows) * n * k / (avg_ms * 1.0e9);
 }
+#endif  // DCU_MEGAMOE_V2_KERNEL_ONLY
 
 __device__ static inline void v2_device_grid_barrier(
     int32_t* barrier,
@@ -2205,6 +2662,7 @@ __device__ static inline void v2_device_grid_barrier(
     return;
 }
 
+#ifndef DCU_MEGAMOE_V2_KERNEL_ONLY
 static std::vector<uint8_t> make_lowlat_pack5_weight(
     const std::vector<uint8_t>& w,
     int experts,
@@ -2214,6 +2672,7 @@ static std::vector<uint8_t> make_lowlat_pack5_weight(
     // and the normal MT256x256 C kernel's pack5 experiment.
     return marlin2_k64_n256_n16_transposed_weight(w, experts, n, k);
 }
+#endif  // DCU_MEGAMOE_V2_KERNEL_ONLY
 
 template <int kExperts,
           int kN,
@@ -2243,8 +2702,16 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
     int num_global_experts,
     int num_max_tokens_per_rank,
     int num_topk,
+    int runtime_num_tokens,
     const int64_t* row_output_ptrs,
-    int k3_tail_reduce = 0) {
+    int k3_tail_reduce = 0,
+    float* route_weights_out = nullptr,
+    int32_t* row_expert_out = nullptr,
+    int32_t* output_index = nullptr,
+    int64_t* row_combine_ptrs_out = nullptr,
+    uint8_t* local_topk_mask = nullptr,
+    int32_t* tail_tokens = nullptr,
+    int32_t* cumulative_local_expert_recv_stats = nullptr) {
     static_assert(kExperts == 32, "readlane expert broadcast assumes <=32 experts");
     static_assert(kBlockM == 16 || kBlockM == 32 || kBlockM == 48 ||
                       kBlockM == 64,
@@ -2286,6 +2753,17 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
         symm_src_ranks + static_cast<int64_t>(kExperts) * m_per_expert;
 
     if constexpr (kUseSymmStage) {
+        if (local_sym_buffer != nullptr && grid_barrier != nullptr &&
+            num_ranks > 1) {
+            if (blockIdx.x == 0) {
+                int** peer_signal_buffers =
+                    deep_gemm::mega::dcu_peer_signal_ptrs(
+                        local_sym_buffer, num_ranks);
+                deep_gemm::mega::mega_moe_rank_barrier(
+                    peer_signal_buffers, rank_idx, num_ranks);
+            }
+            v2_device_grid_barrier(grid_barrier, static_cast<int>(gridDim.x));
+        }
         const int64_t row_capacity =
             static_cast<int64_t>(kExperts) * m_per_expert;
         for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
@@ -2297,6 +2775,12 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
              idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
             symm_src_ranks[idx] = 0;
             symm_src_tokens[idx] = 0;
+            if (route_weights_out != nullptr)
+                route_weights_out[idx] = 0.0f;
+            if (row_expert_out != nullptr)
+                row_expert_out[idx] = static_cast<int32_t>(idx / m_per_expert);
+            if (row_combine_ptrs_out != nullptr)
+                row_combine_ptrs_out[idx] = 0;
         }
         v2_device_grid_barrier(grid_barrier, static_cast<int>(gridDim.x));
 
@@ -2307,6 +2791,48 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
         const int last_expert = first_expert + local_experts;
         const int routes_per_rank = num_max_tokens_per_rank * num_topk;
         const int total_routes = num_ranks * routes_per_rank;
+        if (output_index != nullptr) {
+            for (int route_linear =
+                     static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
+                 route_linear < total_routes;
+                 route_linear += static_cast<int>(gridDim.x) *
+                                 static_cast<int>(blockDim.x)) {
+                output_index[route_linear] = -1;
+            }
+        }
+        if (local_topk_mask != nullptr || tail_tokens != nullptr) {
+            auto local_sections = deep_gemm::mega::get_sections(
+                peer_sym_buffers[rank_idx], num_ranks, num_global_experts,
+                num_max_tokens_per_rank, num_topk, kK);
+            int local_effective_tokens = v2_effective_num_tokens(
+                local_sections.num_tokens, runtime_num_tokens,
+                num_max_tokens_per_rank);
+            for (int token_idx =
+                     static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
+                 token_idx < num_max_tokens_per_rank;
+                 token_idx += static_cast<int>(gridDim.x) *
+                              static_cast<int>(blockDim.x)) {
+                uint8_t mask = 0;
+                if (token_idx < local_effective_tokens) {
+                    for (int topk_slot = 0; topk_slot < num_topk; ++topk_slot) {
+                        const int64_t route_offset =
+                            static_cast<int64_t>(token_idx) * num_topk + topk_slot;
+                        const int64_t expert = local_sections.topk_idx[route_offset];
+                        const float route_weight =
+                            local_sections.topk_weights[route_offset];
+                        if (expert >= 0 && expert < num_global_experts &&
+                            route_weight != 0.0f) {
+                            mask |= static_cast<uint8_t>(1u << topk_slot);
+                        }
+                    }
+                }
+                if (local_topk_mask != nullptr)
+                    local_topk_mask[token_idx] = mask;
+                if (tail_tokens != nullptr)
+                    tail_tokens[token_idx] = token_idx;
+            }
+        }
+        v2_device_grid_barrier(grid_barrier, static_cast<int>(gridDim.x));
         for (int route_linear =
                  static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
              route_linear < total_routes;
@@ -2318,11 +2844,9 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
             auto sections = deep_gemm::mega::get_sections(
                 peer_sym_buffers[source_rank], num_ranks, num_global_experts,
                 num_max_tokens_per_rank, num_topk, kK);
-            int effective_tokens = sections.num_tokens[0];
-            if (effective_tokens < 0)
-                effective_tokens = 0;
-            if (effective_tokens > num_max_tokens_per_rank)
-                effective_tokens = num_max_tokens_per_rank;
+            int effective_tokens = v2_effective_num_tokens(
+                sections.num_tokens, runtime_num_tokens,
+                num_max_tokens_per_rank);
             if (token_idx >= effective_tokens)
                 continue;
             const int64_t expert =
@@ -2351,6 +2875,21 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
                     row_in_expert;
                 symm_src_ranks[row] = source_rank;
                 symm_src_tokens[row] = token_idx;
+                if (route_weights_out != nullptr)
+                    route_weights_out[row] = route_weight;
+                if (row_expert_out != nullptr)
+                    row_expert_out[row] = local_expert;
+                if (output_index != nullptr)
+                    output_index[route_linear] = static_cast<int32_t>(row);
+                if (row_combine_ptrs_out != nullptr) {
+                    const int64_t partial_row =
+                        static_cast<int64_t>(topk_slot) *
+                            num_max_tokens_per_rank +
+                        token_idx;
+                    row_combine_ptrs_out[row] =
+                        static_cast<int64_t>(reinterpret_cast<uintptr_t>(
+                            sections.combine + partial_row * kN));
+                }
             }
         }
         v2_device_grid_barrier(grid_barrier, static_cast<int>(gridDim.x));
@@ -2361,6 +2900,16 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
                 symm_counts[expert] = m_per_expert;
         }
         v2_device_grid_barrier(grid_barrier, static_cast<int>(gridDim.x));
+        if (cumulative_local_expert_recv_stats != nullptr) {
+            for (int expert =
+                     static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
+                 expert < kExperts;
+                 expert += static_cast<int>(gridDim.x) *
+                           static_cast<int>(blockDim.x)) {
+                atomicAdd(cumulative_local_expert_recv_stats + expert,
+                          symm_counts[expert]);
+            }
+        }
 
         if constexpr (kUseSymmStage) {
             uint8_t** peer_sym_buffers =
@@ -2625,9 +3174,11 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
                 local_sym_buffer, num_ranks, num_global_experts,
                 num_max_tokens_per_rank, num_topk, kN);
             const int vecs_per_token = kN / kReduceBf16PerVec;
+            const int tail_reduce_tokens = v2_effective_num_tokens(
+                local_sections.num_tokens, runtime_num_tokens,
+                num_max_tokens_per_rank);
             const int64_t total_reduce_vecs =
-                static_cast<int64_t>(num_max_tokens_per_rank) *
-                vecs_per_token;
+                static_cast<int64_t>(tail_reduce_tokens) * vecs_per_token;
             auto* out_vec = reinterpret_cast<uint4*>(out);
             for (int64_t task =
                      static_cast<int64_t>(blockIdx.x) * blockDim.x +
@@ -2672,18 +3223,10 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
                         static_cast<uint16_t>(packed.w >> 16));
                 }
                 uint4 reduced;
-                reduced.x = pack2_bf16_bits_device(
-                    f32_to_bf16_bits_device(sum0),
-                    f32_to_bf16_bits_device(sum1));
-                reduced.y = pack2_bf16_bits_device(
-                    f32_to_bf16_bits_device(sum2),
-                    f32_to_bf16_bits_device(sum3));
-                reduced.z = pack2_bf16_bits_device(
-                    f32_to_bf16_bits_device(sum4),
-                    f32_to_bf16_bits_device(sum5));
-                reduced.w = pack2_bf16_bits_device(
-                    f32_to_bf16_bits_device(sum6),
-                    f32_to_bf16_bits_device(sum7));
+                reduced.x = pack2_bf16_f32_device(sum0, sum1);
+                reduced.y = pack2_bf16_f32_device(sum2, sum3);
+                reduced.z = pack2_bf16_f32_device(sum4, sum5);
+                reduced.w = pack2_bf16_f32_device(sum6, sum7);
                 out_vec[task] = reduced;
             }
         }
@@ -2691,6 +3234,7 @@ V2_K1_LowLatencyMaskedGroupGemmKernel(
     return;
 }
 
+#ifndef DCU_MEGAMOE_V2_DISABLE_STANDALONE_MAIN
 int main(int argc, char** argv) {
     Options opt = parse_options(argc, argv);
     if (opt.n % 256 != 0 || opt.k % 128 != 0 || opt.experts <= 0) {
@@ -3440,7 +3984,8 @@ int main(int argc, char** argv) {
                 opt.n, opt.k, rows_aligned_per_expert,
                 opt.valid_rows_per_expert, d_local_symm_buffer,
                 d_symm_grid_barrier, c_epoch, opt.rank_idx, opt.symm_ranks,
-                opt.experts * opt.symm_ranks, opt.tokens, opt.topk, nullptr);
+                opt.experts * opt.symm_ranks, opt.tokens, opt.topk,
+                opt.tokens, nullptr);
         } else if (opt.k == 2048) {
             if (use_k3_copy_stage) {
                 V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16<
@@ -3452,7 +3997,7 @@ int main(int argc, char** argv) {
                     d_local_symm_buffer, d_symm_grid_barrier, c_epoch,
                     opt.rank_idx, opt.symm_ranks,
                     opt.experts * opt.symm_ranks, opt.tokens, opt.topk,
-                    d_row_output_ptrs, opt.k3_copy_workers,
+                    -1, d_row_output_ptrs, opt.k3_copy_workers,
                     opt.k3_tail_reduce, d_k3_local_topk_mask,
                     d_k3_tail_out, d_k3_tail_tokens,
                     static_cast<int>(h_k3_tail_tokens.size()));
@@ -3464,7 +4009,7 @@ int main(int argc, char** argv) {
                     d_row_expert, opt.m, opt.n, opt.k,
                     rows_aligned_per_expert, opt.valid_rows_per_expert,
                     nullptr, nullptr, 0, 0, 1, opt.experts, opt.tokens,
-                    opt.topk, d_row_output_ptrs);
+                    opt.topk, -1, d_row_output_ptrs);
             } else {
                 V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16<
                     256, 256, true, false, 1, 4096, 2048>
@@ -3473,7 +4018,7 @@ int main(int argc, char** argv) {
                     d_row_expert, opt.m, opt.n, opt.k,
                     rows_aligned_per_expert, opt.valid_rows_per_expert,
                     nullptr, nullptr, 0, 0, 1, opt.experts, opt.tokens,
-                    opt.topk, nullptr);
+                    opt.topk, -1, nullptr);
             }
         } else {
             V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16<
@@ -3482,7 +4027,7 @@ int main(int argc, char** argv) {
                 d_out, d_x, d_w_pack5, d_x_scale, d_w_scale, d_row_expert,
                 opt.m, opt.n, opt.k, rows_aligned_per_expert,
                 opt.valid_rows_per_expert, nullptr, nullptr, 0, 0, 1,
-                opt.experts, opt.tokens, opt.topk, nullptr);
+                opt.experts, opt.tokens, opt.topk, -1, nullptr);
         }
     };
 
@@ -3504,7 +4049,8 @@ int main(int argc, char** argv) {
                 USE_STAGE ? d_symm_route_scratch : nullptr,                    \
                 (USE_STAGE || (USE_ROWPTR && use_k3_tail_reduce)) ? d_symm_grid_barrier : nullptr, \
                 opt.rank_idx, opt.symm_ranks, opt.experts * opt.symm_ranks,      \
-                opt.tokens, opt.topk, USE_ROWPTR ? d_row_output_ptrs : nullptr,  \
+                opt.tokens, opt.topk, USE_STAGE ? opt.tokens : -1,               \
+                USE_ROWPTR ? d_row_output_ptrs : nullptr,                        \
                 (USE_ROWPTR && use_k3_tail_reduce) ? opt.k3_tail_reduce : 0);    \
         } while (0)
 #define K1_LAUNCH_LOWLAT(BLOCK_M, CUS, MASK_TINY_STORE)                         \
@@ -3801,7 +4347,7 @@ int main(int argc, char** argv) {
                 d_x_scale_ref_compact, d_w_scale, d_row_expert_ref_compact,
                 ref_m, opt.n, opt.k, ref_rows_aligned_per_expert,
                 opt.valid_rows_per_expert, nullptr, nullptr, 0, 0, 1,
-                opt.experts, opt.tokens, opt.topk, nullptr);
+                opt.experts, opt.tokens, opt.topk, -1, nullptr);
         } else {
             V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16<
                 256, 256, true>
@@ -3810,7 +4356,7 @@ int main(int argc, char** argv) {
                 d_x_scale_ref_compact, d_w_scale, d_row_expert_ref_compact,
                 ref_m, opt.n, opt.k, ref_rows_aligned_per_expert,
                 opt.valid_rows_per_expert, nullptr, nullptr, 0, 0, 1,
-                opt.experts, opt.tokens, opt.topk, nullptr);
+                opt.experts, opt.tokens, opt.topk, -1, nullptr);
         }
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
@@ -4058,7 +4604,7 @@ int main(int argc, char** argv) {
                 d_row_expert, opt.m, opt.n, opt.k,
                 rows_aligned_per_expert, opt.valid_rows_per_expert,
                 nullptr, nullptr, 0, 0, 1, opt.experts, opt.tokens,
-                opt.topk, nullptr);
+                opt.topk, -1, nullptr);
         } else {
             V2_DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_C_TN_MT256XNX128_BF16<
                 256, 256, true>
@@ -4067,7 +4613,7 @@ int main(int argc, char** argv) {
                 d_row_expert, opt.m, opt.n, opt.k,
                 rows_aligned_per_expert, opt.valid_rows_per_expert,
                 nullptr, nullptr, 0, 0, 1, opt.experts, opt.tokens,
-                opt.topk, nullptr);
+                opt.topk, -1, nullptr);
         }
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
@@ -4261,3 +4807,4 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipFree(d_k3_local_topk_mask));
     return 0;
 }
+#endif  // DCU_MEGAMOE_V2_DISABLE_STANDALONE_MAIN
