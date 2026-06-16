@@ -194,8 +194,25 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO" in k3_py
     assert "k3_l2_combine_asm_pack5_out" in k3_py
     assert "k3_l2_combine_asm_tail_reduce_pack5_out" in k3_py
+    asm_k3_signature = k3_py.split("def k3_l2_fused_asm_to_combine(", 1)[1].split(
+        ") -> torch.Tensor | None:",
+        1,
+    )[0]
+    assert "ll_block_m" not in asm_k3_signature
+    assert "graph_runtime_num_tokens" not in asm_k3_signature
     assert "k3_v3_ll_combine(" in k3_py
     assert "k3_v3_ll_combine_tail(" in k3_py
+    assert "graph_runtime_num_tokens" in k3_py
+    v3_k3_signature = k3_py.split("def k3_l2_fused_v3_to_combine(", 1)[1].split(
+        ") -> torch.Tensor | None:",
+        1,
+    )[0]
+    assert "graph_runtime_num_tokens: torch.Tensor | None = None" in v3_k3_signature
+    assert "runtime_num_tokens_tensor" in k3_ext
+    assert "runtime_num_tokens_ptr" in k3_ext
+    assert "num_tokens, runtime_num_tokens, num_topk" in k3_ext
+    assert "effective_num_tokens" in k3_header
+    assert "static_cast<int64_t>(effective_num_tokens) * vecs_per_token" in k3_header
     assert "k3_v3_ll_reference" not in k3_ext
     assert "V3_K3_LowLatencyMaskedGroupGemmKernel" in k3_header
     assert "V3_K3_Fused_DeepGemm" not in k3_header
@@ -235,3 +252,12 @@ def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
         assert retired not in production_sources
 
     assert not (ROOT / "megamoe" / "dcu_megamoe_v2").exists()
+
+
+def test_v3_ll_capacity_headroom_covers_256_and_512_exact_buckets():
+    k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+
+    assert "kLlHeadroomExpectedRowsThreshold = 48" in k1_ext
+    assert "kLlHeadroomRows = 64" in k1_ext
+    assert "ll_expected_rows_per_expert >= kLlHeadroomExpectedRowsThreshold" in k1_ext
+    assert "ll_expected_rows_per_expert >= 160 ? 64 : 0" not in k1_ext

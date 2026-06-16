@@ -294,25 +294,24 @@
 - [✅] auto 规则细化：auto 现在同时要求 per-expert fractional saving `>=5%` 且 local tile saving `>=8 tiles`，并额外把 `fixed_capacity_tiles_per_expert >= 7` 的大 rowptr 档切到 compact；后者覆盖 8192/8448 这类 K1 不明显变快但 K3 rowptr/remote combine 明显受益的场景。
 - [✅] 8448 复核：初版 auto 因 compact capacity rows 与 fixed rows 同为 `57344` 而保持 asm，K1-only `5.390 ms`、e2e `12.864 ms`；强制 compact 虽未降低 capacity rows，但 prebuild 后 K3 `staged_rowptr` 从约 `6.22 ms` 降到 `4.78 ms`，e2e `11.248 ms`；加入大 rowptr 规则后 auto 选择 compact，K1 rows/active `57344/57344`、e2e correct 且 fused `11.202 ms`。
 - [✅] 代表 size e2e 矩阵：normal eager no-tail 覆盖 `256,512,1024,1025,2048,2050,4096,4097,8192,8448` 的 `asm/compact/auto`，30/30 correctness 通过；auto 对齐当前强制最优或在噪声容限内。2048 首轮 compact 轻微领先但三轮复核 asm 更优，因此规则保持 `2048/2050 -> asm`。
-- [ ] 验证待补：如继续收敛，需要补至少 4096/8192 tail-reduce 性能哨兵，确认 no-tail 以外路径同样不劣化。
-- [ ] 当前主动项：评估 ASM hot loop 内减少 `source_rank -> peer pointer table -> s_load_dwordx2` 频率、source-rank grouped row emission、或 SRD 缓存的可行性；任何实现前必须先确认 SGPR/resource/occupancy 和 2048/4096/8192 性能不劣化。
+- [ ] 验证待补：如继续收敛，需要补至少 4096/8192 tail-reduce 性能哨兵，确认 no-tail 以外路径同样不劣化；这是收口验证，不是新的 Phase 9 优化方向。
+- [🚫] 当前不继续推进：ASM hot loop 内减少 `source_rank -> peer pointer table -> s_load_dwordx2`、SRD 缓存、source-rank grouped row emission 都属于高风险合同级改动；在 compact/bit2 + auto 规则后，8192/8448 e2e 已恢复到目标区间，暂无足够收益证据支撑继续改生产路径。
 - [🧭] optional backlog：短期继续保留 `_v3_normal_symm_warmup_enabled` 作为低风险生产保护；它只提高 first production `symm_x_span <= UINT32_MAX` 的概率，不作为长期地址合同。
-- [🧭] optional backlog：参考 DeepEP/Flux 的 per-rank pointer table 思路，把当前 K1 ASM bit2 `{rank-local x offset, source rank}` 路径升级为可优化的生产候选，而不是只作为 `symm_x_span > UINT32_MAX` 的慢速兜底。
-- [🧭] optional backlog：优先尝试 source-rank grouped staging / row emission，让一个 row tile 或 producer CTA 尽量只处理一个或少数 source rank，从而把 peer SRD 选择提升到 tile/CTA 粒度，减少热循环内 `source_rank -> pointer table -> s_load_dwordx2` 开销。
-- [🧭] optional backlog：source-rank grouping 若继续推进，不采用每 source rank 固定 256-row 子桶（8192 会从当前 `1792 rows/expert` 膨胀到 `2048 rows/expert`）；优先评估 64-row 子桶/更细 row metadata 合同，理论上 8192 可压到约 `1536 rows/expert`，但这会触及 K1 route emission、stage loop、graph reset 和 K2/K3 row contract。
-- [🧭] optional backlog：若继续深入，定义显式 `{source_rank, rank_local_offset}` row metadata 合同；K1 ASM 从 per-rank SRD + rank-local offset 做 MUBUF load，避免依赖 `symm_base + uint32 offset` 覆盖所有 peer buffer。
-- [🧭] optional backlog：更大改造方向是 DeepEP/Flux 风格的 rank/channel staging：先按 source rank/channel 把 remote x 拉到 local `staged_x`，GEMM 主体只消费 local staged input；该方案会触及 K1 route emission、staged_x layout、graph/uneven、tail/no-tail 合同，必须在 Phase 10 sweep 后再评估。
+- [🧭] optional backlog：只有未来 profiler 再证明 K1 `source_rank`/peer pointer lookup 是 4096/8192/8448 的主瓶颈时，才重新评估 per-rank pointer table、显式 `{source_rank, rank_local_offset}` row metadata、source-rank grouped row emission 等合同级方案；不得作为小 ASM patch 直接推进。
+- [🧭] optional backlog：更大改造方向是 DeepEP/Flux 风格的 rank/channel staging：先按 source rank/channel 把 remote x 拉到 local `staged_x`，GEMM 主体只消费 local staged input；该方案会触及 K1 route emission、staged_x layout、graph/uneven、tail/no-tail 合同，必须等 V3-only scratch/route_scratch 收敛后再评估。
 - [🧭] optional verification：任何去 4GB span 依赖的方案都必须满足 correctness 覆盖 V3 normal no-tail/tail、eager/graph、uniform/uneven，并且 4096/8192 K1 与 e2e 不劣化到当前 warmup fast path 之外；4096 参考 guard 以当前 cleanup refresh `~5.81/5.84 ms` e2e 和历史 K1 `~2.94-2.95 ms` fast path 为准。
-- 状态：[ ] implementation built, perf recheck pending（auto 规则和 absolute branch cleanup 已实现并通过 source/build；等待卡空补齐 4096/8192 性能复测后再关闭）
+- 状态：✅ production optimization complete（absolute pointer 已移除，compact/bit2 与 auto 规则已通过代表 no-tail 矩阵；剩余仅 tail-reduce 哨兵验证和长期合同级 backlog）
 
 ### Phase 10: Required V3 performance sweep
 - [✅] 必做：运行前检查远端 8 卡状态，确保无残留 KFD 进程；同步当前 workspace 到 `hg@10.17.176.11` / `sglang_megamoe` / `/workspace/DeepGEMM`，并重跑 `compileall`、`tests/test_dcu_megamoe_v3.py` 和 `build_ext --inplace` 确认产物新鲜。
-- [✅] 必做/BUG：V3 LL 1024 correctness bug 已修复。根因是 K1 LL host 侧 `rows_per_expert` 只按平均路由数对齐，1024 token/rank 时容量正好等于 `1024*6/32=192`，随机 routing 中部分 local expert 超过容量后被截断，导致 fused stats mismatch 或较大 numerical diff；最终补 headroom 策略收紧为 `expected rows/expert >= 160` 才补 64 rows，513 边界不补且已验证通过，896/1024 no-tail/tail 均通过。
+- [✅] 必做/BUG：V3 LL row-capacity bug 已修复。根因是 K1 LL host 侧 `rows_per_expert` 只按平均路由数对齐，随机 routing 中部分 local expert 超过容量后被截断，导致 fused stats mismatch 或较大 numerical diff；1024 capture 失败后，exact 256 eager 也暴露同类 overflow，因此当前策略改为 `expected rows/expert >= 48` 时补 64 rows，保留 32/128 tiny bucket 原容量，同时保证 LL 实际执行至少支持到 512 tokens/rank。graph capture bucket 可以更大，但不能替代 exact eager bucket 的容量安全验证。
 - [✅] 必做：V3 LL 使用 graph 模式完整刷 uniform tokens per rank `8,32,64,128,256,512,1024`；graph capture bucket 固定按 `1024`，已记录 replay 性能表。旧 `phase10_ll_graph_20260615_232857` 慢表仅代表 K1 row-capacity correctness 修复后的中间状态，已被 runtime-row K3 graph 修复后的新结果覆盖。
 - [✅] 必做：V3 LL graph sweep 同时覆盖 `K3_USE_ASM_TAIL_REDUCE=0` no-tail 与 `K3_USE_ASM_TAIL_REDUCE=1` tail；K1 row-capacity correctness 和 K3 graph fixed-row 性能问题均已修复，全档位均通过，graph replay 性能已落盘。
+- [✅] 必做/BUG：V3 LL tail reduce/signal graph replay 已改为 runtime-token 化。K3 tail reducer 现在从 graph runtime token tensor 读取 replay tokens 并 clamp 到 capture bucket，capture1024/replay8..512 不再按 1024 token 做 reduce；K2 graph 仍保持 capture 固定 grid，但 graph path 传 `row_combine_ptrs`，inactive rows 在 kernel 内 early-return，进一步缩小 grid 属于 graph-update/compact row-list 合同级优化，不作为当前生产缺陷。
 - [✅] 必做：V3 normal 使用 eager 模式刷 uniform tokens per rank `256,512,1024,1025,2048,2050,4096,4097,8192`；不把 graph 结果代替本轮 normal eager sweep。
 - [✅] 必做：V3 normal eager sweep 同时覆盖 no-tail/tail；所有档位 correctness 通过，1024/1025、2048/2050、4096/4097 边界点未见 correctness 异常或明显性能台阶。
 - [✅] 必做：normal eager 结果落盘到 `hygon_tmp/sglang_debug/phase10_v3_sweep_20260615_196S/`；最终 LL graph 补测结果落盘到 `hygon_tmp/sglang_debug/ll_graph_dynamic_verify_20260615_235731/`，包含日志、case status、JSON 和 `summary.csv`；已回写 `progress.md` / `findings.md` / 本 Phase 状态。
+- [🧭] optional backlog：K2 融入 K1 只在后续 profiler 证明 K2 + `l1_out` 中间读写占 LL graph replay 的显著比例时再恢复；当前 K2 约 `0.028 ms` 的历史 stage timing 表明它不是 32/128 小 token 主瓶颈，直接把 SwiGLU/row-wise scale/FP8 quant 塞进 K1 epilogue 有较高 occupancy 和跨 N tile reduction 风险。
 - 状态：✅ complete for required sweep（normal eager sweep、LL 1024 row-capacity bug fix、LL graph `8..1024` no-tail/tail runtime-row replay sweep 均已完成；LL 1024 仍只作为 graph capture/correctness 覆盖，不作为大 token 生产推荐路径）
 
 ## 讨论用接口对照草案

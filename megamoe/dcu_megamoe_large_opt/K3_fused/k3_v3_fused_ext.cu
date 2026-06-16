@@ -26,6 +26,7 @@ static inline void launch_v3_k3_ll_rowptr(
     int num_experts,
     int num_max_tokens_per_rank,
     int num_tokens,
+    const int32_t* runtime_num_tokens,
     int num_topk,
     int done_target,
     int reduce_blocks,
@@ -53,6 +54,7 @@ static inline void launch_v3_k3_ll_rowptr(
             num_experts,
             num_max_tokens_per_rank,
             num_tokens,
+            runtime_num_tokens,
             num_topk,
             1,
             signal_generation_ptr,
@@ -77,6 +79,7 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5(
     int num_experts,
     int num_max_tokens_per_rank,
     int num_tokens,
+    const int32_t* runtime_num_tokens,
     int num_topk,
     int hidden,
     int tail_reduce,
@@ -110,8 +113,8 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5(
         weight_scale,                                                           \
         row_combine_ptrs, rows_per_expert, sym_buffer, done_counter,            \
         signal_addrs, reduce_y, num_ranks, num_experts,                        \
-        num_max_tokens_per_rank, num_tokens, num_topk, done_target,             \
-        reduce_blocks, signal_generation_ptr, stream)
+        num_max_tokens_per_rank, num_tokens, runtime_num_tokens, num_topk,      \
+        done_target, reduce_blocks, signal_generation_ptr, stream)
     if (ll_block_m == 64) {
         if (tail_reduce) {
             DCU_MEGAMOE_V3_LAUNCH_LL(64, true);
@@ -229,6 +232,7 @@ void k3_v3_ll_combine(
         static_cast<int>(weight_scale.size(0)),
         0,
         0,
+        nullptr,
         0,
         hidden,
         0,
@@ -259,7 +263,8 @@ void k3_v3_ll_combine_tail(
     const int64_t num_tokens,
     const int64_t num_topk,
     const int64_t ll_block_m = 32,
-    const std::optional<torch::Tensor>& signal_generation_tensor = std::nullopt) {
+    const std::optional<torch::Tensor>& signal_generation_tensor = std::nullopt,
+    const std::optional<torch::Tensor>& runtime_num_tokens_tensor = std::nullopt) {
     check_cuda_contiguous(output_workspace, "output_workspace");
     check_cuda_contiguous(act_fp8, "act_fp8");
     check_cuda_contiguous(act_scale, "act_scale");
@@ -334,6 +339,15 @@ void k3_v3_ll_combine_tail(
                     "signal_generation_tensor must be a CUDA int32 tensor");
         signal_generation_ptr = generation.data_ptr<int32_t>();
     }
+    const int32_t* runtime_num_tokens_ptr = nullptr;
+    if (runtime_num_tokens_tensor.has_value()) {
+        const auto& runtime = runtime_num_tokens_tensor.value();
+        check_cuda_contiguous(runtime, "runtime_num_tokens_tensor");
+        TORCH_CHECK(runtime.scalar_type() == torch::kInt &&
+                        runtime.numel() >= 1,
+                    "runtime_num_tokens_tensor must be a CUDA int32 tensor");
+        runtime_num_tokens_ptr = runtime.data_ptr<int32_t>();
+    }
     const int local_experts = num_ranks > 0 ? (num_experts / num_ranks) : 0;
     TORCH_CHECK(m_indices.numel() >= local_experts,
                 "m_indices must carry one actual row count per local expert");
@@ -364,6 +378,7 @@ void k3_v3_ll_combine_tail(
         static_cast<int>(num_experts),
         static_cast<int>(num_max_tokens_per_rank),
         static_cast<int>(num_tokens),
+        runtime_num_tokens_ptr,
         static_cast<int>(num_topk),
         hidden,
         1,
@@ -409,5 +424,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_tokens"),
           pybind11::arg("num_topk"),
           pybind11::arg("ll_block_m") = 32,
-          pybind11::arg("signal_generation_tensor") = std::nullopt);
+          pybind11::arg("signal_generation_tensor") = std::nullopt,
+          pybind11::arg("runtime_num_tokens_tensor") = std::nullopt);
 }

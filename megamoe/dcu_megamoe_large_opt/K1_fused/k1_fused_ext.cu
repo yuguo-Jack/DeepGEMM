@@ -1213,10 +1213,16 @@ k1_symm_fused_l1_v3_pack5(
             ceil_div_i64(
                 route_capacity_tokens_per_rank * num_topk,
                 local_experts));
-    // Preserve small/medium LL buckets exactly. Larger buckets need one tile
-    // of headroom because random routing can exceed the mean per-expert count.
+    constexpr int64_t kLlHeadroomExpectedRowsThreshold = 48;
+    constexpr int64_t kLlHeadroomRows = 64;
+    // Preserve the tiny 32/128-token LL buckets exactly. Exact 256/512 eager
+    // buckets need one tile of headroom because random routing can exceed the
+    // mean per-expert count even though graph replay often captures a larger
+    // bucket and therefore hides the issue.
     const int64_t ll_min_slack =
-        ll_expected_rows_per_expert >= 160 ? 64 : 0;
+        ll_expected_rows_per_expert >= kLlHeadroomExpectedRowsThreshold
+            ? kLlHeadroomRows
+            : 0;
     const int64_t ll_rows_per_expert =
         ll_base_rows_per_expert - ll_expected_rows_per_expert < ll_min_slack
             ? deep_gemm::mega::align_i64(

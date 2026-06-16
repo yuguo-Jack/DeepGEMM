@@ -207,7 +207,6 @@ def k3_l2_fused_asm_to_combine(
     prob_storage: torch.Tensor | None = None,
     active_tiles: torch.Tensor | None = None,
     graph_runtime_offset_from_active_tiles: int = 0,
-    ll_block_m: int = 32,
     verbose_build: bool = False,
 ) -> torch.Tensor | None:
     l2_weight, l2_scale = l2_weights
@@ -293,6 +292,7 @@ def k3_l2_fused_v3_to_combine(
     prob_storage: torch.Tensor | None = None,
     active_tiles: torch.Tensor | None = None,
     graph_runtime_offset_from_active_tiles: int = 0,
+    graph_runtime_num_tokens: torch.Tensor | None = None,
     ll_block_m: int = 32,
     verbose_build: bool = False,
 ) -> torch.Tensor | None:
@@ -395,6 +395,9 @@ def k3_l2_fused_v3_to_combine(
                 int(ll_block_m),
                 asm_signal_generation_tensor.contiguous()
                 if asm_signal_generation_tensor is not None
+                else None,
+                graph_runtime_num_tokens.contiguous()
+                if graph_runtime_num_tokens is not None
                 else None,
             )
         else:

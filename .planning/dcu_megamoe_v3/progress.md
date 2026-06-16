@@ -5979,10 +5979,11 @@
   - no-tail 768 通过，capacity 192；
   - no-tail 896 失败，`max_abs=0.02630615234375`；
   - no-tail 960/1024 失败，触发 `stats mismatch`。
-- 修复：
+- 当时修复：
   - 只修改 `megamoe/dcu_megamoe_large_opt/K1_fused/k1_fused_ext.cu` 的 LL host capacity 计算；
-  - 小 token 已调优容量保持不变：512 仍是 128，768 仍是 192；
-  - 当 expected rows/expert >= 160 时补一块 64-row tile 余量，因此 896/960/1024 的 LL rows/expert 从 192 提升到 256。
+  - 当时为了先修 1024 capture，保留 512/768 容量不变；
+  - 当时策略是在 expected rows/expert >= 160 时补一块 64-row tile 余量，因此 896/960/1024 的 LL rows/expert 从 192 提升到 256；
+  - 该阈值已在 2026-06-16 被 exact 256/512 eager headroom fix 取代，当前策略为 expected rows/expert >= 48 时补 64 rows。
 - 远端构建：
   - 同步 `K1_fused/k1_fused_ext.cu` 后，在 `sglang_megamoe` 容器内执行 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过；
   - 验证前后均清理 orphan rank/timeout/tee/resource-tracker 进程，`hy-smi --showpids` 无 KFD 进程残留。
@@ -6009,10 +6010,10 @@
 
 - 用户追问 host-side row headroom 对性能是否有影响，以及 513 token/rank 这种边界是否能过。
 - 新增临时 A/B runner：`hygon_tmp/sglang_debug/run_v3_ll_capacity_ab.sh`，复用同一测试命令跑 `512,513,896,1024` × no-tail/tail。
-- A/B 三个版本：
+- A/B 三个版本（历史过程，结论已被 2026-06-16 exact 256/512 eager 修复取代）：
   - `headroom`：上一版策略，`expected >= 96` 时可能补 slack；513 会从 128 rows/expert 跳到 192；
   - `no_headroom`：临时把 `ll_min_slack=0`；
-  - `refined`：最终收敛策略，只在 `expected rows/expert >= 160` 时补 64 rows，即 512/513 不补，896/1024 补。
+  - `refined`：当时收敛策略，只在 `expected rows/expert >= 160` 时补 64 rows，即 512/513 不补，896/1024 补。
 - 输出目录：
   - `hygon_tmp/sglang_debug/ll_capacity_ab_20260615_230045_headroom/`
   - `hygon_tmp/sglang_debug/ll_capacity_ab_20260615_230735_no_headroom/`
@@ -6023,9 +6024,10 @@
   - 513 refined 可以过且恢复到 no-headroom 性能区间：no-tail `2.193979 ms`，tail `2.279979 ms`；
   - 896/1024 no-headroom 会失败，refined 均通过；
   - refined 1024 no-tail/tail 分别 `4.727219/4.855758 ms`，和上一版 headroom `4.682059/4.915418 ms` 同一量级，差异在短测噪声内。
-- 本轮代码结论：
+- 本轮代码结论（历史，已被 2026-06-16 exact 256/512 eager headroom fix 修正）：
   - 之前“较大 bucket 补 headroom”的表述需要更精确：不能从 513 开始补；
-  - 当前生产策略改为 `ll_expected_rows_per_expert >= 160 ? 64 : 0`，保留 512/513 小中 bucket 原容量，同时修复 896/1024 overflow；
+  - 当时生产策略改为 `ll_expected_rows_per_expert >= 160 ? 64 : 0`，保留 512/513 小中 bucket 原容量，同时修复 896/1024 overflow；
+  - 后续 exact 256 eager 证明该阈值仍过窄，当前生产策略已改为 `ll_expected_rows_per_expert >= 48 ? 64 : 0`，覆盖实际执行到至少 512 tokens/rank；
   - 远端 refined 版已强制重新 hipify/编译 K1 ext，测试后 `hy-smi --showpids` 无 KFD 进程残留。
 
 ## 2026-06-15 - Phase 10 LL graph sweep 补测完成
@@ -6576,3 +6578,158 @@
   - `1025/4096/4097/8192/8448 -> compact` 与代表矩阵一致；
   - 2048 不应因单轮噪声切 compact，三轮复核显示 asm 更稳；
   - no-tail 代表矩阵未发现 correctness 或性能回退。后续只需补 tail-reduce 哨兵，而不是继续扩大 no-tail 矩阵。
+
+## 2026-06-16 - V3 LL graph to-256 refresh and K2 fusion analysis
+
+- 用户要求重刷 V3 LL graph 性能到 256 token/rank，并分析 LL 阶段是否值得把 K2 融到 K1。
+- 远端状态：
+  - 测试前后 `hy-smi --showpids` 均显示无 KFD 测试进程残留；
+  - 输出目录：`hygon_tmp/sglang_debug/ll_graph_to256_20260616_142319/`；
+  - 命令口径：V3 LL backend，graph capture bucket 固定 `1024`，replay tokens `8,32,64,128,256`，no-tail/tail 均覆盖。
+- 性能结果：
+
+| mode | correct | eager fused 1024 ms | baseline 1024 ms | graph replay 8 ms | 32 ms | 64 ms | 128 ms | 256 ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| LL no-tail | true | 4.724817 | 3.745018 | 0.571340 | 0.669559 | 0.720960 | 0.853179 | 1.266899 |
+| LL tail | true | 4.835317 | 3.724398 | 0.769940 | 0.869400 | 0.917420 | 1.046220 | 1.441659 |
+
+- K2 融 K1 的当前判断：
+  - 技术上可以做，但不是轻量 wrapper 合并；K2 需要同时消费 K1 L1 输出的 gate/up 两半，执行 SwiGLU、route weight、整行 amax reduction，再写 FP8 activation 和 per-row scale；
+  - 当前 K1 GEMM 按 N tile 产生 `l1_out`，SwiGLU 和 scale 需要跨 `hidden=2048` 的整行信息；若直接塞进 K1 epilogue，会引入跨 tile 汇总 scale 或新的中间 staging，容易破坏 K1 主循环和 occupancy；
+  - graph replay 中 CPU launch overhead 已被 capture 摊掉，历史 LL stage timing 显示 K2 在 32/128 档约 `0.028 ms`，不是当前 LL 小 token 主瓶颈；
+  - 融合上限主要是省一个 K2 graph node、`l1_out` BF16 写读和 K2 kernel 自身设备时间，预计 8-128 token 收益多半是几个百分点级，256 可能略大，但需要 profiler 证据；若 K1 epilogue 变重或降 occupancy，容易把收益吃掉。
+- 后续建议：
+  - 不把 K2 融 K1 作为当前必做生产项；
+  - 若用户后续继续压 LL 小 token，再先用 profiler/阶段计时确认 32/64/128/256 下 K2 占比是否超过 `~10%`；
+  - 只有 K2+`l1_out` traffic 证明确实成为瓶颈时，再立项做 K1/K2 合同级 prototype，并必须覆盖 LL no-tail/tail、graph/eager、uneven、8/32/64/128/256 correctness 和性能不劣化。
+
+## 2026-06-16 - Latest V3 normal eager refresh
+
+- 用户要求重刷最新 V3 normal eager 性能。
+- 远端状态：
+  - 运行前 8 卡 VRAM/HCU 均空闲，`hy-smi --showpids` 无 KFD 进程；
+  - 运行后 `hy-smi --showpids` 仍无 KFD 进程残留；
+  - 输出目录：`hygon_tmp/sglang_debug/normal_eager_refresh_20260616_143314/`；
+  - 命令口径：V3 normal backend，eager，auto K1 prebuild mode，`warmup=5`、`repeat=10`、`correctness_iters=1`，no-tail/tail 均覆盖。
+- 结果，18/18 case 均 pass 且 `correct=True`：
+
+| tokens/rank | no-tail fused ms | no-tail baseline ms | no-tail speedup | tail fused ms | tail baseline ms | tail speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 1.580579 | 3.014778 | 1.9074x | 1.612399 | 3.003118 | 1.8625x |
+| 512 | 1.693419 | 3.179158 | 1.8774x | 1.756319 | 3.224318 | 1.8358x |
+| 1024 | 2.077039 | 3.674278 | 1.7690x | 2.021579 | 3.692378 | 1.8265x |
+| 1025 | 2.158799 | 3.631338 | 1.6821x | 2.138479 | 3.637958 | 1.7012x |
+| 2048 | 3.354978 | 5.515377 | 1.6439x | 3.316958 | 5.509137 | 1.6609x |
+| 2050 | 3.363358 | 5.432777 | 1.6153x | 3.323778 | 5.508837 | 1.6574x |
+| 4096 | 5.913157 | 9.552534 | 1.6155x | 5.831117 | 9.524435 | 1.6334x |
+| 4097 | 5.893257 | 9.481355 | 1.6088x | 5.845857 | 9.499595 | 1.6250x |
+| 8192 | 10.790015 | 17.325931 | 1.6057x | 10.749434 | 17.274311 | 1.6070x |
+
+- 结论：
+  - 当前 normal eager 最新性能与上一轮 auto-rule no-tail 矩阵一致，8192 维持 `~10.75-10.79 ms`，没有回到旧 asm-route `12ms+` 档；
+  - 4096 tail/no-tail 仍在 `~5.83-5.91 ms`，与 cleanup refresh `~5.81/5.84 ms` 同区间；
+  - tail 在 normal eager 大 token 下没有明显劣化，部分档位还略快于 no-tail，当前不需要单独调整 normal tail 默认策略。
+
+## 2026-06-16 - V3 LL block_m=64 at 256-token A/B
+
+- 用户要求确认 256 token/rank 时 `block_m=64` 是否可能优于当前 `block_m=32`。
+- 执行方式：
+  - 不改生产代码；远端用临时 `sitecustomize.py` monkey-patch `megamoe.large_opt.V3_LL_BLOCK_M`；
+  - 只测 LL no-tail，因为当前 no-tail 是 LL 性能路径；
+  - 输出目录：`hygon_tmp/sglang_debug/ll_blockm64_256_ab_clean_20260616_150434/`。
+- 清理：
+  - 第一轮手动 rank 启动方式发生分布式 hang，已清理 `/tmp/run_ll_blockm_ab.sh` 和对应 Python/KFD 进程；
+  - 清理后复查无残留 Python 测试进程；最终复测后也无相关 Python 残留。
+- graph capture1024/replay256 结果：
+
+| block_m | correctness | fused eager 1024 ms | graph replay 256 ms | 结论 |
+| ---: | --- | ---: | ---: | --- |
+| 32 | true | 4.723016 | 1.249939 | retained default |
+| 64 | true | 10.763655 | 3.216179 | 明显退化 |
+
+- exact eager bucket=256：
+  - `block_m=32` 与 `block_m=64` 都触发 correctness over-threshold（分别约 `0.01697`、`0.01563`），不作为性能判断依据；
+  - 该现象更像 LL exact-256 bucket 的 per-expert row capacity/headroom 太紧，而不是 block_m64 优化收益；当前 Phase 10 生产式 LL graph 使用 capture bucket 1024，replay256 correctness 是 clean 的。
+- 结论：
+  - 256 token/rank 下 `block_m=64` 没有收益，graph replay 约慢 `2.57x`；
+  - retained LL `block_m=32` 继续保留；
+  - 后续若要看 eager 256，应先单独处理 exact-256 bucket row headroom/capacity，而不是把 block_m64 当优化项。
+
+## 2026-06-16 - V3 LL exact 256/512 headroom fix
+
+- 用户要求：LL 实际执行至少支持到 512 tokens/rank；graph capture tokens 可能更大，但不能依赖大 capture bucket 掩盖 exact eager bucket 的容量问题。
+- 根因：
+  - exact eager 256 的 expected rows/expert 为 `ceil(256*6/32)=48`，旧策略不补 headroom，最终每 expert 只有 64 rows；
+  - 随机路由可能让某个 local expert 超过 64 rows，K1 LL staged rows 被截断，导致 correctness over-threshold；
+  - graph capture1024/replay256 之前能过，是因为 capture bucket 提供了更大的 rows/expert capacity，不代表 exact 256/512 eager 安全。
+- 代码修复：
+  - `k1_fused_ext.cu` 新增 `kLlHeadroomExpectedRowsThreshold = 48` 和 `kLlHeadroomRows = 64`；
+  - `ll_expected_rows_per_expert >= 48` 时补一块 64-row headroom；
+  - 保留 32/128 tiny bucket 原容量，exact 256/512 获得 headroom；
+  - `tests/test_dcu_megamoe_v3.py` 增加 source guard，防止旧 `>=160 ? 64 : 0` 策略回流。
+- 本地验证：
+  - `python -m compileall tests/test_dcu_megamoe_v3.py` 通过；
+  - `git diff --check` 通过。
+- 远端验证：
+  - 显式同步 `k1_fused_ext.cu` / `tests/test_dcu_megamoe_v3.py`；
+  - `python3 -m compileall tests/test_dcu_megamoe_v3.py megamoe/dcu_megamoe_large_opt/K1_fused/k1_fused_ext.cu` 通过；
+  - `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`7 passed`；
+  - 删除 K1 object 后 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，确认 K1 重新 hipcc 编译；
+  - 输出目录：`hygon_tmp/sglang_debug/ll_exact512_headroom_fix_20260616_151830/`；
+  - 测试前后 `hy-smi --showpids` 无 KFD 进程残留。
+
+| mode | tail | tokens/capture | correct | eager/capture-bucket ms | baseline ms | replay token ms |
+| --- | ---: | ---: | --- | ---: | ---: | --- |
+| eager | 0 | 32 | True | 0.628280 | 2.808579 |  |
+| eager | 0 | 128 | True | 0.819619 | 2.842279 |  |
+| eager | 0 | 256 | True | 1.227839 | 2.915279 |  |
+| eager | 0 | 512 | True | 2.191659 | 3.253159 |  |
+| eager | 1 | 32 | True | 0.632459 | 2.804659 |  |
+| eager | 1 | 128 | True | 0.842480 | 2.876918 |  |
+| eager | 1 | 256 | True | 1.277139 | 2.987038 |  |
+| eager | 1 | 512 | True | 2.308979 | 3.219738 |  |
+| graph | 0 | 1024 | True | 4.709938 | 3.725738 | 256: 1.268140; 512: 2.232419 |
+| graph | 1 | 1024 | True | 4.895618 | 3.721958 | 256: 1.449939; 512: 2.372699 |
+
+- 结论：
+  - exact eager 256/512 no-tail/tail 已恢复 correctness；
+  - graph capture1024 replay256/512 仍保持 correctness；no-tail replay 相比 exact eager 只慢约 `0.040/0.041 ms`，tail replay 慢约 `0.173/0.064 ms`；
+  - `block_m=64` 仍不作为优化方向，headroom fix 才是 exact 256/512 的根因修复；
+  - LL 的生产上界按用户要求覆盖到至少 512 tokens/rank，capture bucket 更大时仍按 runtime tokens 执行。
+
+## 2026-06-16 - V3 LL graph tail reduce runtime-token fix
+
+- 用户要求修复 K2 和 LL tail reduce/signal 还不是完全 runtime-token 化的问题，重点是 graph 同 runtime size 下 tail 比 eager/no-tail 慢。
+- 根因复核：
+  - K2 graph launcher 形状仍是 capture bucket 固定 grid，这是 CUDA graph 静态 launch 形状限制；当前 graph 路径已经始终传入 `row_combine_ptrs`，K2 kernel 对 inactive row 执行 `row_combine_ptrs[row] == 0` early-return，避免真实 SwiGLU/quant 计算。进一步缩小 K2 grid 需要 graph exec update 或 compact row-list 合同，不作为本次小修。
+  - LL tail reduce 的 K3 C path 在 graph replay 时仍按 capture `num_tokens=1024` 扫 `reduce_y`，导致 replay 8/32/64/128/256/512 都多做 capture bucket 级别的 reduce work。
+- 代码修复：
+  - `large_opt.py` 在 graph tail path 将 `state.scratch.graph_runtime_num_tokens` 传给 K3 V3 wrapper；
+  - `k3_fused.py` 给 V3 K3 wrapper 增加 `graph_runtime_num_tokens` 参数，并透传给 `k3_v3_ll_combine_tail`；
+  - `k3_v3_fused_ext.cu` 增加可选 `runtime_num_tokens_tensor` pybind 参数和 host launcher 指针；
+  - `k3_v3_pack5_groupgemm_impl.cuh` 的 `v3_k3_tail_reduce_worker_device` 用 `effective_num_tokens = clamp(runtime_num_tokens[0], 0, capture_num_tokens)` 限定 reduce vec 数；
+  - `tests/test_dcu_megamoe_v3.py` 增加 source guard，防止 K3 LL tail graph 退回 capture token reduce。
+- 验证：
+  - 本地 `compileall` 通过，`git diff --check` 通过；
+  - 远端 `compileall` + `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`7 passed`；
+  - 删除 K3 V3 object 后 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过；
+  - 输出目录：`hygon_tmp/sglang_debug/ll_runtime_tail_tokens_20260616/`。
+- graph capture1024 replay 性能刷新：
+
+| mode | correct | capture bucket ms | graph replay 8 ms | 32 ms | 64 ms | 128 ms | 256 ms | 512 ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| LL no-tail | true | 4.745158 | 0.569840 | 0.666400 | 0.714360 | 0.838739 | 1.266799 | 2.200319 |
+| LL tail | true | 4.887598 | 0.553399 | 0.649480 | 0.705980 | 0.849259 | 1.283039 | 2.240819 |
+
+- eager tail sanity：
+
+| mode | tokens | correct | fused ms | baseline ms |
+| --- | ---: | --- | ---: | ---: |
+| LL tail eager | 256 | true | 1.260800 | 2.717559 |
+| LL tail eager | 512 | true | 2.364599 | 3.043638 |
+
+- 结论：
+  - tail graph replay 256 从旧 `~1.44 ms` 降到 `~1.28 ms`，512 从旧 `~2.37 ms` 降到 `~2.24 ms`，已接近 no-tail 同 size；
+  - 小 token tail replay 8/32/64 也不再被 capture1024 reduce work 拖慢；
+  - K2 剩余固定 grid 成本是 graph 静态形状限制下的外壳成本，当前通过 rowptr early-return 控制住，未发现需要高风险合同改造的收益证据；
+  - 本修复不改变 eager tail 的生产路径，eager 256/512 correctness 与性能保持正常。

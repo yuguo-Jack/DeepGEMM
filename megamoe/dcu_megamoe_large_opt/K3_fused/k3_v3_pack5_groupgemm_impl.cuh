@@ -803,6 +803,7 @@ __device__ static inline void v3_k3_tail_reduce_worker_device(
     int num_experts,
     int num_max_tokens_per_rank,
     int num_tokens,
+    const int32_t* runtime_num_tokens,
     int num_topk,
     int hidden,
     int threads_per_worker = 768) {
@@ -815,9 +816,17 @@ __device__ static inline void v3_k3_tail_reduce_worker_device(
     const int reduce_tid = static_cast<int>(threadIdx.x);
     if (reduce_tid >= reduce_threads)
         return;
+    int effective_num_tokens = num_tokens;
+    if (runtime_num_tokens != nullptr) {
+        effective_num_tokens = runtime_num_tokens[0];
+        if (effective_num_tokens < 0)
+            effective_num_tokens = 0;
+        if (effective_num_tokens > num_tokens)
+            effective_num_tokens = num_tokens;
+    }
     const int vecs_per_token = hidden / kBf16PerVec;
     const int64_t total_reduce_vecs =
-        static_cast<int64_t>(num_tokens) * vecs_per_token;
+        static_cast<int64_t>(effective_num_tokens) * vecs_per_token;
     const uint16_t* combine_base = deep_gemm::mega::get_sections(
         local_sym_buffer, num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk, hidden).combine;
@@ -888,6 +897,7 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
     int num_experts = 0,
     int num_max_tokens_per_rank = 0,
     int num_tokens = 0,
+    const int32_t* runtime_num_tokens = nullptr,
     int num_topk = 0,
     int signal_generation = 1,
     const int32_t* signal_generation_ptr = nullptr,
@@ -924,7 +934,8 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
                 v3_k3_tail_reduce_worker_device(
                     reduce_y, sym_buffer, reducer_idx, reduce_blocks,
                     num_ranks, num_experts, num_max_tokens_per_rank,
-                    num_tokens, num_topk, kN, static_cast<int>(blockDim.x));
+                    num_tokens, runtime_num_tokens, num_topk, kN,
+                    static_cast<int>(blockDim.x));
             }
             return;
         }
@@ -1196,7 +1207,8 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
                 v3_k3_tail_reduce_worker_device(
                     reduce_y, sym_buffer, 0, 1,
                     num_ranks, num_experts, num_max_tokens_per_rank,
-                    num_tokens, num_topk, kN, static_cast<int>(blockDim.x));
+                    num_tokens, runtime_num_tokens, num_topk, kN,
+                    static_cast<int>(blockDim.x));
             }
         }
     }

@@ -5088,23 +5088,41 @@
   - `ceil(tokens_per_rank * topk / local_experts)`, aligned to 64 rows;
   - for 1024 tokens/rank, `1024 * 6 / 32 = 192`, and aligned capacity was still 192.
 - Random routing is not guaranteed to keep every local expert at or below the mean. Once one expert bucket exceeded 192 rows, K1 LL clipped staged rows by `m_per_expert`; `cumulative_local_expert_recv_stats` then disagreed with the baseline expert counts, and no-tail could also show large output diff.
-- The fix adds host-side headroom only for larger LL buckets:
+- The initial fix added host-side headroom only for larger LL buckets:
   - 512 keeps rows/expert at 128;
   - 768 keeps rows/expert at 192;
   - 896/960/1024 move from 192 to 256.
-- This preserves the already tuned 32/128/512 small-token behavior while making the 1024 capture bucket safe for correctness testing.
-- Follow-up A/B refined the threshold:
-  - 513 is a sensitive boundary: the first headroom version moved 513 from 128 to 192 rows/expert and slowed no-tail/tail from no-headroom `2.200559/2.298519 ms` to `2.343639/2.477599 ms`;
-  - 513 does not need headroom in the checked random route case and passes with no-headroom;
-  - 896/1024 do need headroom; no-headroom fails these large buckets, while refined headroom passes;
-  - production threshold is therefore narrowed to `ll_expected_rows_per_expert >= 160 ? 64 : 0`, so 512/513 stay at the original capacity and 896/1024 get one extra tile.
+- That initial fix preserved the already tuned 32/128/512 small-token behavior while making the 1024 capture bucket safe for correctness testing; this was later superseded by the exact 256/512 eager fix below.
+- Follow-up A/B initially narrowed the threshold to `expected rows/expert >= 160`, but that conclusion is superseded:
+  - exact eager bucket 256 later reproduced the same capacity overflow class that graph capture1024/replay256 had hidden with a larger captured capacity;
+  - production now uses `ll_expected_rows_per_expert >= 48 ? 64 : 0`, so exact 256 and 512 get one 64-row tile of headroom while 32/128 tiny buckets keep their original capacity;
+  - this makes LL actual execution safe up to at least 512 tokens/rank even when graph capture tokens are much larger.
 - Performance interpretation:
   - old small-token guards are unchanged or slightly better within noise: LL tail 32 `0.711300 ms`, 128 uneven graph replay 32/96/128 `0.712760/0.786380/0.801960 ms`;
   - refined 513 no-tail/tail is `2.193979/2.279979 ms`, matching the no-headroom performance class while preserving correctness;
   - LL graph capture1024 is now correct, but 1024 LL replay/eager sits around `4.7-4.9 ms`, so it should remain correctness/capture coverage rather than the production large-token route;
   - normal backend remains the intended production path for >=512 tokens per rank.
 - Follow-up:
-  - if 512/768 or uneven workloads later show rare route overflow, consider making LL rows/expert headroom a direct capacity-percentile policy instead of the current conservative threshold rule.
+  - if future 512/768 or uneven workloads still show rare route overflow, consider making LL rows/expert headroom a direct capacity-percentile policy instead of the current fixed threshold rule.
+
+## 2026-06-16 V3 LL exact 256/512 row-capacity fix
+
+- Symptom:
+  - after the graph runtime-row fix, `capture=1024` graph replay 256/512 stayed correct, but exact eager bucket 256 could still exceed tolerance;
+  - both `block_m=32` and `block_m=64` failed exact eager 256 before the capacity fix, so this was not a block_m tuning issue.
+- Root cause:
+  - graph replay captured with bucket 1024 had enough K1 LL row capacity and masked the issue;
+  - exact eager bucket 256 used `ceil(256*6/32)=48` expected rows/expert, aligned to 64 rows/expert with no slack;
+  - random routing can put more than 64 local rows into one expert, so K1 clips staged rows and K3 consumes incomplete metadata.
+- Fix:
+  - lower the LL headroom threshold to `kLlHeadroomExpectedRowsThreshold = 48`;
+  - add one `kLlHeadroomRows = 64` tile for expected rows/expert >= 48;
+  - preserve exact 32/128 tiny buckets unchanged, while exact 256/512 now have one tile of row headroom.
+- Verification:
+  - source guard added in `tests/test_dcu_megamoe_v3.py` so the old `>=160 ? 64 : 0` rule cannot silently return;
+  - remote `tests/test_dcu_megamoe_v3.py` passed 7/7 and K1 object was rebuilt;
+  - exact eager 32/128/256/512 no-tail and tail all passed;
+  - graph capture1024 replay 256/512 no-tail and tail also passed.
 
 ## 2026-06-15 Phase 10 LL graph replay completion
 
@@ -5289,3 +5307,37 @@
   - source guard rejects host/ASM absolute branch reintroduction;
   - ASM route emit and stage load now only distinguish default uint32-offset MUBUF and bit2 `{rank-local offset, source_rank}` MUBUF.
 - Perf verification is still required after card contention clears, but the static/codegen direction is now simpler: bit1 has no production semantics.
+
+## 2026-06-16 V3 LL graph to-256 refresh and K2 fusion feasibility
+
+- Refreshed V3 LL graph replay with capture bucket `1024` and replay tokens `8,32,64,128,256`:
+  - no-tail replay: `0.571/0.670/0.721/0.853/1.267 ms`;
+  - tail replay: `0.770/0.869/0.917/1.046/1.442 ms`;
+  - both modes were correctness-clean, and no remote KFD test process remained after the run.
+- Current staged LL boundary:
+  - K1 returns `l1_out`, `route_weights`, `m_indices`, `output_index`, and `row_combine_ptrs`;
+  - K2 consumes `l1_out` plus row metadata, applies SwiGLU, route weight, clamp, row-wise amax reduction, and FP8 quantization;
+  - K3 consumes `act_fp8` and `act_scale`.
+- Fusing K2 into K1 is possible only as a K1/K2 contract-level kernel redesign, not as a small wrapper cleanup:
+  - SwiGLU needs both halves of K1 output (`gate` and `up`) for the same row/channel;
+  - FP8 scale needs a reduction across the full hidden row;
+  - current K1 GEMM is tiled over N, so a K1 epilogue would need cross-tile scale aggregation or an equivalent staging pass before quantization.
+- Expected benefit is limited unless profiling proves otherwise:
+  - graph replay already removes most CPU launch overhead;
+  - historical LL stage timing puts K2 around `0.028 ms` for 32/128 tokens, while K1 and K3 dominate;
+  - likely savings are the K2 graph node, `l1_out` BF16 write/read traffic, and the small K2 device time, but a heavier K1 epilogue could reduce occupancy and erase the gain.
+- Recommendation:
+  - keep K2 separate for the current production path;
+  - only revisit K2-in-K1 after profiler evidence shows K2 plus `l1_out` traffic is a meaningful fraction of LL replay time at 32/64/128/256;
+  - any prototype must prove no regression for LL no-tail/tail, eager/graph, uniform/uneven, and the current small-token performance envelope.
+
+## 2026-06-16 V3 LL tail reduce should consume runtime tokens in graph replay
+
+- The earlier LL graph tail slowdown was not a fundamental tail-reduce limit; K3 LL tail reduce was still looping over capture `num_tokens` during replay.
+- Production fix threads graph runtime token tensor through `large_opt.py -> k3_fused.py -> k3_v3_fused_ext.cu -> V3_K3_LowLatencyMaskedGroupGemmKernel`.
+- The device reducer now clamps `effective_num_tokens` from the runtime tensor and uses it for `total_reduce_vecs`, so capture1024/replay256 reduces 256 tokens, not 1024.
+- Refreshed capture1024 replay results after the fix:
+  - no-tail `8/32/64/128/256/512 = 0.570/0.666/0.714/0.839/1.267/2.200 ms`;
+  - tail `8/32/64/128/256/512 = 0.553/0.649/0.706/0.849/1.283/2.241 ms`;
+  - all graph buckets were correctness-clean.
+- K2 remains graph-shape fixed, but graph path passes `row_combine_ptrs` and K2 kernels early-return on inactive rows. Fully shrinking K2 grid is a larger graph-update/compact-row-list design item, not a safe local fix.

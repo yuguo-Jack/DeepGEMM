@@ -752,6 +752,7 @@ def _run_large_opt_3stage_graph(
             k3_kwargs["backend"] = v3_backend
             if v3_backend == "ll":
                 k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+                k3_kwargs["graph_runtime_num_tokens"] = state.scratch.graph_runtime_num_tokens
         k3_launcher(
             act_fp8,
             act_scale,
