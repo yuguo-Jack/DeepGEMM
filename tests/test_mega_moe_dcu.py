@@ -29,6 +29,7 @@ from triton_ops import (
     triton_ep_gather_channelwise,
     triton_ep_scatter_channelwise,
 )
+from megamoe.dcu_megamoe_large_opt.v3_config import get_v3_backend, v3_requested
 from megamoe.dcu_megamoe_large_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
 
 
@@ -345,6 +346,10 @@ def safe_div(numerator: float, denominator: float) -> float:
     return float("nan") if denominator == 0 else numerator / denominator
 
 
+def nonfinite_count(tensor: torch.Tensor) -> int:
+    return int((~torch.isfinite(tensor.float())).sum().item()) if tensor.numel() else 0
+
+
 def pct(numerator: float, denominator: float) -> float:
     return safe_div(numerator, denominator) * 100.0
 
@@ -427,8 +432,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
 
+    large_opt_enabled_for_weights = False
     if args.stages_fused_cuda_graph:
         fused_execution = "large_opt_3stage_graph"
+        large_opt_enabled_for_weights = True
     elif args.big_fused_cuda_graph:
         fused_execution = "persistent_fused_graph"
     else:
@@ -446,6 +453,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 and dispatch_num_tokens_for_display > large_opt_threshold
             )
         )
+        large_opt_enabled_for_weights = large_opt_enabled
         fused_execution = "large_opt_3stage" if large_opt_enabled else "persistent_fused"
     print_once(rank, "DCU MegaMoE channelwise W8A8 test:")
     print_once(rank, f" > megamoe: {getattr(megamoe, '__file__', None)}")
@@ -495,7 +503,32 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     topk_weights = torch.softmax(topk_weights.float(), dim=-1)
 
     x_fp8, x_scale = megamoe.cast_to_fp8_channelwise(x_bf16)
-    l1_weights, l2_weights = megamoe.transform_fp8_weights_for_mega_moe(l1_bf16, l2_bf16)
+    baseline_l1_weights, baseline_l2_weights = megamoe.transform_fp8_weights_for_mega_moe(
+        l1_bf16,
+        l2_bf16,
+    )
+    fused_l1_weights = baseline_l1_weights
+    fused_l2_weights = baseline_l2_weights
+    if large_opt_enabled_for_weights and v3_requested():
+        from megamoe.dcu_megamoe_large_opt import v3_layout
+
+        v3_backend = get_v3_backend()
+        l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
+        l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
+        if v3_backend == "normal":
+            fused_l1_weights = (
+                v3_layout.flatten_pack5_weight_asm_normal(l1_fp8),
+                l1_scale,
+            )
+            fused_l2_weights = (
+                v3_layout.flatten_pack5_weight_asm_normal(l2_fp8),
+                l2_scale,
+            )
+            print_once(rank, " > V3 staged layout: L1/L2 normal ASM plain-pack5")
+        else:
+            fused_l1_weights = (v3_layout.flatten_pack5_weight(l1_fp8), l1_scale)
+            fused_l2_weights = (v3_layout.flatten_pack5_weight(l2_fp8), l2_scale)
+            print_once(rank, " > V3 staged layout: L1/L2 pack5")
     stats_initial = torch.randint(0, 100, (num_experts_per_rank,), dtype=torch.int32, device="cuda")
     stats_fused = stats_initial.clone()
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
@@ -514,8 +547,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dispatch_num_tokens = args.dispatch_num_tokens if args.dispatch_num_tokens >= 0 else None
         megamoe.fp8_w8a8_mega_moe(
             y_fused,
-            l1_weights,
-            l2_weights,
+            fused_l1_weights,
+            fused_l2_weights,
             sym_buffer,
             cumulative_local_expert_recv_stats=stats_fused,
             activation_clamp=args.activation_clamp,
@@ -545,8 +578,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             x_scale,
             topk_idx,
             topk_weights,
-            l1_weights,
-            l2_weights,
+            baseline_l1_weights,
+            baseline_l2_weights,
             num_experts,
             num_experts_per_rank,
             intermediate_hidden,
@@ -606,8 +639,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         def run_graph_bucket_once():
             megamoe.fp8_w8a8_mega_moe(
                 y_graph,
-                l1_weights,
-                l2_weights,
+                fused_l1_weights,
+                fused_l2_weights,
                 sym_buffer,
                 cumulative_local_expert_recv_stats=None,
                 activation_clamp=args.activation_clamp,
@@ -650,8 +683,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 graph_x_scale[:local_token],
                 graph_topk_idx[:local_token],
                 graph_topk_weights[:local_token],
-                l1_weights,
-                l2_weights,
+                baseline_l1_weights,
+                baseline_l2_weights,
                 num_experts,
                 num_experts_per_rank,
                 intermediate_hidden,
@@ -662,13 +695,49 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 layout_cache=None,
                 return_stats=False,
             )
+            graph_nonfinite = nonfinite_count(y_graph[:local_token])
+            baseline_nonfinite = nonfinite_count(baseline_y)
             diff = (y_graph[:local_token].float() - baseline_y.float()).abs()
+            diff_nonfinite = nonfinite_count(diff)
             max_abs = diff.max().item() if diff.numel() else 0.0
             mean_abs = diff.mean().item() if diff.numel() else 0.0
-            if max_abs > args.atol:
+            if graph_nonfinite or baseline_nonfinite or diff_nonfinite:
                 raise AssertionError(
                     f"cuda graph bucket token={token} local_token={local_token} "
-                    f"max_abs={max_abs} exceeds --atol={args.atol}"
+                    f"nonfinite graph={graph_nonfinite} baseline={baseline_nonfinite} "
+                    f"diff={diff_nonfinite}"
+                )
+            if max_abs > args.atol:
+                flat_idx = int(diff.argmax().item()) if diff.numel() else 0
+                row_idx = flat_idx // hidden if hidden else 0
+                col_idx = flat_idx % hidden if hidden else 0
+                graph_value = (
+                    float(y_graph[:local_token].flatten()[flat_idx].float().item())
+                    if diff.numel()
+                    else 0.0
+                )
+                baseline_value = (
+                    float(baseline_y.flatten()[flat_idx].float().item())
+                    if diff.numel()
+                    else 0.0
+                )
+                graph_runtime_debug = (
+                    int(sym_buffer.cuda_graph_num_tokens.detach().cpu().item())
+                    if hasattr(sym_buffer, "cuda_graph_num_tokens")
+                    else -1
+                )
+                graph_active_tiles_debug = (
+                    int(sym_buffer.route_scratch.view(torch.int32)[64].detach().cpu().item())
+                    if hasattr(sym_buffer, "route_scratch")
+                    else -1
+                )
+                raise AssertionError(
+                    f"cuda graph bucket token={token} local_token={local_token} "
+                    f"max_abs={max_abs} exceeds --atol={args.atol}; "
+                    f"argmax=({row_idx},{col_idx}) "
+                    f"graph={graph_value} baseline={baseline_value}; "
+                    f"graph_runtime={graph_runtime_debug} "
+                    f"active_tiles={graph_active_tiles_debug}"
                 )
             print_once(
                 rank,
@@ -729,10 +798,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     for i in range(args.correctness_iters):
         fused_y, fused_stats = run_fused(reset_stats=True)
         baseline_y, baseline_stats, _ = run_baseline(return_stats=True)
+        # The DeepEP baseline oracle uses internal async streams; isolate it
+        # before comparing or starting the next fused iteration.
+        torch.cuda.synchronize()
+        fused_nonfinite = nonfinite_count(fused_y)
+        baseline_nonfinite = nonfinite_count(baseline_y)
         diff = (fused_y.float() - baseline_y.float()).abs()
+        diff_nonfinite = nonfinite_count(diff)
         max_abs = diff.max().item() if diff.numel() else 0.0
         mean_abs = diff.mean().item() if diff.numel() else 0.0
         stats_ok = torch.equal(fused_stats, baseline_stats)
+        if fused_nonfinite or baseline_nonfinite or diff_nonfinite:
+            raise AssertionError(
+                f"fused/baseline nonfinite fused={fused_nonfinite} "
+                f"baseline={baseline_nonfinite} diff={diff_nonfinite}"
+            )
         if max_abs > args.atol:
             raise AssertionError(f"fused/baseline max_abs={max_abs} exceeds --atol={args.atol}")
         if not stats_ok:

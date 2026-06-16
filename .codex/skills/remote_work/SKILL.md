@@ -1,6 +1,6 @@
 ---
 name: remote-ssh-docker-workflow
-description: Run remote compile, test, profiling, and debug tasks through SSH plus docker exec while keeping code edits local and synced to the remote node. Use when Codex must validate environment readiness, check ROCm/DTK/Hygon GPU card status, inspect Python packages, verify host-to-container workspace mounts, or execute project commands inside a remote container. Defaults for this DeepDEMM workspace are hg@10.17.176.13:22, Docker container megamoe, host /home/hg/yuguo mapped to container /workspace, and repo path /home/hg/yuguo/DeepDEMM mapped to /workspace/DeepDEMM.
+description: Run remote compile, test, profiling, and debug tasks through SSH plus docker exec while keeping code edits local and synced to the remote node. Use when Codex must validate environment readiness, check ROCm/DTK/Hygon GPU card status, inspect Python packages, verify host-to-container workspace mounts, or execute project commands inside a remote container. Defaults for this DeepGEMM workspace are hg@10.17.176.11:22, Docker container sglang_megamoe, host /home/hg/yuguo mapped to container /workspace, and repo path /home/hg/yuguo/DeepGEMM mapped to /workspace/DeepGEMM.
 ---
 
 # Remote SSH Docker Workflow (Simplified)
@@ -15,8 +15,9 @@ Follow this rule for all downstream remote skills:
 - Every `docker exec` command that runs inside the container must source DTK first with `source /opt/dtk/env.sh && ...`.
 - Host-side Docker management commands such as `docker ps`, `docker inspect`, and `docker start` do not run inside the container and do not source `/opt/dtk/env.sh`.
 - Avoid direct remote-host compilation and testing outside Docker unless explicitly requested.
+- Put temporary logs, status files, profiler output, and debug artifacts under the repo's `hygon_tmp/` tree, for example `$CONTAINER_REPO/hygon_tmp/sglang_debug/`; do not scatter project artifacts under `/tmp`.
 - For this workspace, the host mount root is `/home/hg/yuguo` and the container mount root is `/workspace`.
-- The local project may not be uploaded yet. Before first upload, remote `/home/hg/yuguo/DeepDEMM` and container `/workspace/DeepDEMM` may be missing; treat that as setup state, not an environment failure.
+- The local project may not be uploaded yet. Before first upload, remote `/home/hg/yuguo/DeepGEMM` and container `/workspace/DeepGEMM` may be missing; treat that as setup state, not an environment failure.
 
 ## Parameters
 
@@ -27,23 +28,23 @@ Derive connection details from `.vscode/sftp.json` first instead of hardcoding h
 - `SSH_PORT`: read from `.vscode/sftp.json` field `port`
 - `SSH_KEY`: read from `.vscode/sftp.json` field `privateKeyPath`
 - `SSH_TARGET`: `$SSH_USER@$SSH_HOST`
-- `DOCKER_NAME`: default `megamoe` unless the project specifies otherwise
+- `DOCKER_NAME`: default `sglang_megamoe` unless the project specifies otherwise
 - `REMOTE_PATH`: read from `.vscode/sftp.json` field `remotePath`
 - `HOST_MOUNT_ROOT`: default `/home/hg/yuguo`
 - `CONTAINER_WORKSPACE`: default `/workspace`
-- `CONTAINER_REPO`: replace the `HOST_MOUNT_ROOT` prefix in `REMOTE_PATH` with `CONTAINER_WORKSPACE`; for this project that yields `/workspace/DeepDEMM`
+- `CONTAINER_REPO`: replace the `HOST_MOUNT_ROOT` prefix in `REMOTE_PATH` with `CONTAINER_WORKSPACE`; for this project that yields `/workspace/DeepGEMM`
 
 For this project:
 
-- `host` = `10.17.176.13`
+- `host` = `10.17.176.11`
 - `username` = `hg`
 - `port` = `22`
 - `privateKeyPath` = `C:/Users/Administrator/.ssh/id_rsa`
-- `remotePath` = `/home/hg/yuguo/DeepDEMM`
-- `DOCKER_NAME` = `megamoe`
+- `remotePath` = `/home/hg/yuguo/DeepGEMM`
+- `DOCKER_NAME` = `sglang_megamoe`
 - `HOST_MOUNT_ROOT` = `/home/hg/yuguo`
 - `CONTAINER_WORKSPACE` = `/workspace`
-- `CONTAINER_REPO` = `/workspace/DeepDEMM`
+- `CONTAINER_REPO` = `/workspace/DeepGEMM`
 
 ## Read Parameters From sftp.json
 
@@ -56,7 +57,7 @@ $SSH_USER = $Sftp.username
 $SSH_PORT = $Sftp.port
 $SSH_KEY = $Sftp.privateKeyPath
 $SSH_TARGET = "$SSH_USER@$SSH_HOST"
-$DOCKER_NAME = "megamoe"
+$DOCKER_NAME = "sglang_megamoe"
 $REMOTE_PATH = $Sftp.remotePath
 $HOST_MOUNT_ROOT = "/home/hg/yuguo"
 $CONTAINER_WORKSPACE = "/workspace"
@@ -82,7 +83,7 @@ Example temporary-key workflow:
 
 ```powershell
 $SSH_KEY_SRC = $Sftp.privateKeyPath
-$SSH_KEY = Join-Path $env:TEMP "DeepDEMM_id_rsa"
+$SSH_KEY = Join-Path $env:TEMP "DeepGEMM_id_rsa"
 Copy-Item -LiteralPath $SSH_KEY_SRC -Destination $SSH_KEY -Force
 icacls $SSH_KEY /inheritance:r /grant:r "$((whoami)):F"
 ```
@@ -196,7 +197,7 @@ ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker exec $DOCKER_NAME bash -
 
 ## Sync Back Container Outputs
 
-Files generated inside `megamoe` are usually owned by `root` on the host bind mount. Downloading them from the host as `hg` works only when host permissions allow read and directory traversal.
+Files generated inside `sglang_megamoe` are usually owned by `root` on the host bind mount. Downloading them from the host as `hg` works only when host permissions allow read and directory traversal.
 
 - `root:root` files with mode `0644` and directories with mode `0755` can be pulled by `scp` or SFTP.
 - `root:root` files with mode `0600` or directories with mode `0700` cannot be pulled by `hg`; expect `Permission denied`.
@@ -210,7 +211,7 @@ scp -F NUL -P $SSH_PORT -i $SSH_KEY -r "${SSH_TARGET}:$REMOTE_PATH/<output_dir>"
 
 - If ownership cannot be changed, use `source /opt/dtk/env.sh && chmod -R u+rwX,go+rX <output_dir>` in Docker as a read-only pull fallback. Avoid broad `chmod 777`.
 - In PowerShell, write remote scp paths as `"${SSH_TARGET}:$REMOTE_PATH/<path>"`; `"$SSH_TARGET:$REMOTE_PATH"` is parsed incorrectly.
-- Avoid creating `/workspace/DeepDEMM` as root before the first upload. If the repo path is not uploaded yet, create sync-back tests under `/workspace/.codex_*` or upload the project first.
+- Avoid creating `/workspace/DeepGEMM` as root before the first upload. If the repo path is not uploaded yet, create sync-back tests under `/workspace/.codex_*` or upload the project first.
 
 ## Failure Handling
 
@@ -222,6 +223,6 @@ ssh -F NUL $SSH_TARGET -p $SSH_PORT -i $SSH_KEY "docker start $DOCKER_NAME"
 
 - If authentication fails before reaching the remote shell, check for local OpenSSH ACL problems on `~/.ssh/config` or the private key and switch to `-F NUL` plus a temporary key copy.
 - If `.vscode/sftp.json` host differs from the skill default, trust `.vscode/sftp.json`.
-- If the host shell resolves to a different home prefix while `remotePath` is `/home/hg/yuguo/DeepDEMM`, treat the configured `remotePath` as the source of truth and verify the file directly with `ls`.
+- If the host shell resolves to a different home prefix while `remotePath` is `/home/hg/yuguo/DeepGEMM`, treat the configured `remotePath` as the source of truth and verify the file directly with `ls`.
 - If `rocm-smi` is unavailable in container, run it on host once to confirm driver state, then return to Docker workflow.
 - If package or import checks fail, treat environment mismatch separately from code regressions.

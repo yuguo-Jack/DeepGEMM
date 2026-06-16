@@ -43,6 +43,36 @@ def _large_opt_3stage_selected(num_tokens: int, mode: str, threshold: int) -> bo
     return False
 
 
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _v3_normal_symm_warmup_enabled(
+    requested_num_max_tokens_per_rank: int,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> bool:
+    if not _is_hip_backend():
+        return False
+    if _large_opt_3stage_mode() != "force":
+        return False
+    if not _env_flag_enabled("USE_MEGAMOE_V3"):
+        return False
+    backend = os.getenv("MEGAMOE_DCU_V3_BACKEND", "normal").strip().lower() or "normal"
+    if backend != "normal":
+        return False
+    if requested_num_max_tokens_per_rank < 512:
+        return False
+    if (num_experts, num_topk, hidden, intermediate_hidden) != (256, 6, 4096, 2048):
+        return False
+    return _env_flag_enabled("MEGAMOE_DCU_V3_SYMM_WARMUP_ALLOC", True)
+
+
 def _is_current_stream_capturing() -> bool:
     checker = getattr(torch.cuda, "is_current_stream_capturing", None)
     return bool(checker()) if checker is not None else False
@@ -122,6 +152,7 @@ class SymmBuffer:
         use_fp8_dispatch: bool = True,
         activation: str = "swiglu",
         cuda_graph_max_tokens_per_rank: Optional[int] = None,
+        prepare_large_opt_3stage: bool = True,
     ):
         if not _is_hip_backend():
             raise RuntimeError("megamoe is the HIP/DCU MegaMoE package")
@@ -215,7 +246,7 @@ class SymmBuffer:
         self.cuda_graph_num_tokens = slices[8]
         self.cuda_graph_num_tokens.fill_(self.cuda_graph_max_tokens_per_rank)
 
-        if self._large_opt_3stage_mode in {"force", "auto"}:
+        if prepare_large_opt_3stage and self._large_opt_3stage_mode in {"force", "auto"}:
             from .large_opt import prepare_large_opt_3stage
 
             prepare_large_opt_3stage(
@@ -264,6 +295,31 @@ def get_symm_buffer_for_mega_moe(
         num_max_tokens_per_rank,
         _C.get_token_alignment_for_mega_moe(),
     )
+    if _v3_normal_symm_warmup_enabled(
+        requested_num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+    ):
+        dummy_tokens = _align(1, _C.get_token_alignment_for_mega_moe())
+        dummy_buffer = None
+        try:
+            dummy_buffer = SymmBuffer(
+                group,
+                num_experts,
+                dummy_tokens,
+                num_topk,
+                hidden,
+                intermediate_hidden,
+                use_fp8_dispatch,
+                activation,
+                cuda_graph_max_tokens_per_rank=1,
+                prepare_large_opt_3stage=False,
+            )
+        finally:
+            if dummy_buffer is not None:
+                dummy_buffer.destroy()
     return SymmBuffer(
         group,
         num_experts,

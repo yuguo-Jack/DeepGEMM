@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from ..v3_config import normalize_v3_backend
 from . import k3_fused_ext as _ext
 
 
@@ -12,6 +13,8 @@ THIS_DIR = Path(__file__).resolve().parent
 K3_COMBINE_ASM_NAME = "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE"
 K3_COMBINE_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}.co"
 K3_COMBINE_TAIL_REDUCE_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_TAILREDUCE.co"
+K3_COMBINE_PACK5_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_PACK5.co"
+K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_TAILREDUCE_PACK5.co"
 
 
 def _ensure_prebuilt_code_object(co: Path, label: str) -> Path:
@@ -31,8 +34,29 @@ def ensure_k3_combine_tail_reduce_asm_code_object() -> Path:
     return _ensure_prebuilt_code_object(K3_COMBINE_TAIL_REDUCE_ASM_CO, "K3 tail-reduce")
 
 
+def ensure_k3_combine_pack5_asm_code_object() -> Path:
+    return _ensure_prebuilt_code_object(K3_COMBINE_PACK5_ASM_CO, "K3 V3 pack5 combine")
+
+
+def ensure_k3_combine_tail_reduce_pack5_asm_code_object() -> Path:
+    return _ensure_prebuilt_code_object(
+        K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO,
+        "K3 V3 pack5 tail-reduce",
+    )
+
+
 def load_extension(verbose: bool = False):
     return _ext
+
+
+def load_v3_ll_extension(verbose: bool = False):
+    try:
+        from . import k3_v3_fused_ext as _v3_ext
+    except ImportError as exc:
+        raise RuntimeError(
+            "V3 K3 LL pack5 extension is not built. Rebuild and reinstall the megamoe wheel."
+        ) from exc
+    return _v3_ext
 
 
 def build_asm_tail_signal_addrs(
@@ -74,7 +98,9 @@ def rank_barrier(
     k1_graph_reset_layout: tuple[int, int, int, int] | None = None,
     graph_runtime_num_tokens: torch.Tensor | None = None,
     graph_runtime_num_tokens_out: torch.Tensor | None = None,
+    graph_tail_signal_generation_out: torch.Tensor | None = None,
     graph_max_tokens: int = -1,
+    barrier_signal_slot_base: int = 18,
     verbose_build: bool = False,
 ) -> None:
     ext = load_extension(verbose=verbose_build)
@@ -99,7 +125,11 @@ def rank_barrier(
         meta_flags_numel,
         graph_runtime_num_tokens.contiguous() if graph_runtime_num_tokens is not None else None,
         graph_runtime_num_tokens_out.contiguous() if graph_runtime_num_tokens_out is not None else None,
+        graph_tail_signal_generation_out.contiguous()
+        if graph_tail_signal_generation_out is not None
+        else None,
         int(graph_max_tokens),
+        int(barrier_signal_slot_base),
     )
 
 
@@ -165,6 +195,7 @@ def k3_l2_fused_asm_to_combine(
     asm_done_target: int = 0,
     asm_signal_num_ranks: int = 0,
     asm_signal_generation: int = 0,
+    asm_signal_generation_tensor: torch.Tensor | None = None,
     asm_reduce_y: torch.Tensor | None = None,
     sym_buffer=None,
     num_ranks: int = 0,
@@ -176,6 +207,7 @@ def k3_l2_fused_asm_to_combine(
     prob_storage: torch.Tensor | None = None,
     active_tiles: torch.Tensor | None = None,
     graph_runtime_offset_from_active_tiles: int = 0,
+    ll_block_m: int = 32,
     verbose_build: bool = False,
 ) -> torch.Tensor | None:
     l2_weight, l2_scale = l2_weights
@@ -213,6 +245,9 @@ def k3_l2_fused_asm_to_combine(
             str(code_object),
             active_tiles.contiguous() if active_tiles is not None else None,
             int(graph_runtime_offset_from_active_tiles),
+            asm_signal_generation_tensor.contiguous()
+            if asm_signal_generation_tensor is not None
+            else None,
         )
     else:
         if asm_done_counter is not None or asm_signal_addrs is not None:
@@ -231,3 +266,148 @@ def k3_l2_fused_asm_to_combine(
             active_tiles.contiguous() if active_tiles is not None else None,
         )
     return None
+
+
+def k3_l2_fused_v3_to_combine(
+    act_fp8: torch.Tensor,
+    act_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    l2_weights: tuple[torch.Tensor, torch.Tensor],
+    row_combine_ptrs: torch.Tensor,
+    *,
+    backend: str,
+    asm_done_counter: torch.Tensor | None = None,
+    asm_signal_addrs: torch.Tensor | None = None,
+    asm_done_target: int = 0,
+    asm_signal_num_ranks: int = 0,
+    asm_signal_generation: int = 0,
+    asm_signal_generation_tensor: torch.Tensor | None = None,
+    asm_reduce_y: torch.Tensor | None = None,
+    sym_buffer=None,
+    num_ranks: int = 0,
+    num_experts: int = 0,
+    num_tokens: int = 0,
+    num_topk: int = 0,
+    hidden: int = 0,
+    output_workspace: torch.Tensor | None = None,
+    prob_storage: torch.Tensor | None = None,
+    active_tiles: torch.Tensor | None = None,
+    graph_runtime_offset_from_active_tiles: int = 0,
+    ll_block_m: int = 32,
+    verbose_build: bool = False,
+) -> torch.Tensor | None:
+    """V3 K3 dispatch point for staged large_opt.
+
+    Phase 3 wires staged combine paths. V3 LL pack5 kernels consume the
+    per-expert row counts returned by K1 so graph replay can keep a fixed
+    captured capacity while doing GEMM work for the runtime-token rows.
+    """
+    backend = normalize_v3_backend(backend)
+    if backend not in ("normal", "ll"):
+        raise NotImplementedError("V3 K3 staged path supports normal or LL backend only")
+    if sym_buffer is None and asm_signal_addrs is not None:
+        raise ValueError("V3 K3 no-tail path must not receive peer signal tensors")
+    if asm_signal_num_ranks or asm_signal_generation:
+        if sym_buffer is None:
+            raise ValueError("V3 K3 no-tail signal metadata requires sym_buffer")
+    if output_workspace is None or prob_storage is None:
+        raise ValueError("integrated V3 K3 path requires output_workspace and prob_storage")
+
+    l2_weight, l2_scale = l2_weights
+    if backend == "normal":
+        ext = load_extension(verbose=verbose_build)
+        if asm_reduce_y is None:
+            code_object = ensure_k3_combine_pack5_asm_code_object()
+            ext.k3_l2_combine_asm_pack5_out(
+                output_workspace,
+                act_fp8.contiguous(),
+                act_scale.contiguous(),
+                m_indices.contiguous(),
+                l2_weight.contiguous(),
+                l2_scale.contiguous(),
+                row_combine_ptrs.contiguous(),
+                prob_storage.contiguous(),
+                str(code_object),
+                active_tiles.contiguous() if active_tiles is not None else None,
+                int(graph_runtime_offset_from_active_tiles),
+            )
+            return None
+        if sym_buffer is None or asm_done_counter is None or asm_signal_addrs is None:
+            raise ValueError("V3 K3 ASM-pack5 tail path requires sym_buffer, done counter, and signal addrs")
+        if not num_ranks or not num_experts or not num_tokens or not num_topk or not hidden:
+            raise ValueError("V3 K3 ASM-pack5 tail path requires shape metadata")
+        code_object = ensure_k3_combine_tail_reduce_pack5_asm_code_object()
+        ext.k3_l2_combine_asm_tail_reduce_pack5_out(
+            act_fp8.contiguous(),
+            act_scale.contiguous(),
+            m_indices.contiguous(),
+            l2_weight.contiguous(),
+            l2_scale.contiguous(),
+            row_combine_ptrs.contiguous(),
+            asm_done_counter.contiguous(),
+            asm_signal_addrs.contiguous(),
+            asm_reduce_y.contiguous(),
+            sym_buffer.buffer,
+            output_workspace,
+            prob_storage,
+            int(asm_done_target),
+            int(asm_signal_num_ranks),
+            int(asm_signal_generation),
+            int(num_ranks),
+            int(num_experts),
+            int(sym_buffer.num_max_tokens_per_rank),
+            int(num_tokens),
+            int(num_topk),
+            int(hidden),
+            str(code_object),
+            active_tiles.contiguous() if active_tiles is not None else None,
+            int(graph_runtime_offset_from_active_tiles),
+            asm_signal_generation_tensor.contiguous()
+            if asm_signal_generation_tensor is not None
+            else None,
+        )
+        return None
+
+    ext = load_v3_ll_extension(verbose=verbose_build)
+    if backend == "ll":
+        if asm_reduce_y is not None:
+            if sym_buffer is None or asm_done_counter is None or asm_signal_addrs is None:
+                raise ValueError("V3 K3 LL tail path requires sym_buffer, done counter, and signal addrs")
+            if not num_ranks or not num_experts or not num_tokens or not num_topk or not hidden:
+                raise ValueError("V3 K3 LL tail path requires shape metadata")
+            ext.k3_v3_ll_combine_tail(
+                output_workspace,
+                act_fp8.contiguous(),
+                act_scale.contiguous(),
+                m_indices.contiguous(),
+                l2_weight.contiguous(),
+                l2_scale.contiguous(),
+                row_combine_ptrs.contiguous(),
+                sym_buffer.buffer,
+                asm_done_counter.contiguous(),
+                asm_signal_addrs.contiguous(),
+                asm_reduce_y.contiguous(),
+                int(num_ranks),
+                int(num_experts),
+                int(sym_buffer.num_max_tokens_per_rank),
+                int(num_tokens),
+                int(num_topk),
+                int(ll_block_m),
+                asm_signal_generation_tensor.contiguous()
+                if asm_signal_generation_tensor is not None
+                else None,
+            )
+        else:
+            ext.k3_v3_ll_combine(
+                output_workspace,
+                act_fp8.contiguous(),
+                act_scale.contiguous(),
+                m_indices.contiguous(),
+                l2_weight.contiguous(),
+                l2_scale.contiguous(),
+                row_combine_ptrs.contiguous(),
+                False,
+                int(ll_block_m),
+            )
+        return None
+    raise NotImplementedError(f"unsupported V3 K3 backend: {backend}")

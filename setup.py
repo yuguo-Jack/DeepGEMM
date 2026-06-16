@@ -149,17 +149,24 @@ def get_ext_modules():
                              extra_compile_args={'cxx': cxx_flags, 'nvcc': hipcc_flags})]
     if IS_HIP_EXTENSION and package_name == 'megamoe':
         large_opt_root = project_path('megamoe', 'dcu_megamoe_large_opt')
-        v2_root = project_path('megamoe', 'dcu_megamoe_v2')
+        large_opt_k1_hipcc_flags = hipcc_flags + [
+            '-DNDEBUG',
+            '-mllvm',
+            '-enable-num-vgprs-768=true',
+        ]
         modules.extend([
             CUDAExtension(
                 name='megamoe.dcu_megamoe_large_opt.K1_fused.k1_fused_ext',
-                sources=[os.path.join(large_opt_root, 'K1_fused', 'k1_fused_ext.cu')],
+                sources=[
+                    os.path.join(large_opt_root, 'K1_fused', 'k1_fused_ext.cu'),
+                    os.path.join(large_opt_root, 'K1_fused', 'k1_v3_fused_ext.cu'),
+                ],
                 include_dirs=build_include_dirs,
                 libraries=build_libraries,
                 library_dirs=build_library_dirs,
                 extra_compile_args={
                     'cxx': cxx_flags,
-                    'nvcc': hipcc_flags + ['-DNDEBUG'],
+                    'nvcc': large_opt_k1_hipcc_flags,
                 },
             ),
             CUDAExtension(
@@ -185,39 +192,14 @@ def get_ext_modules():
                 },
             ),
             CUDAExtension(
-                name='megamoe.dcu_megamoe_v2.K1_fused.k1_fused_ext',
-                sources=[
-                    os.path.join(v2_root, 'K1_fused', 'k1_fused_pybind.cpp'),
-                    os.path.join(v2_root, 'K1_fused', 'k1_fused_ext.cu'),
-                ],
+                name='megamoe.dcu_megamoe_large_opt.K3_fused.k3_v3_fused_ext',
+                sources=[os.path.join(large_opt_root, 'K3_fused', 'k3_v3_fused_ext.cu')],
                 include_dirs=build_include_dirs,
                 libraries=build_libraries,
                 library_dirs=build_library_dirs,
                 extra_compile_args={
                     'cxx': cxx_flags,
-                    'nvcc': hipcc_flags + [
-                        '-DNDEBUG',
-                        '-mllvm',
-                        '-enable-num-vgprs-768=true',
-                    ],
-                },
-            ),
-            CUDAExtension(
-                name='megamoe.dcu_megamoe_v2.K3_fused.k3_fused_ext',
-                sources=[
-                    os.path.join(v2_root, 'K3_fused', 'k3_fused_pybind.cpp'),
-                    os.path.join(v2_root, 'K3_fused', 'k3_fused_ext.cu'),
-                ],
-                include_dirs=build_include_dirs,
-                libraries=build_libraries,
-                library_dirs=build_library_dirs,
-                extra_compile_args={
-                    'cxx': cxx_flags,
-                    'nvcc': hipcc_flags + [
-                        '-DNDEBUG',
-                        '-mllvm',
-                        '-enable-num-vgprs-768=true',
-                    ],
+                    'nvcc': hipcc_flags + ['-DNDEBUG'],
                 },
             ),
         ])
@@ -232,10 +214,6 @@ def get_python_packages():
             'megamoe.dcu_megamoe_large_opt.K1_fused',
             'megamoe.dcu_megamoe_large_opt.K2_fused',
             'megamoe.dcu_megamoe_large_opt.K3_fused',
-            'megamoe.dcu_megamoe_v2',
-            'megamoe.dcu_megamoe_v2.K1_fused',
-            'megamoe.dcu_megamoe_v2.K2_fused',
-            'megamoe.dcu_megamoe_v2.K3_fused',
         ]
     return find_packages('.')
 
@@ -250,11 +228,9 @@ def get_package_data():
     }
     if IS_HIP_EXTENSION and package_name == 'megamoe':
         data.update({
-            'megamoe.dcu_megamoe_large_opt.K1_fused': ['*.cu', '*.s', '*.co'],
+            'megamoe.dcu_megamoe_large_opt.K1_fused': ['*.cu', '*.cuh', '*.s', '*.co'],
             'megamoe.dcu_megamoe_large_opt.K2_fused': ['*.cu'],
-            'megamoe.dcu_megamoe_large_opt.K3_fused': ['*.cu', '*.s', '*.co'],
-            'megamoe.dcu_megamoe_v2.K1_fused': ['*.cu', '*.cpp'],
-            'megamoe.dcu_megamoe_v2.K3_fused': ['*.cu', '*.cpp'],
+            'megamoe.dcu_megamoe_large_opt.K3_fused': ['*.cu', '*.cuh', '*.s', '*.co'],
         })
     return data
 
@@ -279,6 +255,21 @@ LARGE_OPT_ASM_CODE_OBJECTS = [
         project_path(
             'megamoe',
             'dcu_megamoe_large_opt',
+            'K1_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s',
+        ),
+        os.path.join(
+            'megamoe',
+            'dcu_megamoe_large_opt',
+            'K1_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co',
+        ),
+        'K1_CLANG',
+    ),
+    (
+        project_path(
+            'megamoe',
+            'dcu_megamoe_large_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE.s',
         ),
@@ -295,6 +286,21 @@ LARGE_OPT_ASM_CODE_OBJECTS = [
             'megamoe',
             'dcu_megamoe_large_opt',
             'K3_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.s',
+        ),
+        os.path.join(
+            'megamoe',
+            'dcu_megamoe_large_opt',
+            'K3_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co',
+        ),
+        'K3_CLANG',
+    ),
+    (
+        project_path(
+            'megamoe',
+            'dcu_megamoe_large_opt',
+            'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE.s',
         ),
         os.path.join(
@@ -302,6 +308,21 @@ LARGE_OPT_ASM_CODE_OBJECTS = [
             'dcu_megamoe_large_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE.co',
+        ),
+        'K3_CLANG',
+    ),
+    (
+        project_path(
+            'megamoe',
+            'dcu_megamoe_large_opt',
+            'K3_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.s',
+        ),
+        os.path.join(
+            'megamoe',
+            'dcu_megamoe_large_opt',
+            'K3_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.co',
         ),
         'K3_CLANG',
     ),

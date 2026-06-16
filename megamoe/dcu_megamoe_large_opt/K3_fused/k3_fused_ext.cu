@@ -67,6 +67,7 @@ struct __attribute__((packed)) GpuProb {
     uint32_t asm_reduce_blocks;
     uint32_t graph_reserved_c4;
     int32_t* active_tiles;
+    int32_t* asm_signal_generation_ptr;
 };
 
 static_assert(offsetof(GpuProb, scaleA) == 0x70,
@@ -89,6 +90,8 @@ static_assert(offsetof(GpuProb, asm_reduce_blocks) == 0xc0,
               "K3 tail reduce asm expects reduce blocks at GpuProb+0xc0");
 static_assert(offsetof(GpuProb, active_tiles) == 0xc8,
               "K3 graph asm expects active_tiles at GpuProb+0xc8");
+static_assert(offsetof(GpuProb, asm_signal_generation_ptr) == 0xd0,
+              "K3 graph asm expects signal generation ptr at GpuProb+0xd0");
 
 struct __attribute__((packed)) KernelArgs {
     uint32_t gemm_count;
@@ -179,7 +182,9 @@ void launch_l2_deepgemm_original_asm(
     const int64_t reduce_hidden = 0,
     const torch::Tensor* prob_storage_override = nullptr,
     const torch::Tensor* active_tiles = nullptr,
-    const int64_t graph_runtime_offset_from_active_tiles = 0) {
+    const int64_t graph_runtime_offset_from_active_tiles = 0,
+    const torch::Tensor* asm_signal_generation_tensor = nullptr,
+    const bool weight_pack5_layout = false) {
     check_cuda_contiguous(output, "output");
     check_cuda_contiguous(act_fp8, "act_fp8");
     check_cuda_contiguous(act_scale, "act_scale");
@@ -202,7 +207,6 @@ void launch_l2_deepgemm_original_asm(
     const int total_rows = static_cast<int>(act_fp8.size(0));
     const int k = static_cast<int>(act_fp8.size(1));
     const int hidden = static_cast<int>(output.size(1));
-    const int local_experts = static_cast<int>(l2_weight.size(0));
     TORCH_CHECK(output.dim() == 2 && output.size(0) == total_rows,
                 "output shape must be [rows, hidden]");
     TORCH_CHECK(act_scale.numel() == total_rows,
@@ -213,14 +217,24 @@ void launch_l2_deepgemm_original_asm(
                 "K3 asm expects rows padded to a 256-row tile");
     TORCH_CHECK(hidden == 4096 && k == 2048,
                 "current K3 asm path is specialized for hidden=4096, intermediate=2048");
-    TORCH_CHECK(l2_weight.dim() == 3 &&
-                    l2_weight.size(1) == hidden / 16 &&
-                    l2_weight.size(2) == k * 16,
-                "invalid Marlin L2 weight shape");
     TORCH_CHECK(l2_scale.dim() == 2 &&
-                    l2_scale.size(0) == local_experts &&
+                    l2_scale.size(0) > 0 &&
                     l2_scale.size(1) == hidden,
                 "invalid L2 scale shape");
+    const int local_experts = static_cast<int>(l2_scale.size(0));
+    if (weight_pack5_layout) {
+        TORCH_CHECK(
+            l2_weight.dim() >= 1 &&
+                l2_weight.numel() >=
+                    static_cast<int64_t>(local_experts) * hidden * k,
+            "invalid V3 pack5 L2 weight shape");
+    } else {
+        TORCH_CHECK(l2_weight.dim() == 3 &&
+                        l2_weight.size(0) == local_experts &&
+                        l2_weight.size(1) == hidden / 16 &&
+                        l2_weight.size(2) == k * 16,
+                    "invalid Marlin L2 weight shape");
+    }
     if (row_combine_ptrs != nullptr) {
         check_cuda_contiguous(*row_combine_ptrs, "row_combine_ptrs");
         TORCH_CHECK(row_combine_ptrs->scalar_type() == torch::kInt64,
@@ -231,27 +245,31 @@ void launch_l2_deepgemm_original_asm(
     if (asm_tail_signal) {
         TORCH_CHECK(row_combine_ptrs != nullptr,
                     "K3 asm tail signal is only supported by combine asm");
-        TORCH_CHECK(asm_done_counter != nullptr && asm_signal_addrs != nullptr,
-                    "asm_done_counter and asm_signal_addrs are required");
+        TORCH_CHECK(asm_done_counter != nullptr,
+                    "asm_done_counter is required for K3 asm publish");
         check_cuda_contiguous(*asm_done_counter, "asm_done_counter");
-        check_cuda_contiguous(*asm_signal_addrs, "asm_signal_addrs");
         TORCH_CHECK(asm_done_counter->scalar_type() == torch::kInt,
                     "asm_done_counter must be int32");
         TORCH_CHECK(asm_done_counter->numel() >= 1,
                     "asm_done_counter must have at least one element");
-        TORCH_CHECK(asm_signal_addrs->scalar_type() == torch::kInt64,
-                    "asm_signal_addrs must be int64");
-        TORCH_CHECK(asm_signal_addrs->numel() >= 16,
-                    "asm_signal_addrs must contain 8 local and 8 peer signal addresses");
-        TORCH_CHECK(asm_signal_num_ranks > 0 && asm_signal_num_ranks <= 8,
-                    "asm_signal_num_ranks must be in [1, 8]");
         TORCH_CHECK(asm_done_target > 0 &&
                         asm_done_target <= static_cast<int64_t>(UINT32_MAX),
                     "asm_done_target must fit in uint32");
+        if (asm_signal_addrs != nullptr) {
+            check_cuda_contiguous(*asm_signal_addrs, "asm_signal_addrs");
+            TORCH_CHECK(asm_signal_addrs->scalar_type() == torch::kInt64,
+                        "asm_signal_addrs must be int64");
+            TORCH_CHECK(asm_signal_addrs->numel() >= 16,
+                        "asm_signal_addrs must contain 8 local and 8 peer signal addresses");
+            TORCH_CHECK(asm_signal_num_ranks > 0 && asm_signal_num_ranks <= 8,
+                        "asm_signal_num_ranks must be in [1, 8]");
+        }
     }
     if (asm_reduce_y != nullptr) {
         TORCH_CHECK(asm_tail_signal,
                     "asm tail reduce requires asm_tail_signal");
+        TORCH_CHECK(asm_signal_addrs != nullptr,
+                    "asm tail reduce requires asm_signal_addrs");
         TORCH_CHECK(sym_buffer != nullptr,
                     "sym_buffer is required for asm tail reduce");
         check_cuda_contiguous(*asm_reduce_y, "asm_reduce_y");
@@ -306,7 +324,8 @@ void launch_l2_deepgemm_original_asm(
     prob.scaleB = act_scale.data_ptr<float>();
     if (asm_tail_signal) {
         prob.asm_done_counter = asm_done_counter->data_ptr<int32_t>();
-        prob.asm_signal_addrs = asm_signal_addrs->data_ptr<int64_t>();
+        prob.asm_signal_addrs =
+            asm_signal_addrs == nullptr ? nullptr : asm_signal_addrs->data_ptr<int64_t>();
         prob.asm_done_target = static_cast<uint32_t>(asm_done_target);
         prob.asm_signal_num_ranks = static_cast<uint32_t>(asm_signal_num_ranks);
         prob.asm_tail_signal = 1;
@@ -330,6 +349,15 @@ void launch_l2_deepgemm_original_asm(
         prob.asm_signal_generation = static_cast<uint32_t>(asm_signal_generation);
         prob.asm_tail_reduce = 1;
         prob.asm_reduce_blocks = static_cast<uint32_t>(default_reduce_blocks);
+        if (asm_signal_generation_tensor != nullptr) {
+            check_cuda_contiguous(*asm_signal_generation_tensor,
+                                  "asm_signal_generation_tensor");
+            TORCH_CHECK(asm_signal_generation_tensor->scalar_type() == torch::kInt &&
+                            asm_signal_generation_tensor->numel() >= 1,
+                        "asm_signal_generation_tensor must be a CUDA int32 tensor");
+            prob.asm_signal_generation_ptr =
+                asm_signal_generation_tensor->data_ptr<int32_t>();
+        }
     }
     if (active_tiles != nullptr) {
         check_cuda_contiguous(*active_tiles, "active_tiles");
@@ -420,6 +448,7 @@ __global__ void reduce_local_combine_vec_kernel(
     const int* runtime_num_tokens,
     const int num_topk,
     const int hidden) {
+    asm volatile("buffer_wbinvl1_vol\n" ::: "memory");
     int effective_num_tokens = num_tokens;
     if (runtime_num_tokens != nullptr) {
         effective_num_tokens = runtime_num_tokens[0];
@@ -454,9 +483,10 @@ __global__ void reduce_local_combine_vec_kernel(
         for (int topk_slot = 0; topk_slot < num_topk; ++topk_slot) {
             const int64_t partial_row =
                 static_cast<int64_t>(topk_slot) * num_max_tokens_per_rank + token_idx;
-            const auto packed =
+            const auto* combine_vec =
                 reinterpret_cast<const uint4*>(
-                    local_sections.combine + partial_row * hidden)[vec_idx];
+                    local_sections.combine + partial_row * hidden) + vec_idx;
+            const auto packed = *combine_vec;
             sum0 += deep_gemm::mega::bf16_bits_to_float(static_cast<uint16_t>(packed.x));
             sum1 += deep_gemm::mega::bf16_bits_to_float(static_cast<uint16_t>(packed.x >> 16));
             sum2 += deep_gemm::mega::bf16_bits_to_float(static_cast<uint16_t>(packed.y));
@@ -475,6 +505,12 @@ __global__ void reduce_local_combine_vec_kernel(
     }
 }
 
+__device__ static inline int load_signal_system_acquire(const volatile int* ptr) {
+    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+constexpr int kDefaultStagedBarrierSignalSlotBase = 18;
+
 __global__ void rank_barrier_kernel(
     uint8_t* local_sym_buffer,
     const int rank_idx,
@@ -488,9 +524,9 @@ __global__ void rank_barrier_kernel(
     const int64_t k1_meta_flags_numel,
     const int32_t* graph_runtime_num_tokens,
     int32_t* graph_runtime_num_tokens_out,
-    const int graph_max_tokens) {
-    constexpr int kStagedBarrierArrivalSlot = 18;
-    constexpr int kStagedBarrierReleaseSlot = 19;
+    int32_t* graph_tail_signal_generation_out,
+    const int graph_max_tokens,
+    const int barrier_signal_slot_base) {
     auto* signal_buffers =
         deep_gemm::mega::dcu_peer_signal_ptrs(local_sym_buffer, num_ranks);
     auto* my_signals = signal_buffers[rank_idx];
@@ -500,7 +536,8 @@ __global__ void rank_barrier_kernel(
     __shared__ int barrier_generation;
     __shared__ int barrier_ticket;
     if (thread_id == 0 && asm_done_counter != nullptr) {
-        *asm_done_counter = 0;
+        asm_done_counter[0] = 0;
+        asm_done_counter[1] = 0;
     }
     if (thread_id == 0 && graph_runtime_num_tokens != nullptr &&
         graph_runtime_num_tokens_out != nullptr) {
@@ -536,35 +573,51 @@ __global__ void rank_barrier_kernel(
     __syncthreads();
 
     auto* barrier_signals = signal_buffers[0];
+    const int barrier_arrival_slot = barrier_signal_slot_base;
+    const int barrier_release_slot = barrier_signal_slot_base + 1;
     if (thread_id == 0) {
         barrier_ticket =
-            atomicAdd_system(barrier_signals + kStagedBarrierArrivalSlot, 1);
+            atomicAdd_system(barrier_signals + barrier_arrival_slot, 1);
         barrier_generation = barrier_ticket / num_ranks + 1;
         if (barrier_ticket % num_ranks == num_ranks - 1) {
             __threadfence_system();
-            __hip_atomic_store(barrier_signals + kStagedBarrierReleaseSlot,
+            __hip_atomic_store(barrier_signals + barrier_release_slot,
                                barrier_generation, __ATOMIC_RELEASE,
                                __HIP_MEMORY_SCOPE_SYSTEM);
         } else {
             const auto start_time = clock64();
             volatile int* release_ptr = reinterpret_cast<volatile int*>(
-                barrier_signals + kStagedBarrierReleaseSlot);
-            while (deep_gemm::mega::load_signal_system(release_ptr) <
-                   barrier_generation) {
+                barrier_signals + barrier_release_slot);
+            while (true) {
+                const int release_value =
+                    load_signal_system_acquire(release_ptr);
+                if (release_value >= barrier_generation) {
+                    break;
+                }
                 if (clock64() - start_time >
                     deep_gemm::mega::kBarrierTimeoutCycles) {
                     const int arrival = deep_gemm::mega::load_signal_system(
                         reinterpret_cast<volatile int*>(
-                            barrier_signals + kStagedBarrierArrivalSlot));
+                            barrier_signals + barrier_arrival_slot));
                     const int release =
                         deep_gemm::mega::load_signal_system(release_ptr);
                     printf("MegaMoE HIP staged rank barrier timeout: rank=%d "
-                           "ticket=%d generation=%d arrival=%d release=%d\n",
-                           rank_idx, barrier_ticket, barrier_generation,
-                           arrival, release);
+                           "slot=%d ticket=%d generation=%d arrival=%d release=%d\n",
+                           rank_idx, barrier_signal_slot_base, barrier_ticket,
+                           barrier_generation, arrival, release);
                     abort();
                 }
             }
+        }
+        if (graph_tail_signal_generation_out != nullptr) {
+            graph_tail_signal_generation_out[0] = barrier_generation;
+            if (asm_done_counter != nullptr) {
+                constexpr int kTailDoneCounterRingSlots = 16;
+                const int slot = barrier_generation & (kTailDoneCounterRingSlots - 1);
+                asm_done_counter[2 * slot] = 0;
+                asm_done_counter[2 * slot + 1] = 0;
+            }
+            __threadfence_system();
         }
     }
     __syncthreads();
@@ -604,7 +657,29 @@ void k3_l2_combine_asm_out(
         code_object_path, kCombineAsmKernelName, &row_combine_ptrs,
         nullptr, nullptr, 0, 0, false, nullptr, nullptr,
         0, 0, 0, 0, 0, 0, 0, &prob_storage,
-        active_tiles.has_value() ? &active_tiles.value() : nullptr);
+        active_tiles.has_value() ? &active_tiles.value() : nullptr, 0, nullptr);
+}
+
+void k3_l2_combine_asm_pack5_out(
+    const torch::Tensor& output_workspace,
+    const torch::Tensor& act_fp8,
+    const torch::Tensor& act_scale,
+    const torch::Tensor& m_indices,
+    const torch::Tensor& l2_weight,
+    const torch::Tensor& l2_scale,
+    const torch::Tensor& row_combine_ptrs,
+    const torch::Tensor& prob_storage,
+    const std::string& code_object_path,
+    const std::optional<torch::Tensor>& active_tiles,
+    const int64_t graph_runtime_offset_from_active_tiles) {
+    launch_l2_deepgemm_original_asm(
+        output_workspace, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
+        code_object_path, kCombineAsmKernelName, &row_combine_ptrs,
+        nullptr, nullptr, 0, 0, false,
+        nullptr, nullptr,
+        0, 0, 0, 0, 0, 0, 0, &prob_storage,
+        active_tiles.has_value() ? &active_tiles.value() : nullptr,
+        graph_runtime_offset_from_active_tiles, nullptr, true);
 }
 
 void k3_l2_combine_asm_tail_reduce_out(
@@ -631,7 +706,8 @@ void k3_l2_combine_asm_tail_reduce_out(
     const int64_t hidden_arg,
     const std::string& code_object_path,
     const std::optional<torch::Tensor>& active_tiles,
-    const int64_t graph_runtime_offset_from_active_tiles) {
+    const int64_t graph_runtime_offset_from_active_tiles,
+    const std::optional<torch::Tensor>& asm_signal_generation_tensor) {
     const int64_t hidden = l2_weight.size(1) * 16;
     TORCH_CHECK(hidden_arg == hidden,
                 "hidden_arg must match L2 weight hidden");
@@ -644,7 +720,55 @@ void k3_l2_combine_asm_tail_reduce_out(
         num_max_tokens_per_rank, num_tokens, num_topk, hidden_arg,
         &prob_storage,
         active_tiles.has_value() ? &active_tiles.value() : nullptr,
-        graph_runtime_offset_from_active_tiles);
+        graph_runtime_offset_from_active_tiles,
+        asm_signal_generation_tensor.has_value()
+            ? &asm_signal_generation_tensor.value()
+            : nullptr);
+}
+
+void k3_l2_combine_asm_tail_reduce_pack5_out(
+    const torch::Tensor& act_fp8,
+    const torch::Tensor& act_scale,
+    const torch::Tensor& m_indices,
+    const torch::Tensor& l2_weight,
+    const torch::Tensor& l2_scale,
+    const torch::Tensor& row_combine_ptrs,
+    const torch::Tensor& asm_done_counter,
+    const torch::Tensor& asm_signal_addrs,
+    const torch::Tensor& asm_reduce_y,
+    const torch::Tensor& sym_buffer,
+    const torch::Tensor& output_workspace,
+    const torch::Tensor& prob_storage,
+    const int64_t asm_done_target,
+    const int64_t asm_signal_num_ranks,
+    const int64_t asm_signal_generation,
+    const int64_t num_ranks,
+    const int64_t num_experts,
+    const int64_t num_max_tokens_per_rank,
+    const int64_t num_tokens,
+    const int64_t num_topk,
+    const int64_t hidden_arg,
+    const std::string& code_object_path,
+    const std::optional<torch::Tensor>& active_tiles,
+    const int64_t graph_runtime_offset_from_active_tiles,
+    const std::optional<torch::Tensor>& asm_signal_generation_tensor) {
+    const int64_t hidden = output_workspace.size(1);
+    TORCH_CHECK(hidden_arg == hidden,
+                "hidden_arg must match output_workspace hidden");
+    launch_l2_deepgemm_original_asm(
+        output_workspace, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
+        code_object_path, kCombineAsmKernelName, &row_combine_ptrs,
+        &asm_done_counter, &asm_signal_addrs, asm_done_target,
+        asm_signal_num_ranks, true, &asm_reduce_y, &sym_buffer,
+        asm_signal_generation, num_ranks, num_experts,
+        num_max_tokens_per_rank, num_tokens, num_topk, hidden_arg,
+        &prob_storage,
+        active_tiles.has_value() ? &active_tiles.value() : nullptr,
+        graph_runtime_offset_from_active_tiles,
+        asm_signal_generation_tensor.has_value()
+            ? &asm_signal_generation_tensor.value()
+            : nullptr,
+        true);
 }
 
 void reduce_local_combine(
@@ -739,10 +863,14 @@ void rank_barrier(
     const int64_t k1_meta_flags_numel,
     const std::optional<torch::Tensor>& graph_runtime_num_tokens,
     const std::optional<torch::Tensor>& graph_runtime_num_tokens_out,
-    const int64_t graph_max_tokens) {
+    const std::optional<torch::Tensor>& graph_tail_signal_generation_out,
+    const int64_t graph_max_tokens,
+    const int64_t barrier_signal_slot_base) {
     check_cuda_contiguous(sym_buffer, "sym_buffer");
     TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8,
                 "sym_buffer must be int8");
+    TORCH_CHECK(barrier_signal_slot_base >= 0,
+                "barrier_signal_slot_base must be non-negative");
     int32_t* done_counter_ptr = nullptr;
     if (asm_done_counter.has_value()) {
         const auto& counter = asm_done_counter.value();
@@ -792,6 +920,15 @@ void rank_barrier(
     TORCH_CHECK((graph_runtime_num_tokens_ptr == nullptr) ==
                     (graph_runtime_num_tokens_out_ptr == nullptr),
                 "graph runtime token input/output must be provided together");
+    int32_t* graph_tail_signal_generation_out_ptr = nullptr;
+    if (graph_tail_signal_generation_out.has_value()) {
+        const auto& generation_out = graph_tail_signal_generation_out.value();
+        check_cuda_contiguous(generation_out, "graph_tail_signal_generation_out");
+        TORCH_CHECK(generation_out.scalar_type() == torch::kInt &&
+                        generation_out.numel() >= 1,
+                    "graph_tail_signal_generation_out must be a CUDA int32 tensor");
+        graph_tail_signal_generation_out_ptr = generation_out.data_ptr<int32_t>();
+    }
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     hipLaunchKernelGGL(rank_barrier_kernel, dim3(1), dim3(64), 0, stream,
                        reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
@@ -806,7 +943,9 @@ void rank_barrier(
                        k1_meta_flags_numel,
                        graph_runtime_num_tokens_ptr,
                        graph_runtime_num_tokens_out_ptr,
-                       static_cast<int>(graph_max_tokens));
+                       graph_tail_signal_generation_out_ptr,
+                       static_cast<int>(graph_max_tokens),
+                       static_cast<int>(barrier_signal_slot_base));
     K3_HIP_CHECK(hipGetLastError());
 }
 
@@ -841,6 +980,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("prob_storage"),
           pybind11::arg("code_object_path"),
           pybind11::arg("active_tiles") = std::nullopt);
+    m.def("k3_l2_combine_asm_pack5_out", &k3_l2_combine_asm_pack5_out,
+          pybind11::arg("output_workspace"),
+          pybind11::arg("act_fp8"),
+          pybind11::arg("act_scale"),
+          pybind11::arg("m_indices"),
+          pybind11::arg("l2_weight"),
+          pybind11::arg("l2_scale"),
+          pybind11::arg("row_combine_ptrs"),
+          pybind11::arg("prob_storage"),
+          pybind11::arg("code_object_path"),
+          pybind11::arg("active_tiles") = std::nullopt,
+          pybind11::arg("graph_runtime_offset_from_active_tiles") = 0);
     m.def("k3_l2_combine_asm_tail_reduce_out", &k3_l2_combine_asm_tail_reduce_out,
           pybind11::arg("act_fp8"),
           pybind11::arg("act_scale"),
@@ -865,7 +1016,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("hidden"),
           pybind11::arg("code_object_path"),
           pybind11::arg("active_tiles") = std::nullopt,
-          pybind11::arg("graph_runtime_offset_from_active_tiles") = 0);
+          pybind11::arg("graph_runtime_offset_from_active_tiles") = 0,
+          pybind11::arg("asm_signal_generation_tensor") = std::nullopt);
+    m.def("k3_l2_combine_asm_tail_reduce_pack5_out", &k3_l2_combine_asm_tail_reduce_pack5_out,
+          pybind11::arg("act_fp8"),
+          pybind11::arg("act_scale"),
+          pybind11::arg("m_indices"),
+          pybind11::arg("l2_weight"),
+          pybind11::arg("l2_scale"),
+          pybind11::arg("row_combine_ptrs"),
+          pybind11::arg("asm_done_counter"),
+          pybind11::arg("asm_signal_addrs"),
+          pybind11::arg("asm_reduce_y"),
+          pybind11::arg("sym_buffer"),
+          pybind11::arg("output_workspace"),
+          pybind11::arg("prob_storage"),
+          pybind11::arg("asm_done_target"),
+          pybind11::arg("asm_signal_num_ranks"),
+          pybind11::arg("asm_signal_generation"),
+          pybind11::arg("num_ranks"),
+          pybind11::arg("num_experts"),
+          pybind11::arg("num_max_tokens_per_rank"),
+          pybind11::arg("num_tokens"),
+          pybind11::arg("num_topk"),
+          pybind11::arg("hidden"),
+          pybind11::arg("code_object_path"),
+          pybind11::arg("active_tiles") = std::nullopt,
+          pybind11::arg("graph_runtime_offset_from_active_tiles") = 0,
+          pybind11::arg("asm_signal_generation_tensor") = std::nullopt);
     m.def("reduce_local_combine", &reduce_local_combine,
           pybind11::arg("y"),
           pybind11::arg("sym_buffer"),
@@ -898,7 +1076,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("k1_meta_flags_numel") = 0,
           pybind11::arg("graph_runtime_num_tokens") = std::nullopt,
           pybind11::arg("graph_runtime_num_tokens_out") = std::nullopt,
-          pybind11::arg("graph_max_tokens") = 0);
+          pybind11::arg("graph_tail_signal_generation_out") = std::nullopt,
+          pybind11::arg("graph_max_tokens") = 0,
+          pybind11::arg("barrier_signal_slot_base") =
+              kDefaultStagedBarrierSignalSlotBase);
     m.def("fill_i64_tensor_from_host", &fill_i64_tensor_from_host,
           pybind11::arg("out"),
           pybind11::arg("values"));

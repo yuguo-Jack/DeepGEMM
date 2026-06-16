@@ -985,6 +985,8 @@ K3_Scatter_C_Tile_Done:
 .set vgprLocalReadAddrASwap1, 249
 .set vgprGlobalReadOffsetBForSWTL, 250
 .set vgprLocalReadAddrA_forLdsWrapTailLoop, 247
+.set vgprPack5OffsetBaseA, 250
+.set vgprPack5OffsetTmpA, 251
 
 .set vgprValuBias_M, 225
 /* Num VGPR=240 */
@@ -1462,10 +1464,9 @@ K3_Scatter_C_Tile_Done:
 
 /* Global Offset A */
 .macro GLOBAL_OFFSET_A vgprAddr:req vgprOffsetL:req vgprOffset0I:req vgprTmp:req
-   s_lshl_b32 s68, s[sgprStrideA0I], 4                           
-   v_mul_lo_u32 v[\vgprTmp+0], s68, v[\vgprOffset0I] // mul d1 lower
-   _v_add_co_u32 v[\vgprAddr+0], vcc, v[\vgprOffsetL], v[\vgprTmp+0] // accumulate K lower
-   _v_add_u32 v[\vgprAddr+0], 0x10, v[\vgprAddr+0]    // add prepad for pointer shift
+   v_lshlrev_b32 v[\vgprTmp+0], 10, v[\vgprOffset0I] // no256 * (4096 / 4)
+   _v_add_co_u32 v[\vgprAddr+0], vcc, v[vgprPack5OffsetBaseA], v[\vgprTmp+0]
+   _v_add_u32 v[\vgprAddr+0], 0x10, v[\vgprAddr+0]    // keep original ASM prepad compensation
                                                       // offset *= bytes/element (multiplier is 1, do nothing)
 .endm
 
@@ -1902,13 +1903,6 @@ s_load_dwordx4 s[76:79], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb
 s_load_dword s80, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc0
 s_waitcnt lgkmcnt(0)
 K3_TAIL_APPLY_GRAPH_RUNTIME_STATE
-s_cmp_eq_u32 s89, 0
-s_cbranch_scc1 .L_k3_tail_done_counter_ready
-s_and_b32 s87, s78, 15
-s_lshl_b32 s87, s87, 3
-s_add_u32 s52, s52, s87
-s_addc_u32 s53, s53, 0
-.L_k3_tail_done_counter_ready:
 s_cmp_eq_u32 s62, 1
 s_cbranch_scc0 .L_k3_extra_reduce_endpgm
 s_cmp_eq_u32 s79, 1
@@ -2273,6 +2267,14 @@ _v_add_co_u32 v18, vcc, 64, v9                     // groBL_1 + LSCB
 
 /* global read addresses: final offsets a */
 
+v_lshrrev_b32 v[vgprPack5OffsetBaseA], 10, v8 // pack5 ko64
+v_lshlrev_b32 v[vgprPack5OffsetBaseA], 18, v[vgprPack5OffsetBaseA] // ko64 * (4096 * 64)
+v_and_b32 v[vgprPack5OffsetTmpA], 0x300, v8 // ks16 * 256
+_v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
+v_and_b32 v[vgprPack5OffsetTmpA], 15, v[vgprSerial] // physical ni for plain ASM-pack5
+v_lshlrev_b32 v[vgprPack5OffsetTmpA], 4, v[vgprPack5OffsetTmpA]
+_v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
+
 GLOBAL_OFFSET_A vgprGlobalReadOffsetA+0,  8,  4, 10 // gROA_0_0_0_0
 GLOBAL_OFFSET_A vgprGlobalReadOffsetA+1,  8,  5, 10 // gROA_0_0_1_0
 GLOBAL_OFFSET_A vgprGlobalReadOffsetA+2,  8,  11, 10 // gROA_0_0_0_0
@@ -2327,37 +2329,12 @@ GLOBAL_STRUCT_OFFSET_B vgprGlobalReadOffsetB+7, 18, 7
 
 /* global read addresses: addresses a */
 
-/* max read offset = size[n] * stride[n-1] */
-s_mul_hi_u32 s71, s[sgprWorkGroup0], 16           // WorkGroup[01] * MT
-s_mul_i32 s70, s[sgprWorkGroup0], 16              // WorkGroup[01] * MT
-s_lshl_b32 s68, s[sgprStrideA0I], 4
-s_mul_hi_u32 s71, s70, s68           // tlu=0, scaled tile-offset by stride
-s_mul_i32 s70, s70, s68               // tlu=0, scaled tile-offset by stride
-
-s_mov_b32 s68, 1                                   // Init tensor size
-s_mov_b32 s69, 0                                   // init tensor size
-s_sub_u32 s67, s[sgprSizeL], 1                     // (size-1)  (size_k - 1)
-s_mul_hi_u32 s66, constStrideAL, s67               // stride x (size-1)
-s_mul_i32 s67, constStrideAL, s67                  // stride x (size-1)
-
-s_add_u32 s68, s68, s67                            // sum tensor size
-s_addc_u32 s69, s69, s66                           // sum tensor size
-s_sub_u32 s67, s[sgprSizeI], 1                     // (size-1)   (size_m - 1)
-s_mul_hi_u32 s66, s[sgprStrideA0I], s67            // stride x (size-1)
-s_mul_i32 s67, s[sgprStrideA0I], s67               // stride x (size-1)
-s_add_u32 s68, s68, s67                            // sum tensor size, s68 -> s[sgprTensor2dSizeA]
-s_addc_u32 s69, s69, s66                           // sum tensor size, s69 -> s[sgprTensor2dSizeA+1]
-
-s_sub_u32 s[sgprShadowLimitA+0], s68, s70 // sub tileStart
-s_subb_u32 s[sgprShadowLimitA+1], s69, s71 // sub tileStart
-
-//s_sub_u32 s[sgprShadowLimitA+0], s[sgprTensor2dSizeA], s70 // sub tileStart
-//s_subb_u32 s[sgprShadowLimitA+1], s[sgprTensor2dSizeA+1], s71 // sub tileStart
-s_lshl_b64 s[sgprShadowLimitA:sgprShadowLimitA+1], s[sgprShadowLimitA:sgprShadowLimitA+1], 0x0 // Set limit to use bytes
-s_add_u32 s[sgprShadowLimitA+0], s[sgprShadowLimitA+0], 16 // extend limit for pre-pad
-s_addc_u32 s[sgprShadowLimitA+1], s[sgprShadowLimitA+1], 0 // extend limit for pre-pad
-s_cmp_eq_u32 s[sgprShadowLimitA+1], 0              // are we within 2^32?
-s_cselect_b32 s[sgprSrdA+2], s[sgprShadowLimitA+0], BufferLimit // Move shadow to real if we are within 2^32
+/* V3 pack5 weight base: hidden tile + expert stride. */
+s_mul_i32 s70, s[sgprWorkGroup0], 0x4000
+s_mov_b32 s71, 0
+s_mov_b32 s[sgprShadowLimitA+0], BufferLimit
+s_mov_b32 s[sgprShadowLimitA+1], 0
+s_mov_b32 s[sgprSrdA+2], BufferLimit
 
 /***************token E_id * (N * K), 指向对应线程块所处理的token属于的E**************/
 s_mul_hi_u32 s69, s[sgprStrideAK], s[sgprScaleFlag] // Stride*WG
@@ -2381,7 +2358,7 @@ s_mov_b64 s[sgprShadowLimitA_forTailLoop+0:sgprShadowLimitA_forTailLoop+1], s[sg
 s_lshr_b32 s[sgprLoopCounterL], s[sgprSizesSum+0], 7 //  s[sgprLoopCounterL] = s[sgprSizesSum+0] / 128
 
 ;s_mov_b32 s[sgprGlobalReadIncsA+0], DepthU*BpeA       // incrB (unrollIdx)    128
-s_mov_b32 s[sgprGlobalReadIncsA+0], 0x800
+s_mov_b32 s[sgprGlobalReadIncsA+0], 0x80000
 s_mul_i32 s[sgprGlobalReadIncsA+0], s[sgprGlobalReadIncsA+0], s[sgprLoopCounterL]  
 
 s_add_u32 s[sgprSrdA_forTailLoop+0], s[sgprSrdA_forTailLoop+0], s[sgprGlobalReadIncsA+0] // 
@@ -2479,7 +2456,7 @@ s_or_b32 s[sgprSrdB+1], s[sgprSrdB+1], s[sgprStructNumB]  //
 
 /* global read addresses: increments a */
 ; s_mul_i32 s54, s[sgprGSU], DepthU*BpeAGR
-s_mov_b32 s[sgprGlobalReadIncsA+0], 0x800            // incrA (unrollIdx)  128 * 16
+s_mov_b32 s[sgprGlobalReadIncsA+0], 0x80000          // V3 pack5 incrA, 128 K step
 ; //s_mov_b32 s[sgprGlobalReadIncsA+0], DepthU*BpeA    // incrA (unrollIdx)
 
 
@@ -3323,6 +3300,13 @@ s_load_dwordx4 s[76:79], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb
 s_load_dword s80, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc0
 s_waitcnt lgkmcnt(0)
 K3_TAIL_APPLY_GRAPH_RUNTIME_STATE
+s_cmp_eq_u32 s89, 0
+s_cbranch_scc1 .L_k3_tail_main_done_counter_ready
+s_and_b32 s87, s78, 15
+s_lshl_b32 s87, s87, 3
+s_add_u32 s52, s52, s87
+s_addc_u32 s53, s53, 0
+.L_k3_tail_main_done_counter_ready:
 s_cmp_eq_u32 s62, 1
 s_cbranch_scc0 .L_k3_tail_signal_done
 s_cmp_eq_u64 s[52:53], 0

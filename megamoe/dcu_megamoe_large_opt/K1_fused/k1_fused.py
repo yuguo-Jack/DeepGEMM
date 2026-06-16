@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from ..v3_config import normalize_v3_backend
 from . import k1_fused_ext as _ext
 
 
@@ -14,6 +15,8 @@ FUSED_L1_ASM_NAME = (
     "MEGAMOE_DISPATCH_PULL_L1"
 )
 FUSED_L1_ASM_CO = THIS_DIR / f"{FUSED_L1_ASM_NAME}.co"
+FUSED_L1_ASM_PACK5_NAME = f"{FUSED_L1_ASM_NAME}_PACK5"
+FUSED_L1_ASM_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_PACK5_NAME}.co"
 
 K1_SUPPORTED_RANKS = 8
 K1_SUPPORTED_EXPERTS = 256
@@ -56,6 +59,15 @@ def ensure_fused_l1_asm_code_object() -> Path:
             "Rebuild and reinstall the megamoe wheel."
         )
     return FUSED_L1_ASM_CO
+
+
+def ensure_fused_l1_asm_pack5_code_object() -> Path:
+    if not FUSED_L1_ASM_PACK5_CO.exists():
+        raise FileNotFoundError(
+            f"prebuilt K1 V3 pack5 asm code object not found: {FUSED_L1_ASM_PACK5_CO}. "
+            "Rebuild and reinstall the megamoe wheel."
+        )
+    return FUSED_L1_ASM_PACK5_CO
 
 
 def load_extension(verbose: bool = False):
@@ -232,4 +244,276 @@ def k1_symm_fused_l1_asm_graph(
         None,
         runtime_num_tokens.contiguous(),
         True,
+    )
+
+
+def _v3_asm_pack5_weight_view(
+    l1_weight_pack5: torch.Tensor,
+    l1_scale: torch.Tensor,
+    *,
+    num_ranks: int,
+    num_experts: int,
+    hidden: int,
+) -> torch.Tensor:
+    return l1_weight_pack5.contiguous().view(
+        int(num_experts) // int(num_ranks),
+        int(l1_scale.size(1)) // 16,
+        int(hidden) * 16,
+    )
+
+
+def k1_symm_fused_l1_v3_asm_pack5(
+    sym_buffer,
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+    *,
+    rank_idx: int,
+    num_ranks: int,
+    num_experts: int,
+    num_tokens: int,
+    num_topk: int,
+    hidden: int,
+    alignment: int = 256,
+    l1_out_workspace: torch.Tensor | None = None,
+    cumulative_local_expert_recv_stats: torch.Tensor | None = None,
+    force_compact_prebuild: bool = False,
+    verbose_build: bool = False,
+):
+    _check_fused_l1_shape(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_tokens=num_tokens,
+        num_max_tokens_per_rank=sym_buffer.num_max_tokens_per_rank,
+        num_topk=num_topk,
+        hidden=hidden,
+        alignment=alignment,
+    )
+    l1_weight_pack5, l1_scale = l1_weights
+    ext = load_extension(verbose=verbose_build)
+    code_object = ensure_fused_l1_asm_pack5_code_object()
+    symm_base_addr, symm_x_span = _cached_symm_x_addr_range(
+        sym_buffer, num_ranks, hidden
+    )
+    return ext.k1_symm_fused_l1_v3_asm_pack5(
+        sym_buffer.buffer,
+        sym_buffer.route_scratch,
+        _v3_asm_pack5_weight_view(
+            l1_weight_pack5,
+            l1_scale,
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            hidden=hidden,
+        ),
+        l1_scale.contiguous(),
+        int(rank_idx),
+        int(num_ranks),
+        int(num_experts),
+        int(sym_buffer.num_max_tokens_per_rank),
+        int(num_tokens),
+        int(num_topk),
+        int(hidden),
+        int(symm_base_addr),
+        int(symm_x_span),
+        int(alignment),
+        str(code_object),
+        l1_out_workspace,
+        cumulative_local_expert_recv_stats,
+        None,
+        bool(force_compact_prebuild),
+    )
+
+
+def k1_symm_fused_l1_v3_asm_pack5_graph(
+    sym_buffer,
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+    *,
+    rank_idx: int,
+    num_ranks: int,
+    num_experts: int,
+    graph_max_tokens: int,
+    num_topk: int,
+    hidden: int,
+    runtime_num_tokens: torch.Tensor,
+    alignment: int = 256,
+    l1_out_workspace: torch.Tensor | None = None,
+    verbose_build: bool = False,
+):
+    _check_fused_l1_shape(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_tokens=graph_max_tokens,
+        num_max_tokens_per_rank=sym_buffer.num_max_tokens_per_rank,
+        num_topk=num_topk,
+        hidden=hidden,
+        alignment=alignment,
+    )
+    l1_weight_pack5, l1_scale = l1_weights
+    ext = load_extension(verbose=verbose_build)
+    code_object = ensure_fused_l1_asm_pack5_code_object()
+    symm_base_addr, symm_x_span = _cached_symm_x_addr_range(
+        sym_buffer, num_ranks, hidden
+    )
+    return ext.k1_symm_fused_l1_v3_asm_pack5(
+        sym_buffer.buffer,
+        sym_buffer.route_scratch,
+        _v3_asm_pack5_weight_view(
+            l1_weight_pack5,
+            l1_scale,
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            hidden=hidden,
+        ),
+        l1_scale.contiguous(),
+        int(rank_idx),
+        int(num_ranks),
+        int(num_experts),
+        int(sym_buffer.num_max_tokens_per_rank),
+        int(graph_max_tokens),
+        int(num_topk),
+        int(hidden),
+        int(symm_base_addr),
+        int(symm_x_span),
+        int(alignment),
+        str(code_object),
+        l1_out_workspace,
+        None,
+        runtime_num_tokens.contiguous(),
+        True,
+    )
+
+
+def k1_symm_fused_l1_v3(
+    sym_buffer,
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+    *,
+    rank_idx: int,
+    num_ranks: int,
+    num_experts: int,
+    num_tokens: int,
+    num_topk: int,
+    hidden: int,
+    backend: str,
+    alignment: int = 256,
+    l1_out_workspace: torch.Tensor | None = None,
+    cumulative_local_expert_recv_stats: torch.Tensor | None = None,
+    force_compact_prebuild: bool = False,
+    ll_block_m: int = 32,
+    ll_asm_compatible_layout: bool = False,
+    verbose_build: bool = False,
+):
+    backend = normalize_v3_backend(backend)
+    _check_fused_l1_shape(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_tokens=num_tokens,
+        num_max_tokens_per_rank=sym_buffer.num_max_tokens_per_rank,
+        num_topk=num_topk,
+        hidden=hidden,
+        alignment=alignment,
+    )
+    ext = load_extension(verbose=verbose_build)
+    if backend == "normal":
+        return k1_symm_fused_l1_v3_asm_pack5(
+            sym_buffer,
+            l1_weights,
+            rank_idx=rank_idx,
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_tokens=num_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            alignment=alignment,
+            l1_out_workspace=l1_out_workspace,
+            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+            force_compact_prebuild=force_compact_prebuild,
+            verbose_build=verbose_build,
+        )
+    l1_weight_pack5, l1_scale = l1_weights
+    return ext.k1_symm_fused_l1_v3_pack5(
+        sym_buffer.buffer,
+        sym_buffer.route_scratch,
+        l1_weight_pack5.contiguous(),
+        l1_scale.contiguous(),
+        int(rank_idx),
+        int(num_ranks),
+        int(num_experts),
+        int(sym_buffer.num_max_tokens_per_rank),
+        int(num_tokens),
+        int(num_topk),
+        int(hidden),
+        int(alignment),
+        backend,
+        l1_out_workspace,
+        cumulative_local_expert_recv_stats,
+        None,
+        int(ll_block_m),
+        64,
+        bool(ll_asm_compatible_layout),
+    )
+
+
+def k1_symm_fused_l1_v3_graph(
+    sym_buffer,
+    l1_weights: tuple[torch.Tensor, torch.Tensor],
+    *,
+    rank_idx: int,
+    num_ranks: int,
+    num_experts: int,
+    graph_max_tokens: int,
+    num_topk: int,
+    hidden: int,
+    runtime_num_tokens: torch.Tensor,
+    backend: str,
+    alignment: int = 256,
+    l1_out_workspace: torch.Tensor | None = None,
+    ll_block_m: int = 32,
+    ll_asm_compatible_layout: bool = False,
+    verbose_build: bool = False,
+):
+    backend = normalize_v3_backend(backend)
+    _check_fused_l1_shape(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_tokens=graph_max_tokens,
+        num_max_tokens_per_rank=sym_buffer.num_max_tokens_per_rank,
+        num_topk=num_topk,
+        hidden=hidden,
+        alignment=alignment,
+    )
+    ext = load_extension(verbose=verbose_build)
+    if backend == "normal":
+        return k1_symm_fused_l1_v3_asm_pack5_graph(
+            sym_buffer,
+            l1_weights,
+            rank_idx=rank_idx,
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            graph_max_tokens=graph_max_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            runtime_num_tokens=runtime_num_tokens,
+            alignment=alignment,
+            l1_out_workspace=l1_out_workspace,
+            verbose_build=verbose_build,
+        )
+    l1_weight_pack5, l1_scale = l1_weights
+    return ext.k1_symm_fused_l1_v3_pack5(
+        sym_buffer.buffer,
+        sym_buffer.route_scratch,
+        l1_weight_pack5.contiguous(),
+        l1_scale.contiguous(),
+        int(rank_idx),
+        int(num_ranks),
+        int(num_experts),
+        int(sym_buffer.num_max_tokens_per_rank),
+        int(graph_max_tokens),
+        int(num_topk),
+        int(hidden),
+        int(alignment),
+        backend,
+        l1_out_workspace,
+        None,
+        runtime_num_tokens.contiguous(),
+        int(ll_block_m),
+        64,
+        bool(ll_asm_compatible_layout),
     )

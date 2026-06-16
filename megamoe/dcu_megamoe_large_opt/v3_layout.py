@@ -1,10 +1,16 @@
-"""V2 pack5 weight layout helpers for real-flow integration."""
+"""V3 pack5 weight layout helpers for offline fixtures.
+
+These helpers are intentionally not used by the large-opt runtime path. V3
+execution expects callers/tests to provide weights that are already in this
+pack5 layout.
+"""
 
 from __future__ import annotations
 
 from typing import Tuple
 
 import torch
+
 
 PACK5_K64 = 64
 PACK5_N256 = 256
@@ -41,7 +47,6 @@ def pack5_shape(experts: int, n: int, k: int) -> tuple[int, int, int, int, int, 
 
 
 def pack5_flat_offset(*, expert: int, n: int, k: int, row: int, col: int) -> int:
-    """Return the flattened V2 pack5 byte offset for logical [expert, row, col]."""
     shape = pack5_shape(expert + 1, n, k)
     if row < 0 or row >= n or col < 0 or col >= k:
         raise ValueError("row/col out of range for pack5 shape")
@@ -60,7 +65,6 @@ def pack5_flat_offset(*, expert: int, n: int, k: int, row: int, col: int) -> int
 
 
 def pack5_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Transform [expert, n, k] FP8 weight into V2 pack5 layout."""
     if weight.dim() != 3:
         raise ValueError("pack5_weight expects [expert, n, k]")
     experts, n, k = weight.shape
@@ -82,13 +86,44 @@ def pack5_weight(weight: torch.Tensor) -> torch.Tensor:
 
 
 def flatten_pack5_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Return pack5 storage as [expert, n * k] for pointer-only launchers."""
     packed = pack5_weight(weight)
     return packed.reshape(weight.shape[0], weight.shape[1] * weight.shape[2])
 
 
+def pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
+    """Pack L2 weights for the isolated normal K3 ASM-pack5 experiment.
+
+    The original K3 ASM epilogue stores accumulator lanes in logical `ni`
+    order. The default V3 C/LL pack5 layout uses a transposed physical `ni`
+    order and compensates with an accumulator-lane shuffle before store. This
+    helper keeps the same 5pack tile nesting but leaves `ni` in plain order so
+    the isolated no-tail ASM path can reuse the original store schedule.
+    """
+    if weight.dim() != 3:
+        raise ValueError("pack5_weight_asm_normal expects [expert, n, k]")
+    experts, n, k = weight.shape
+    if n % PACK5_N256 != 0 or k % PACK5_K64 != 0:
+        raise ValueError(
+            "pack5_weight_asm_normal expects n divisible by 256 and k divisible by 64"
+        )
+    view = weight.reshape(
+        experts,
+        n // PACK5_N256,
+        PACK5_N256 // PACK5_N16,
+        PACK5_N16,
+        k // PACK5_K64,
+        PACK5_K64 // PACK5_K16,
+        PACK5_K16,
+    )
+    return view.permute(0, 4, 1, 2, 5, 3, 6).contiguous()
+
+
+def flatten_pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
+    packed = pack5_weight_asm_normal(weight)
+    return packed.reshape(weight.shape[0], weight.shape[1] * weight.shape[2])
+
+
 def unpack_pack5_weight(packed: torch.Tensor, *, n: int, k: int) -> torch.Tensor:
-    """Inverse transform from V2 pack5 layout back to [expert, n, k]."""
     if packed.dim() != 7:
         raise ValueError("unpack_pack5_weight expects the 7D pack5 tensor")
     experts = packed.shape[0]
@@ -109,9 +144,9 @@ def unpack_pack5_weight(packed: torch.Tensor, *, n: int, k: int) -> torch.Tensor
 
 def _cast_weight_to_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if weight.dim() != 3:
-        raise ValueError("V2 weight transform expects [expert, n, k]")
+        raise ValueError("V3 weight transform expects [expert, n, k]")
     if not hasattr(torch, "float8_e4m3fn"):
-        raise RuntimeError("torch.float8_e4m3fn is required for V2 FP8 weight transform")
+        raise RuntimeError("torch.float8_e4m3fn is required for V3 FP8 weight transform")
     scale = weight.float().abs().amax(dim=2).clamp(min=1.0e-4) / 448.0
     fp8 = (weight.float() / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
     return fp8.contiguous(), scale.contiguous()
@@ -122,12 +157,13 @@ def _pack_fp8_weight_and_scale(weight: torch.Tensor) -> tuple[torch.Tensor, torc
     return flatten_pack5_weight(fp8), scale
 
 
-def transform_fp8_weights_for_mega_moe_v2_pack5(
+def transform_fp8_weights_for_mega_moe_v3_pack5(
     l1_bf16: torch.Tensor,
     l2_bf16: torch.Tensor,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    """Transform BF16 L1/L2 weights into the V2-owned FP8 pack5 layout.
+    """Transform BF16 L1/L2 weights into V3-owned FP8 pack5 layout.
 
-    This deliberately does not call the baseline MegaMoE weight transform.
+    This is an offline/test setup helper. Do not call it from the runtime or
+    benchmark execution path.
     """
     return _pack_fp8_weight_and_scale(l1_bf16), _pack_fp8_weight_and_scale(l2_bf16)

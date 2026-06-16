@@ -1,0 +1,67 @@
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_runtime.h>
+
+#include <cstdint>
+
+#include "k1_v3_pack5_groupgemm_impl.cuh"
+
+void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
+    hip_bfloat16* out,
+    const uint8_t* staged_x,
+    const uint8_t* weight_pack5,
+    const float* staged_x_scale,
+    const float* weight_scale,
+    const int32_t* problem_size,
+    uint8_t* sym_buffer,
+    int32_t* route_scratch_i32,
+    int32_t* grid_barrier,
+    int barrier_epoch,
+    int rank_idx,
+    int num_ranks,
+    int num_global_experts,
+    int num_max_tokens_per_rank,
+    int num_topk,
+    int runtime_num_tokens,
+    int rows_aligned_per_expert,
+    int valid_rows_per_expert,
+    int ll_block_m,
+    int ll_cus,
+    float* route_weights,
+    int32_t* m_indices,
+    int32_t* output_index,
+    int64_t* row_combine_ptrs,
+    uint8_t* local_topk_mask,
+    int32_t* tail_tokens,
+    int32_t* local_expert_stats,
+    hipStream_t stream) {
+    const bool mask_tiny_store = valid_rows_per_expert <= 16;
+#define DCU_MEGAMOE_V3_LAUNCH_K1_LL(                                            \
+    BLOCK_M, CUS, MASK_TINY_STORE, PARALLEL_STAGE_COPY)                         \
+    V3_K1_LowLatencyMaskedGroupGemmKernel<                                      \
+        32, 4096, 4096, BLOCK_M, 256, 64, 4, CUS, MASK_TINY_STORE, true,        \
+        PARALLEL_STAGE_COPY>                                                     \
+        <<<dim3(CUS), dim3(256), 0, stream>>>(                                  \
+            out, staged_x, weight_pack5, staged_x_scale, weight_scale,           \
+            problem_size, rows_aligned_per_expert, sym_buffer,                  \
+            route_scratch_i32, grid_barrier, barrier_epoch, rank_idx,           \
+            num_ranks, num_global_experts, num_max_tokens_per_rank, num_topk,    \
+            runtime_num_tokens, route_weights, m_indices, output_index,          \
+            row_combine_ptrs, local_topk_mask, tail_tokens, local_expert_stats)
+
+    if (ll_block_m == 32 && ll_cus == 64) {
+        if (mask_tiny_store) {
+            DCU_MEGAMOE_V3_LAUNCH_K1_LL(32, 64, true, true);
+        } else {
+            DCU_MEGAMOE_V3_LAUNCH_K1_LL(32, 64, false, true);
+        }
+    } else if (ll_block_m == 48 && ll_cus == 64) {
+        DCU_MEGAMOE_V3_LAUNCH_K1_LL(48, 64, false, false);
+    } else if (ll_block_m == 64 && ll_cus == 64) {
+        if (mask_tiny_store) {
+            DCU_MEGAMOE_V3_LAUNCH_K1_LL(64, 64, true, false);
+        } else {
+            DCU_MEGAMOE_V3_LAUNCH_K1_LL(64, 64, false, false);
+        }
+    }
+#undef DCU_MEGAMOE_V3_LAUNCH_K1_LL
+}
