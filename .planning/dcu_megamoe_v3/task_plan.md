@@ -279,15 +279,31 @@
 - [🧭] planned verification：route_scratch 缩容实现必须覆盖 V3 normal/LL、tail/no-tail、eager/graph、uniform/uneven、32/128/1024/4096；同时确认 big fused 入口、legacy staged fused 非 V3 入口、graph flag reset/fallback 的删除或 fail-fast 语义清晰。
 - 状态：✅ audit complete（big fused 退役后，route_scratch 缩容进入 staged/V3 显存优化计划；当前不改生产分配）
 
-### Phase 9: K1 source-rank address contract 去 4GB span 依赖（optional）
+### Phase 9: K1 source-rank address contract / >4GB span 优化
+- [✅] 当前主动项：借 8192 放大 `symm_x_span > UINT32_MAX` 问题，拆清 K1 normal ASM 的 fast uint32-offset、absolute pointer、rank-local bit2 三类路径耗时，优先找通用优化，不做 8192 特化。
+- [✅] 诊断：4096 warmup=1 可把 `v3_symm_span` 压到 `3781689344 <= UINT32_MAX`，K1 median 约 `2.70-2.77 ms`；warmup=0 时 `v3_symm_span=5683806208`，K1 median 约 `3.33-3.38 ms`，说明 4GB span 对 K1 有明确影响。
+- [✅] 诊断：8192 warmup=0/1 都仍 `symm_x_span > UINT32_MAX`，K1 median 都约 `5.36-5.41 ms`，warmup 无法解决 8192；K3 warmup A/B 对 remote combine 基本无正收益，4GB span 主要伤 K1 地址路径而非 K3 peer-store 本体。
+- [✅] 历史诊断：8192 旧 `K1_PREBUILD_MODE=auto/asm/compact` A/B 显示当时 auto 与 asm-route 等价，K1 约 `5.37 ms`；旧 compact 因为 `symm_x_span > UINT32_MAX` 时走 absolute pointer，虽把 rows 从 `57344` 降到 `54272`，但 K1 变慢到约 `6.50 ms`。该结论只适用于 absolute compact 旧实现。
+- [✅] 诊断：已隔离 asm-route bit2 `{rank-local x offset, source rank}` 与 asm-route absolute pointer；同为 8192/rows `57344` 时 bit2 约 `5.33 ms`，absolute 约 `6.40 ms`，因此不能把 `>4GB` 路径简单切到 absolute。
+- [✅] 诊断：K3 remote combine locality / peer-write A/B 已覆盖 2048/4096/8192。简单 dest-sort 在 8192 从约 `5.98 ms` 退化到约 `8.07 ms`，rank-bucket compact 在 2048/4096 仅噪声级小幅变化、8192 两轮一正一负；当前没有可直接生产化的 K3 rowptr locality 改动。
+- [✅] 生产收口：K1 compact/graph prebuild 在 `symm_x_span > UINT32_MAX` 时不再写 absolute x pointer，也不再设置 `reserved_c0` bit1；row_x_ptrs 改写为 bit2 `{rank-local x offset, source rank}`，graph/compact 与 asm-route 使用同一 MUBUF source-load 合同。
+- [✅] 验证：远端 source pytest 6/6、K1 object 强制重编通过；`K1_PREBUILD_MODE=compact` 8192 no-tail e2e correctness 通过，fused `10.667 ms`；K1-only compact 8192 `v3_symm_span_gt_u32=true`、rows `54272`、median `5.156 ms`，相较旧 compact absolute `~6.50 ms` 明显恢复；normal graph no-tail/tail replay 512/1024 均 correct 且无性能劣化。
+- [✅] 生产 auto 收口：降低 auto compact 门槛后，8192 `K1_PREBUILD_MODE=auto` 已选择 compact/bit2，K1-only rows/active `54272/54272`、median `5.158 ms`，与强制 compact `5.187 ms` 等价；full e2e no-tail auto correctness 通过，fused `10.792 ms`，强制 compact `10.859 ms`。
+- [✅] 12ms+ 复现与归因：强制旧 `K1_PREBUILD_MODE=asm` full e2e no-tail 可复现 `12.712 ms`，说明当前 auto 不复现 12ms+ 是因为默认路径改变；K3 拆分显示 rows `57344 -> 54272` 后 `staged_rowptr` 从 `5.943 ms` 降到 `4.671 ms`，full e2e 约 `1.9 ms` 改善主要来自 K3/rowptr 下游压力下降，而不是 K1 kernel 本体单独贡献。
+- [✅] 生产清理：K1 ASM `reserved_c0` bit1 absolute pointer 死分支已从 route emit 和 stage source-load 中移除；bit2 `{rank-local offset, source_rank}` 与默认 uint32-offset 路径保留，source guard 防止 absolute label/旧 host bitfield 回流。
+- [✅] auto 规则细化：auto 现在同时要求 per-expert fractional saving `>=5%` 且 local tile saving `>=8 tiles`，并额外把 `fixed_capacity_tiles_per_expert >= 7` 的大 rowptr 档切到 compact；后者覆盖 8192/8448 这类 K1 不明显变快但 K3 rowptr/remote combine 明显受益的场景。
+- [✅] 8448 复核：初版 auto 因 compact capacity rows 与 fixed rows 同为 `57344` 而保持 asm，K1-only `5.390 ms`、e2e `12.864 ms`；强制 compact 虽未降低 capacity rows，但 prebuild 后 K3 `staged_rowptr` 从约 `6.22 ms` 降到 `4.78 ms`，e2e `11.248 ms`；加入大 rowptr 规则后 auto 选择 compact，K1 rows/active `57344/57344`、e2e correct 且 fused `11.202 ms`。
+- [✅] 代表 size e2e 矩阵：normal eager no-tail 覆盖 `256,512,1024,1025,2048,2050,4096,4097,8192,8448` 的 `asm/compact/auto`，30/30 correctness 通过；auto 对齐当前强制最优或在噪声容限内。2048 首轮 compact 轻微领先但三轮复核 asm 更优，因此规则保持 `2048/2050 -> asm`。
+- [ ] 验证待补：如继续收敛，需要补至少 4096/8192 tail-reduce 性能哨兵，确认 no-tail 以外路径同样不劣化。
+- [ ] 当前主动项：评估 ASM hot loop 内减少 `source_rank -> peer pointer table -> s_load_dwordx2` 频率、source-rank grouped row emission、或 SRD 缓存的可行性；任何实现前必须先确认 SGPR/resource/occupancy 和 2048/4096/8192 性能不劣化。
 - [🧭] optional backlog：短期继续保留 `_v3_normal_symm_warmup_enabled` 作为低风险生产保护；它只提高 first production `symm_x_span <= UINT32_MAX` 的概率，不作为长期地址合同。
 - [🧭] optional backlog：参考 DeepEP/Flux 的 per-rank pointer table 思路，把当前 K1 ASM bit2 `{rank-local x offset, source rank}` 路径升级为可优化的生产候选，而不是只作为 `symm_x_span > UINT32_MAX` 的慢速兜底。
-- [🧭] optional backlog：先做诊断矩阵，记录 1024/2048/4096/8192 下的 `symm_x_span`、reserved bit mode、K1 stage time、e2e time，明确 fast single-SRD、absolute pointer、rank-local bit2 三类路径的差距。
 - [🧭] optional backlog：优先尝试 source-rank grouped staging / row emission，让一个 row tile 或 producer CTA 尽量只处理一个或少数 source rank，从而把 peer SRD 选择提升到 tile/CTA 粒度，减少热循环内 `source_rank -> pointer table -> s_load_dwordx2` 开销。
+- [🧭] optional backlog：source-rank grouping 若继续推进，不采用每 source rank 固定 256-row 子桶（8192 会从当前 `1792 rows/expert` 膨胀到 `2048 rows/expert`）；优先评估 64-row 子桶/更细 row metadata 合同，理论上 8192 可压到约 `1536 rows/expert`，但这会触及 K1 route emission、stage loop、graph reset 和 K2/K3 row contract。
 - [🧭] optional backlog：若继续深入，定义显式 `{source_rank, rank_local_offset}` row metadata 合同；K1 ASM 从 per-rank SRD + rank-local offset 做 MUBUF load，避免依赖 `symm_base + uint32 offset` 覆盖所有 peer buffer。
 - [🧭] optional backlog：更大改造方向是 DeepEP/Flux 风格的 rank/channel staging：先按 source rank/channel 把 remote x 拉到 local `staged_x`，GEMM 主体只消费 local staged input；该方案会触及 K1 route emission、staged_x layout、graph/uneven、tail/no-tail 合同，必须在 Phase 10 sweep 后再评估。
 - [🧭] optional verification：任何去 4GB span 依赖的方案都必须满足 correctness 覆盖 V3 normal no-tail/tail、eager/graph、uniform/uneven，并且 4096/8192 K1 与 e2e 不劣化到当前 warmup fast path 之外；4096 参考 guard 以当前 cleanup refresh `~5.81/5.84 ms` e2e 和历史 K1 `~2.94-2.95 ms` fast path 为准。
-- 状态：🧭 optional backlog（当前不改生产路径；Phase 10 必做刷数已完成，后续需用户明确点名或新性能证据再转为主动优化）
+- 状态：[ ] implementation built, perf recheck pending（auto 规则和 absolute branch cleanup 已实现并通过 source/build；等待卡空补齐 4096/8192 性能复测后再关闭）
 
 ### Phase 10: Required V3 performance sweep
 - [✅] 必做：运行前检查远端 8 卡状态，确保无残留 KFD 进程；同步当前 workspace 到 `hg@10.17.176.11` / `sglang_megamoe` / `/workspace/DeepGEMM`，并重跑 `compileall`、`tests/test_dcu_megamoe_v3.py` 和 `build_ext --inplace` 确认产物新鲜。

@@ -148,6 +148,15 @@ def test_v3_build_surface_is_minimal_and_explicit():
 def test_v3_runtime_sources_have_clear_backend_boundaries():
     k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
     k1_asm_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+    k1_asm_sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            K1_FUSED_DIR
+            / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1.s",
+            K1_FUSED_DIR
+            / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s",
+        )
+    )
     k1_ext = (K1_FUSED_DIR / "k1_v3_fused_ext.cu").read_text(encoding="utf-8")
     k1_header = (K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh").read_text(
         encoding="utf-8"
@@ -167,6 +176,14 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "k1_symm_fused_l1_v3_pack5" in k1_py
     assert "k1_symm_fused_l1_v3_asm_pack5" in k1_asm_ext
     assert "k1_symm_fused_l1_asm_impl" in k1_asm_ext
+    assert "use_absolute_x_ptrs" not in k1_asm_ext
+    assert "prob.reserved_c0 |= 4u" in k1_asm_ext
+    assert "use_compact_prebuild ? 2u : 4u" not in k1_asm_ext
+    assert "kK1AutoCompactMinLocalTileSaving" in k1_asm_ext
+    assert "kK1AutoCompactLargeTilesPerExpert" in k1_asm_ext
+    assert "label_SymmRouteStoreAbsolutePtr" not in k1_asm_sources
+    assert "label_SymmStageLoadAbsolutePtr" not in k1_asm_sources
+    assert "absolute 64-bit" not in k1_asm_sources
     assert "dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5" in k1_ext
     assert "V3_K1_LowLatencyMaskedGroupGemmKernel" in k1_header
     assert "V3_K1_Fused_DeepGemm" not in k1_header

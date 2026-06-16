@@ -5218,3 +5218,74 @@
 - Planning impact:
   - the previously reopened normal tail graph intermittent correctness bug is now closed by the K1 reset fix;
   - future normal graph regressions should first check whether any new path bypasses the K1 graph flag/meta reset contract.
+
+## 2026-06-16 K1 >4GB and K3 remote-combine locality findings
+
+- K1 `symm_x_span > UINT32_MAX`:
+  - 4096 can benefit from `_v3_normal_symm_warmup_enabled` because warmup can move the first production symm buffer below the 4GB span limit;
+  - 8192 remains above 4GB even with warmup, so it exercises the K1 ASM bit2 `{rank-local offset, source_rank}` path;
+  - 8192 bit2 MUBUF path is much faster than absolute pointer/global-load (`~5.33 ms` vs `~6.40 ms` in the K1-only A/B), so switching >4GB to absolute pointers is not a valid optimization.
+- K1 ASM hot path:
+  - route emits row metadata through atomics, so rows inside a 256-row expert tile are not source-rank grouped;
+  - stage loop reads `{offset, source_rank}` from LDS and uses `source_rank` to load the peer base before MUBUF source loads;
+  - the pack5 code object already uses `sgpr_count=102` and `vgpr_count=255`, so caching all peer SRDs in spare SGPRs is not obviously safe.
+- K3 remote combine locality:
+  - dest-sorting rowptrs is harmful: 2048 remote-only `1.325 ms` vs dest-sorted `1.989 ms`; 8192 remote-only `5.981 ms` vs dest-sorted `8.074 ms`;
+  - rank-bucket compact rowptrs are not a stable win: 2048/4096 are noise-level positive, while 8192 is inconsistent across repeated probes;
+  - current ASM uses half-tile LDS staging and vectorized `global_store_dwordx4` combine stores, so preserving tile/store cadence matters more than simple destination-rank locality.
+- Design implication:
+  - do not implement a K3-only rowptr reorder/rank-bucket production change;
+  - any future locality optimization must be a K1/K2/K3 contract change that preserves row/data/expert alignment, likely via source-rank or destination-rank grouped row emission, and must prove 2048/4096/8192 no-tail/tail correctness and performance.
+
+## 2026-06-16 K1 compact prebuild should use bit2, not absolute pointers
+
+- The previous compact prebuild fallback for `symm_x_span > UINT32_MAX` encoded `row_x_ptrs` as absolute 64-bit pointers and set `reserved_c0` bit1.
+- A/B evidence showed this is the wrong production fallback:
+  - asm-route bit2 `{rank-local offset, source_rank}` at 8192 was about `5.33 ms`;
+  - absolute pointer source-load path at the same rows was about `6.40 ms`;
+  - compact absolute prebuild was about `6.50 ms` even though it had fewer rows.
+- Production fix:
+  - compact prebuild now writes the same bit2-compatible packed metadata as asm-route for >4GB spans;
+  - host no longer sets absolute-pointer bit1, including graph-forced compact capture;
+  - source guard rejects `use_absolute_x_ptrs` returning to `k1_fused_ext.cu`.
+- Verification after the fix:
+  - K1-only compact 8192 with `v3_symm_span_gt_u32=true` is `5.156 ms` median, rows `54272`;
+  - compact 8192 no-tail e2e correctness passes with `max_abs=0.000488281`, fused `10.667 ms`;
+  - normal graph no-tail/tail replay 512/1024 remains correct and in the expected `~1.62-1.95 ms` replay range.
+- Design implication:
+  - absolute pointer should not be considered a performance fallback for V3 normal K1;
+  - if the residual ASM bit1 branch is removed later, it should be treated as code-object dead-branch cleanup after source-level host guards have been stable, not as a separate performance optimization.
+
+## 2026-06-16 8192 auto compact improves e2e mostly through K3 row pressure
+
+- After compact prebuild switched from absolute pointers to bit2 `{rank-local offset, source_rank}`, the old auto heuristic was stale:
+  - old auto selected asm-route at 8192 because compact absolute had been slower;
+  - with bit2 compact, K1-only auto/compact both use rows `54272` and run at about `5.16-5.19 ms`.
+- Full e2e no-tail evidence:
+  - current `K1_PREBUILD_MODE=auto`: correctness passes, fused `10.792 ms`;
+  - forced `K1_PREBUILD_MODE=compact`: correctness passes, fused `10.859 ms`;
+  - forced old `K1_PREBUILD_MODE=asm`: correctness passes, fused `12.712 ms`.
+- K3 split explains why the e2e improvement is larger than the K1-only delta:
+  - asm rows `57344`: K3 ASM-pack5 `staged_rowptr` about `5.943 ms`;
+  - compact rows `54272`: K3 ASM-pack5 `staged_rowptr` about `4.671 ms`;
+  - K3 alone accounts for about `1.27 ms` of the e2e improvement, while K1-only accounts for about `0.25 ms`.
+- Interpretation:
+  - the 8192 improvement is a row-contract/downstream effect, not only a K1 source-load optimization;
+  - compact rows reduce K3 GEMM/rowptr/remote-combine work enough to justify making compact/bit2 the 8192 auto choice;
+  - future 8192 work should always report K1-only, K3 split, and full e2e together, because K1 route capacity changes can shift K3 cost substantially.
+
+## 2026-06-16 K1 auto should require both relative and absolute row savings
+
+- The old auto rule was too one-dimensional because it only looked at fractional tile saving.
+- Current production heuristic should encode the two observed regimes:
+  - use asm-route when there is no meaningful row reduction, because it avoids compact prebuild overhead;
+  - use compact when it materially reduces local rows, because the e2e benefit can be dominated by downstream K3 rowptr/remote-combine work rather than K1 alone.
+- The refined rule therefore requires:
+  - estimated per-expert tile saving ratio `>= 5%`;
+  - estimated local tile saving `>= 8 tiles`.
+- This keeps obvious no-gain cases on asm (`256/512/1024/2048/2050`) while retaining compact for row-pressure cases (`1025/4096/4097/8192`).
+- The ASM absolute pointer bit1 path is no longer a valid fallback:
+  - host no longer sets bit1;
+  - source guard rejects host/ASM absolute branch reintroduction;
+  - ASM route emit and stage load now only distinguish default uint32-offset MUBUF and bit2 `{rank-local offset, source_rank}` MUBUF.
+- Perf verification is still required after card contention clears, but the static/codegen direction is now simpler: bit1 has no production semantics.

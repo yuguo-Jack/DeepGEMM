@@ -72,7 +72,9 @@ static constexpr int kK1RouteTileM = 256;
 static constexpr int kK1SupportedAlignment = 256;
 static constexpr int kK1RouteCapacitySlack = 64;
 static constexpr int64_t kK1RowPointerPadding = 512;
-static constexpr double kK1AutoCompactMinSaving = 0.10;
+static constexpr double kK1AutoCompactMinSaving = 0.05;
+static constexpr double kK1AutoCompactMinLocalTileSaving = 8.0;
+static constexpr int64_t kK1AutoCompactLargeTilesPerExpert = 7;
 static constexpr double kK1CompactTightMarginMinSaving = 0.45;
 static constexpr const char* kK1ShapeContract =
     "K1_fused dispatch-pull L1 asm is currently specialized for ranks=8, "
@@ -116,9 +118,13 @@ double estimate_compact_tiles_per_expert(
 bool should_auto_compact_routes(
     const int64_t total_tasks,
     const int64_t num_experts,
+    const int64_t local_experts,
     const int64_t asm_tiles_per_expert) {
     if (asm_tiles_per_expert <= 1) {
         return false;
+    }
+    if (asm_tiles_per_expert >= kK1AutoCompactLargeTilesPerExpert) {
+        return true;
     }
     const double compact_tiles =
         estimate_compact_tiles_per_expert(
@@ -126,7 +132,13 @@ bool should_auto_compact_routes(
     const double saving =
         (static_cast<double>(asm_tiles_per_expert) - compact_tiles) /
         static_cast<double>(asm_tiles_per_expert);
-    return saving >= kK1AutoCompactMinSaving;
+    if (saving < kK1AutoCompactMinSaving) {
+        return false;
+    }
+    const double local_tile_saving =
+        (static_cast<double>(asm_tiles_per_expert) - compact_tiles) *
+        static_cast<double>(local_experts);
+    return local_tile_saving >= kK1AutoCompactMinLocalTileSaving;
 }
 
 int64_t compact_capacity_tiles(
@@ -412,7 +424,7 @@ __global__ void k1_emit_compact_routes_kernel(
     const int num_topk,
     const int hidden,
     const int capacity_tiles,
-    const int use_absolute_x_ptrs) {
+    const int use_rank_local_x_ptrs) {
     constexpr int kTileM = kK1RouteTileM;
     const int tid = static_cast<int>(threadIdx.x);
     const int source_rank = static_cast<int>(blockIdx.y);
@@ -471,8 +483,13 @@ __global__ void k1_emit_compact_routes_kernel(
             reinterpret_cast<uint64_t>(x) +
             static_cast<uint64_t>(token_idx) * static_cast<uint64_t>(hidden);
         output_index[task] = row;
-        if (use_absolute_x_ptrs) {
-            row_x_ptrs[row] = static_cast<int64_t>(x_addr);
+        if (use_rank_local_x_ptrs) {
+            const uint64_t peer_base_addr =
+                reinterpret_cast<uint64_t>(sym_buffers[source_rank]);
+            const uint64_t rank_local_offset = x_addr - peer_base_addr;
+            row_x_ptrs[row] = static_cast<int64_t>(
+                (static_cast<uint64_t>(source_rank) << 32) |
+                static_cast<uint32_t>(rank_local_offset));
         } else {
             row_x_ptrs[row] =
                 static_cast<int64_t>(
@@ -537,7 +554,7 @@ void launch_l1_deepgemm_fused_asm(
     const int64_t num_tokens,
     const int64_t num_topk,
     const uint32_t expert_tiles_per_expert,
-    const bool use_absolute_x_ptrs,
+    const bool use_rank_local_x_ptrs,
     const bool use_compact_prebuild,
     const int* runtime_num_tokens,
     const std::string& code_object_path) {
@@ -680,7 +697,7 @@ void launch_l1_deepgemm_fused_asm(
             static_cast<int>(num_topk),
             hidden,
             capacity_tiles,
-            use_absolute_x_ptrs ? 1 : 0);
+            use_rank_local_x_ptrs ? 1 : 0);
         K1_HIP_CHECK(hipGetLastError());
     }
     GpuProb prob{};
@@ -720,12 +737,12 @@ void launch_l1_deepgemm_fused_asm(
     prob.num_topk = static_cast<uint32_t>(num_topk);
     // reserved_c0 is a compact/asm-route mode bitfield:
     // bit0: metadata is prebuilt by HIP compact kernels.
-    // bit1: row_x_ptrs stores absolute 64-bit pointers.
-    // bit2: asm route stores {rank-local x offset, source rank}.
-    // The bit2 path keeps asm-route source loads on MUBUF for >4GB spans.
+    // bit2: row_x_ptrs stores {rank-local x offset, source rank}.
+    // The bit2 path keeps source loads on MUBUF for >4GB spans, including
+    // compact/graph prebuild.
     prob.reserved_c0 = (use_compact_prebuild ? 1u : 0u);
-    if (use_absolute_x_ptrs) {
-        prob.reserved_c0 |= use_compact_prebuild ? 2u : 4u;
+    if (use_rank_local_x_ptrs) {
+        prob.reserved_c0 |= 4u;
     }
     prob.reserved_c4 = 0;
     prob.flag_generation = next_fused_l1_flag_generation();
@@ -888,7 +905,8 @@ k1_symm_fused_l1_asm_impl(
     }
     if (!use_compact_prebuild && !force_asm_route) {
         use_compact_prebuild = should_auto_compact_routes(
-            capacity_total_tasks, num_experts, fixed_capacity_tiles_per_expert);
+            capacity_total_tasks, num_experts, local_experts,
+            fixed_capacity_tiles_per_expert);
     }
     const int64_t fixed_capacity_tiles =
         local_experts * fixed_capacity_tiles_per_expert;
@@ -973,7 +991,7 @@ k1_symm_fused_l1_asm_impl(
     }
     const uint64_t symm_base_addr =
         static_cast<uint64_t>(symm_base_addr_value);
-    bool use_absolute_x_ptrs =
+    bool use_rank_local_x_ptrs =
         static_cast<uint64_t>(symm_x_span_value) >
         static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
     const int64_t total_rows = capacity_rows;
@@ -1023,7 +1041,7 @@ k1_symm_fused_l1_asm_impl(
         local_expert_stats,
         rank_idx, num_ranks, num_experts, num_max_tokens_per_rank,
         num_tokens, num_topk, expert_tiles_per_expert,
-        use_absolute_x_ptrs, use_compact_prebuild,
+        use_rank_local_x_ptrs, use_compact_prebuild,
         runtime_num_tokens_ptr,
         code_object_path);
 

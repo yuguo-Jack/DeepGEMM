@@ -1327,10 +1327,11 @@ s_load_dwordx2 s[sgprExternalArgAddress:sgprExternalArgAddress+1], s[sgprKernArg
 
 s_load_dwordx2 s[98:99], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x1c
 
-/* MegaMoE dispatch-pull L1: D-side aux kernarg carries row x metadata. In fast mode it stores
- * uint32 offsets in the low dword; in safe mode it stores absolute 64-bit
- * pointers. s52:s55 are reused by COMPUTE_ADDRESS_SCALE, so keep the pointer
- * in s100:s101 until B offset initialization. */
+/* MegaMoE dispatch-pull L1: D-side aux kernarg carries row x metadata.
+ * Default mode stores rank-local uint32 offsets in the low dword. Bit2 mode
+ * stores {rank-local uint32 offset, source rank}. s52:s55 are reused by
+ * COMPUTE_ADDRESS_SCALE, so keep the pointer in s100:s101 until B offset
+ * initialization. */
 s_load_dwordx2 s[100:101], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x24
 /* Grouped Gemm: Load address of kernel arguments */
 s_load_dwordx2 s[sgprKernArgAddress:sgprKernArgAddress+1], s[sgprKernArgAddress:sgprKernArgAddress+1], 0xc
@@ -2006,8 +2007,9 @@ v_mov_b32 v252, v241
 v_lshlrev_b32 v253, 2, v239
 buffer_store_dword v252, v253, s[76:79], 0, offen, offset:0
 
-s_cmp_ge_u32 s12, 2
-s_cbranch_scc1 label_SymmRouteStoreWidePtr
+s_and_b32 s78, s12, 4
+s_cmp_eq_u32 s78, 4
+s_cbranch_scc1 label_SymmRouteStoreRankLocalPtr
 v_lshlrev_b32 v252, 12, v251
 s_add_u32 s76, s64, 0x90
 s_addc_u32 s77, s65, 0
@@ -2015,18 +2017,6 @@ s_sub_u32 s76, s76, s68
 s_subb_u32 s77, s77, s69
 v_add_u32 v252, s76, v252
 v_mov_b32 v253, 0
-s_branch label_SymmRouteStorePtrReady
-label_SymmRouteStoreWidePtr:
-s_and_b32 s78, s12, 4
-s_cmp_eq_u32 s78, 4
-s_cbranch_scc1 label_SymmRouteStoreRankLocalPtr
-label_SymmRouteStoreAbsolutePtr:
-v_lshlrev_b32 v252, 12, v251
-s_add_u32 s76, s64, 0x90
-s_addc_u32 s77, s65, 0
-v_add_co_u32 v252, vcc, s76, v252
-v_mov_b32 v253, s77
-v_addc_co_u32 v253, vcc, v253, 0, vcc
 s_branch label_SymmRouteStorePtrReady
 label_SymmRouteStoreRankLocalPtr:
 v_lshlrev_b32 v252, 12, v251
@@ -2341,25 +2331,13 @@ v_lshlrev_b32 v252, 5, v252
 v_cmp_ne_u32 vcc, v254, 0xffffffff
 s_and_saveexec_b64 s[54:55], vcc
 s_cbranch_execz label_SymmStageSkipSourceLoad
-s_cmp_ge_u32 s12, 2
-s_cbranch_scc1 label_SymmStageLoadWidePtr
+s_and_b32 s63, s12, 4
+s_cmp_eq_u32 s63, 4
+s_cbranch_scc1 label_SymmStageLoadRankLocalPtr
 v_add_u32 v253, v253, v252
 buffer_load_dwordx4 v[232:235], v253, s[68:71], 0, offen, offset:0
 v_add_u32 v253, 16, v253
 buffer_load_dwordx4 v[236:239], v253, s[68:71], 0, offen, offset:0
-s_branch label_SymmStageSourceLoadIssued
-
-label_SymmStageLoadWidePtr:
-s_and_b32 s63, s12, 4
-s_cmp_eq_u32 s63, 4
-s_cbranch_scc1 label_SymmStageLoadRankLocalPtr
-label_SymmStageLoadAbsolutePtr:
-v_add_co_u32 v253, vcc, v253, v252
-v_addc_co_u32 v254, vcc, v254, 0, vcc
-global_load_dwordx4 v[232:235], v[253:254], off glc
-v_add_co_u32 v253, vcc, 16, v253
-v_addc_co_u32 v254, vcc, v254, 0, vcc
-global_load_dwordx4 v[236:239], v[253:254], off glc
 s_branch label_SymmStageSourceLoadIssued
 
 label_SymmStageLoadRankLocalPtr:

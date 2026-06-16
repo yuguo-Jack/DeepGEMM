@@ -6283,3 +6283,296 @@
 - 诊断备注：
   - synthetic rowptr locality A/B 中的 contig/dest-sorted 模式会触发 K3COMBINE VMFault，不作为生产路径性能证据；
   - 结束后远端 `hy-smi` 显示无测试进程残留、HCU/VRAM 空闲。
+
+## 2026-06-16 - K1/K3 span and remote-combine follow-up
+
+- 用户要求继续验证 8192 性能问题，并借 8192 尝试优化 `symm_x_span > UINT32_MAX` 执行路径；同时关注 K3 remote combine locality / peer 写吞吐方向。
+- K3 warmup A/B 已解析，输出来自 `hygon_tmp/sglang_debug/span_ab_20260616/k3_warm*.json`：
+
+| tokens/rank | warmup | local_rowptr avg ms | staged_remote_only avg ms | staged_rowptr avg ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 4096 | 0 | 1.560811 | 2.477867 | 2.503051 |
+| 4096 | 1 | 1.559883 | 2.553583 | 2.571263 |
+| 8192 | 0 | 2.961683 | 5.869373 | 5.838537 |
+| 8192 | 1 | 2.965099 | 5.867301 | 5.841858 |
+
+- K3 结论：
+  - warmup 对 K3 remote combine 没有稳定正收益；
+  - `symm_x_span > UINT32_MAX` 的主要影响在 K1 input staging/addressing，不是 K3 peer-store 本体；
+  - K3 remote 方向后续应使用安全的 store-only/rowptr-locality probe，避免再用会破坏 row/data/expert 对齐的 synthetic contig rowptr 直接跑 K3COMBINE。
+- K1 8192 `K1_PREBUILD_MODE` A/B：
+  - 输出目录：`hygon_tmp/sglang_debug/k1_span_mode_ab_20260616/`；
+  - auto：K1 V3 median 约 `5.377 ms`，rows `57344`，active `48975`，`symm_span_gt_u32=true`；
+  - asm：K1 V3 median 约 `5.375 ms`，rows `57344`，active `48975`，`symm_span_gt_u32=true`；
+  - compact：K1 V3 median 约 `6.502 ms`，rows `54272`，active `54272`，`symm_span_gt_u32=true`。
+- K1 结论：
+  - 8192 auto 已等价 asm-route fixed rows；强制 compact 虽减少 rows，但额外 prebuild/absolute-pointer 路径更慢，不能作为 8192 通用优化；
+  - 下一步需要隔离 asm-route bit2 `{rank-local offset, source rank}` 与 asm-route absolute pointer 的差异，确认热循环内 source-rank SRD 选择是否是 8192 的可优化项。
+
+## 2026-06-16 - K1 >4GB asm-route pointer mode A/B
+
+- 为隔离 8192 `symm_x_span > UINT32_MAX` 下的 K1 source-load 路径，临时在 host 侧增加 `K1_ASM_ROUTE_X_PTR_MODE=rank_local|absolute` A/B 开关；测试后已从本地源码删除，并重新同步/重建远端 `.so`，不保留新生产环境变量。
+- 输出目录：
+  - `hygon_tmp/sglang_debug/k1_xptr_mode_ab_20260616/`
+- 固定条件：
+  - tokens/rank `8192`；
+  - `K1_PREBUILD_MODE=asm`；
+  - `K1_NORMAL_BENCH_MODE=v3`；
+  - `K1_NORMAL_BENCH_ALLOC_ORDER=v3_first`；
+  - `symm_span_gt_u32=true`；
+  - rows `57344`，active rows `48975`。
+- 结果：
+  - rank-local bit2：K1 V3 median 约 `5.333675 ms`，min `5.290235 ms`；
+  - absolute pointer：K1 V3 median 约 `6.395594 ms`，min `6.330554 ms`。
+- 结论：
+  - 当前 bit2 `{rank-local x offset, source rank}` MUBUF 路径明显优于 absolute global-load，同 rows 下快约 `1.06 ms`；
+  - 8192 的 4GB span 优化不能通过切 absolute pointer 解决；
+  - 后续若继续优化 K1 >4GB 路径，应考虑 ASM hot loop 内减少 `source_rank -> peer pointer table -> s_load_dwordx2` 的频率，或重整 row emission/source-rank grouping；但当前 code object `.amdhsa_next_free_sgpr=102`，没有显而易见的空闲 SGPR 缓存 8 个 peer SRD，任何 ASM 改动都必须做 code object resource/occupancy 和 2048/4096/8192 A/B。
+
+## 2026-06-16 - K3 remote combine locality / peer-write A/B
+
+- 用户要求在确认 K1 span 后继续试 K3 remote combine locality / peer 写吞吐方向，优先找通用优化，不做 8192 特化。
+- 已执行的安全 synthetic probe：
+  - `hygon_tmp/sglang_debug/k3_locality_ab_20260616/k3_dest_sorted_2048.json`
+  - `hygon_tmp/sglang_debug/k3_locality_ab_20260616/k3_rank_bucket_2048.json`
+  - `hygon_tmp/sglang_debug/k3_locality_ab_20260616/k3_rank_bucket_4096.json`
+  - `hygon_tmp/sglang_debug/k3_locality_ab_20260616/k3_rank_bucket_8192.json`
+  - `hygon_tmp/sglang_debug/k3_locality_ab_20260616/k3_sorted_8192.json`
+- 2048 dest-sort 结果：
+  - `staged_remote_only` avg `1.325055 ms`；
+  - `staged_remote_dest_sorted` avg `1.988875 ms`；
+  - 单纯按目标地址排序会明显破坏当前 K3 ASM half-tile staging/vector store 节奏。
+- rank-bucket compact rowptr 结果：
+
+| tokens/rank | staged_remote_only avg ms | rank_bucket_remote_only avg ms | 结论 |
+| ---: | ---: | ---: | --- |
+| 2048 | 1.335035 | 1.329027 | 噪声级略好 |
+| 4096 | 2.486547 | 2.471371 | 噪声级略好 |
+| 8192 | 5.758673 | 6.021509 | 退化 |
+
+- 8192 sorted 复核：
+
+| mode | avg ms |
+| --- | ---: |
+| staged_remote_only | 5.981337 |
+| staged_rank_bucket_remote_only | 5.932649 |
+| staged_remote_dest_sorted | 8.074312 |
+| staged_rank_bucket_remote_sorted | 8.219244 |
+
+- K3 结论：
+  - rank-bucket compact 本身没有稳定正收益：8192 两轮一正一负，幅度都不足以支撑生产改动；
+  - dest-sorted / rank-bucket-sorted 均显著劣化，说明当前 K3 ASM 的 half-tile LDS staging 与 `global_store_dwordx4` store cadence 比简单目的 rank 聚集更关键；
+  - 不应做 K3-only rowptr reorder 或 combine-buffer rank bucket 生产改动；若未来重启 K3 locality，必须连同 K1 row emission、K2/K3 row order 和 correctness 合同一起设计。
+- K1 静态复核：
+  - V3 normal pack5 K1 ASM `sgpr_count=102`、`vgpr_count=255`、`private_segment=0`，没有明显 SGPR 余量缓存 8 个 peer SRD；
+  - bit2 路径 route 阶段写 `{rank-local offset, source_rank}`，stage 阶段在每个 row/vector loop 里用 `source_rank` 从 peer pointer table `s_load_dwordx2` 得到 MUBUF base；
+  - route 阶段 4 个 builder row tile 分 source rank 扫描，但 per-expert row 分配靠 atomic，行顺序天然混合 source rank；把 peer base 选择提升到 tile/CTA 粒度需要 source-rank grouped row emission 或 row metadata 合同变化，不能作为小补丁直接改。
+- source-rank 分桶容量账：
+  - 如果每个 expert/source-rank 子桶仍按 256-row K1 tile 对齐，2048/4096/8192 都会变成 `2048 rows/expert`，8192 比当前 `1792 rows/expert` 还差；
+  - 如果设计 64-row 子桶，理论容量约为 2048=`512 rows/expert`、4096=`1024 rows/expert`、8192=`1536 rows/expert`，8192 有潜在收益；
+  - 但 64-row 子桶会触动 K1 route emission、stage loop 的 peer-base 推导、K1 graph flag/reset 和后续 K2/K3 row contract，属于合同级改造，不适合在当前 pack5 ASM 上做小补丁。
+- 当前状态：
+  - K3 remote locality 方向先收敛为反证，不改生产路径；
+  - Phase 9 剩余主动项集中在 K1 >4GB ASM/source-rank 合同级优化可行性评估。
+
+## 2026-06-16 - Remove compact absolute pointer production path
+
+- 用户判断：absolute pointer 路径性能太差，V3 normal cuda graph/compact prebuild 不应继续存在这个性能隐患；应尽量走 bit2 `{rank-local offset, source_rank}` MUBUF 路径。
+- 代码收口：
+  - `k1_emit_compact_routes_kernel()` 参数从 `use_absolute_x_ptrs` 改为 `use_rank_local_x_ptrs`；
+  - compact prebuild 在 `symm_x_span > UINT32_MAX` 时写 `row_x_ptrs[row] = (source_rank << 32) | uint32(rank_local_offset)`；
+  - host `prob.reserved_c0` 不再设置 bit1 absolute pointer，只在 compact bit0 外追加 bit2；
+  - `tests/test_dcu_megamoe_v3.py` 增加 source guard，禁止 `use_absolute_x_ptrs` 和旧 `use_compact_prebuild ? 2u : 4u` 回流。
+- 静态/构建验证：
+  - 本地 `git diff --check` 通过；
+  - 远端 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`6 passed`；
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过；
+  - 为避免 ninja 误判增量，删除远端生成物 `build/temp.../K1_fused/k1_fused_ext.o` 后重建，确认 `hipcc` 重新编译 K1 object。
+- 远端验证输出目录：
+  - `hygon_tmp/sglang_debug/k1_compact_bit2_20260616_1058/`
+- compact + >4GB e2e 验证：
+  - env：`MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1 USE_MEGAMOE_V3=1 MEGAMOE_DCU_V3_BACKEND=normal K1_PREBUILD_MODE=compact K3_USE_ASM_TAIL_REDUCE=0`；
+  - tokens/rank `8192`，correctness 通过，`max_abs=0.000488281`；
+  - fused `10.667335 ms`，baseline `16.507452 ms`，speedup `1.5475x`。
+- K1-only compact 8192 验证：
+  - `v3_symm_span_gt_u32=true`；
+  - rows/active rows `54272/54272`；
+  - K1 V3 median `5.156397 ms`，min `5.078558 ms`；
+  - 相比旧 compact absolute 约 `6.50 ms`，说明去掉 absolute 后 compact 路径恢复到 bit2 MUBUF 性能区间。
+- V3 normal graph smoke：
+  - no-tail graph replay 512/1024：correct，replay `1.616879/1.948219 ms`，eager fused `2.033879 ms`；
+  - tail graph replay 512/1024：correct，replay `1.660819/1.946260 ms`，eager fused `2.053519 ms`；
+  - graph capture/compact 路径未发现 correctness 或性能回退。
+- 结论：
+  - production host path 已不再触发 absolute pointer bit1；
+  - ASM code object 中旧 bit1 分支目前作为不可达历史分支保留，避免为删死分支重写 code object；
+  - 若后续继续优化 8192，优先看 source-rank grouping/SRD 选择频率，而不是恢复 absolute pointer。
+
+## 2026-06-16 - 8192 auto compact threshold and e2e/K3 attribution
+
+- 用户指出 `12ms+ -> 10ms+` 不可能只由 K1 kernel 本体解释，要求测 e2e 并包含 K3。
+- 远端状态：
+  - `hy-smi` 显示 8 卡空闲；
+  - 已同步 `k1_fused_ext.cu` / `tests/test_dcu_megamoe_v3.py` / 临时 bench wrapper；
+  - 删除远端 K1 object 后 `MAX_JOBS=16 python3 setup.py build_ext --inplace`，确认 K1 重新 hipcc 编译。
+- K1-only auto/compact 验证：
+  - 输出目录：`hygon_tmp/sglang_debug/k1_only_auto_compact_20260616_auto_threshold_after_build/`；
+  - `auto`: `symm_gt_u32=true`，rows/active `54272/54272`，K1 median max-rank `5.158318 ms`，rank0 `active_tiles=207`；
+  - `compact`: `symm_gt_u32=true`，rows/active `54272/54272`，K1 median max-rank `5.187278 ms`；
+  - 结论：当前 auto 已经选择 compact/bit2，不再走旧 asm-route。
+- Full e2e no-tail auto/compact：
+  - 输出目录：`hygon_tmp/sglang_debug/normal_8192_auto_compact_20260616_e2e_auto_compact_after_threshold/`；
+  - `auto`: correctness 通过，`max_abs=0.000488281`，fused `10.792295 ms`，baseline `17.250931 ms`，speedup `1.5984x`；
+  - `compact`: correctness 通过，`max_abs=0.000488281`，fused `10.858693 ms`，baseline `17.223492 ms`，speedup `1.5861x`。
+- 旧 12ms+ 路径复现：
+  - 输出目录：`hygon_tmp/sglang_debug/normal_8192_force_asm_20260616_asm_repro_12ms/`；
+  - env：`K1_PREBUILD_MODE=asm`，其余同 V3 normal no-tail production；
+  - correctness 通过，`max_abs=0.000488281`；
+  - fused `12.712474 ms`，baseline `16.581692 ms`，speedup `1.3044x`；
+  - 结论：12ms+ 可以复现，当前 auto 不复现是因为 auto path 已改成 compact/bit2。
+- K3 拆分归因：
+  - 输出目录：`hygon_tmp/sglang_debug/k3_8192_k1mode_compare_20260616_k3_k1mode_after_threshold/`；
+  - `K1_PREBUILD_MODE=asm`: rows `57344`，K3 `staged_rowptr` median avg-rank `5.942537 ms`，`staged_remote_only` `5.929757 ms`，`local_rowptr` `2.962478 ms`，`rowptr_all_zero` `2.874631 ms`；
+  - `K1_PREBUILD_MODE=compact`: rows `54272`，K3 `staged_rowptr` median avg-rank `4.670578 ms`，`staged_remote_only` `4.643146 ms`，`local_rowptr` `2.804235 ms`，`rowptr_all_zero` `2.714691 ms`；
+  - K3 staged rowptr 单项下降约 `1.27 ms`，K1-only 仅下降约 `0.25 ms`，因此 e2e `12.71 -> 10.79 ms` 的主要改善来自 compact rows/rowptr 合同降低 K3 下游远端 combine 压力。
+- 当前结论：
+  - `kK1AutoCompactMinSaving=0.05` 与 compact/bit2 组合在 8192 上是合理默认；
+  - 不应再把旧 compact absolute 的 `~6.50 ms` 结论外推到当前 compact/bit2；
+  - 后续若继续优化 8192，应优先关注 source-rank grouped row emission / SRD 选择频率这类合同级方向，并用 e2e + K3 split 同时验证。
+
+## 2026-06-16 - Auto rule refinement and ASM absolute branch cleanup
+
+- 目标：
+  - 根据当前性能归因完善 `K1_PREBUILD_MODE=auto`；
+  - 清掉 K1 ASM 中已经不可达、且性能很差的 absolute pointer bit1 路径。
+- auto 规则改动：
+  - 保留 fractional saving 门槛 `kK1AutoCompactMinSaving=0.05`；
+  - 新增 absolute local tile saving 门槛 `kK1AutoCompactMinLocalTileSaving=8.0`；
+  - auto 只有在“比例上省得够”和“本 rank local tiles 绝对减少够多”同时满足时才启用 compact；
+  - 公式检查结果：
+
+| tokens/rank | auto | fixed rows | compact rows | 说明 |
+| ---: | --- | ---: | ---: | --- |
+| 256 | asm | 8192 | 8192 | 1 tile/expert，不 compact |
+| 512 | asm | 8192 | 8192 | 1 tile/expert，不 compact |
+| 1024 | asm | 8192 | 8192 | 1 tile/expert，不 compact |
+| 1025 | compact | 16384 | 8960 | 跨 1024 后 fixed rows 翻倍，compact 明显压 rows |
+| 2048 | asm | 16384 | 16384 | 预计无 rows savings |
+| 2050 | asm | 16384 | 16384 | 预计无 rows savings |
+| 4096 | compact | 32768 | 29696 | rows 降 `3072` |
+| 4097 | compact | 32768 | 29696 | rows 降 `3072` |
+| 8192 | compact | 57344 | 54272 | rows 降 `3072` |
+
+- ASM cleanup：
+  - 两份 K1 ASM 源都移除了 `label_SymmRouteStoreAbsolutePtr` 和 `label_SymmStageLoadAbsolutePtr`；
+  - route emit 不再根据 `reserved_c0 >= 2` 写 absolute pointer，只检查 bit2；
+  - stage source-load 不再根据 bit1 做 `global_load_dwordx4` absolute pointer，只保留 default uint32-offset MUBUF 与 bit2 rank-local MUBUF。
+- Source guard：
+  - `tests/test_dcu_megamoe_v3.py` 增加 guard，要求 host 不出现旧 `use_absolute_x_ptrs` / `use_compact_prebuild ? 2u : 4u`，ASM 源不出现 absolute labels 或 `absolute 64-bit` 注释。
+- 验证：
+  - 本地 `git diff --check` 通过；
+  - 本地 `python -m compileall tests/test_dcu_megamoe_v3.py` 通过；
+  - 本地 pytest 不可用：`No module named pytest`；
+  - 远端 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`6 passed`；
+  - 远端删除 K1 object 后 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，K1 host ext 已重编，build_ext 末尾会重新构建 large-opt ASM code objects。
+- 待补：
+  - 远端当前被外部 `sglang serve` 占用，`hy-smi` 显示多卡 `90-96% VRAM` 且多卡 HCU 接近 `100%`；
+  - 未跑 8192/4096 e2e perf，避免得到污染数据；
+  - 卡空后补：K1-only auto、8192 e2e auto/compact、4096/8192 no-tail/tail 至少一组性能哨兵。
+
+## 2026-06-16 - 8448 auto rule boundary check
+
+- 用户要求等卡空后单独刷 8448，分别比较 `K1_PREBUILD_MODE=compact/asm`，确认 auto 规则效果是否符合预期。
+- 远端状态：
+  - 初始被外部 `sglang serve --mem-fraction-static 0.88` 占用，8 卡 VRAM `91-93%`，未清理外部进程；
+  - 卡空后 `hy-smi` 显示 8 卡 VRAM/HCU 均为 `0%`，开始测试。
+- 输出目录：
+  - 初版规则 A/B：`hygon_tmp/sglang_debug/normal_8448_auto_rule_20260616_130012/`；
+  - 修正后 auto 复测：`hygon_tmp/sglang_debug/normal_8448_auto_rule_after_fix_20260616_131259/`。
+- K1-only 初版规则结果：
+
+| mode | rows max | active max | K1 median max-rank ms | rank0 active_tiles |
+| --- | ---: | ---: | ---: | ---: |
+| asm | 57344 | 50935 | 5.410402 | 0 |
+| compact | 57344 | 57344 | 5.400239 | 221 |
+| auto | 57344 | 50935 | 5.389836 | 0 |
+
+- 解释：
+  - 8448 下 fixed capacity 是 `7 tiles/expert = 57344 rows`；
+  - compact prebuild 的真实 tile 需求约 `221 tiles`，但加 margin 后被 clamp 到 fixed `224 tiles`，所以最终 capacity rows 没降；
+  - 因此“compact 不降 rows”只表示最终 launch/capacity rows 未减少，不表示没有走 count/prebuild。
+- Full e2e 初版规则结果：
+
+| mode | correct | fused median ms | fused min ms | baseline median ms | speedup |
+| --- | --- | ---: | ---: | ---: | ---: |
+| asm | true | 12.747614 | 12.652854 | 18.021132 | 1.4137x |
+| compact | true | 11.247952 | 11.129933 | 17.924590 | 1.5936x |
+| auto | true | 12.863582 | 12.492222 | 18.040603 | 1.4025x |
+
+- K3 split 归因：
+
+| mode | rows | active rows | K3 staged_remote_only max-rank ms | K3 staged_rowptr max-rank ms |
+| --- | ---: | ---: | ---: | ---: |
+| asm | 57344 | 50688 | 6.194325 | 6.380214 |
+| compact | 57344 | 57344 | 4.807185 | 4.865729 |
+| auto | 57344 | 50688 | 6.007669 | 6.036385 |
+
+- 结论：
+  - 初版 auto 只看 estimated capacity rows saving，8448 被留在 asm；
+  - 但 compact 即使没有降低最终 capacity rows，仍通过 prebuild/padding/row metadata 形态显著降低 K3 rowptr/remote combine 时间；
+  - auto 规则需要覆盖 `fixed_capacity_tiles_per_expert >= 7` 的大 rowptr 档。
+- 代码修正：
+  - 新增 `kK1AutoCompactLargeTilesPerExpert = 7`；
+  - `should_auto_compact_routes()` 在 `asm_tiles_per_expert >= 7` 时直接选择 compact；
+  - `tests/test_dcu_megamoe_v3.py` 增加 source guard 防止该规则被误删。
+- 验证：
+  - 本地 `git diff --check` 通过；
+  - 本地 `python -m compileall tests/test_dcu_megamoe_v3.py` 通过；
+  - 公式 sanity：`256/512/1024/2048/2050` 仍为 asm，`1025/4096/4097/8192/8448` 为 compact；
+  - 远端 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`6 passed`；
+  - 远端删除 K1 object 后 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，K1 host ext 已重新 hipcc 编译。
+- 修正后 8448 auto：
+  - K1-only：`symm_gt_u32=true`，rows/active `57344/57344`，rank0 `active_tiles=221`，K1 median max-rank `5.440002 ms`；
+  - e2e：correct，fused `11.202062 ms`，baseline `17.889183 ms`，speedup `1.5970x`；
+  - 结果与强制 compact 对齐，auto 规则符合当前性能预期。
+
+## 2026-06-16 - Representative auto-rule e2e matrix
+
+- 用户要求对代表 size 全部跑 `asm/compact` e2e，并检查当前 auto 规则是否能选到最好的。
+- 测试口径：
+  - V3 normal eager no-tail；
+  - `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1 USE_MEGAMOE_V3=1 MEGAMOE_DCU_V3_BACKEND=normal K3_USE_ASM_TAIL_REDUCE=0`；
+  - 每个 size 跑 `K1_PREBUILD_MODE=asm/compact/auto`；
+  - `correctness_iters=1, warmup=2, repeat=5`；
+  - 输出目录：`hygon_tmp/sglang_debug/normal_auto_rule_matrix_20260616_131851/`。
+- 矩阵结果，30/30 case 均 rc=0 且 correctness 通过：
+
+| tokens/rank | asm ms | compact ms | auto ms | forced best | auto 判定 |
+| ---: | ---: | ---: | ---: | --- | --- |
+| 256 | 1.585520 | 1.637019 | 1.585900 | asm | ok |
+| 512 | 1.691620 | 1.736819 | 1.701539 | asm | ok |
+| 1024 | 2.070819 | 2.071639 | 2.057319 | asm | ok |
+| 1025 | 2.707359 | 2.137899 | 2.130799 | compact | ok |
+| 2048 | 3.414738 | 3.371778 | 3.357278 | compact/noise | ok |
+| 2050 | 3.354319 | 3.416038 | 3.405738 | asm | ok |
+| 4096 | 6.367037 | 5.911437 | 5.902677 | compact | ok |
+| 4097 | 6.423017 | 5.972537 | 5.936797 | compact | ok |
+| 8192 | 12.591534 | 10.754614 | 10.836473 | compact | ok |
+| 8448 | 12.800073 | 11.193274 | 11.371170 | compact | ok |
+
+- 2048 边界复核：
+  - 首轮矩阵里 2048 forced compact 只比 forced asm 快 `0.043 ms`，且 auto 反而更快，属于噪声级；
+  - 追加三轮 2048 e2e 复核，输出目录 `hygon_tmp/sglang_debug/normal_auto_rule_2048_recheck_20260616_134105/`；
+  - 三轮均 correctness 通过：
+
+| mode | runs ms | median-of-runs ms | mean ms |
+| --- | --- | ---: | ---: |
+| asm | `3.347297, 3.380317, 3.327497` | 3.347297 | 3.351704 |
+| compact | `3.422937, 3.411917, 3.416197` | 3.416197 | 3.417017 |
+| auto | `3.397477, 3.374377, 3.408717` | 3.397477 | 3.393523 |
+
+- 结论：
+  - 当前 auto 规则保留 `256/512/1024/2048/2050 -> asm` 是合理的；
+  - `1025/4096/4097/8192/8448 -> compact` 与代表矩阵一致；
+  - 2048 不应因单轮噪声切 compact，三轮复核显示 asm 更稳；
+  - no-tail 代表矩阵未发现 correctness 或性能回退。后续只需补 tail-reduce 哨兵，而不是继续扩大 no-tail 矩阵。
