@@ -9,6 +9,17 @@
 
 默认行为必须保持不变：`USE_MEGAMOE_V3` 只在 `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1` 时生效；如果 3-stage large_opt 未强制开启，即使设置了 `USE_MEGAMOE_V3` 也不改变原始 DCU MegaMoE 逻辑。
 
+## 2026-06-16 V3 转正目标更新
+
+本节 supersedes 上述历史 gate 目标：V3 不再作为 `USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND` 隔离实验路径，而要转为 DCU MegaMoE 主路径。
+
+- retained production route：对外 DCU MegaMoE 接口和单测参数尽量沿用原有使用方法；除权重必须使用 V3 pack5 layout 外，框架侧不应因为 V3 转正而新增必需调用参数。
+- backend auto policy：按实际运行 tokens per rank 分流，`<=256` 走 V3 LL，`>256` 走 V3 normal。graph capture bucket 可以大于实际 replay tokens，backend 选择不能简单使用 capture 上限；uneven 场景必须按全局/dispatch token bucket 保证所有 rank 选同一 backend。
+- legacy route retirement：之前 big fused 主路径退役并由 LL 覆盖；之前 legacy staged fused 主路径退役并由 V3 normal 覆盖。旧路径不再作为生产 fallback、默认 benchmark 对照或性能优化对象。
+- env cleanup：V3 转正后删除 `USE_MEGAMOE_V3` 与 `MEGAMOE_DCU_V3_BACKEND` 对生产路径的影响；README 中移除对应实验开关说明；生产 API 不再读取 backend env，测试脚本用 `MEGAMOE_DCU_BACKEND=auto|ll|normal` 与 `MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD` 模拟框架层选择。
+- memory cleanup：big fused 删除后，Phase 8 的 `route_scratch` / symm buffer 空间优化从 optional backlog 升级为必做，实现 V3-only staged scratch layout，减少历史兼容包袱。
+- final gate：完成后必须重跑 README 覆盖命令、source tests、远端 build、V3 LL/normal 功能/精度/性能矩阵，并确认各 size 性能符合历史预期。
+
 ## 当前状态
 - V2 独立路径只保留为历史证据；`DG_BUILD_MEGAMOE_V2_EXT`、`megamoe/dcu_megamoe_v2/`、`csrc/kernels/dcu_megamoe_v2/`、`tests/test_dcu_megamoe_v2.py` 和相关 setup/package/test 引用已清理，V3 决策不再依赖 V2 代码路径。
 - K1/K3 V3 LL compute core 仍来自 stage-owned C pack5 fused 实现；K1/K3 V3 normal 生产路径已切到 isolated ASM-pack5 pair（no-tail 与 tail-reduce），不再依赖 normal C/aicc kernel。
@@ -277,7 +288,7 @@
 - [🧭] planned direction：新增 V3-only/staged-only route_scratch size/layout 公式，按 retained V3 staged fused 真实合同分配：K1 metadata/task workspace、`staged_x`、`l1_out`、`act_fp8`、`act_scale`、K3 `prob_storage`、graph runtime token、tail done counter/signal addrs、K1 graph flags/meta flags；不再预留 big fused 的 L2 queue、tile pull/done counters、tile rowptr arrays 等 persistent kernel scratch。
 - [🧭] planned direction：V3 LL 小 token 用 backend/token-bucket rows 分配 scratch，避免 32/128 档按 384-token big-fused route layout 分配；V3 normal ASM-pack5 用 K1 actual capacity rows 分配 staged scratch，而不是按 route tile worst-case rows。
 - [🧭] planned verification：route_scratch 缩容实现必须覆盖 V3 normal/LL、tail/no-tail、eager/graph、uniform/uneven、32/128/1024/4096；同时确认 big fused 入口、legacy staged fused 非 V3 入口、graph flag reset/fallback 的删除或 fail-fast 语义清晰。
-- 状态：✅ audit complete（big fused 退役后，route_scratch 缩容进入 staged/V3 显存优化计划；当前不改生产分配）
+- 状态：✅ audit complete（big fused DSV4 主路径退役后，route_scratch 缩容已进入 Phase 12 生产实现）
 
 ### Phase 9: K1 source-rank address contract / >4GB span 优化
 - [✅] 当前主动项：借 8192 放大 `symm_x_span > UINT32_MAX` 问题，拆清 K1 normal ASM 的 fast uint32-offset、absolute pointer、rank-local bit2 三类路径耗时，优先找通用优化，不做 8192 特化。
@@ -294,25 +305,57 @@
 - [✅] auto 规则细化：auto 现在同时要求 per-expert fractional saving `>=5%` 且 local tile saving `>=8 tiles`，并额外把 `fixed_capacity_tiles_per_expert >= 7` 的大 rowptr 档切到 compact；后者覆盖 8192/8448 这类 K1 不明显变快但 K3 rowptr/remote combine 明显受益的场景。
 - [✅] 8448 复核：初版 auto 因 compact capacity rows 与 fixed rows 同为 `57344` 而保持 asm，K1-only `5.390 ms`、e2e `12.864 ms`；强制 compact 虽未降低 capacity rows，但 prebuild 后 K3 `staged_rowptr` 从约 `6.22 ms` 降到 `4.78 ms`，e2e `11.248 ms`；加入大 rowptr 规则后 auto 选择 compact，K1 rows/active `57344/57344`、e2e correct 且 fused `11.202 ms`。
 - [✅] 代表 size e2e 矩阵：normal eager no-tail 覆盖 `256,512,1024,1025,2048,2050,4096,4097,8192,8448` 的 `asm/compact/auto`，30/30 correctness 通过；auto 对齐当前强制最优或在噪声容限内。2048 首轮 compact 轻微领先但三轮复核 asm 更优，因此规则保持 `2048/2050 -> asm`。
-- [ ] 验证待补：如继续收敛，需要补至少 4096/8192 tail-reduce 性能哨兵，确认 no-tail 以外路径同样不劣化；这是收口验证，不是新的 Phase 9 优化方向。
+- [✅] tail-reduce 哨兵已补：后续 latest matrix 与 normal graph/eager 回归已覆盖 4096/8192 tail/no-tail、eager/graph、uniform/uneven；未见 correctness 回退，性能处于历史预期区间。
 - [🚫] 当前不继续推进：ASM hot loop 内减少 `source_rank -> peer pointer table -> s_load_dwordx2`、SRD 缓存、source-rank grouped row emission 都属于高风险合同级改动；在 compact/bit2 + auto 规则后，8192/8448 e2e 已恢复到目标区间，暂无足够收益证据支撑继续改生产路径。
 - [🧭] optional backlog：短期继续保留 `_v3_normal_symm_warmup_enabled` 作为低风险生产保护；它只提高 first production `symm_x_span <= UINT32_MAX` 的概率，不作为长期地址合同。
 - [🧭] optional backlog：只有未来 profiler 再证明 K1 `source_rank`/peer pointer lookup 是 4096/8192/8448 的主瓶颈时，才重新评估 per-rank pointer table、显式 `{source_rank, rank_local_offset}` row metadata、source-rank grouped row emission 等合同级方案；不得作为小 ASM patch 直接推进。
 - [🧭] optional backlog：更大改造方向是 DeepEP/Flux 风格的 rank/channel staging：先按 source rank/channel 把 remote x 拉到 local `staged_x`，GEMM 主体只消费 local staged input；该方案会触及 K1 route emission、staged_x layout、graph/uneven、tail/no-tail 合同，必须等 V3-only scratch/route_scratch 收敛后再评估。
 - [🧭] optional verification：任何去 4GB span 依赖的方案都必须满足 correctness 覆盖 V3 normal no-tail/tail、eager/graph、uniform/uneven，并且 4096/8192 K1 与 e2e 不劣化到当前 warmup fast path 之外；4096 参考 guard 以当前 cleanup refresh `~5.81/5.84 ms` e2e 和历史 K1 `~2.94-2.95 ms` fast path 为准。
-- 状态：✅ production optimization complete（absolute pointer 已移除，compact/bit2 与 auto 规则已通过代表 no-tail 矩阵；剩余仅 tail-reduce 哨兵验证和长期合同级 backlog）
+- 状态：✅ production optimization complete（absolute pointer 已移除，compact/bit2 与 auto 规则已通过代表矩阵和 tail-reduce 哨兵验证；剩余仅长期合同级 backlog）
 
 ### Phase 10: Required V3 performance sweep
 - [✅] 必做：运行前检查远端 8 卡状态，确保无残留 KFD 进程；同步当前 workspace 到 `hg@10.17.176.11` / `sglang_megamoe` / `/workspace/DeepGEMM`，并重跑 `compileall`、`tests/test_dcu_megamoe_v3.py` 和 `build_ext --inplace` 确认产物新鲜。
 - [✅] 必做/BUG：V3 LL row-capacity bug 已修复。根因是 K1 LL host 侧 `rows_per_expert` 只按平均路由数对齐，随机 routing 中部分 local expert 超过容量后被截断，导致 fused stats mismatch 或较大 numerical diff；1024 capture 失败后，exact 256 eager 也暴露同类 overflow，因此当前策略改为 `expected rows/expert >= 48` 时补 64 rows，保留 32/128 tiny bucket 原容量，同时保证 LL 实际执行至少支持到 512 tokens/rank。graph capture bucket 可以更大，但不能替代 exact eager bucket 的容量安全验证。
 - [✅] 必做：V3 LL 使用 graph 模式完整刷 uniform tokens per rank `8,32,64,128,256,512,1024`；graph capture bucket 固定按 `1024`，已记录 replay 性能表。旧 `phase10_ll_graph_20260615_232857` 慢表仅代表 K1 row-capacity correctness 修复后的中间状态，已被 runtime-row K3 graph 修复后的新结果覆盖。
 - [✅] 必做：V3 LL graph sweep 同时覆盖 `K3_USE_ASM_TAIL_REDUCE=0` no-tail 与 `K3_USE_ASM_TAIL_REDUCE=1` tail；K1 row-capacity correctness 和 K3 graph fixed-row 性能问题均已修复，全档位均通过，graph replay 性能已落盘。
-- [✅] 必做/BUG：V3 LL tail reduce/signal graph replay 已改为 runtime-token 化。K3 tail reducer 现在从 graph runtime token tensor 读取 replay tokens 并 clamp 到 capture bucket，capture1024/replay8..512 不再按 1024 token 做 reduce；K2 graph 仍保持 capture 固定 grid，但 graph path 传 `row_combine_ptrs`，inactive rows 在 kernel 内 early-return，进一步缩小 grid 属于 graph-update/compact row-list 合同级优化，不作为当前生产缺陷。
+- [✅] 必做/BUG：V3 LL tail reduce/signal graph replay 已改为 runtime-token 化。K3 tail reducer 现在从 graph runtime token tensor 读取 replay tokens 并 clamp 到 capture bucket，capture1024/replay8..512 不再按 1024 token 做 reduce；capture8192 下 K2 graph 固定-row block 开销已通过现有 K2 reg kernel 的 grid-stride row loop + 内部 `max_row_blocks=2048` 收敛，不新增 kernel、不引入 D2H sync，LL replay 8 token 已恢复到 `~0.56 ms`。
+- [✅] 2026-06-17 cleanup follow-up：LL tail eager 不再误传 graph runtime token output；eager 128/512 with `num_max_tokens_per_rank=1024` tail correctness 通过，graph capture1024 replay 32/96/128/256/512 tail correctness 通过。确认 eager 有效 rows 不被 max 放大，max 只作为 symm combine stride / scratch capacity 合同。
 - [✅] 必做：V3 normal 使用 eager 模式刷 uniform tokens per rank `256,512,1024,1025,2048,2050,4096,4097,8192`；不把 graph 结果代替本轮 normal eager sweep。
 - [✅] 必做：V3 normal eager sweep 同时覆盖 no-tail/tail；所有档位 correctness 通过，1024/1025、2048/2050、4096/4097 边界点未见 correctness 异常或明显性能台阶。
 - [✅] 必做：normal eager 结果落盘到 `hygon_tmp/sglang_debug/phase10_v3_sweep_20260615_196S/`；最终 LL graph 补测结果落盘到 `hygon_tmp/sglang_debug/ll_graph_dynamic_verify_20260615_235731/`，包含日志、case status、JSON 和 `summary.csv`；已回写 `progress.md` / `findings.md` / 本 Phase 状态。
 - [🧭] optional backlog：K2 融入 K1 只在后续 profiler 证明 K2 + `l1_out` 中间读写占 LL graph replay 的显著比例时再恢复；当前 K2 约 `0.028 ms` 的历史 stage timing 表明它不是 32/128 小 token 主瓶颈，直接把 SwiGLU/row-wise scale/FP8 quant 塞进 K1 epilogue 有较高 occupancy 和跨 N tile reduction 风险。
 - 状态：✅ complete for required sweep（normal eager sweep、LL 1024 row-capacity bug fix、LL graph `8..1024` no-tail/tail runtime-row replay sweep 均已完成；LL 1024 仍只作为 graph capture/correctness 覆盖，不作为大 token 生产推荐路径）
+
+### Phase 11: V3 转正为 DCU MegaMoE 主路径
+- [✅] 梳理当前 public DCU MegaMoE 入口、`large_opt.py`、`__init__.py`、tests 和 README 中的 big fused / legacy staged / V3 gate 分支，确认哪些是生产入口、哪些只剩历史引用。
+- [✅] 将默认 DCU MegaMoE 主路径切到 V3 staged dispatcher：实际 tokens per rank `<=256` 选择 LL，`>256` 选择 normal；保留外部调用参数和单测使用方式，权重 layout 差异仍由 V3 pack5 helper/fixture 处理。
+- [✅] 处理 graph 与 uneven backend 选择：graph 不用 capture max tokens 误判 backend；uneven 使用 dispatch/global bucket，确保 8 rank backend 一致。
+- [✅] 移除 `USE_MEGAMOE_V3` 和 `MEGAMOE_DCU_V3_BACKEND` 对生产路径的控制；同步删除 source guards、测试 env 组合和 README 实验开关说明。
+- [✅] 清理之前 big fused 主路径相关代码/默认入口/测试引用，以 V3 LL 覆盖小 token 主路径；DSV4 public eager/graph 已默认进入 V3 staged，public API 改为显式 `megamoe_backend="ll"|"normal"` 加 `graph=True|False`，不再保留旧 `big_fused_cuda_graph` / `stages_fused_cuda_graph` / `ll_cuda_graph` / `normal_cuda_graph` 语义。
+- [✅] 清理之前 legacy staged fused 主路径相关代码/默认入口/测试引用，以 V3 normal 覆盖大 token 主路径；Python 旧 K1/K3 非-pack5 staged wrapper 已删除，V3 normal 只通过 isolated ASM-pack5 entry 表达。
+- [✅] 保留并验证仍有意义的非 V3 参数/env：tail/no-tail、K1 auto/compact 策略、`MEGAMOE_DCU_LARGE_OPT_VERBOSE_BUILD` 仍保留；`USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND` 等实验 env 已不再被生产路径消费。
+- [🧭] retained compatibility：底层 `_C.fp8_mega_moe*` 暂保留为非 DSV4 shape fallback；DSV4 route_scratch size 已按 V3-only staged layout 缩容，不能再把旧 persistent big-fused 当作 DSV4 私有直调用路径。
+- 状态：✅ complete for public V3 main path（底层非 DSV4 `_C` fallback 作为兼容保留，不再列为 V3 主路径阻塞项）
+
+### Phase 12: V3-only route_scratch / symm footprint 优化
+- [✅] 在 DSV4 V3 staged 主路径上重新定义 retained route_scratch 合同：K1 metadata workspace、`staged_x`、normal ASM K1 graph flags/meta/GpuProb、`l1_out`、`act_fp8`、`act_scale`、K3 `prob_storage`、graph runtime token、tail done/signal addrs。
+- [✅] DSV4 size API 不再按 legacy big-fused `DcuRouteTileScratchLayout` full layout 分配，不再预留 L2 queue、tile pull/done counters、tile rowptr arrays、persistent kernel scratch 等空间；非 DSV4 shape 暂留 legacy fallback。
+- [✅] 按 V3 backend/token bucket 缩容：小 buffer 按 LL rows/headroom；大 buffer 按 normal fixed-capacity 上界覆盖 auto compact/graph compact；实测 8192 requested max 对齐 8448 后 route_scratch 为 `0.830 GiB`，旧约 `4.013 GiB`。
+- [✅] 校验 symm buffer 的 combine 区、runtime token、peer pointer header 是否仍是 retained V3 path 必需；combine 区仍被 K3 no-tail 外部 reduce 与 tail in-kernel reduce 共同消费，runtime token/peer header 仍是 graph/跨 rank 合同的一部分，当前不做高风险 shrink。
+- [✅] 覆盖完整 eager/graph、uniform/uneven、tail/no-tail 的 route_scratch 缩容验证；Phase 13 矩阵 40/40 case pass，LL/normal eager、graph replay、uneven eager/graph 均通过。
+- 状态：✅ complete（DSV4 route_scratch shrink 已落地，symm buffer retained 区域暂无可安全删除项）
+
+### Phase 13: README、测试与最终回归矩阵
+- [✅] 更新工程 README 的 DCU MegaMoE 部分：V3 成为主路径、权重 pack5 layout 要求、框架/测试层 `<=256` LL / `>256` normal 策略、保留参数/env、移除 V3 gate/backend env；graph 示例使用 `megamoe_backend` + `graph=True`，不再沿用旧 graph flag 名称。
+- [✅] 更新 `tests/test_mega_moe_dcu.py` 和 `tests/test_dcu_megamoe_v3.py`：尽量复用原参数和使用方法，删除 V3 env-gated 专用断言，新增默认主路径、auto backend、retired symbol 和 route_scratch shrink 合同测试。
+- [✅] 本地静态验证：`compileall`、`git diff --check` 通过；本地无 pytest 环境，source pytest 在远端容器执行。
+- [✅] 远端构建验证：同步到 `/workspace/DeepGEMM`，`compileall`、`PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 7/7 通过，`MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过。
+- [✅] 远端功能/精度验证：LL/normal、tail/no-tail、eager/graph、uniform/uneven 均通过；结果目录 `hygon_tmp/sglang_debug/phase13_final_20260616_181534/`。
+- [✅] 远端性能 sweep：LL 刷 `8,32,64,128,256`；normal main path 刷 `512,1024,1025,2048,2050,4096,4097,8192`，另补 normal actual256/dispatch512 boundary；对照历史 progress 表，未见功能回退，8192 当前稳定在 `~10.9-11.0 ms`，相对最近 `~10.75-10.79 ms` 有约 1-2% 漂移但仍优于旧 `12ms+` 档。
+- [✅] README 命令验证：`scripts/run_dcu_megamoe_large_opt.sh` 以 `TOKENS_LIST=512 SKIP_BENCH=1` smoke 通过，验证 README/script 入口可执行。
+- [✅] 2026-06-17 follow-up：上层 API 再收敛为 `megamoe_backend` + `graph`；auto/threshold/env 只存在于 `tests/test_mega_moe_dcu.py` 作为框架选择模拟；旧 `dispatch_num_tokens` public/CLI 参数删除，eager-only 容量上界改名为 `capacity_num_tokens`，不参与分化、不进入 graph。远端 build、source tests、LL/normal eager/graph smoke 已通过。
+- [✅] 2026-06-17 latest matrix：K2 actual_m replay pruning 与 LL 8192 headroom 修复后，重刷 LL `8,32,33,64,128,129,256,257,512,513` eager/graph、normal `256,512,1024,1025,2048,2050,3072,4096,4097,8192` eager/graph，graph 均 capture8192；LL/normal eager/graph uneven smoke 均 `correct=True`，README smoke v2 通过。结果落盘 `hygon_tmp/sglang_debug/full_matrix_latest_20260617_191221`，表格已写入 `progress.md`。
+- 状态：✅ complete（最终回归矩阵通过，8192 轻微性能漂移已记录为后续观察项）
 
 ## 讨论用接口对照草案
 
@@ -325,8 +368,8 @@
 | 通信语义 | K1 dispatch-pull + K3 combine/tail reduce | pure normal/LL 本身不带通信 | 在通信外壳中保留 5pack C groupgemm core 性能 |
 | pipeline 融合 | ASM 把通信与 GEMM 调度绑定 | C pure 更容易改 pipeline | K1 藏到 load/route，K3 藏到 epilogue/store/reduce |
 | GEMM 流水保护 | 原 ASM 自带融合流水 | pure 5pack C 已有高性能流水 | 不破坏 load/compute/store 核心调度 |
-| 后端选择 | 原 ASM 单一路径 | LL / normal 两套 C pack5 | 使用 `MEGAMOE_DCU_V3_BACKEND=ll|normal` |
-| 隔离 | 默认原逻辑 | `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1 && USE_MEGAMOE_V3=1` 才启用 | off path 零行为变化 |
+| 后端选择 | 原 ASM 单一路径 | LL C pack5 / normal ASM-pack5 | public API 执行显式 `megamoe_backend`；测试/框架层按 selector tokens 与 threshold 自动选择 |
+| 隔离 | 历史 env-gated 实验路径 | DSV4 shape 默认 V3 staged；非 DSV4 暂留 `_C` fallback | 不再消费 `USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND` |
 | layout | 原始 DCU MegaMoE layout | V3 pack5 layout | 单测/离线侧提前转好，runtime/bench 不做权重处理 kernel |
 
 ## 风险
@@ -346,6 +389,6 @@
 - 首选远端 8 卡验证和 benchmark，运行前检查 `hy-smi`/进程/显存状态。
 - 如果有人占用部分显存但测试仍能在 8 卡或可用卡上推进，优先继续跑 correctness/compile/smoke，不因非致命占用停下。
 - 如果 8 卡全部不可用，保持监控而不是中断工作；期间继续做本地代码梳理、实现、静态检查和计划更新，卡空后恢复远端验证。
-- 每个验证命令都记录环境变量组合，尤其是 `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE`、`USE_MEGAMOE_V3`、`MEGAMOE_DCU_V3_BACKEND`、`K3_USE_ASM_TAIL_REDUCE`。
+- 每个验证命令都记录当前生产相关参数/环境：`megamoe_backend`、`graph`、selector tokens、`K3_USE_ASM_TAIL_REDUCE`、`K1_PREBUILD_MODE`、tokens/rank、tail/no-tail；旧 `USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND` 不再作为生产验证项。
 - 远端 build/test/profiler/debug 的临时日志、status 和产物统一放到 repo 内 `hygon_tmp/`，默认使用 `hygon_tmp/sglang_debug/`；不要把项目调试产物散落在 `/tmp`。
 - 当前 tail-reduce 验证优先级：normal tail 走 isolated ASM-pack5 production path，LL tail 走 retained C pack5 path；不再恢复 normal C/raw tail-reduce 定位链条。`tests/test_dcu_megamoe_v3.py` 只用于 env gate、wrapper/source boundary、V2 隔离和源码 guard，不作为 GPU correctness。历史 `global_load_dwordx4 off`、stage compare、direct-signal、signal-slot/generation 等 C/raw tail A/B 已反证，后续不重复同一方向；新的 tail 变更必须直接用 8 卡 eager/graph correctness 与性能 gate 验收。

@@ -36,7 +36,6 @@ for tokens in $tokens_list; do
         extra_args+=(--skip-bench)
     fi
 
-    MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1 \
     python tests/test_mega_moe_dcu.py \
         --num-processes "$num_processes" \
         --num-max-tokens-per-rank "$max_tokens" \

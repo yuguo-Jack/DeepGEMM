@@ -11,8 +11,6 @@ from . import k3_fused_ext as _ext
 THIS_DIR = Path(__file__).resolve().parent
 
 K3_COMBINE_ASM_NAME = "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE"
-K3_COMBINE_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}.co"
-K3_COMBINE_TAIL_REDUCE_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_TAILREDUCE.co"
 K3_COMBINE_PACK5_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_PACK5.co"
 K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_TAILREDUCE_PACK5.co"
 
@@ -24,14 +22,6 @@ def _ensure_prebuilt_code_object(co: Path, label: str) -> Path:
             "Rebuild and reinstall the megamoe wheel."
         )
     return co
-
-
-def ensure_k3_combine_asm_code_object() -> Path:
-    return _ensure_prebuilt_code_object(K3_COMBINE_ASM_CO, "K3 combine")
-
-
-def ensure_k3_combine_tail_reduce_asm_code_object() -> Path:
-    return _ensure_prebuilt_code_object(K3_COMBINE_TAIL_REDUCE_ASM_CO, "K3 tail-reduce")
 
 
 def ensure_k3_combine_pack5_asm_code_object() -> Path:
@@ -181,90 +171,6 @@ def reduce_local_combine_graph(
         int(num_topk),
         int(hidden),
     )
-
-
-def k3_l2_fused_asm_to_combine(
-    act_fp8: torch.Tensor,
-    act_scale: torch.Tensor,
-    m_indices: torch.Tensor,
-    l2_weights: tuple[torch.Tensor, torch.Tensor],
-    row_combine_ptrs: torch.Tensor,
-    *,
-    asm_done_counter: torch.Tensor | None = None,
-    asm_signal_addrs: torch.Tensor | None = None,
-    asm_done_target: int = 0,
-    asm_signal_num_ranks: int = 0,
-    asm_signal_generation: int = 0,
-    asm_signal_generation_tensor: torch.Tensor | None = None,
-    asm_reduce_y: torch.Tensor | None = None,
-    sym_buffer=None,
-    num_ranks: int = 0,
-    num_experts: int = 0,
-    num_tokens: int = 0,
-    num_topk: int = 0,
-    hidden: int = 0,
-    output_workspace: torch.Tensor | None = None,
-    prob_storage: torch.Tensor | None = None,
-    active_tiles: torch.Tensor | None = None,
-    graph_runtime_offset_from_active_tiles: int = 0,
-    verbose_build: bool = False,
-) -> torch.Tensor | None:
-    l2_weight, l2_scale = l2_weights
-    ext = load_extension(verbose=verbose_build)
-    if output_workspace is None or prob_storage is None:
-        raise ValueError("integrated K3 path requires output_workspace and prob_storage")
-    if asm_reduce_y is not None:
-        if asm_done_counter is None or asm_signal_addrs is None:
-            raise ValueError("asm_done_counter and asm_signal_addrs are required with asm_reduce_y")
-        if sym_buffer is None:
-            raise ValueError("sym_buffer is required with asm_reduce_y")
-        code_object = ensure_k3_combine_tail_reduce_asm_code_object()
-        ext.k3_l2_combine_asm_tail_reduce_out(
-            act_fp8.contiguous(),
-            act_scale.contiguous(),
-            m_indices.contiguous(),
-            l2_weight.contiguous(),
-            l2_scale.contiguous(),
-            row_combine_ptrs.contiguous(),
-            asm_done_counter.contiguous(),
-            asm_signal_addrs.contiguous(),
-            asm_reduce_y.contiguous(),
-            sym_buffer.buffer,
-            output_workspace,
-            prob_storage,
-            int(asm_done_target),
-            int(asm_signal_num_ranks),
-            int(asm_signal_generation),
-            int(num_ranks),
-            int(num_experts),
-            int(sym_buffer.num_max_tokens_per_rank),
-            int(num_tokens),
-            int(num_topk),
-            int(hidden),
-            str(code_object),
-            active_tiles.contiguous() if active_tiles is not None else None,
-            int(graph_runtime_offset_from_active_tiles),
-            asm_signal_generation_tensor.contiguous()
-            if asm_signal_generation_tensor is not None
-            else None,
-        )
-    else:
-        if asm_done_counter is not None or asm_signal_addrs is not None:
-            raise ValueError("asm tail-signal path requires asm_reduce_y for tail-reduce")
-        code_object = ensure_k3_combine_asm_code_object()
-        ext.k3_l2_combine_asm_out(
-            act_fp8.contiguous(),
-            act_scale.contiguous(),
-            m_indices.contiguous(),
-            l2_weight.contiguous(),
-            l2_scale.contiguous(),
-            row_combine_ptrs.contiguous(),
-            output_workspace,
-            prob_storage,
-            str(code_object),
-            active_tiles.contiguous() if active_tiles is not None else None,
-        )
-    return None
 
 
 def k3_l2_fused_v3_to_combine(

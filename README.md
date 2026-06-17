@@ -119,33 +119,44 @@ scratch files; it is not required for installed kernel binaries.
 
 ### Runtime Routing
 
-The default DCU execution path uses token-threshold auto selection.  Without
-setting `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE`, the public
-`megamoe.fp8_w8a8_mega_moe` API uses the original persistent fused kernel for
-small token counts and the large-token staged path for larger token counts:
+The default DCU execution path is the V3 staged K1/K2/K3 implementation:
 
 - K1: dispatch pull + L1 FP8 grouped GEMM
 - K2: SwiGLU + channelwise FP8 quant
 - K3: L2 FP8 grouped GEMM + combine reduce
 
-The default threshold is 128 tokens per rank: `num_tokens_per_rank <= 128` uses
-the original persistent fused kernel, and `num_tokens_per_rank > 128` uses the
-staged K1/K2/K3 path.  Override the threshold with
-`MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD`; the comparison is strictly
-greater than the threshold.  Set `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1` to force
-the staged path for all token counts, or `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=0`
-to force the original persistent fused kernel.  Set these environment variables
-before creating `SymmBuffer`: the mode and threshold are captured on buffer
-initialization so graph-captured runs see a stable branch choice.
+`megamoe.fp8_w8a8_mega_moe` executes the backend selected by its caller:
 
-The staged path keeps all K1/K2/K3 implementation files under
-`megamoe.dcu_megamoe_large_opt`.  Its large temporary activations reuse the
-original DCU MegaMoE `route_scratch` allocation; the integration does not
-allocate a second persistent L1/K2/K3 activation workspace.  In `auto` mode,
-`SymmBuffer` prepares the staged path during initialization by creating tensor
-views into the same `route_scratch` storage; no extra device kernels, D2H
-synchronization, or duplicate activation buffers are introduced for the later
-first large-token call.
+- `megamoe_backend="ll"` selects V3 LL, optimized for small-token requests.
+- `megamoe_backend="normal"` selects V3 normal, optimized for larger requests.
+
+The library call does not auto-dispatch between LL and normal.  Frameworks
+should make that decision before calling the API, typically by comparing the
+EP-group maximum local token count for the current request with their threshold
+so every rank chooses the same backend.  In this repository's test script, that
+framework-side policy is modeled by `MEGAMOE_DCU_BACKEND=auto|ll|normal` and
+`MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD` with a default threshold of 256 tokens.
+Those two environment variables only affect `tests/test_mega_moe_dcu.py`; they
+are not consumed by the production library call, `large_opt.py`, or the C++
+workspace size API.
+
+For eager uneven-rank requests, pass the same EP-group maximum local token count
+as the optional host scalar `capacity_num_tokens`.  This value is not a backend
+selector, does not affect graph replay, and is not a runtime token tensor; it
+only lets K1 size its host-side route capacity from the current request's
+global max while the kernels still read each rank's actual local token count
+from symmetric-buffer metadata.  If a framework cannot provide the current
+request max, the conservative fallback is the symmetric-buffer
+`num_max_tokens_per_rank` bucket, but that may do more K1 route work than
+necessary.
+
+The V3 staged path keeps all K1/K2/K3 implementation files under
+`megamoe.dcu_megamoe_large_opt`.  Its temporary activations reuse the DCU
+MegaMoE `route_scratch` allocation; the integration does not allocate a second
+staged LL/normal L1/K2/K3 activation workspace.  `SymmBuffer` prepares the staged path
+during initialization by creating tensor views into the same `route_scratch`
+storage; no extra device kernels, D2H synchronization, or duplicate activation
+buffers are introduced for the first timed call.
 
 By default K3 uses the integrated ASM tail-reduce path for both eager and graph
 staged execution, so it avoids the separate `rank_barrier + reduce` tail that
@@ -154,27 +165,11 @@ debugging the older barrier/reduce path.  For `num_max_tokens_per_rank <= 2048`,
 the tail reducer defaults to 64 reducer workgroups; larger max-token buffers
 keep the previous 128-workgroup default.
 
-The staged path keeps the tail-reduce signal state in `route_scratch`; when the
-large-opt environment is enabled before creating the symmetric buffer, this
+The staged path keeps the tail-reduce signal state in `route_scratch`; this
 state is prepared during buffer initialization rather than the timed execution
-path.  The original persistent fused path and the staged path both read the same
-input slices in the symmetric buffer (`x`, `x_sf`, `topk_idx`, and
-`topk_weights`), so switching by token threshold does not require duplicate
-input copies.
-
-For EP runs with uneven per-rank local token counts, the eager auto threshold
-decision must be identical on every rank.  Frameworks should pass a uniform
-`dispatch_num_tokens` to `megamoe.fp8_w8a8_mega_moe`, typically the EP-group
-maximum local token count for the current request.  If it is omitted, eager
-auto mode falls back to the local `y.size(0)` on each rank, which is safe only
-when every rank has the same token count or when the path is forced by
-`MEGAMOE_DCU_USE_LARGE_OPT_3STAGE`.  The `dispatch_num_tokens` value is only a
-host-side branch selector for big-fused versus staged execution; it does not pad
-inputs, does not change the valid row count, and does not make a rank compute
-more than its local `y.size(0)` rows.  Keep it in
-`[0, sym_buffer.num_max_tokens_per_rank]`.  Without a uniform dispatch value,
-one rank can enter the persistent fused kernel while another enters staged
-K1/K2/K3, and their cross-rank barriers will not match.
+path.  All V3 backends read the same input slices in the symmetric buffer
+(`x`, `x_sf`, `topk_idx`, and `topk_weights`), so backend switching by token
+bucket does not require duplicate input copies.
 
 ### CUDA Graph Mode
 
@@ -183,17 +178,14 @@ DCU MegaMoE exposes graph-bucket mode through the public
 buffer's requested `num_max_tokens_per_rank`; no separate CUDA Graph max-token
 environment variable is used.  The internal buffer capacity may be aligned up
 for kernel requirements, but graph replay uses
-`sym_buffer.cuda_graph_max_tokens_per_rank`.  Pass exactly one graph flag to
-choose the implementation captured into the graph:
+`sym_buffer.cuda_graph_max_tokens_per_rank`.
 
-- `big_fused_cuda_graph=True` captures the original persistent fused kernel.
-- `stages_fused_cuda_graph=True` captures the staged K1/K2/K3 large-token path
-  when `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE` is `auto` or forced on.
+Use `graph=True` during graph capture and pass the same explicit
+`megamoe_backend` that the framework selected for that graph bucket.
 
-When the current stream is being captured, the eager auto-dispatch path is
-rejected.  Framework integrations should pass one of the graph flags during
-capture; otherwise a fixed eager launch could be captured with the wrong token
-count or implementation choice for later replays.
+When the current stream is being captured, callers must pass `graph=True`;
+otherwise a fixed eager launch could be captured with the wrong token count or
+implementation choice for later replays.
 
 ```python
 y_graph = torch.empty((sym_buffer.cuda_graph_max_tokens_per_rank, hidden),
@@ -203,7 +195,8 @@ megamoe.fp8_w8a8_mega_moe(
     l1_weights,
     l2_weights,
     sym_buffer,
-    big_fused_cuda_graph=True,
+    megamoe_backend="ll",
+    graph=True,
 )
 ```
 
@@ -219,10 +212,13 @@ to 0; kernels publish the count through peer-visible symmetric memory and skip
 that rank's local output prefix while still serving remote expert work.
 This matches the usual static-buffer CUDA Graph usage: the graph shape is fixed,
 while the framework owns the valid-token prefix and chooses which captured graph
-to replay.  A typical framework setup captures one big-fused graph and one
-staged graph with the same `num_max_tokens_per_rank`, then replays by token
-threshold.  The replay choice must also be uniform across the EP group, using
-the same global dispatch token rule as eager mode.
+to replay.  The V3 backend captured into the graph is explicit in
+`megamoe_backend`, not inferred from the capture bucket size.  For example, a
+framework may capture a single 8192-token LL graph with
+`megamoe_backend="ll"` for small-token replay and a separate 8192-token normal
+graph with `megamoe_backend="normal"` for larger replay.  The choice of which
+graph to capture or replay should use the same global token-bucket rule as
+eager mode, so uneven ranks still agree on LL vs normal.
 
 In `tests/test_mega_moe_dcu.py`, the CUDA Graph test options separate capacity,
 ordinary correctness input, and replay buckets:
@@ -235,13 +231,19 @@ ordinary correctness input, and replay buckets:
 - `--num-tokens-per-rank-list` overrides `--num-tokens` with an exact local
   token count per rank, useful for reproducing framework cases such as
   `0,133,0,0,0,0,0,0`.
-- `--dispatch-num-tokens` passes the API-level `dispatch_num_tokens` argument.
-  It is used only by eager auto-dispatch to choose the implementation
-  uniformly across ranks.  For uneven-rank tests, set it to the EP-group max
-  local token count, for example `133` for `0,133,0,0,0,0,0,0`.  The actual
-  per-rank work still comes from each rank's local token count.
+- `--megamoe-backend auto|ll|normal` selects the backend in the test script.
+  `auto` uses the per-run token bucket computed by the test: uniform
+  `--num-tokens`, the maximum from `--num-tokens-per-rank-list`, or
+  `--num-max-tokens-per-rank` for random uneven mode.  The actual per-rank work
+  still comes from each rank's local token count.  In eager mode this same
+  per-run token bucket is passed to the library as the host
+  `capacity_num_tokens` capacity bound.
+- `--cuda-graph` captures the selected V3 staged backend as a graph.
 - `--cuda-graph-test-tokens` is only the list of runtime token counts replayed
   against the captured graph, for example `32,64,128`.
+  For graph-only performance sweeps, keep `--num-tokens` equal to the capture
+  bucket so the test's auxiliary setup does not perturb allocator state; replay
+  work is still controlled solely by `--cuda-graph-test-tokens`.
 - `--cuda-graph-skip-baseline` smoke-tests graph capture/replay without running
   the DeepEP baseline checker, which is useful when isolating graph
   compatibility from baseline communication behavior.
@@ -254,7 +256,6 @@ python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 256 \
   --num-tokens-per-rank-list 0,133,0,0,0,0,0,0 \
-  --dispatch-num-tokens 133 \
   --hidden 4096 \
   --intermediate-hidden 2048 \
   --num-experts 256 \
@@ -272,13 +273,11 @@ per-expert statistics across variable-token requests.
 
 Host-side tuning knobs for the staged path do not add device kernels:
 
-- `MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD` controls the `auto` token
-  cutoff. The default is 128 based on the DSV4-Flash sweep where 32/64/128
-  favor the persistent fused kernel and 256+ favors the staged path.
-- `K2_SKIP_INACTIVE_ROWS_MIN_TOKENS` controls when K2 consumes K1's
+- `K2_SKIP_INACTIVE_ROWS_MIN_TOKENS` controls when eager K2 consumes K1's
   `row_combine_ptrs` validity metadata. The default is 1536, so larger token
   counts skip inactive-row activation work while smaller token counts keep the
-  leaner K2 launch path.
+  leaner K2 launch path. Graph replay always passes row metadata so inactive
+  capture rows can early-return under variable runtime token counts.
 
 ### Validate
 
@@ -300,26 +299,27 @@ python tests/test_mega_moe_dcu.py \
   --out hygon_tmp/megamoe_dcu_dsv4_flash_512.json
 ```
 
-To exercise CUDA-compatible uneven per-rank local token counts, set
-`--num-tokens 0 --num-max-removed-tokens N`.  The DCU test follows the CUDA
-MegaMoE convention `local_tokens=max(0, max_tokens-random_remove)`, so this also
-covers ranks with zero local tokens:
+To exercise CUDA-compatible uneven per-rank local token counts, pass an exact
+`--num-tokens-per-rank-list`.  This mirrors the framework case where every rank
+knows the EP-group maximum token count for backend selection while each rank
+still replays with its own local token prefix.  The example below also covers
+ranks with zero local tokens:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1 python tests/test_mega_moe_dcu.py \
+python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 512 \
-  --num-tokens 0 \
-  --num-max-removed-tokens 768 \
+  --num-tokens 512 \
+  --num-tokens-per-rank-list 512,257,128,64,32,7,0,0 \
   --hidden 4096 \
   --intermediate-hidden 2048 \
   --num-experts 256 \
   --num-topk 6 \
-  --correctness-iters 1 \
+  --correctness-iters 0 \
   --skip-bench \
-  --large-opt-3stage \
-  --stages-fused-cuda-graph \
+  --megamoe-backend normal \
+  --cuda-graph \
   --cuda-graph-test-tokens 7,32,128,512
 ```
 
@@ -336,39 +336,40 @@ the weight FP8 conversion chunked by default; tune
 `MEGAMOE_DCU_WEIGHT_CAST_CHUNK_ROWS` if the random-weight setup needs a smaller
 or larger temporary allocation.
 
-Check one captured persistent-fused graph bucket across several token prefixes:
+Check one captured LL graph bucket across several token prefixes:
 
 ```bash
 source /opt/dtk-26.04/env.sh
 python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
-  --num-max-tokens-per-rank 2048 \
-  --num-tokens 2048 \
+  --num-max-tokens-per-rank 8192 \
+  --num-tokens 8192 \
   --hidden 4096 \
   --intermediate-hidden 2048 \
   --num-experts 256 \
   --num-topk 6 \
-  --big-fused-cuda-graph \
-  --cuda-graph-test-tokens 32,64,128 \
+  --megamoe-backend ll \
+  --cuda-graph \
+  --cuda-graph-test-tokens 8,32,33,64,128,129,256,257,512,513 \
   --skip-bench
 ```
 
-Check one captured staged K1/K2/K3 graph bucket across token prefixes with a
-2048-token symmetric buffer:
+Check one captured normal K1/K2/K3 graph bucket across token prefixes with a
+8192-token symmetric buffer:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=auto \
 python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
-  --num-max-tokens-per-rank 2048 \
-  --num-tokens 2048 \
+  --num-max-tokens-per-rank 8192 \
+  --num-tokens 8192 \
   --hidden 4096 \
   --intermediate-hidden 2048 \
   --num-experts 256 \
   --num-topk 6 \
-  --stages-fused-cuda-graph \
-  --cuda-graph-test-tokens 32,512,1024,2048 \
+  --megamoe-backend normal \
+  --cuda-graph \
+  --cuda-graph-test-tokens 256,512,1024,1025,2048,2050,3072,4096,4097,8192 \
   --skip-bench
 ```
 
@@ -376,7 +377,7 @@ Force one staged-path size directly:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1 python tests/test_mega_moe_dcu.py \
+python tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 2048 \
   --num-tokens 1024 \
@@ -390,25 +391,40 @@ MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1 python tests/test_mega_moe_dcu.py \
   --out hygon_tmp/large_opt/integrated/dsv4_flash_large_opt_1024.json
 ```
 
-Force the original persistent fused path while keeping the symmetric buffer
-capacity fixed at 2048 tokens per rank:
+Run a small-token LL sweep and a larger normal sweep with the same public API:
 
 ```bash
 source /opt/dtk-26.04/env.sh
 mkdir -p hygon_tmp/megamoe_dcu_dsv4_flash
-for tokens in 512 1024 2048; do
-  MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=0 python tests/test_mega_moe_dcu.py \
+for tokens in 8 32 33 64 128 129 256 257 512 513; do
+  python tests/test_mega_moe_dcu.py \
     --num-processes 8 \
-    --num-max-tokens-per-rank 2048 \
+    --num-max-tokens-per-rank 8192 \
     --num-tokens "${tokens}" \
     --hidden 4096 \
     --intermediate-hidden 2048 \
     --num-experts 256 \
     --num-topk 6 \
+    --megamoe-backend ll \
     --correctness-iters 1 \
     --warmup 3 \
     --repeat 8 \
-    --out "hygon_tmp/megamoe_dcu_dsv4_flash/bench_${tokens}.json"
+    --out "hygon_tmp/megamoe_dcu_dsv4_flash/ll_${tokens}.json"
+done
+for tokens in 256 512 1024 1025 2048 2050 3072 4096 4097 8192; do
+  python tests/test_mega_moe_dcu.py \
+    --num-processes 8 \
+    --num-max-tokens-per-rank 8192 \
+    --num-tokens "${tokens}" \
+    --hidden 4096 \
+    --intermediate-hidden 2048 \
+    --num-experts 256 \
+    --num-topk 6 \
+    --megamoe-backend normal \
+    --correctness-iters 1 \
+    --warmup 3 \
+    --repeat 8 \
+    --out "hygon_tmp/megamoe_dcu_dsv4_flash/normal_${tokens}.json"
 done
 ```
 

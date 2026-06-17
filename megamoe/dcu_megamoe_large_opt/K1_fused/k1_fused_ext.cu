@@ -356,6 +356,7 @@ __global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
     int32_t* m_indices,
     uint16_t* padding_combine_sink,
     const int capacity_tiles,
+    const int runtime_limited_init,
     const int hidden) {
     constexpr int kLocalExperts = 32;
     constexpr int kTileM = kK1RouteTileM;
@@ -382,7 +383,8 @@ __global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
     __syncthreads();
     const int active_rows = active_tiles_shared * kTileM;
     const int capacity_rows = capacity_tiles * kTileM;
-    for (int row = tid; row < capacity_rows; row += static_cast<int>(blockDim.x)) {
+    const int init_rows = runtime_limited_init != 0 ? active_rows : capacity_rows;
+    for (int row = tid; row < init_rows; row += static_cast<int>(blockDim.x)) {
         const int tile_id = row / kTileM;
         const int expert =
             row < active_rows ? route_scratch_i32[65 + tile_id] : 0;
@@ -392,9 +394,9 @@ __global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
         m_indices[row] = expert >= 0 ? expert : 0;
     }
     for (int row = tid;
-         row < capacity_rows + static_cast<int>(kK1RowPointerPadding);
+         row < init_rows + static_cast<int>(kK1RowPointerPadding);
          row += static_cast<int>(blockDim.x)) {
-        const int sink_row = row < capacity_rows ? row : 0;
+        const int sink_row = row < init_rows ? row : 0;
         row_combine_ptrs[row] = padding_combine_sink == nullptr
             ? 0
             : static_cast<int64_t>(
@@ -552,6 +554,7 @@ void launch_l1_deepgemm_fused_asm(
     const int64_t num_experts,
     const int64_t num_max_tokens_per_rank,
     const int64_t num_tokens,
+    const int64_t route_capacity_num_tokens,
     const int64_t num_topk,
     const uint32_t expert_tiles_per_expert,
     const bool use_rank_local_x_ptrs,
@@ -642,12 +645,15 @@ void launch_l1_deepgemm_fused_asm(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     if (use_compact_prebuild) {
         constexpr int route_threads = 256;
-        const int routes_per_rank = static_cast<int>(num_tokens * num_topk);
-        const int blocks_per_rank = routes_per_rank <= 8192 ? 6 : static_cast<int>(
-            std::min<int64_t>(
-                16,
-                std::max<int64_t>(
-                    4, ceil_div_i64(routes_per_rank, 768))));
+        const int routes_per_rank =
+            static_cast<int>(route_capacity_num_tokens * num_topk);
+        const int blocks_per_rank = runtime_num_tokens != nullptr
+            ? 12
+            : (routes_per_rank <= 8192 ? 6 : static_cast<int>(
+                   std::min<int64_t>(
+                       16,
+                       std::max<int64_t>(
+                           4, ceil_div_i64(routes_per_rank, 768)))));
         dim3 route_grid(blocks_per_rank, static_cast<unsigned>(num_ranks), 1);
         k1_init_compact_routes_kernel<<<1, route_threads, 0, stream>>>(
             reinterpret_cast<int32_t*>(route_scratch.data_ptr()));
@@ -673,6 +679,7 @@ void launch_l1_deepgemm_fused_asm(
             m_indices.data_ptr<int32_t>(),
             reinterpret_cast<uint16_t*>(output.data_ptr()),
             capacity_tiles,
+            runtime_num_tokens == nullptr ? 0 : 1,
             hidden);
         K1_HIP_CHECK(hipGetLastError());
         k1_emit_compact_routes_kernel<<<route_grid, route_threads, 0, stream>>>(
@@ -825,7 +832,8 @@ k1_symm_fused_l1_asm_impl(
     const std::optional<torch::Tensor>& l1_out_workspace,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const std::optional<torch::Tensor>& runtime_num_tokens,
-    const bool force_compact_prebuild) {
+    const bool force_compact_prebuild,
+    const int64_t capacity_num_tokens) {
     TORCH_CHECK(sym_buffer.is_cuda() && route_scratch.is_cuda() &&
                     l1_weight.is_cuda() && l1_scale.is_cuda(),
                 "symm K1 tensors must be CUDA/HIP tensors");
@@ -850,6 +858,14 @@ k1_symm_fused_l1_asm_impl(
     TORCH_CHECK(rank_idx >= 0 && rank_idx < num_ranks, "invalid rank_idx");
     TORCH_CHECK(num_tokens >= 0 && num_tokens <= num_max_tokens_per_rank,
                 kK1ShapeContract);
+    const int64_t route_capacity_num_tokens =
+        capacity_num_tokens >= 0
+            ? capacity_num_tokens
+            : (force_compact_prebuild ? num_max_tokens_per_rank : num_tokens);
+    TORCH_CHECK(route_capacity_num_tokens >= num_tokens &&
+                    route_capacity_num_tokens <= num_max_tokens_per_rank,
+                "capacity_num_tokens must be in [num_tokens, "
+                "num_max_tokens_per_rank]");
     TORCH_CHECK(symm_base_addr_value > 0 && symm_x_span_value > 0,
                 "invalid symm x address range");
     TORCH_CHECK(alignment == kK1SupportedAlignment, kK1ShapeContract);
@@ -876,7 +892,7 @@ k1_symm_fused_l1_asm_impl(
     const int64_t max_stride_tasks =
         num_ranks * num_max_tokens_per_rank * num_topk;
     const int64_t capacity_total_tasks =
-        force_compact_prebuild ? max_stride_tasks : total_tasks;
+        num_ranks * route_capacity_num_tokens * num_topk;
 
     const int64_t expected_per_expert =
         (capacity_total_tasks + num_experts - 1) / num_experts;
@@ -1040,43 +1056,13 @@ k1_symm_fused_l1_asm_impl(
         route_weights, row_combine_ptrs, output_index,
         local_expert_stats,
         rank_idx, num_ranks, num_experts, num_max_tokens_per_rank,
-        num_tokens, num_topk, expert_tiles_per_expert,
+        num_tokens, route_capacity_num_tokens, num_topk, expert_tiles_per_expert,
         use_rank_local_x_ptrs, use_compact_prebuild,
         runtime_num_tokens_ptr,
         code_object_path);
 
     return std::make_tuple(
         l1_out, route_weights, m_indices, output_index, row_combine_ptrs);
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-k1_symm_fused_l1(
-    const torch::Tensor& sym_buffer,
-    const torch::Tensor& route_scratch,
-    const torch::Tensor& l1_weight,
-    const torch::Tensor& l1_scale,
-    const int64_t rank_idx,
-    const int64_t num_ranks,
-    const int64_t num_experts,
-    const int64_t num_max_tokens_per_rank,
-    const int64_t num_tokens,
-    const int64_t num_topk,
-    const int64_t hidden,
-    const int64_t symm_base_addr_value,
-    const int64_t symm_x_span_value,
-    const int64_t alignment,
-    const std::string& code_object_path,
-    const std::optional<torch::Tensor>& l1_out_workspace,
-    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-    const std::optional<torch::Tensor>& runtime_num_tokens,
-    const bool force_compact_prebuild) {
-    return k1_symm_fused_l1_asm_impl(
-        sym_buffer, route_scratch, l1_weight, l1_scale,
-        rank_idx, num_ranks, num_experts, num_max_tokens_per_rank,
-        num_tokens, num_topk, hidden, symm_base_addr_value,
-        symm_x_span_value, alignment, code_object_path,
-        l1_out_workspace, cumulative_local_expert_recv_stats,
-        runtime_num_tokens, force_compact_prebuild);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -1099,14 +1085,15 @@ k1_symm_fused_l1_v3_asm_pack5(
     const std::optional<torch::Tensor>& l1_out_workspace,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const std::optional<torch::Tensor>& runtime_num_tokens,
-    const bool force_compact_prebuild) {
+    const bool force_compact_prebuild,
+    const int64_t capacity_num_tokens) {
     return k1_symm_fused_l1_asm_impl(
         sym_buffer, route_scratch, l1_weight_pack5_asm, l1_scale,
         rank_idx, num_ranks, num_experts, num_max_tokens_per_rank,
         num_tokens, num_topk, hidden, symm_base_addr_value,
         symm_x_span_value, alignment, code_object_path,
         l1_out_workspace, cumulative_local_expert_recv_stats,
-        runtime_num_tokens, force_compact_prebuild);
+        runtime_num_tokens, force_compact_prebuild, capacity_num_tokens);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -1129,7 +1116,8 @@ k1_symm_fused_l1_v3_pack5(
     const std::optional<torch::Tensor>& runtime_num_tokens,
     const int64_t ll_block_m,
     const int64_t ll_cus,
-    const bool ll_asm_compatible_layout) {
+    const bool ll_asm_compatible_layout,
+    const int64_t capacity_num_tokens) {
     TORCH_CHECK(sym_buffer.is_cuda() && route_scratch.is_cuda() &&
                     l1_weight_pack5.is_cuda() && l1_scale.is_cuda(),
                 "V3 K1 tensors must be CUDA/HIP tensors");
@@ -1180,7 +1168,12 @@ k1_symm_fused_l1_v3_pack5(
     const int64_t ll_row_tile =
         ll_asm_compatible_layout ? kK1RouteTileM : 64;
     const int64_t row_tile = use_ll ? ll_row_tile : kK1RouteTileM;
-    const int64_t route_capacity_tokens_per_rank = num_tokens;
+    const int64_t route_capacity_tokens_per_rank =
+        capacity_num_tokens >= 0 ? capacity_num_tokens : num_tokens;
+    TORCH_CHECK(route_capacity_tokens_per_rank >= num_tokens &&
+                    route_capacity_tokens_per_rank <= num_max_tokens_per_rank,
+                "capacity_num_tokens must be in [num_tokens, "
+                "num_max_tokens_per_rank]");
     const int64_t capacity_total_tasks =
         num_ranks * route_capacity_tokens_per_rank * num_topk;
     const int64_t expected_per_expert =
@@ -1214,15 +1207,17 @@ k1_symm_fused_l1_v3_pack5(
                 route_capacity_tokens_per_rank * num_topk,
                 local_experts));
     constexpr int64_t kLlHeadroomExpectedRowsThreshold = 48;
+    constexpr int64_t kLlLargeHeadroomExpectedRowsThreshold = 512;
     constexpr int64_t kLlHeadroomRows = 64;
-    // Preserve the tiny 32/128-token LL buckets exactly. Exact 256/512 eager
-    // buckets need one tile of headroom because random routing can exceed the
-    // mean per-expert count even though graph replay often captures a larger
-    // bucket and therefore hides the issue.
+    constexpr int64_t kLlLargeHeadroomRows = 128;
+    // Preserve tiny LL buckets exactly, but reserve enough per-expert headroom
+    // for large buckets: random routing can exceed the mean per-expert count.
     const int64_t ll_min_slack =
-        ll_expected_rows_per_expert >= kLlHeadroomExpectedRowsThreshold
-            ? kLlHeadroomRows
-            : 0;
+        ll_expected_rows_per_expert >= kLlLargeHeadroomExpectedRowsThreshold
+            ? kLlLargeHeadroomRows
+            : (ll_expected_rows_per_expert >= kLlHeadroomExpectedRowsThreshold
+                   ? kLlHeadroomRows
+                   : 0);
     const int64_t ll_rows_per_expert =
         ll_base_rows_per_expert - ll_expected_rows_per_expert < ll_min_slack
             ? deep_gemm::mega::align_i64(
@@ -1483,26 +1478,6 @@ k1_graph_flag_reset_layout(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("k1_symm_fused_l1", &k1_symm_fused_l1,
-          pybind11::arg("sym_buffer"),
-          pybind11::arg("route_scratch"),
-          pybind11::arg("l1_weight"),
-          pybind11::arg("l1_scale"),
-          pybind11::arg("rank_idx"),
-          pybind11::arg("num_ranks"),
-          pybind11::arg("num_experts"),
-          pybind11::arg("num_max_tokens_per_rank"),
-          pybind11::arg("num_tokens"),
-          pybind11::arg("num_topk"),
-          pybind11::arg("hidden"),
-          pybind11::arg("symm_base_addr"),
-          pybind11::arg("symm_x_span"),
-          pybind11::arg("alignment") = 256,
-          pybind11::arg("code_object_path") = "",
-          pybind11::arg("l1_out_workspace") = std::nullopt,
-          pybind11::arg("cumulative_local_expert_recv_stats") = std::nullopt,
-          pybind11::arg("runtime_num_tokens") = std::nullopt,
-          pybind11::arg("force_compact_prebuild") = false);
     m.def("k1_symm_fused_l1_v3_asm_pack5", &k1_symm_fused_l1_v3_asm_pack5,
           pybind11::arg("sym_buffer"),
           pybind11::arg("route_scratch"),
@@ -1522,7 +1497,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("l1_out_workspace") = std::nullopt,
           pybind11::arg("cumulative_local_expert_recv_stats") = std::nullopt,
           pybind11::arg("runtime_num_tokens") = std::nullopt,
-          pybind11::arg("force_compact_prebuild") = false);
+          pybind11::arg("force_compact_prebuild") = false,
+          pybind11::arg("capacity_num_tokens") = -1);
     m.def("k1_symm_fused_l1_v3_pack5", &k1_symm_fused_l1_v3_pack5,
           pybind11::arg("sym_buffer"),
           pybind11::arg("route_scratch"),
@@ -1542,7 +1518,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("runtime_num_tokens") = std::nullopt,
           pybind11::arg("ll_block_m") = 32,
           pybind11::arg("ll_cus") = 64,
-          pybind11::arg("ll_asm_compatible_layout") = false);
+          pybind11::arg("ll_asm_compatible_layout") = false,
+          pybind11::arg("capacity_num_tokens") = -1);
     m.def("k1_graph_flag_reset_layout", &k1_graph_flag_reset_layout,
           pybind11::arg("num_ranks"),
           pybind11::arg("num_experts"),

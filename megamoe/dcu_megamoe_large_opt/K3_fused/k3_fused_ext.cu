@@ -641,25 +641,6 @@ __global__ void rank_barrier_kernel(
     }
 }
 
-void k3_l2_combine_asm_out(
-    const torch::Tensor& act_fp8,
-    const torch::Tensor& act_scale,
-    const torch::Tensor& m_indices,
-    const torch::Tensor& l2_weight,
-    const torch::Tensor& l2_scale,
-    const torch::Tensor& row_combine_ptrs,
-    const torch::Tensor& output_workspace,
-    const torch::Tensor& prob_storage,
-    const std::string& code_object_path,
-    const std::optional<torch::Tensor>& active_tiles) {
-    launch_l2_deepgemm_original_asm(
-        output_workspace, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
-        code_object_path, kCombineAsmKernelName, &row_combine_ptrs,
-        nullptr, nullptr, 0, 0, false, nullptr, nullptr,
-        0, 0, 0, 0, 0, 0, 0, &prob_storage,
-        active_tiles.has_value() ? &active_tiles.value() : nullptr, 0, nullptr);
-}
-
 void k3_l2_combine_asm_pack5_out(
     const torch::Tensor& output_workspace,
     const torch::Tensor& act_fp8,
@@ -680,50 +661,6 @@ void k3_l2_combine_asm_pack5_out(
         0, 0, 0, 0, 0, 0, 0, &prob_storage,
         active_tiles.has_value() ? &active_tiles.value() : nullptr,
         graph_runtime_offset_from_active_tiles, nullptr, true);
-}
-
-void k3_l2_combine_asm_tail_reduce_out(
-    const torch::Tensor& act_fp8,
-    const torch::Tensor& act_scale,
-    const torch::Tensor& m_indices,
-    const torch::Tensor& l2_weight,
-    const torch::Tensor& l2_scale,
-    const torch::Tensor& row_combine_ptrs,
-    const torch::Tensor& asm_done_counter,
-    const torch::Tensor& asm_signal_addrs,
-    const torch::Tensor& asm_reduce_y,
-    const torch::Tensor& sym_buffer,
-    const torch::Tensor& output_workspace,
-    const torch::Tensor& prob_storage,
-    const int64_t asm_done_target,
-    const int64_t asm_signal_num_ranks,
-    const int64_t asm_signal_generation,
-    const int64_t num_ranks,
-    const int64_t num_experts,
-    const int64_t num_max_tokens_per_rank,
-    const int64_t num_tokens,
-    const int64_t num_topk,
-    const int64_t hidden_arg,
-    const std::string& code_object_path,
-    const std::optional<torch::Tensor>& active_tiles,
-    const int64_t graph_runtime_offset_from_active_tiles,
-    const std::optional<torch::Tensor>& asm_signal_generation_tensor) {
-    const int64_t hidden = l2_weight.size(1) * 16;
-    TORCH_CHECK(hidden_arg == hidden,
-                "hidden_arg must match L2 weight hidden");
-    launch_l2_deepgemm_original_asm(
-        output_workspace, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
-        code_object_path, kCombineAsmKernelName, &row_combine_ptrs,
-        &asm_done_counter, &asm_signal_addrs, asm_done_target,
-        asm_signal_num_ranks, true, &asm_reduce_y, &sym_buffer,
-        asm_signal_generation, num_ranks, num_experts,
-        num_max_tokens_per_rank, num_tokens, num_topk, hidden_arg,
-        &prob_storage,
-        active_tiles.has_value() ? &active_tiles.value() : nullptr,
-        graph_runtime_offset_from_active_tiles,
-        asm_signal_generation_tensor.has_value()
-            ? &asm_signal_generation_tensor.value()
-            : nullptr);
 }
 
 void k3_l2_combine_asm_tail_reduce_pack5_out(
@@ -969,17 +906,6 @@ void fill_i64_tensor_from_host(
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("k3_l2_combine_asm_out", &k3_l2_combine_asm_out,
-          pybind11::arg("act_fp8"),
-          pybind11::arg("act_scale"),
-          pybind11::arg("m_indices"),
-          pybind11::arg("l2_weight"),
-          pybind11::arg("l2_scale"),
-          pybind11::arg("row_combine_ptrs"),
-          pybind11::arg("output_workspace"),
-          pybind11::arg("prob_storage"),
-          pybind11::arg("code_object_path"),
-          pybind11::arg("active_tiles") = std::nullopt);
     m.def("k3_l2_combine_asm_pack5_out", &k3_l2_combine_asm_pack5_out,
           pybind11::arg("output_workspace"),
           pybind11::arg("act_fp8"),
@@ -992,32 +918,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("code_object_path"),
           pybind11::arg("active_tiles") = std::nullopt,
           pybind11::arg("graph_runtime_offset_from_active_tiles") = 0);
-    m.def("k3_l2_combine_asm_tail_reduce_out", &k3_l2_combine_asm_tail_reduce_out,
-          pybind11::arg("act_fp8"),
-          pybind11::arg("act_scale"),
-          pybind11::arg("m_indices"),
-          pybind11::arg("l2_weight"),
-          pybind11::arg("l2_scale"),
-          pybind11::arg("row_combine_ptrs"),
-          pybind11::arg("asm_done_counter"),
-          pybind11::arg("asm_signal_addrs"),
-          pybind11::arg("asm_reduce_y"),
-          pybind11::arg("sym_buffer"),
-          pybind11::arg("output_workspace"),
-          pybind11::arg("prob_storage"),
-          pybind11::arg("asm_done_target"),
-          pybind11::arg("asm_signal_num_ranks"),
-          pybind11::arg("asm_signal_generation"),
-          pybind11::arg("num_ranks"),
-          pybind11::arg("num_experts"),
-          pybind11::arg("num_max_tokens_per_rank"),
-          pybind11::arg("num_tokens"),
-          pybind11::arg("num_topk"),
-          pybind11::arg("hidden"),
-          pybind11::arg("code_object_path"),
-          pybind11::arg("active_tiles") = std::nullopt,
-          pybind11::arg("graph_runtime_offset_from_active_tiles") = 0,
-          pybind11::arg("asm_signal_generation_tensor") = std::nullopt);
     m.def("k3_l2_combine_asm_tail_reduce_pack5_out", &k3_l2_combine_asm_tail_reduce_pack5_out,
           pybind11::arg("act_fp8"),
           pybind11::arg("act_scale"),

@@ -7,17 +7,9 @@
 namespace deep_gemm::mega {
 
 static constexpr int kTokenAlignment = 384;
-static constexpr int kDcuRouteTileMMinLog2 = 4;
-static constexpr int kDcuRouteTileMDefaultLog2 = 5;
-static constexpr int kDcuRouteScratchMmacTileM = 16;
-static constexpr int kDcuRouteScratchPipelineCounterCount = 5;
 
 __host__ __device__ static inline int64_t align_i64(const int64_t value, const int64_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
-}
-
-__host__ __device__ static inline int dcu_route_tile_m_from_log2(const int tile_m_log2) {
-    return 1 << tile_m_log2;
 }
 
 __host__ __device__ static inline int64_t dcu_sym_buffer_ptrs_offset() {
@@ -129,141 +121,6 @@ __host__ __device__ static inline int64_t combine_token_offset(const int num_ran
            static_cast<int64_t>(num_max_tokens_per_rank) * num_topk * sizeof(float);
 }
 
-__host__ __device__ static inline int64_t dcu_route_scratch_capacity_tiles(
-    const int num_ranks,
-    const int num_experts,
-    const int num_max_tokens_per_rank,
-    const int num_topk,
-    const int tile_m) {
-    const int num_experts_per_rank = num_experts / num_ranks;
-    const int64_t max_route_tasks =
-        static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank * num_topk;
-    return num_experts_per_rank + (max_route_tasks + tile_m - 1) / tile_m;
-}
-
-struct DcuRouteTileScratchLayout {
-    int tile_m;
-    int64_t x_fp8_offset;
-    int64_t act_bf16_offset;
-    int64_t act_fp8_offset;
-    int64_t act_scale_offset;
-    int64_t act_chunk_amax_offset;
-    int64_t tile_x_row_ptrs_offset;
-    int64_t tile_combine_row_ptrs_offset;
-    int64_t tile_route_weight_offset;
-    int64_t tile_x_scale_offset;
-    int64_t tile_expert_offset;
-    int64_t tile_pool_base_offset;
-    int64_t tile_count_offset;
-    int64_t expert_l1_task_offset;
-    int64_t expert_quant_done_count_offset;
-    int64_t l2_group_done_count_offset;
-    int64_t tile_pull_done_offset;
-    int64_t l1_done_count_offset;
-    int64_t l2_queue_offset;
-    int64_t l2_queue_ready_offset;
-    int64_t pipeline_counter_offset;
-    int64_t total_tiles_offset;
-    int64_t bytes;
-};
-
-__host__ __device__ static inline DcuRouteTileScratchLayout dcu_route_tile_scratch_layout(
-    const int64_t max_route_tiles,
-    const int tile_m,
-    const int hidden,
-    const int intermediate_hidden) {
-    DcuRouteTileScratchLayout layout{};
-    layout.tile_m = tile_m;
-    int64_t offset = 0;
-    layout.x_fp8_offset = offset;
-    offset += max_route_tiles * tile_m * static_cast<int64_t>(hidden);
-    offset = align_i64(offset, 16);
-    layout.act_bf16_offset = offset;
-    offset += max_route_tiles * tile_m * intermediate_hidden * static_cast<int64_t>(sizeof(uint16_t));
-    offset = align_i64(offset, 16);
-    layout.act_fp8_offset = offset;
-    offset += max_route_tiles * tile_m * intermediate_hidden;
-    offset = align_i64(offset, 16);
-    layout.act_scale_offset = offset;
-    offset += max_route_tiles * tile_m * static_cast<int64_t>(sizeof(float));
-    offset = align_i64(offset, 16);
-    layout.act_chunk_amax_offset = offset;
-    offset += max_route_tiles * tile_m *
-              ((intermediate_hidden + 255) / 256) *
-              static_cast<int64_t>(sizeof(float));
-    offset = align_i64(offset, 16);
-    layout.tile_x_row_ptrs_offset = offset;
-    offset += max_route_tiles * tile_m * static_cast<int64_t>(sizeof(uint8_t*));
-    offset = align_i64(offset, 16);
-    layout.tile_combine_row_ptrs_offset = offset;
-    offset += max_route_tiles * tile_m * static_cast<int64_t>(sizeof(uint16_t*));
-    offset = align_i64(offset, 16);
-    layout.tile_route_weight_offset = offset;
-    offset += max_route_tiles * tile_m * static_cast<int64_t>(sizeof(float));
-    offset = align_i64(offset, 16);
-    layout.tile_x_scale_offset = offset;
-    offset += max_route_tiles * tile_m * static_cast<int64_t>(sizeof(float));
-    offset = align_i64(offset, 16);
-    layout.tile_expert_offset = offset;
-    offset += max_route_tiles * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    layout.tile_pool_base_offset = offset;
-    offset += max_route_tiles * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    layout.tile_count_offset = offset;
-    offset += max_route_tiles * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    layout.expert_l1_task_offset = offset;
-    offset += (max_route_tiles + 1) * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    layout.expert_quant_done_count_offset = offset;
-    offset += (max_route_tiles + 1) * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    const int subtiles_per_tile = tile_m / kDcuRouteScratchMmacTileM;
-    const int64_t max_subtiles = max_route_tiles * subtiles_per_tile;
-    layout.l2_group_done_count_offset = offset;
-    offset += max_subtiles * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    layout.tile_pull_done_offset = offset;
-    offset += max_route_tiles * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    layout.l1_done_count_offset = offset;
-    offset += max_subtiles * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    const int64_t max_l2_tasks = max_subtiles * ((hidden + 15) / 16);
-    layout.l2_queue_offset = offset;
-    offset += max_l2_tasks * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    layout.l2_queue_ready_offset = offset;
-    offset += max_l2_tasks * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    layout.pipeline_counter_offset = offset;
-    offset += kDcuRouteScratchPipelineCounterCount * static_cast<int64_t>(sizeof(int));
-    offset = align_i64(offset, 16);
-    layout.total_tiles_offset = offset;
-    offset += static_cast<int64_t>(sizeof(int));
-    layout.bytes = align_i64(offset, 16);
-    return layout;
-}
-
-__host__ __device__ static inline int64_t dcu_route_scratch_bytes(
-    const int num_ranks,
-    const int num_experts,
-    const int num_max_tokens_per_rank,
-    const int num_topk,
-    const int tile_m,
-    const int hidden,
-    const int intermediate_hidden) {
-    const int64_t route_scratch_tiles = dcu_route_scratch_capacity_tiles(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, tile_m);
-    const auto route_tile_layout = dcu_route_tile_scratch_layout(
-        route_scratch_tiles, tile_m, hidden, intermediate_hidden);
-    return align_i64(
-        route_task_workspace_bytes(num_ranks, num_experts, num_max_tokens_per_rank) +
-            route_tile_layout.bytes,
-        16);
-}
-
 __host__ __device__ static inline uint8_t** dcu_peer_sym_buffer_ptrs(uint8_t* sym_buffer) {
     return reinterpret_cast<uint8_t**>(sym_buffer + dcu_sym_buffer_ptrs_offset());
 }
@@ -281,27 +138,6 @@ __host__ __device__ static inline int32_t* dcu_runtime_num_tokens_ptr(uint8_t* s
 __host__ __device__ static inline int32_t* dcu_uniform_num_tokens_ptr(uint8_t* sym_buffer,
                                                                       const int num_ranks) {
     return reinterpret_cast<int32_t*>(sym_buffer + dcu_uniform_num_tokens_offset(num_ranks));
-}
-
-__device__ static inline int* route_scratch_expert_counts(uint8_t* route_scratch) {
-    return reinterpret_cast<int*>(route_scratch);
-}
-
-__device__ static inline int* route_scratch_expert_task_pool(
-    uint8_t* route_scratch,
-    const int num_experts_per_rank) {
-    const int64_t offset = align_i64(
-        static_cast<int64_t>(num_experts_per_rank) * sizeof(int), 16);
-    return reinterpret_cast<int*>(route_scratch + offset);
-}
-
-__host__ __device__ static inline uint8_t* route_tile_scratch_base(
-    uint8_t* route_scratch,
-    const int num_ranks,
-    const int num_experts,
-    const int num_max_tokens_per_rank) {
-    return route_scratch +
-           route_task_workspace_bytes(num_ranks, num_experts, num_max_tokens_per_rank);
 }
 
 } // namespace deep_gemm::mega

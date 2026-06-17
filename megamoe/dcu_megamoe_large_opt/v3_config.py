@@ -1,54 +1,65 @@
-"""V3 gate and backend selection for DCU MegaMoE large-opt stages."""
+"""V3 backend names and test-layer backend selection helpers."""
 
 from __future__ import annotations
 
 import os
 
-
-LARGE_OPT_3STAGE_ENV = "MEGAMOE_DCU_USE_LARGE_OPT_3STAGE"
-V3_ENV = "USE_MEGAMOE_V3"
-V3_BACKEND_ENV = "MEGAMOE_DCU_V3_BACKEND"
 V3_BACKEND_LL = "ll"
 V3_BACKEND_NORMAL = "normal"
+V3_BACKEND_AUTO = "auto"
 
-_LARGE_OPT_FORCE_VALUES = {"1", "true", "yes", "on", "large_opt", "3stage"}
-_V3_TRUE_VALUES = {"1", "true", "yes", "on"}
+BACKEND_ENV = "MEGAMOE_DCU_BACKEND"
+NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
+DEFAULT_NORMAL_LL_TOKEN_THRESHOLD = 256
+
 _VALID_V3_BACKENDS = {V3_BACKEND_LL, V3_BACKEND_NORMAL}
+_VALID_BACKEND_MODES = {V3_BACKEND_AUTO, V3_BACKEND_LL, V3_BACKEND_NORMAL}
 
 
-def _normalize_env_value(value: str | None) -> str:
-    return "" if value is None else value.strip().lower()
-
-
-def large_opt_3stage_forced(value: str | None = None) -> bool:
-    raw = os.getenv(LARGE_OPT_3STAGE_ENV, "auto") if value is None else value
-    return _normalize_env_value(raw) in _LARGE_OPT_FORCE_VALUES
-
-
-def v3_requested(value: str | None = None) -> bool:
-    raw = os.getenv(V3_ENV, "0") if value is None else value
-    return _normalize_env_value(raw) in _V3_TRUE_VALUES
-
-
-def v3_enabled(
-    *,
-    large_opt_3stage_value: str | None = None,
-    use_v3_value: str | None = None,
-) -> bool:
-    return large_opt_3stage_forced(large_opt_3stage_value) and v3_requested(
-        use_v3_value
-    )
-
-
-def normalize_v3_backend(value: str | None) -> str:
-    backend = (value or V3_BACKEND_NORMAL).strip().lower()
+def normalize_v3_backend(value: str) -> str:
+    backend = str(value).strip().lower()
     if backend not in _VALID_V3_BACKENDS:
         raise ValueError(
-            f"{V3_BACKEND_ENV} must be one of {sorted(_VALID_V3_BACKENDS)}, "
-            f"got {value!r}"
+            f"V3 backend must be one of {sorted(_VALID_V3_BACKENDS)}, got {value!r}"
         )
     return backend
 
 
-def get_v3_backend() -> str:
-    return normalize_v3_backend(os.getenv(V3_BACKEND_ENV, V3_BACKEND_NORMAL))
+def normalize_backend_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in _VALID_BACKEND_MODES:
+        raise ValueError(
+            f"{BACKEND_ENV} must be one of {sorted(_VALID_BACKEND_MODES)}, got {value!r}"
+        )
+    return mode
+
+
+def normal_ll_token_threshold(value: str | int | None = None) -> int:
+    raw = os.getenv(
+        NORMAL_LL_TOKEN_THRESHOLD_ENV,
+        str(DEFAULT_NORMAL_LL_TOKEN_THRESHOLD),
+    )
+    if value is not None:
+        raw = value
+    threshold = int(raw)
+    if threshold < 0:
+        raise ValueError(f"{NORMAL_LL_TOKEN_THRESHOLD_ENV} must be non-negative")
+    return threshold
+
+
+def v3_backend_mode(value: str | None = None) -> str:
+    raw = os.getenv(BACKEND_ENV, V3_BACKEND_AUTO) if value is None else value
+    return normalize_backend_mode(raw)
+
+
+def select_v3_backend(selector_tokens: int, backend_mode: str | None = None) -> str:
+    """Return the test-layer V3 backend for a uniform EP selector token bucket."""
+
+    tokens = int(selector_tokens)
+    if tokens < 0:
+        raise ValueError("selector_tokens must be non-negative")
+    mode = v3_backend_mode(backend_mode)
+    if mode != V3_BACKEND_AUTO:
+        return normalize_v3_backend(mode)
+    threshold = normal_ll_token_threshold()
+    return V3_BACKEND_LL if tokens <= threshold else V3_BACKEND_NORMAL

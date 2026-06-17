@@ -6733,3 +6733,643 @@
   - 小 token tail replay 8/32/64 也不再被 capture1024 reduce work 拖慢；
   - K2 剩余固定 grid 成本是 graph 静态形状限制下的外壳成本，当前通过 rowptr early-return 控制住，未发现需要高风险合同改造的收益证据；
   - 本修复不改变 eager tail 的生产路径，eager 256/512 correctness 与性能保持正常。
+
+## 2026-06-16 - V3 uneven eager regression after latest cleanup
+
+- 用户要求确认最新 K3 wrapper cleanup 与 LL tail runtime-token 修复没有破坏 normal/LL uneven 功能。
+- 远端状态：
+  - 运行前 8 卡空闲，VRAM/HCU 均为 `0%`；
+  - 输出目录：`hygon_tmp/sglang_debug/uneven_regression_20260616/`；
+  - 全部命令使用 `--skip-bench`，只做 correctness。
+- normal backend uneven 列表：`1024,768,512,896,640,384,256,128`，`num_max_tokens_per_rank=1024`。
+- LL backend uneven 列表：`17,31,48,64,79,96,112,127`，`num_max_tokens_per_rank=128`。
+
+| backend | tail | correct | max_abs | log |
+| --- | ---: | --- | ---: | --- |
+| normal | 0 | true | 0.000488281 | `normal_notail.log` |
+| normal | 1 | true | 0.000488281 | `normal_tail.log` |
+| LL | 0 | true | 0.000244141 | `ll_notail.log` |
+| LL | 1 | true | 0.000244141 | `ll_tail.log` |
+
+- 结论：最新 cleanup 后 normal/LL uneven eager no-tail/tail 均未被破坏。
+
+## 2026-06-16 - 启动 V3 转正为主路径
+
+- 用户要求：
+  - V3 转为 DCU MegaMoE 主路径；
+  - 旧 big fused 主路径清理并由 V3 LL 覆盖；
+  - 旧 legacy staged fused 主路径清理并由 V3 normal 覆盖；
+  - 默认策略按实际 tokens per rank 分流：`<=256` 走 LL，`>256` 走 normal；
+  - 对外接口和单测尽量复用原参数/使用方法，除 V3 pack5 权重 layout 外框架侧尽量不改；
+  - 转正后去掉 `USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND` 实验 env；
+  - 更新 README DCU 部分；
+  - big fused 去掉后继续 Phase 8 的 `route_scratch` 等显存空间优化；
+  - 最后重刷 README 测试、功能、精度和各 size 性能。
+- 已完成：
+  - 重读 `task_plan.md`、`progress.md`、`findings.md` 恢复上下文；
+  - `git status --short` 显示当前只有 `.planning/dcu_megamoe_v3/progress.md` 已有未提交改动；
+  - 在 `task_plan.md` 增加“V3 转正目标更新”，明确旧 env-gated 目标被新主路径目标取代；
+  - 新增 Phase 11/12/13：V3 主路径切换、V3-only route_scratch/symm footprint 优化、README+最终回归矩阵。
+- 当前关注点：
+  - graph capture bucket 可能大于实际 replay tokens，backend auto 不能简单按 capture max 选择；
+  - uneven 场景必须按 dispatch/global token bucket 保证所有 rank 选同一个 backend；
+  - route_scratch 缩容要等 big fused/legacy staged 生产入口退役后再做，避免一边兼容旧路径一边缩空间。
+
+## 2026-06-16 - Phase 11 首轮入口/env 切换
+
+- 代码改动：
+  - `v3_config.py` 从 env gate/backend parser 收敛为显式 V3 backend selector：`dispatch_num_tokens <= 256 -> ll`，`>256 -> normal`；
+  - `large_opt.py` 不再读取 `USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND`，eager/graph 均由传入的 `dispatch_num_tokens` 选择 V3 LL/normal；legacy staged ASM fallback 不再作为 large_opt dispatcher 分支；
+  - `megamoe/__init__.py` 在 DSV4-Flash shape 下默认走 V3 staged；`big_fused_cuda_graph` 和 `stages_fused_cuda_graph` 作为兼容 graph flag 接受，但 DSV4 下均捕获 V3 staged；非 DSV4 shape 暂保留原 `_C` fallback，避免无关小形状调用被本轮硬切断；
+  - `tests/test_mega_moe_dcu.py` 默认准备 V3 pack5 权重；uneven 测试若未显式给 `--dispatch-num-tokens`，source test 会用 rank-list max 或 max capacity 做统一 selector；graph 调用也透传 `dispatch_num_tokens`；
+  - `tests/test_dcu_megamoe_v3.py` 从 V3 env gate 测试改为 V3 backend auto policy 测试；
+  - README DCU 部分改为 V3 主路径说明，删除旧 staged env/persistent fused threshold 文档；
+  - `scripts/run_dcu_megamoe_large_opt.sh` 删除旧 staged env，改为显式传 `--dispatch-num-tokens`。
+- 本地验证：
+  - `python -m compileall megamoe/__init__.py megamoe/large_opt.py megamoe/dcu_megamoe_large_opt/v3_config.py megamoe/dcu_megamoe_large_opt/K1_fused/k1_fused.py megamoe/dcu_megamoe_large_opt/K3_fused/k3_fused.py tests/test_mega_moe_dcu.py tests/test_dcu_megamoe_v3.py` 通过；
+  - `git diff --check` 通过；
+  - `rg` 在 `megamoe tests scripts README.md` 中未再找到旧 `USE_MEGAMOE_V3`、`MEGAMOE_DCU_V3_BACKEND`、`MEGAMOE_DCU_USE_LARGE_OPT_3STAGE`、`MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD`；
+  - file-path inline selector sanity 通过；
+  - 本地 `python -m pytest` 仍不可用，报 `No module named pytest`，需要远端容器跑 pytest。
+- 待验证/待清理：
+  - 尚未远端 build/pytest/GPU correctness；
+  - big fused C++/persistent implementation 仍作为非 DSV4 fallback/底层扩展存在，Phase 11 还需继续确认是否删除或隔离；
+  - route_scratch 缩容尚未开始，等 legacy route 入口收敛后进入 Phase 12。
+
+## 2026-06-16 - Phase 11 远端 smoke 验证
+
+- 代码清理补充：
+  - 删除 Python 层旧 K1 非-pack5 staged wrapper：`k1_symm_fused_l1_asm()` / `k1_symm_fused_l1_asm_graph()` / `ensure_fused_l1_asm_code_object()`；
+  - 删除 Python 层旧 K3 非-pack5 staged wrapper：`k3_l2_fused_asm_to_combine()` / `ensure_k3_combine_asm_code_object()` / `ensure_k3_combine_tail_reduce_asm_code_object()`；
+  - V3 normal 仍保留 isolated ASM-pack5 entry，LL 仍保留 C pack5 entry；rank barrier、external reduce 和 tail signal helper 仍被 V3 no-tail/tail 使用。
+- 远端验证：
+  - 运行前 `hy-smi --showpids` 显示无 KFD PIDs；
+  - 显式同步本轮改动到 `/workspace/DeepGEMM`；
+  - 远端 `compileall` 通过；
+  - `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`6 passed`；
+  - `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过；
+  - 运行后 `hy-smi --showpids` 显示无 KFD PIDs。
+- 默认主路径 eager smoke，输出目录 `hygon_tmp/sglang_debug/v3_mainpath_smoke_20260616/`：
+
+| case | tail | correct | max_abs | fused ms |
+| --- | ---: | --- | ---: | ---: |
+| LL 128, dispatch 128 | 0 | true | 0.000244141 | 0.817639 |
+| LL 128, dispatch 128 | 1 | true | 0.000244141 | 0.840340 |
+| normal 512, dispatch 512 | 0 | true | 0.000488281 | 1.700419 |
+| normal 512, dispatch 512 | 1 | true | 0.000488281 | 1.751319 |
+
+- graph smoke：
+  - LL graph capture1024 / dispatch128 / tail=1：replay 32/128/256 均 correct，`max_abs=0.000488281`；
+  - normal graph capture1024 / dispatch512 / tail=1：replay 512/1024 均 correct，`max_abs=0.000488281`。
+- 当前结论：
+  - DSV4 public API 默认 V3 staged 主路径已经可用；
+  - `dispatch_num_tokens` 可以承载 eager/graph 的统一 backend selector；
+  - 还没完成底层 persistent big fused 物理删除或 V3-only route_scratch 缩容，因此 Phase 11/12 仍未关闭。
+
+## 2026-06-16 - Phase 12 route_scratch V3-only shrink implementation draft
+
+- 目标：
+  - 在 DSV4 V3 staged 主路径上停止按 legacy big-fused `DcuRouteTileScratchLayout` 分配 route_scratch；
+  - 保留非 DSV4 shape 的 legacy `_C` fallback size，避免本轮影响无关路径；
+  - 先做分配/layout 缩容，不改 K1/K2/K3 kernel 执行逻辑和 row emission 合同。
+- 代码改动：
+  - `csrc/apis/mega_dcu.hpp` 的 `get_mega_moe_route_scratch_size_for_mega_moe()` 对 DSV4 shape 改用 V3 staged scratch size：
+    - `num_max_tokens_per_rank <= 256` 按 LL rows/headroom 上界分配；
+    - `>256` 按 normal fixed-capacity rows 上界分配，覆盖 auto compact 和 graph compact；
+    - `staged_x` 后为 normal ASM K1 graph flags/meta flags/GpuProb 显式预留安全区；
+    - 后续只保留 V3 staged 需要的 `l1_out`、`act_fp8`、`act_scale`、K3 prob storage、graph runtime token、tail done/signal addrs。
+  - `megamoe/large_opt.py` 同步 Python route_scratch view 公式，避免 `l1_out` 覆盖 K1 ASM flags/prob；
+  - `tests/test_dcu_megamoe_v3.py` 增加 source guard，防止 DSV4 size API 回到 legacy full route-tile scratch layout。
+- 关键修正：
+  - 首轮 normal512 no-tail 暴露 `l1_out_workspace must be [>=total_rows, l1_rows]`；
+  - 根因是旧 `act_bf16` 区按 `capacity_rows * intermediate_hidden` 分配，但 Python/V3 实际当作 `[capacity_rows, intermediate_hidden * 2]` 的 K1 L1 BF16 输出；
+  - 旧 huge row capacity 曾掩盖该半容量问题，V3-only shrink 后必须显式按 `2 * intermediate_hidden` 分配；
+  - 已同步修正 C++ size API 与 Python view 公式，并加 source guard。
+- 本地验证：
+  - `python -m compileall megamoe/large_opt.py tests/test_dcu_megamoe_v3.py` 通过；
+  - `git diff --check` 通过。
+- 预估显存变化（route_scratch only，修正 `l1_out` 真实宽度后）：
+
+| tokens/rank capacity | V3 rows | V3 scratch GiB |
+| ---: | ---: | ---: |
+| 384 | 8192 | 0.112 |
+| 512 | 8192 | 0.113 |
+| 768 | 8192 | 0.115 |
+| 1024 | 8192 | 0.117 |
+| 4096 | 32768 | 0.469 |
+| 8192 | 57344 | 0.828 |
+| 8448 | 57344 | 0.830 |
+
+- 远端验证：
+  - `python3 -m compileall megamoe/large_opt.py tests/test_dcu_megamoe_v3.py` 通过；
+  - `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`7 passed`；
+  - `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，`megamoe._C` 因 header 改动已重编；
+  - `_C.get_mega_moe_route_scratch_size_for_mega_moe()` 实际返回：
+    - 128: `0.021 GiB`，256: `0.041 GiB`，512: `0.113 GiB`，1024: `0.117 GiB`，4096: `0.469 GiB`，8192: `0.828 GiB`，8448: `0.830 GiB`。
+- GPU smoke：
+
+| case | route_scratch | correct | max_abs | fused/graph result |
+| --- | ---: | --- | ---: | --- |
+| LL 128 no-tail eager, requested max 128 -> aligned 384 | 0.081 GiB | true | 0.000244141 | fused `0.815 ms` |
+| LL 256 tail eager, requested max 256 -> aligned 384 | 0.081 GiB | true | 0.000244141 | fused `1.275 ms` |
+| normal 512 no-tail eager, requested max 512 -> aligned 768 | 0.115 GiB | true | 0.000488281 | fused `1.686 ms` |
+| normal 8192 tail eager, requested max 8192 -> aligned 8448 | 0.830 GiB | true | 0.000488281 | fused `10.978 ms` |
+| LL graph capture1024/dispatch128 tail replay 32/128/256 | 0.228 GiB | true | 0.000488281 | all replay checks pass |
+| normal graph capture1024/dispatch512 tail replay 512/1024 | 0.228 GiB | true | 0.000488281 | all replay checks pass |
+
+- 远端清理：
+  - 测试后 `hy-smi --showpids` 显示无 KFD PIDs。
+- 待补：
+  - 需要用标准 Phase 13 sweep 口径重刷完整性能矩阵；当前 8192 tail smoke `10.98 ms` 略慢于最近 refresh `~10.75 ms`，可能是 repeat/warmup/噪声，需标准化确认。
+
+## 2026-06-16 - Phase 13 final validation after V3 main-path promotion
+
+- 本轮目标：
+  - V3 转正为 DSV4 DCU MegaMoE public 主路径后，收口 README/test 口径、route_scratch shrink、远端 build/source tests、功能/精度/性能矩阵；
+  - 保持外部接口兼容，`big_fused_cuda_graph` 仅作为 graph 兼容 alias，README 示例改为推荐 `stages_fused_cuda_graph=True`；
+  - 底层 `_C.fp8_mega_moe*` 暂保留为非 DSV4 fallback，不再作为 DSV4 production 主路径或性能对象。
+- 本地验证：
+  - `python -m compileall megamoe/__init__.py megamoe/large_opt.py megamoe/dcu_megamoe_large_opt/v3_config.py tests/test_mega_moe_dcu.py tests/test_dcu_megamoe_v3.py` 通过；
+  - `git diff --check` 通过；
+  - 旧 V3 env 字符串只剩在 planning 历史段落中，`megamoe/tests/scripts/README.md` 不再消费 `USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND`。
+- 远端构建/source tests：
+  - 运行前 8 卡空闲，`hy-smi --showpids` 无 KFD 进程；
+  - 同步到 `hg@10.17.176.11` / `sglang_megamoe` / `/workspace/DeepGEMM`；
+  - 容器内 `compileall` 通过；
+  - `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`7 passed`；
+  - `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过。
+- Phase 13 矩阵输出目录：
+  - `hygon_tmp/sglang_debug/phase13_final_20260616_181534/`
+  - `case_status.tsv`: 40/40 PASS；
+  - `summary.csv`: 记录 eager fused/baseline/speedup 与 graph replay timings；
+  - 临时 driver 脚本由 PowerShell 生成时带 CRLF，最后写出了一个 `status.txt\r` 小尾巴；已手动修正 `status.txt` 为 DONE，后续临时脚本需显式 LF。
+- LL eager main path，tail=0/1 均 correct：
+
+| tokens/rank | no-tail fused ms | tail fused ms |
+| ---: | ---: | ---: |
+| 8 | 0.579180 | 0.587960 |
+| 32 | 0.629260 | 0.634280 |
+| 64 | 0.682280 | 0.687919 |
+| 128 | 0.818040 | 0.840960 |
+| 256 | 1.225779 | 1.276760 |
+
+- LL graph capture1024 / dispatch256 replay，tail=0/1 均 correct，replay-only：
+
+| replay tokens | no-tail graph ms | tail graph ms |
+| ---: | ---: | ---: |
+| 8 | 0.572721 | 0.553920 |
+| 32 | 0.669101 | 0.649981 |
+| 64 | 0.722541 | 0.703540 |
+| 128 | 0.847920 | 0.853861 |
+| 256 | 1.271261 | 1.291501 |
+
+- V3 normal eager main path，tail=0/1 均 correct：
+
+| tokens/rank | no-tail fused ms | tail fused ms |
+| ---: | ---: | ---: |
+| 512 | 1.698379 | 1.747519 |
+| 1024 | 2.069899 | 2.080219 |
+| 1025 | 2.159859 | 2.137139 |
+| 2048 | 3.372279 | 3.317679 |
+| 2050 | 3.343679 | 3.385099 |
+| 4096 | 5.907758 | 5.863558 |
+| 4097 | 5.933797 | 5.896064 |
+| 8192 | 10.978735 | 10.895767 |
+
+- Boundary guard：
+  - actual 256 with dispatch512 forces normal backend for boundary coverage, not the default production selector；
+  - no-tail `1.593039 ms`，tail `1.624799 ms`，both correct。
+- 8192 repeat=20 confirmation：
+  - 输出目录 `hygon_tmp/sglang_debug/phase13_8192_confirm_20260616_1848b/`；
+  - no-tail correct, fused `11.008075 ms`, baseline `17.334093 ms`, speedup `1.5747x`；
+  - tail correct, fused `10.929035 ms`, baseline `17.173992 ms`, speedup `1.5714x`；
+  - 结论：当前 8192 在 route_scratch shrink 后稳定约 `10.9-11.0 ms`，相对最近 `10.75-10.79 ms` 有 `~1-2%` 漂移，但远优于旧 asm-route `12ms+` 档和 baseline `17ms+`；记录为后续观察项，不阻塞本轮 V3 主路径收口。
+- V3 normal graph capture1024 / dispatch512 replay，tail=0/1 均 correct，replay-only：
+
+| replay tokens | no-tail graph ms | tail graph ms |
+| ---: | ---: | ---: |
+| 512 | 1.663201 | 1.693701 |
+| 1024 | 2.022701 | 1.979681 |
+
+- Uneven smoke：
+  - LL eager list `17,31,48,64,79,96,112,127`, dispatch128, no-tail/tail correctness both pass；
+  - normal eager list `1024,768,512,896,640,384,256,128`, dispatch1024, no-tail/tail correctness both pass；
+  - LL uneven graph replay 32/96/128 no-tail `0.660880/0.740980/0.764720 ms`, tail `0.648540/0.732481/0.759641 ms`；
+  - normal uneven graph replay 512/1024 no-tail `1.634641/1.716441 ms`, tail `1.631921/1.756281 ms`。
+- README/script smoke：
+  - `OUT_DIR=hygon_tmp/sglang_debug/readme_script_smoke_20260616 TOKENS_LIST=512 SKIP_BENCH=1 CORRECTNESS_ITERS=1 WARMUP=1 REPEAT=1 PYTHONPATH=. bash scripts/run_dcu_megamoe_large_opt.sh` 通过；
+  - fused execution `v3_staged`，layout `normal ASM plain-pack5`，`max_abs=0.000488281`，route_scratch `0.236 GiB` for default max-token 2048 script capacity；
+  - 运行后 `hy-smi --showpids` 无 KFD 进程残留。
+
+## 2026-06-17 - dispatch token / graph public API semantic correction
+
+- 本轮修正目标：
+  - 恢复 `dispatch_num_tokens` 的原始语义：只作为 eager host-side backend selector；uneven 每 rank token 不同时用 EP-group/global max token 保证所有 rank 选择同一 backend，不作为 runtime token 或 graph replay 行数。
+  - graph backend 改为显式 public 参数 `ll_cuda_graph` / `normal_cuda_graph`；框架应在 capture/replay 外部按同一 dispatch token 规则决定使用哪个 graph，API 内部不再根据 `dispatch_num_tokens` 或 capture bucket 自动切 backend。
+  - `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE` / `MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD` 生产口径改为 `MEGAMOE_DCU_USE_NORMAL` / `MEGAMOE_DCU_NORMAL_TOKEN_THRESHOLD`；默认 threshold 仍为 256，`MEGAMOE_DCU_USE_NORMAL=1` 强制 normal。
+- 已落地代码：
+  - `megamoe/__init__.py`：public API 改为 `ll_cuda_graph` / `normal_cuda_graph`；eager 通过 `select_v3_backend(dispatch_num_tokens or y.size(0))` 选择 LL/normal；graph 只消费显式 graph backend。
+  - `megamoe/large_opt.py`：staged eager/graph 入口只接收已选定的 `v3_backend`，不再自行读取 dispatch token。
+  - `tests/test_mega_moe_dcu.py`：graph capture 使用 `--ll-cuda-graph` / `--normal-cuda-graph`；`dispatch_num_tokens` 只在 eager 和测试侧 layout/backend 展示中使用。
+  - `README.md` / `scripts/run_dcu_megamoe_large_opt.sh`：示例和说明切到新 graph 参数与新 env 名称；`K2_SKIP_INACTIVE_ROWS_MIN_TOKENS` 说明保留为 eager K2 inactive-row skip 阈值，graph 固定传 row metadata 以支持 runtime-token replay。
+  - `tests/test_dcu_megamoe_v3.py`：新增 source guard，锁住 graph 调用不传 `dispatch_num_tokens`、旧 graph 参数名不回流。
+  - `csrc/apis/mega_dcu.hpp`：C++ route_scratch size API 同步读取 `MEGAMOE_DCU_USE_NORMAL` / `MEGAMOE_DCU_NORMAL_TOKEN_THRESHOLD`，`MEGAMOE_DCU_USE_NORMAL` 解析改为大小写无关。
+- 待验证：
+  - 本地 `compileall` / `git diff --check`；
+  - 远端 source pytest、`build_ext --inplace`；
+  - 远端 8 卡 smoke：LL eager、normal eager、LL graph capture1024 replay 32/128/256、normal graph capture1024 replay 512/1024、uneven dispatch selector。
+- 验证结果：
+  - 本地 `python -m compileall ...` 通过；`git diff --check` 通过；本机无 pytest。
+  - 远端同步到 `/workspace/DeepGEMM`，删除旧非 pack5 ASM `.s` 与 `scripts/build_dcu_megamoe_v2.sh`。
+  - 远端 `python3 -m compileall ...` 通过；`PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`8 passed`。
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，`megamoe._C` 因 `mega_dcu.hpp` env 解析修改已重编。
+  - 8 卡 correctness smoke 输出目录：`hygon_tmp/sglang_debug/dispatch_graph_fix_20260617/`。
+
+| case | backend evidence | correct | max_abs / notes |
+| --- | --- | --- | --- |
+| LL eager 128 | layout `L1/L2 pack5`, auto threshold 256 | true | `0.000244141` |
+| normal eager 512 | layout `normal ASM plain-pack5` | true | `0.000488281` |
+| eager dispatch128 | explicit `--dispatch-num-tokens 128`, still LL | true | `0.000244141` |
+| env force normal 128 | `MEGAMOE_DCU_USE_NORMAL=1`, build config `normal_forced=True`, layout `normal ASM plain-pack5` | true | `0.000244141` |
+| LL graph capture1024 | `--ll-cuda-graph`, replay 32/128/256 | true | replay max_abs <= `0.000488281` |
+| normal graph capture1024 | `--normal-cuda-graph`, replay 512/1024 | true | replay max_abs <= `0.000488281` |
+| uneven eager list `17,31,48,64,79,96,112,127` | test computes global dispatch bucket for eager selector, LL layout | true | `0.000244141` |
+
+- 远端清理：验证后 `hy-smi --showpids` 显示无 KFD PIDs。
+
+## 2026-06-17 - upper API simplification to explicit backend + graph
+
+- 本轮目标 supersedes 上一条 dispatch/graph follow-up：
+  - `fp8_w8a8_mega_moe` public API 不再做 LL/normal auto 分化；
+  - 删除 public `dispatch_num_tokens` 参数和 `ll_cuda_graph` / `normal_cuda_graph` 参数；
+  - 新 public contract：`megamoe_backend="ll"|"normal"` 明确指定 backend，`graph=True|False` 明确指定是否捕获/执行 graph；
+  - auto 选择只保留在框架层；本工程用 `tests/test_mega_moe_dcu.py` 模拟：`MEGAMOE_DCU_BACKEND=auto|ll|normal`，`MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD` 默认 256，auto 时用单测计算的 EP 统一 selector tokens 做选择。
+- 已落地代码：
+  - `megamoe/__init__.py`：public API 改为 `megamoe_backend` + `graph`，内部只做 `normalize_v3_backend()`，不再读取 env、threshold 或 selector tokens；
+  - `megamoe/large_opt.py`：删除 env/threshold 参数依赖，route_scratch view 按可覆盖 LL/normal 的 capacity 布局；
+  - `csrc/apis/mega_dcu.hpp`：删除 `MEGAMOE_DCU_USE_NORMAL` / `MEGAMOE_DCU_NORMAL_TOKEN_THRESHOLD` 解析，route_scratch size API 不再受 env 影响；
+  - `megamoe/dcu_megamoe_large_opt/v3_config.py`：保留 backend normalize，新增测试层 `MEGAMOE_DCU_BACKEND` / `MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD` auto selector；
+  - `tests/test_mega_moe_dcu.py`：删除 `--dispatch-num-tokens`、`--ll-cuda-graph`、`--normal-cuda-graph`，新增 `--megamoe-backend auto|ll|normal` 和 `--cuda-graph`；auto selector tokens 由 uniform tokens、rank-list max 或 random uneven max capacity 计算；
+  - `README.md` 和 `scripts/run_dcu_megamoe_large_opt.sh` 已同步新参数。
+- 本地验证：
+  - `python -m compileall megamoe/__init__.py megamoe/large_opt.py megamoe/dcu_megamoe_large_opt/v3_config.py tests/test_mega_moe_dcu.py tests/test_dcu_megamoe_v3.py setup.py` 通过；
+  - `git diff --check` 通过；
+  - 本机无 pytest，source tests 待远端容器执行。
+- 待验证：
+  - 远端 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py`；
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace`；
+  - 远端 8 卡 smoke：LL eager、normal eager、`MEGAMOE_DCU_BACKEND=normal` 强制、LL graph、normal graph、uneven auto selector。
+- 远端验证结果：
+  - 同步到 `/workspace/DeepGEMM` 后，`python3 -m compileall ...` 通过；
+  - `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`8 passed`；
+  - `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，`megamoe._C` 因 `mega_dcu.hpp` route_scratch size 公式变更已重编；
+  - 初始 `hy-smi` 显示 VRAM 85-87% 但 HCU 0%，仍完成小矩阵 smoke；验证后 `hy-smi --showpids` 无 KFD PIDs。
+
+| case | selector / backend | correct | max_abs |
+| --- | --- | --- | ---: |
+| LL eager 128 | `--megamoe-backend ll`, selector 128 | true | `0.000244141` |
+| normal eager 512 | `--megamoe-backend normal`, selector 512 | true | `0.000488281` |
+| auto uneven list `17,31,48,64,79,96,112,127` | `--megamoe-backend auto`, selector 127 -> LL | true | `0.000244141` |
+| LL graph capture1024 replay 32/128/256 | `--megamoe-backend ll --cuda-graph` | true | replay max <= `0.000488281` |
+| normal graph capture1024 replay 512/1024 | `--megamoe-backend normal --cuda-graph` | true | replay max <= `0.000488281` |
+
+## 2026-06-17 - LL tail runtime-token follow-up after cleanup
+
+- 用户追问：LL 的 128/max1024 bug 是否由清理代码导致，以及 eager 是否理论上不应受 `num_max_tokens_per_rank` 影响。
+- 结论：
+  - `symm_buffer` 和 `route_scratch` 仍按同一个 `num_max_tokens_per_rank` 分配，LL/normal 复用同一块物理空间；
+  - eager 的有效 K1/K2/K3 rows 由本次 `num_tokens` 决定，不应被 max 放大；
+  - `num_max_tokens_per_rank` 在 eager 中仍必须作为 symm combine buffer stride 传给 K1/K3，用于 `topk_slot * max_tokens + token_idx` 地址计算。
+- 根因：
+  - 不是旧 big-fused / persistent 文件删除直接导致；
+  - 最近 LL tail runtime-token 调试留下了 eager 参数误用：eager LL tail 给 `rank_barrier()` 只传 `graph_runtime_num_tokens_out`，但 wrapper/C++ 现在要求 graph runtime input/output 成对；
+  - 该错误会在 eager LL tail 128/max1024 进入 K3 之前失败，并容易被误判成 LL tail kernel 或 cleanup 后 scratch 容量问题。
+- 修复：
+  - 恢复 LL tail 默认启用，不再用 `v3_backend != V3_BACKEND_LL` 临时屏蔽；
+  - eager path 不再给 `rank_barrier()` 传 graph runtime token output，也不再给 K3 LL tail 传 graph runtime token tensor；
+  - graph path 保持 input/output 成对：`sym_buffer.cuda_graph_num_tokens -> state.scratch.graph_runtime_num_tokens -> K3 LL tail reducer`，继续按 replay runtime tokens 做 reduce。
+- 验证：
+  - 本地 `python -m compileall megamoe/large_opt.py` 通过，`git diff --check` 通过；
+  - 远端同步后 `python3 -m compileall megamoe/large_opt.py` 通过；
+  - LL eager tail `tokens=128, num_max_tokens_per_rank=1024` correct，`max_abs=0.000244141`；
+  - LL eager tail `tokens=512, num_max_tokens_per_rank=1024` correct，`max_abs=0.000488281`；
+  - LL graph tail capture1024 replay `32,96,128,256,512` 全部 correct，replay max_abs <= `0.000488281`；
+  - LL graph tail capture1024 replay bench smoke：32 `0.982 ms` median / `0.636 ms` min，128 `0.845 ms` median，256 `1.285 ms` median；
+  - 远端 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`8 passed`。
+- 状态：✅ LL tail eager/graph cleanup regression closed；保留 graph runtime-token 化修复，删除 eager 误用参数。
+
+## 2026-06-17 - latest V3 validation sweep after remote cleanup
+
+- 用户要求停掉远端占卡进程、复查最近代码修正，并用和历史一致的 warmup/repeat 重新刷数据。
+- 远端状态处理：
+  - `sglang_megamoe` 内只有历史 `watch rocm-smi`，实际占卡来自 `dsq_sglang_601` 的 `sglang serve`；已停止该服务，8 卡 VRAM 从 `88%` 回到空闲状态。
+  - 远端仓库无法访问 GitHub，使用本地 bundle + worktree patch 同步到 `/workspace/DeepGEMM`；远端 HEAD 对齐 `a85a689`，并应用当前工作区 diff。
+- 代码验证：
+  - 本地 `git diff --check` 通过；
+  - 本地 `python -m compileall megamoe tests/test_mega_moe_dcu.py tests/test_dcu_megamoe_v3.py` 通过；
+  - 远端 `python3 -m compileall megamoe tests/test_mega_moe_dcu.py tests/test_dcu_megamoe_v3.py` 通过；
+  - 远端 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`8 passed`；
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，`megamoe._C` 和 K1/K2/K3 extensions 均完成 inplace copy。
+- 最新正式 sweep：
+  - 输出目录：`hygon_tmp/sglang_debug/latest_v3_validation_20260617_121101/`；
+  - 所有 case 使用 `warmup=5 repeat=10`，避免此前 smoke `repeat=1` 的抖动；
+  - LL graph capture bucket 固定为 `1024`，replay `8,32,64,128,256,512`，开启 `--cuda-graph-bench`。
+
+| case | mode/backend | tokens | correct | fused ms | baseline ms | speedup | graph replay median ms |
+| --- | --- | ---: | --- | ---: | ---: | ---: | --- |
+| auto_boundary_256 | auto/ll | 256 | true | 1.282179 | 2.987999 | 2.3304 |  |
+| auto_boundary_512 | auto/normal | 512 | true | 1.732439 | 2.985159 | 1.7231 |  |
+| ll_eager_128 | ll/ll | 128 | true | 0.847220 | 2.867339 | 3.3844 |  |
+| ll_eager_256 | ll/ll | 256 | true | 1.269380 | 2.999979 | 2.3633 |  |
+| ll_graph_cap1024_replay_8_512 | ll/ll | 1024 | true | 4.857478 | 3.731839 | 0.7683 | 8: 0.555380; 32: 0.651660; 64: 0.701420; 128: 0.850280; 256: 1.281440; 512: 2.250439 |
+| normal_eager_512 | normal/normal | 512 | true | 1.743799 | 3.209099 | 1.8403 |  |
+| normal_eager_1024 | normal/normal | 1024 | true | 2.060339 | 3.660499 | 1.7766 |  |
+| normal_eager_2048 | normal/normal | 2048 | true | 3.346319 | 5.472398 | 1.6353 |  |
+| normal_eager_4096 | normal/normal | 4096 | true | 5.837399 | 9.512577 | 1.6296 |  |
+| normal_eager_8192 | normal/normal | 8192 | true | 10.934376 | 17.325154 | 1.5845 |  |
+
+- 结论：
+  - 代码修正后的 LL eager/graph 均正确，LL graph replay 仍按 runtime token 增长，没有回到 capture rows 固定 work 的旧问题；
+  - auto selector 边界符合预期：`256 -> LL`，`512 -> normal`；
+  - normal 4096 `5.837399 ms` 对齐历史 `~5.81-5.84 ms`；8192 `10.934376 ms` 对齐 route_scratch shrink 后历史 `~10.9-11.0 ms`，明显好于旧 `12ms+` 档；
+  - 验证后发现 `dsq_sglang_601` 又拉起 `sglang serve` 和 `bench_serving` 占卡；已停止该容器。最终 `hy-smi` 显示 8 卡 VRAM `0%`、HCU `0%`，`hy-smi --showpids` 显示 `No KFD PIDs currently running!`。
+
+## 2026-06-17 - eager large-uneven host global-max capacity contract
+
+- 用户要求 LL/normal eager/graph 使用更完整 token 矩阵验证，并要求 graph capture 统一按 max 8192；在正式 sweep 前复现到 normal eager true uneven correctness failure。
+- 失败 case：
+  - backend normal，eager，exact rank list `8192,4097,4096,3072,2050,2048,1025,256`；
+  - no-tail/tail 都可复现 `max_abs ~0.07` 级别错误；
+  - uniform 8192、normal graph capture8192 replay、旧小 uneven `1024,768,512,896,640,384,256,128` 均可通过。
+- 根因：
+  - K1 eager host 侧 route capacity 不能只按本 rank `y.size(0)` 估算；
+  - true uneven 时，小 token owner rank 仍可能接收大 token peer rank 路由到本地 expert 的 rows；
+  - 本 rank token 较小时 capacity 被低估，K1 route rows 被截断，后续 K2/K3 输出出现大 diff；
+  - LL eager 理论上同类 contract 也成立，只是 fixed-row/headroom 更容易遮住问题。
+- graph 为什么没有同类问题：
+  - graph capture 已按 bucket max 固定 host capacity；
+  - replay 只改 device runtime token scalar，K1/K3 根据 runtime token 跳过无效前缀外工作；
+  - 因此 graph 大跨度 uneven 的风险点不是 local-token capacity，而是 graph reset/runtime-token 化。
+- 生产修复：
+  - public API 使用可选 host scalar `capacity_num_tokens`，语义限定为 eager K1 host-side capacity/global max；
+  - 测试/框架层在 uneven 时传 `max(tokens_per_rank)`，不引入 device scalar、D2H sync 或新 kernel；
+  - K1 compact count/emit 仍从每个 source rank 的 sym-buffer header 读取实际 `sections.num_tokens`，所以 global max 只扩大容量边界，不把有效 token 伪装成 max；
+  - 未传 `capacity_num_tokens` 时保留原本 local-token eager 行为，性能敏感框架应传本次 EP-group global max；用 `num_max_tokens_per_rank` 兜底 correctness-safe 但可能扩大 eager K1 work；
+  - `capacity_num_tokens` 不参与 LL/normal 分化，也不传入 graph。
+- 本地/远端验证：
+  - 本地 `compileall` 和 `git diff --check` 通过；
+  - 远端 `compileall` 与 `tests/test_dcu_megamoe_v3.py` 8/8 通过；
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过；
+  - large-uneven normal eager no-tail/tail 都通过，`max_abs=0.000488281`；
+  - large-uneven normal graph capture8192 tail smoke 通过，`max_abs=0.000488281`。
+
+## 2026-06-17 - LL graph capture8192 small-token replay regression investigation
+
+- 用户要求恢复完整 LL graph 语义：capture bucket 按 `num_max_tokens_per_rank=8192`，LL replay 也必须能覆盖到 8192；不能引入额外 `--cuda-graph-capture-runtime-tokens` 或内部 1024 上限来绕过问题。
+- 已回退/清理：
+  - 删除测试 CLI `--cuda-graph-capture-runtime-tokens` 和 README 说明；
+  - `large_opt.py` graph path 恢复按 `graph_max_tokens` 建图，K1 重新直接消费 `sym_buffer.cuda_graph_num_tokens`；
+  - 本地 `compileall` / `git diff --check` 通过，远端 source tests 8/8 通过。
+- 复现：
+  - LL graph capture8192 replay `8,32,33,64,128,256,512,513` correctness 通过；
+  - replay median 分别约 `0.781/0.819/0.827/0.867/1.011/1.446/2.424/2.426 ms`，相比历史 capture1024 小 token 表慢约 `0.15~0.18 ms`。
+- 当前根因假设：
+  - 小 token replay 的 runtime-token 化在 K1/K3 已生效，但 K2 graph 仍按 K1 返回的 captured rows 固定发 row-level grid；
+  - capture8192 时 LL K1 rows 约 5 万级，K2 即使通过 `row_combine_ptrs` early-return，也仍需要承受大量 inactive row blocks/rowptr checks；
+  - 因此问题不是 graph token 参数，而是 K2 固定 row-grid 与完整 capture8192 的小 token replay 性能冲突。
+- 实验性修复（待卡空验证，未定案）：
+  - 不新增 kernel、不加 D2H sync；
+  - 在已有 K2 reg kernel 内改为 grid-stride row loop，并给 Python wrapper 增加内部 `max_row_blocks` 参数；
+  - 仅 LL graph path 传内部 `max_row_blocks=graph_max_tokens`，复用 capture bucket / `num_max_tokens_per_rank` 语义；eager/normal 默认保持 one-block-per-row；
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 已通过。
+- 待验证：
+  - 卡当前显存仍被其他任务占用，禁止 kill；等待空闲后跑 LL graph capture8192 replay 表；
+  - 如果 correctness 或 performance 不达标，回退该 K2 grid-stride 实验，继续查 K1/K3 或另寻无新 kernel 的映射方案。
+
+## 2026-06-17 - retired non-pack5 K1/K3 extension exports cleanup
+
+- 清理项：
+  - 删除 `k1_fused_ext.cu` 中旧 public pybind `k1_symm_fused_l1` 和同名薄 wrapper；
+  - 保留共享 `k1_symm_fused_l1_asm_impl`，因为 V3 normal ASM-pack5 入口仍复用它；
+  - 删除 `k3_fused_ext.cu` 中旧非 pack5 `k3_l2_combine_asm_out` / `k3_l2_combine_asm_tail_reduce_out` 及其 pybind；
+  - 保留 `k3_l2_combine_asm_pack5_out` / `k3_l2_combine_asm_tail_reduce_pack5_out` 和共享 ASM launcher。
+- guard：
+  - `tests/test_dcu_megamoe_v3.py` 增加 source guard，要求旧 public pybind 不再出现在扩展源码中，pack5 entry 仍存在。
+- 验证：
+  - 本地 `compileall` 通过；
+  - 本地 `git diff --check` 通过；
+  - 远端 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`8 passed`；
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，K1/K2/K3 extension 均完成编译和 inplace copy。
+
+## 2026-06-17 - graph capture8192 K2 row-block replay tuning
+
+- 用户要求：
+  - graph capture 仍按 `num_max_tokens_per_rank=8192`，不能重新引入独立 `--cuda-graph-capture-runtime-tokens`；
+  - replay 性能应由 runtime token 决定，LL 8 token 需要恢复到历史 `~0.55 ms`；
+  - 不新增 kernel，不引入 D2H sync，尽量少引入 H2D。
+- 根因复核：
+  - K1 LL graph 已通过 device runtime token 扫描 peer rank token 前缀；
+  - K3 LL tail reducer 已通过 graph runtime token 限制 reduce token 前缀；
+  - K2 graph 仍按 K1 captured capacity rows 发大量 row-level blocks，即使 inactive row 可以通过 `row_combine_ptrs` early-return，小 token capture8192 replay 仍会承担固定 block 调度成本。
+- 修复方式：
+  - 不新增 kernel；在现有 K2 reg kernel 内改为 grid-stride row loop；
+  - 新增内部参数 `max_row_blocks`，仅由 staged graph path 传入；
+  - 当前 graph path 使用 `K_K2_GRAPH_ROW_BLOCKS=2048`，K2 仍覆盖全部 captured rows，但 launch block 数固定为 2048，剩余 rows 由 grid-stride 消化；
+  - eager 默认仍保持 one-block-per-row，不影响现有 eager 行为。
+- LL graph A/B（capture8192，tail，replay-only，correctness 均 pass）：
+
+| K2 graph row blocks | replay 8 ms | replay 128 ms | replay 512 ms | notes |
+| ---: | ---: | ---: | ---: | --- |
+| 8192 / graph max | 0.620 | 0.850 | 2.280 | 初始修复后仍慢于历史 8-token |
+| 1024 | 0.565 | 0.857 | 2.303 | 8-token 接近历史，但 512 略慢 |
+| 2048 | 0.556 | 0.846 | 2.288 | 当前采用，8-token 回到历史区间 |
+
+- 最新 LL graph sweep（capture8192，`--num-tokens 8192` 仅作为测试 setup/capacity bucket；实际 replay tokens 来自 `--cuda-graph-test-tokens`）：
+
+| replay tokens | median ms |
+| ---: | ---: |
+| 8 | 0.556 |
+| 32 | 0.652 |
+| 33 | 0.660 |
+| 64 | 0.701 |
+| 128 | 0.846 |
+| 256 | 1.293 |
+| 512 | 2.288 |
+| 513 | 2.285 |
+
+- normal graph 验证（capture8192，tail，K2 row blocks=2048；correctness 全 pass）：
+
+| replay tokens | no-cap previous ms | cap2048 current ms |
+| ---: | ---: | ---: |
+| 256 | 1.925 | 1.812 |
+| 512 | 2.036 | 1.944 |
+| 1024 | 2.369 | 2.252 |
+| 2048 | 3.527 | 3.474 |
+| 4096 | 5.877 | 5.799 |
+| 8192 | 10.688 | 10.810 |
+
+- 备注：
+  - `--cuda-graph-test-tokens` 才是 graph bucket replay 的 runtime token 列表；
+  - graph-only benchmark 中 `--num-tokens` 仍会影响测试脚本的辅助 tensor 分配顺序，小 token 计时会受 allocator/地址状态扰动；README graph 性能示例改为 `--num-tokens 8192`，避免把这个测试侧扰动误解成 graph runtime-token 语义。
+  - 当前 `2048` cap 对 LL 8-token 恢复最稳，对 normal 256-4096 有小幅收益，8192 在抖动范围内；继续观察正式全矩阵。
+
+## 2026-06-17 - eager capacity scalar naming
+
+- 用户确认：上层 eager host scalar 应命名为 `capacity_num_tokens`，不再叫 `dispatch_num_tokens`，因为它不参与 LL/normal 分化，也不参与 graph。
+- 代码收敛：
+  - `megamoe.fp8_w8a8_mega_moe(..., capacity_num_tokens=...)` 只在 eager 分支透传；
+  - graph 分支仍只使用 `sym_buffer.cuda_graph_num_tokens` runtime token，不接收 `capacity_num_tokens`；
+  - `large_opt.py` eager 侧统一把 `route_capacity_num_tokens` 传给 K1，LL/normal 都复用同一 host capacity contract；当它等于本 rank `num_tokens` 时不扩大 LL eager work。
+- 验证：
+  - 本地 `python -m compileall megamoe/__init__.py megamoe/large_opt.py tests/test_mega_moe_dcu.py tests/test_dcu_megamoe_v3.py` 通过；
+  - 本地 `git diff --check` 通过；
+  - 远端 `compileall` 与 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`8 passed`；
+  - 远端 LL eager uniform 256：correct，`max_abs=0.000244141`，median `1.278 ms`；
+  - 远端 LL eager uneven `17,31,48,64,79,96,112,127`：correct，`max_abs=0.000244141`。
+
+## 2026-06-17 - LL graph replay8192 correctness and K2 actual_m replay pruning
+
+- 问题：
+  - `LL graph capture8192/replay8192` 在旧 64-row headroom 下部分 rank 会失败，典型日志为 `max_abs=0.0256`，测试侧 debug 的 `active_tiles` 为无效负值；
+  - 根因不是 graph runtime token 传错，`graph_runtime=8192` 已正确写入；真正问题是 8192 bucket 的 per-expert routing 随机峰值可能超过 K1 LL 固定 `m_per_expert=1600`。
+- 修复：
+  - K1 LL 大 bucket headroom 从 64 rows 调整为 128 rows，8192 bucket `m_per_expert` 覆盖到 1664；
+  - K2 现有 kernel 增加可选 `actual_m/m_per_expert` 参数，LL 路径传 K1 输出的 per-expert actual rows；
+  - K2 在 kernel 内用 `actual_m` 做 device-side logical-row 到 physical-row 映射，只处理活跃 rows，不新增 kernel，不引入 D2H sync。
+- 验证：
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过；
+  - `LL graph capture8192` 全 replay 列表 correctness 全 pass，8192 replay `max_abs=0.000488281`。
+
+| replay tokens | graph median ms |
+| ---: | ---: |
+| 8 | 0.540 |
+| 32 | 0.635 |
+| 33 | 0.641 |
+| 64 | 0.686 |
+| 128 | 0.836 |
+| 129 | 0.842 |
+| 256 | 1.296 |
+| 257 | 1.296 |
+| 512 | 2.282 |
+| 513 | 2.271 |
+| 8192 | 38.170 |
+
+- 结论：
+  - `LL graph 8192` 现在可以过；
+  - 小 token graph replay 没有被 8192 capture/headroom 拖慢，8 token 回到并略优于历史 `~0.55 ms` 档；
+  - 后续全矩阵继续使用该版本刷 LL eager、normal eager/graph、uneven 和 README 示例。
+
+## 2026-06-17 - latest full V3 matrix after K2 actual_m pruning
+
+- 目录：`hygon_tmp/sglang_debug/full_matrix_latest_20260617_191221`
+- 运行前状态：清理上一轮被本地中断遗留的 `test_mega_moe_dcu.py` 进程；`hy-smi` 显示 8 卡空闲后启动。
+- 测试脚本修正：每个子测试使用独立 `MASTER_PORT`，避免连续多进程/中断后的 NCCL rendezvous socket 残留干扰。
+- 构建：远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 已在同一份同步代码上通过。
+- 结论：LL/normal eager、LL/normal graph capture8192、LL/normal uneven eager/graph 均 `correct=True`；README smoke v2 通过。
+
+### LL latest sweep
+
+| tokens/rank | eager ms | graph ms (capture8192) |
+| ---: | ---: | ---: |
+| 8 | 0.599 | 0.541 |
+| 32 | 0.641 | 0.637 |
+| 33 | 0.645 | 0.641 |
+| 64 | 0.696 | 0.691 |
+| 128 | 0.851 | 0.837 |
+| 129 | 0.856 | 0.844 |
+| 256 | 1.270 | 1.297 |
+| 257 | 1.266 | 1.286 |
+| 512 | 2.295 | 2.278 |
+| 513 | 2.273 | 2.270 |
+
+### Normal latest sweep
+
+| tokens/rank | eager ms | graph ms (capture8192) |
+| ---: | ---: | ---: |
+| 256 | 1.632 | 1.813 |
+| 512 | 1.757 | 1.951 |
+| 1024 | 2.035 | 2.260 |
+| 1025 | 2.154 | 2.263 |
+| 2048 | 3.348 | 3.467 |
+| 2050 | 3.363 | 3.469 |
+| 3072 | 4.774 | 4.757 |
+| 4096 | 5.832 | 5.775 |
+| 4097 | 5.821 | 5.788 |
+| 8192 | 10.875 | 10.743 |
+
+### Uneven smoke
+
+| case | correct | ms | execution | rank0 tokens | selector |
+| --- | ---: | ---: | --- | ---: | ---: |
+| ll_eager_uneven | true | 1.607 | v3_staged | 513 | 513 |
+| ll_graph_uneven | true | 1.618 | v3_ll_graph | 513 | 513 |
+| normal_eager_uneven | true | 9.394 | v3_staged | 8192 | 8192 |
+| normal_graph_uneven | true | 7.652 | v3_normal_graph | 8192 | 8192 |
+
+### README smoke
+
+- 初始 README random uneven graph 示例 `--num-tokens 0 --num-max-removed-tokens 768` 在 V3 normal graph 下会先触发普通 eager correctness，部分 rank 的 `y` shape 不是 graph bucket shape，导致 normal ASM tail path 缺 shape metadata；该示例已改为显式 `--num-tokens-per-rank-list` + `--correctness-iters 0`，更贴近框架传入每 rank token 的真实使用方式。
+- 已通过：
+  - `readme_uneven_graph`
+  - `readme_ll_graph`
+  - `readme_normal_graph`
+  - `readme_force_auto_1024`
+  - `readme_script_smoke`
+
+### Notes
+
+- LL graph capture8192 replay 8 token 为 `0.541 ms`，符合历史 `~0.55 ms` 预期；K2 actual_m pruning 未拖慢小 token graph。
+- normal graph 4096/4097/8192 与 eager 相比无劣化，8192 graph `10.743 ms` 略快于 eager `10.875 ms`。
+- LL 256/257 graph 比 eager 高约 `0.02-0.03 ms`，处于当前 replay/K2 row-block cap 抖动范围；512/513 graph 与 eager 基本持平或略快。
+
+## 2026-06-17 - normal graph runtime-work stability follow-up
+
+- 用户关注：`3072` 以下 normal graph capture8192 比 eager 慢较多，需要修复但不能影响已支持的 LL/normal、eager/graph、uneven 和现有优化特性；硬约束仍是不新增 kernel、不引入 D2H sync。
+- 根因分解：
+  - K2 graph 原先按 capture capacity rows 启动，虽然可用 `row_combine_ptrs==0` skip inactive row，但 replay 仍有固定 capacity 扫描/调度成本；
+  - K1 compact prebuild graph 原先会初始化 capacity rows 的 row metadata/row_combine sink，小 runtime token replay 也承担一部分固定 work；
+  - K3 normal ASM 已有 active-tile gate，但 graph capture8192 下 launch grid 仍按 capacity workgroups 固定，inactive workgroup 只能在 ASM 内 early return；这部分是 single capture8192 graph 的剩余固定开销。
+- 修复：
+  - K2 `swiglu_quant_channelwise_out` 增加可选 `active_tiles/active_tile_m`，normal graph 传 K1 `active_tiles`，在 device 侧把 effective rows 限制到 runtime active rows；LL 仍优先使用 `actual_m/m_per_expert` 路径；
+  - K2 graph row-block cap 从 `2048` 调到 `8192`，减少 1024/2048/3072 replay 下的 grid-stride row loop；该改动只影响 graph K2 launch 参数，不改 eager；
+  - K1 compact prebuild 在 graph 模式下只初始化 runtime active rows，并把 graph route count/emit grid 从 capture capacity 16 blocks/rank 收敛到 12 blocks/rank；eager auto/compact/asm 规则不变；
+  - source guard 增加 normal graph runtime-work contract，防止 `active_tiles` pruning、K1 graph init shrink、K2 row-block cap 和 K1 graph route grid 被后续清理误删。
+- 验证：
+  - 本地 `python -m py_compile megamoe/large_opt.py megamoe/dcu_megamoe_large_opt/K1_fused/k1_fused.py megamoe/dcu_megamoe_large_opt/K2_fused/k2_fused.py tests/test_dcu_megamoe_v3.py` 通过；
+  - 本地 `git diff --check` 通过；
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过；
+  - 远端 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py -q` 通过，`9/9`；
+  - normal graph capture8192 完整 replay 列表 correctness 全 pass；
+  - LL graph capture8192 smoke correctness 全 pass，8-token replay 回到 `0.56 ms` 档；
+  - LL eager smoke `8/128/256/512/513` correctness 全 pass，确认 K2 actual_m 改动未伤 eager。
+
+### normal graph after runtime-work follow-up
+
+| tokens/rank | graph ms (capture8192) | latest eager reference ms | comment |
+| ---: | ---: | ---: | --- |
+| 256 | 1.695 | 1.632-1.682 | graph still +1-4%, acceptable fixed-grid tail |
+| 512 | 1.841 | 1.757-1.765 | graph still +4-5%, acceptable fixed-grid tail |
+| 1024 | 2.151 | 2.031-2.035 | graph still +5-6% median, min close to eager |
+| 1025 | 2.134 | 2.120-2.154 | graph within noise |
+| 2048 | 3.403 | 3.348-3.416 | graph within noise |
+| 2050 | 3.401 | 3.353-3.363 | graph within noise |
+| 3072 | 4.623 | 4.774-4.837 | graph faster |
+| 4096 | 5.658 | 5.832 | graph faster |
+| 4097 | 5.681 | 5.821 | graph faster |
+| 8192 | 10.506 | 10.875 | graph faster |
+
+### LL smoke after normal graph fix
+
+| tokens/rank | LL graph ms (capture8192) | LL eager ms |
+| ---: | ---: | ---: |
+| 8 | 0.561 | 0.598 |
+| 32 | 0.656 | - |
+| 128 | 0.848 | 0.848 |
+| 256 | 1.305 | 1.274 |
+| 512 | 2.261 | 2.299 |
+| 513 | 2.273 | 2.302 |
+
+- 结论：
+  - normal graph 的主要异常已经收敛；`2048+` 与 eager 持平或更快，`256/512/1024` 剩余差距来自 single capture8192 下 K1/K3 ASM fixed launch-grid/early-return 成本；
+  - 在“不新增 kernel、不 D2H、不做多 bucket graph、不重写 ASM launch-grid 合同”的约束下，继续追平小 normal graph 需要高风险 ASM/grid redesign，当前不建议作为本轮生产修复继续推进；
+  - 生产默认 `<=256` 走 LL，因此 256 档 normal graph 只是 boundary/forced-normal 覆盖；512/1024 差距已缩到可接受范围，功能和大 token 性能稳定。

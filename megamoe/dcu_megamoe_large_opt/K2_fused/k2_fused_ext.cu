@@ -157,11 +157,16 @@ void swiglu_quant_channelwise_kernel(
     const uint16_t* __restrict__ x,
     const float* __restrict__ topk_weights,
     const int64_t* __restrict__ row_combine_ptrs,
+    const int32_t* __restrict__ actual_m,
+    const int32_t* __restrict__ active_tiles,
     uint8_t* __restrict__ out_fp8,
     float* __restrict__ out_scale,
     uint16_t* __restrict__ out_bf16,
     const int rows,
     const int hidden,
+    const int m_per_expert,
+    const int local_experts,
+    const int active_tile_m,
     const bool has_topk_weights,
     const bool has_clamp_value,
     const bool output_bf16,
@@ -170,9 +175,34 @@ void swiglu_quant_channelwise_kernel(
     float* y_smem = smem;
     float* reduce_smem = smem + hidden;
 
-    const int row = static_cast<int>(blockIdx.x);
-    if (row >= rows)
+    int effective_rows = rows;
+    int logical_m_per_expert = m_per_expert;
+    const bool has_actual_m =
+        actual_m != nullptr && m_per_expert > 0 && local_experts > 0;
+    if (has_actual_m) {
+        int max_m = 0;
+        for (int expert = 0; expert < local_experts; ++expert)
+            max_m = actual_m[expert] > max_m ? actual_m[expert] : max_m;
+        logical_m_per_expert = max_m;
+        effective_rows = max_m * local_experts;
+    }
+    if (!has_actual_m && active_tiles != nullptr && active_tile_m > 0) {
+        const int active_rows = active_tiles[0] > 0
+                                    ? active_tiles[0] * active_tile_m
+                                    : 0;
+        effective_rows = active_rows < effective_rows ? active_rows : effective_rows;
+    }
+    const int logical_row = static_cast<int>(blockIdx.x);
+    if (logical_row >= effective_rows)
         return;
+    int row = logical_row;
+    if (has_actual_m) {
+        const int expert = logical_row / logical_m_per_expert;
+        const int row_in_expert = logical_row - expert * logical_m_per_expert;
+        if (row_in_expert >= actual_m[expert])
+            return;
+        row = expert * m_per_expert + row_in_expert;
+    }
 
     const int tid = static_cast<int>(threadIdx.x);
     const int stride = hidden * 2;
@@ -257,10 +287,15 @@ void swiglu_quant_channelwise_reg_kernel(
     const uint16_t* __restrict__ x,
     const float* __restrict__ topk_weights,
     const int64_t* __restrict__ row_combine_ptrs,
+    const int32_t* __restrict__ actual_m,
+    const int32_t* __restrict__ active_tiles,
     uint8_t* __restrict__ out_fp8,
     float* __restrict__ out_scale,
     uint16_t* __restrict__ out_bf16,
     const int rows,
+    const int m_per_expert,
+    const int local_experts,
+    const int active_tile_m,
     const bool has_topk_weights,
     const bool has_clamp_value,
     const bool output_bf16,
@@ -269,109 +304,143 @@ void swiglu_quant_channelwise_reg_kernel(
     constexpr int hidden = Threads * VecGroups * 4;
     extern __shared__ float reduce_smem[];
 
-    const int row = static_cast<int>(blockIdx.x);
-    if (row >= rows)
-        return;
-
     const int tid = static_cast<int>(threadIdx.x);
-    const int stride = hidden * 2;
-    const int64_t row_base = static_cast<int64_t>(row) * stride;
-    if (!output_bf16 && row_combine_ptrs != nullptr &&
-        row_combine_ptrs[row] == 0) {
-        return;
+    int effective_rows = rows;
+    int logical_m_per_expert = m_per_expert;
+    const bool has_actual_m =
+        actual_m != nullptr && m_per_expert > 0 && local_experts > 0;
+    if (has_actual_m) {
+        int max_m = 0;
+        for (int expert = 0; expert < local_experts; ++expert)
+            max_m = actual_m[expert] > max_m ? actual_m[expert] : max_m;
+        logical_m_per_expert = max_m;
+        effective_rows = max_m * local_experts;
     }
-    const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
-    if (has_topk_weights && route_weight == 0.0f) {
+    if (!has_actual_m && active_tiles != nullptr && active_tile_m > 0) {
+        const int active_rows = active_tiles[0] > 0
+                                    ? active_tiles[0] * active_tile_m
+                                    : 0;
+        effective_rows = active_rows < effective_rows ? active_rows : effective_rows;
+    }
+    for (int logical_row = static_cast<int>(blockIdx.x);
+         logical_row < effective_rows;
+         logical_row += static_cast<int>(gridDim.x)) {
+        int row = logical_row;
+        if (has_actual_m) {
+            const int expert = logical_row / logical_m_per_expert;
+            const int row_in_expert =
+                logical_row - expert * logical_m_per_expert;
+            if (row_in_expert >= actual_m[expert])
+                continue;
+            row = expert * m_per_expert + row_in_expert;
+        }
+        const int stride = hidden * 2;
+        const int64_t row_base = static_cast<int64_t>(row) * stride;
+        if (!output_bf16 && row_combine_ptrs != nullptr &&
+            row_combine_ptrs[row] == 0) {
+            continue;
+        }
+        const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
+        if (has_topk_weights && route_weight == 0.0f) {
+            if (tid == 0)
+                out_scale[row] = 1.0e-4f / 448.0f;
+            const int64_t out_base = static_cast<int64_t>(row) * hidden;
+#pragma unroll
+            for (int g = 0; g < VecGroups; ++g) {
+                const int col = (g * Threads + tid) * 4;
+                *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) = 0u;
+                if (output_bf16) {
+                    uint32_t* bf16_ptr = reinterpret_cast<uint32_t*>(out_bf16 + out_base + col);
+                    bf16_ptr[0] = 0u;
+                    bf16_ptr[1] = 0u;
+                }
+            }
+            continue;
+        }
+
+        float y0[VecGroups];
+        float y1[VecGroups];
+        float y2[VecGroups];
+        float y3[VecGroups];
+        float local_amax = 0.0f;
+
+#pragma unroll
+        for (int g = 0; g < VecGroups; ++g) {
+            const int col = (g * Threads + tid) * 4;
+            float gate0 = bf16_bits_to_float(x[row_base + col + 0]);
+            float gate1 = bf16_bits_to_float(x[row_base + col + 1]);
+            float gate2 = bf16_bits_to_float(x[row_base + col + 2]);
+            float gate3 = bf16_bits_to_float(x[row_base + col + 3]);
+            float up0 = bf16_bits_to_float(x[row_base + hidden + col + 0]);
+            float up1 = bf16_bits_to_float(x[row_base + hidden + col + 1]);
+            float up2 = bf16_bits_to_float(x[row_base + hidden + col + 2]);
+            float up3 = bf16_bits_to_float(x[row_base + hidden + col + 3]);
+            if (has_clamp_value) {
+                up0 = fminf(clamp_value, fmaxf(-clamp_value, up0));
+                up1 = fminf(clamp_value, fmaxf(-clamp_value, up1));
+                up2 = fminf(clamp_value, fmaxf(-clamp_value, up2));
+                up3 = fminf(clamp_value, fmaxf(-clamp_value, up3));
+                gate0 = fminf(clamp_value, gate0);
+                gate1 = fminf(clamp_value, gate1);
+                gate2 = fminf(clamp_value, gate2);
+                gate3 = fminf(clamp_value, gate3);
+            }
+            y0[g] = gate0 * (1.0f / (1.0f + __expf(-gate0))) * up0 * route_weight;
+            y1[g] = gate1 * (1.0f / (1.0f + __expf(-gate1))) * up1 * route_weight;
+            y2[g] = gate2 * (1.0f / (1.0f + __expf(-gate2))) * up2 * route_weight;
+            y3[g] = gate3 * (1.0f / (1.0f + __expf(-gate3))) * up3 * route_weight;
+            local_amax = fmaxf(local_amax, fabsf(y0[g]));
+            local_amax = fmaxf(local_amax, fabsf(y1[g]));
+            local_amax = fmaxf(local_amax, fabsf(y2[g]));
+            local_amax = fmaxf(local_amax, fabsf(y3[g]));
+        }
+
+        float row_amax = 0.0f;
+        if constexpr (Threads == 64) {
+            row_amax = wave_reduce_max_64(local_amax);
+        } else {
+            reduce_smem[tid] = local_amax;
+            __syncthreads();
+
+            for (int offset = Threads / 2; offset > 0; offset >>= 1) {
+                if (tid < offset)
+                    reduce_smem[tid] = fmaxf(reduce_smem[tid], reduce_smem[tid + offset]);
+                __syncthreads();
+            }
+            row_amax = reduce_smem[0];
+        }
+
+        const float clamped_amax = fmaxf(row_amax, 1.0e-4f);
+        const float inv_scale = 448.0f / clamped_amax;
         if (tid == 0)
-            out_scale[row] = 1.0e-4f / 448.0f;
+            out_scale[row] = clamped_amax / 448.0f;
+
         const int64_t out_base = static_cast<int64_t>(row) * hidden;
 #pragma unroll
         for (int g = 0; g < VecGroups; ++g) {
             const int col = (g * Threads + tid) * 4;
-            *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) = 0u;
+            *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) =
+                pack4_e4m3fn(y0[g] * inv_scale, y1[g] * inv_scale,
+                             y2[g] * inv_scale, y3[g] * inv_scale);
             if (output_bf16) {
+                const uint32_t b01 =
+                    static_cast<uint32_t>(float_to_bf16_bits(y0[g])) |
+                    (static_cast<uint32_t>(float_to_bf16_bits(y1[g])) << 16);
+                const uint32_t b23 =
+                    static_cast<uint32_t>(float_to_bf16_bits(y2[g])) |
+                    (static_cast<uint32_t>(float_to_bf16_bits(y3[g])) << 16);
                 uint32_t* bf16_ptr = reinterpret_cast<uint32_t*>(out_bf16 + out_base + col);
-                bf16_ptr[0] = 0u;
-                bf16_ptr[1] = 0u;
+                bf16_ptr[0] = b01;
+                bf16_ptr[1] = b23;
             }
         }
-        return;
-    }
-
-    float y0[VecGroups];
-    float y1[VecGroups];
-    float y2[VecGroups];
-    float y3[VecGroups];
-    float local_amax = 0.0f;
-
-#pragma unroll
-    for (int g = 0; g < VecGroups; ++g) {
-        const int col = (g * Threads + tid) * 4;
-        float gate0 = bf16_bits_to_float(x[row_base + col + 0]);
-        float gate1 = bf16_bits_to_float(x[row_base + col + 1]);
-        float gate2 = bf16_bits_to_float(x[row_base + col + 2]);
-        float gate3 = bf16_bits_to_float(x[row_base + col + 3]);
-        float up0 = bf16_bits_to_float(x[row_base + hidden + col + 0]);
-        float up1 = bf16_bits_to_float(x[row_base + hidden + col + 1]);
-        float up2 = bf16_bits_to_float(x[row_base + hidden + col + 2]);
-        float up3 = bf16_bits_to_float(x[row_base + hidden + col + 3]);
-        if (has_clamp_value) {
-            up0 = fminf(clamp_value, fmaxf(-clamp_value, up0));
-            up1 = fminf(clamp_value, fmaxf(-clamp_value, up1));
-            up2 = fminf(clamp_value, fmaxf(-clamp_value, up2));
-            up3 = fminf(clamp_value, fmaxf(-clamp_value, up3));
-            gate0 = fminf(clamp_value, gate0);
-            gate1 = fminf(clamp_value, gate1);
-            gate2 = fminf(clamp_value, gate2);
-            gate3 = fminf(clamp_value, gate3);
-        }
-        y0[g] = gate0 * (1.0f / (1.0f + __expf(-gate0))) * up0 * route_weight;
-        y1[g] = gate1 * (1.0f / (1.0f + __expf(-gate1))) * up1 * route_weight;
-        y2[g] = gate2 * (1.0f / (1.0f + __expf(-gate2))) * up2 * route_weight;
-        y3[g] = gate3 * (1.0f / (1.0f + __expf(-gate3))) * up3 * route_weight;
-        local_amax = fmaxf(local_amax, fabsf(y0[g]));
-        local_amax = fmaxf(local_amax, fabsf(y1[g]));
-        local_amax = fmaxf(local_amax, fabsf(y2[g]));
-        local_amax = fmaxf(local_amax, fabsf(y3[g]));
-    }
-
-    float row_amax = 0.0f;
-    if constexpr (Threads == 64) {
-        row_amax = wave_reduce_max_64(local_amax);
-    } else {
-        reduce_smem[tid] = local_amax;
-        __syncthreads();
-
-        for (int offset = Threads / 2; offset > 0; offset >>= 1) {
-            if (tid < offset)
-                reduce_smem[tid] = fmaxf(reduce_smem[tid], reduce_smem[tid + offset]);
+        if constexpr (Threads != 64) {
+            // Only needed between grid-stride row iterations that reuse shared
+            // reduction storage. The default one-row-per-block path avoids an
+            // extra barrier and stays close to the original launch behavior.
+            if (row + static_cast<int>(gridDim.x) >= rows)
+                continue;
             __syncthreads();
-        }
-        row_amax = reduce_smem[0];
-    }
-
-    const float clamped_amax = fmaxf(row_amax, 1.0e-4f);
-    const float inv_scale = 448.0f / clamped_amax;
-    if (tid == 0)
-        out_scale[row] = clamped_amax / 448.0f;
-
-    const int64_t out_base = static_cast<int64_t>(row) * hidden;
-#pragma unroll
-    for (int g = 0; g < VecGroups; ++g) {
-        const int col = (g * Threads + tid) * 4;
-        *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) =
-            pack4_e4m3fn(y0[g] * inv_scale, y1[g] * inv_scale,
-                         y2[g] * inv_scale, y3[g] * inv_scale);
-        if (output_bf16) {
-            const uint32_t b01 =
-                static_cast<uint32_t>(float_to_bf16_bits(y0[g])) |
-                (static_cast<uint32_t>(float_to_bf16_bits(y1[g])) << 16);
-            const uint32_t b23 =
-                static_cast<uint32_t>(float_to_bf16_bits(y2[g])) |
-                (static_cast<uint32_t>(float_to_bf16_bits(y3[g])) << 16);
-            uint32_t* bf16_ptr = reinterpret_cast<uint32_t*>(out_bf16 + out_base + col);
-            bf16_ptr[0] = b01;
-            bf16_ptr[1] = b23;
         }
     }
 }
@@ -381,16 +450,26 @@ void launch_swiglu_quant_channelwise(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
     const int64_t* row_combine_ptrs,
+    const int32_t* actual_m,
+    const int32_t* active_tiles,
     torch::Tensor& out_fp8,
     torch::Tensor& out_scale,
     torch::Tensor& out_bf16,
     const bool output_bf16,
     const bool has_clamp_value,
-    const double clamp_value) {
+    const double clamp_value,
+    const int64_t max_row_blocks,
+    const int64_t m_per_expert,
+    const int64_t local_experts,
+    const int64_t active_tile_m) {
     const int rows = static_cast<int>(x.size(0));
     const int hidden = static_cast<int>(x.size(1) / 2);
     if (rows == 0)
         return;
+    const int launch_blocks =
+        max_row_blocks > 0
+            ? std::max<int>(1, std::min<int64_t>(rows, max_row_blocks))
+            : rows;
     const bool has_topk_weights = topk_weights.numel() > 0;
     const size_t shared_bytes_for_reg =
         Threads == 64 ? 0 : static_cast<size_t>(Threads) * sizeof(float);
@@ -399,17 +478,22 @@ void launch_swiglu_quant_channelwise(
         constexpr int vec_groups = 2048 / (Threads * 4);
         hipLaunchKernelGGL(
             (swiglu_quant_channelwise_reg_kernel<Threads, vec_groups>),
-            dim3(rows),
+            dim3(launch_blocks),
             dim3(Threads),
             shared_bytes_for_reg,
             stream,
             reinterpret_cast<const uint16_t*>(x.data_ptr<at::BFloat16>()),
             has_topk_weights ? topk_weights.data_ptr<float>() : nullptr,
             row_combine_ptrs,
+            actual_m,
+            active_tiles,
             reinterpret_cast<uint8_t*>(out_fp8.data_ptr()),
             out_scale.data_ptr<float>(),
             output_bf16 ? reinterpret_cast<uint16_t*>(out_bf16.data_ptr<at::BFloat16>()) : nullptr,
             rows,
+            static_cast<int>(m_per_expert),
+            static_cast<int>(local_experts),
+            static_cast<int>(active_tile_m),
             has_topk_weights,
             has_clamp_value,
             output_bf16,
@@ -418,17 +502,22 @@ void launch_swiglu_quant_channelwise(
         constexpr int vec_groups = 4096 / (Threads * 4);
         hipLaunchKernelGGL(
             (swiglu_quant_channelwise_reg_kernel<Threads, vec_groups>),
-            dim3(rows),
+            dim3(launch_blocks),
             dim3(Threads),
             shared_bytes_for_reg,
             stream,
             reinterpret_cast<const uint16_t*>(x.data_ptr<at::BFloat16>()),
             has_topk_weights ? topk_weights.data_ptr<float>() : nullptr,
             row_combine_ptrs,
+            actual_m,
+            active_tiles,
             reinterpret_cast<uint8_t*>(out_fp8.data_ptr()),
             out_scale.data_ptr<float>(),
             output_bf16 ? reinterpret_cast<uint16_t*>(out_bf16.data_ptr<at::BFloat16>()) : nullptr,
             rows,
+            static_cast<int>(m_per_expert),
+            static_cast<int>(local_experts),
+            static_cast<int>(active_tile_m),
             has_topk_weights,
             has_clamp_value,
             output_bf16,
@@ -445,11 +534,16 @@ void launch_swiglu_quant_channelwise(
             reinterpret_cast<const uint16_t*>(x.data_ptr<at::BFloat16>()),
             has_topk_weights ? topk_weights.data_ptr<float>() : nullptr,
             row_combine_ptrs,
+            actual_m,
+            active_tiles,
             reinterpret_cast<uint8_t*>(out_fp8.data_ptr()),
             out_scale.data_ptr<float>(),
             output_bf16 ? reinterpret_cast<uint16_t*>(out_bf16.data_ptr<at::BFloat16>()) : nullptr,
             rows,
             hidden,
+            static_cast<int>(m_per_expert),
+            static_cast<int>(local_experts),
+            static_cast<int>(active_tile_m),
             has_topk_weights,
             has_clamp_value,
             output_bf16,
@@ -462,29 +556,43 @@ void launch_swiglu_quant_channelwise_auto(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
     const int64_t* row_combine_ptrs,
+    const int32_t* actual_m,
+    const int32_t* active_tiles,
     torch::Tensor& out_fp8,
     torch::Tensor& out_scale,
     torch::Tensor& out_bf16,
     const bool output_bf16,
     const bool has_clamp_value,
-    const double clamp_value) {
+    const double clamp_value,
+    const int64_t max_row_blocks,
+    const int64_t m_per_expert,
+    const int64_t local_experts,
+    const int64_t active_tile_m) {
     const int hidden = static_cast<int>(x.size(1) / 2);
     if (hidden <= 2048 && !output_bf16) {
         launch_swiglu_quant_channelwise<64>(
-            x, topk_weights, row_combine_ptrs, out_fp8, out_scale, out_bf16,
-            output_bf16, has_clamp_value, clamp_value);
+            x, topk_weights, row_combine_ptrs, actual_m, active_tiles,
+            out_fp8, out_scale, out_bf16,
+            output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+            m_per_expert, local_experts, active_tile_m);
     } else if (hidden <= 2048) {
         launch_swiglu_quant_channelwise<128>(
-            x, topk_weights, row_combine_ptrs, out_fp8, out_scale, out_bf16,
-            output_bf16, has_clamp_value, clamp_value);
+            x, topk_weights, row_combine_ptrs, actual_m, active_tiles,
+            out_fp8, out_scale, out_bf16,
+            output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+            m_per_expert, local_experts, active_tile_m);
     } else if (hidden == 4096) {
         launch_swiglu_quant_channelwise<128>(
-            x, topk_weights, row_combine_ptrs, out_fp8, out_scale, out_bf16,
-            output_bf16, has_clamp_value, clamp_value);
+            x, topk_weights, row_combine_ptrs, actual_m, active_tiles,
+            out_fp8, out_scale, out_bf16,
+            output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+            m_per_expert, local_experts, active_tile_m);
     } else {
         launch_swiglu_quant_channelwise<256>(
-            x, topk_weights, row_combine_ptrs, out_fp8, out_scale, out_bf16,
-            output_bf16, has_clamp_value, clamp_value);
+            x, topk_weights, row_combine_ptrs, actual_m, active_tiles,
+            out_fp8, out_scale, out_bf16,
+            output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+            m_per_expert, local_experts, active_tile_m);
     }
 }
 
@@ -504,7 +612,12 @@ void swiglu_quant_channelwise_out(
     const bool output_bf16,
     const bool has_clamp_value,
     const double clamp_value,
-    const std::optional<torch::Tensor>& row_combine_ptrs) {
+    const std::optional<torch::Tensor>& row_combine_ptrs,
+    const int64_t max_row_blocks,
+    const std::optional<torch::Tensor>& actual_m,
+    const int64_t m_per_expert,
+    const std::optional<torch::Tensor>& active_tiles,
+    const int64_t active_tile_m) {
     check_cuda_contiguous(x, "x");
     check_cuda_contiguous(out_fp8, "out_fp8");
     check_cuda_contiguous(out_scale, "out_scale");
@@ -543,6 +656,33 @@ void swiglu_quant_channelwise_out(
                     "row_combine_ptrs must cover every row");
         row_combine_ptrs_data = ptrs.data_ptr<int64_t>();
     }
+    const int32_t* actual_m_data = nullptr;
+    int64_t local_experts = 0;
+    if (actual_m.has_value()) {
+        const auto& actual = actual_m.value();
+        check_cuda_contiguous(actual, "actual_m");
+        TORCH_CHECK(actual.scalar_type() == torch::kInt,
+                    "actual_m must be int32");
+        TORCH_CHECK(actual.numel() > 0, "actual_m must be non-empty");
+        TORCH_CHECK(m_per_expert > 0 && rows % m_per_expert == 0,
+                    "m_per_expert must evenly divide rows when actual_m is set");
+        local_experts = rows / m_per_expert;
+        TORCH_CHECK(actual.numel() >= local_experts,
+                    "actual_m must cover every local expert");
+        actual_m_data = actual.data_ptr<int32_t>();
+    }
+    const int32_t* active_tiles_data = nullptr;
+    if (active_tiles.has_value()) {
+        const auto& tiles = active_tiles.value();
+        check_cuda_contiguous(tiles, "active_tiles");
+        TORCH_CHECK(tiles.scalar_type() == torch::kInt,
+                    "active_tiles must be int32");
+        TORCH_CHECK(tiles.numel() >= 1,
+                    "active_tiles must contain at least one int32");
+        TORCH_CHECK(active_tile_m > 0,
+                    "active_tile_m must be positive when active_tiles is set");
+        active_tiles_data = tiles.data_ptr<int32_t>();
+    }
     if (output_bf16) {
         check_cuda_contiguous(out_bf16, "out_bf16");
         TORCH_CHECK(out_bf16.scalar_type() == torch::kBFloat16,
@@ -556,9 +696,11 @@ void swiglu_quant_channelwise_out(
     auto out_scale_view = out_scale.view({-1});
     auto out_bf16_view = out_bf16;
     launch_swiglu_quant_channelwise_auto(
-        x, topk_weights, row_combine_ptrs_data,
+        x, topk_weights, row_combine_ptrs_data, actual_m_data,
+        active_tiles_data,
         out_fp8_view, out_scale_view, out_bf16_view,
-        output_bf16, has_clamp_value, clamp_value);
+        output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+        m_per_expert, local_experts, active_tile_m);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -571,5 +713,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("output_bf16") = false,
           pybind11::arg("has_clamp_value") = true,
           pybind11::arg("clamp_value") = 10.0,
-          pybind11::arg("row_combine_ptrs") = std::nullopt);
+          pybind11::arg("row_combine_ptrs") = std::nullopt,
+          pybind11::arg("max_row_blocks") = -1,
+          pybind11::arg("actual_m") = std::nullopt,
+          pybind11::arg("m_per_expert") = 0,
+          pybind11::arg("active_tiles") = std::nullopt,
+          pybind11::arg("active_tile_m") = 0);
 }

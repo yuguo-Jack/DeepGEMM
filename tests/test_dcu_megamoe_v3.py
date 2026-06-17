@@ -12,6 +12,7 @@ V3_CONFIG_PATH = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "v3_config.py"
 V3_LAYOUT_PATH = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "v3_layout.py"
 LARGE_OPT_PATH = ROOT / "megamoe" / "large_opt.py"
 SETUP_PATH = ROOT / "setup.py"
+MEGA_DCU_API_PATH = ROOT / "csrc" / "apis" / "mega_dcu.hpp"
 K1_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "K1_fused"
 K2_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "K2_fused"
 K3_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "K3_fused"
@@ -25,37 +26,35 @@ def load_module(name: str, path: Path):
     return module
 
 
-def test_v3_gate_requires_forced_large_opt(monkeypatch):
+def test_v3_backend_auto_policy(monkeypatch):
     config = load_module("dcu_megamoe_v3_config", V3_CONFIG_PATH)
+    monkeypatch.delenv("MEGAMOE_DCU_BACKEND", raising=False)
+    monkeypatch.delenv("MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD", raising=False)
 
-    monkeypatch.setenv("USE_MEGAMOE_V3", "1")
-    monkeypatch.delenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", raising=False)
-    assert not config.v3_enabled()
-
-    for value in ("auto", "threshold", "adaptive", "0", "false", "off"):
-        monkeypatch.setenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", value)
-        assert not config.v3_enabled()
-
-    for value in ("1", "true", "yes", "on", "large_opt", "3stage"):
-        monkeypatch.setenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", value)
-        assert config.v3_enabled()
-
-    monkeypatch.setenv("USE_MEGAMOE_V3", "0")
-    monkeypatch.setenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "1")
-    assert not config.v3_enabled()
-
-
-def test_v3_backend_contract(monkeypatch):
-    config = load_module("dcu_megamoe_v3_config_backend", V3_CONFIG_PATH)
-
-    monkeypatch.delenv("MEGAMOE_DCU_V3_BACKEND", raising=False)
-    assert config.get_v3_backend() == "normal"
-    monkeypatch.setenv("MEGAMOE_DCU_V3_BACKEND", "ll")
-    assert config.get_v3_backend() == "ll"
-    monkeypatch.setenv("MEGAMOE_DCU_V3_BACKEND", "NORMAL")
-    assert config.get_v3_backend() == "normal"
-    with pytest.raises(ValueError, match="MEGAMOE_DCU_V3_BACKEND"):
-        config.normalize_v3_backend("auto")
+    assert config.BACKEND_ENV == "MEGAMOE_DCU_BACKEND"
+    assert config.NORMAL_LL_TOKEN_THRESHOLD_ENV == "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
+    assert config.DEFAULT_NORMAL_LL_TOKEN_THRESHOLD == 256
+    for tokens in (0, 1, 8, 32, 128, 256):
+        assert config.select_v3_backend(tokens) == "ll"
+    for tokens in (257, 512, 1024, 4096, 8192):
+        assert config.select_v3_backend(tokens) == "normal"
+    assert config.v3_backend_mode("auto") == "auto"
+    assert config.v3_backend_mode("ll") == "ll"
+    assert config.v3_backend_mode("normal") == "normal"
+    assert config.select_v3_backend(8, "ll") == "ll"
+    assert config.select_v3_backend(8, "normal") == "normal"
+    assert config.normal_ll_token_threshold("512") == 512
+    monkeypatch.setenv("MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD", "512")
+    assert config.select_v3_backend(512) == "ll"
+    assert config.select_v3_backend(513) == "normal"
+    monkeypatch.setenv("MEGAMOE_DCU_BACKEND", "normal")
+    assert config.select_v3_backend(8) == "normal"
+    with pytest.raises(ValueError, match="non-negative"):
+        config.select_v3_backend(-1)
+    with pytest.raises(ValueError, match="non-negative"):
+        config.normal_ll_token_threshold("-1")
+    with pytest.raises(ValueError, match="MEGAMOE_DCU_BACKEND"):
+        config.select_v3_backend(8, "bogus")
 
 
 def reference_pack5_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -134,6 +133,7 @@ def test_v3_build_surface_is_minimal_and_explicit():
     for retired in (
         "DG_BUILD_MEGAMOE_V2_EXT",
         "dcu_megamoe_v2",
+        "mega_moe_fused_hip.cu",
         "k1_v3_stub_ext.cu",
         "k3_v3_stub_ext.cu",
         "DG_BUILD_MEGAMOE_V3_K1_RAW_KERNELS",
@@ -152,8 +152,6 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
         path.read_text(encoding="utf-8")
         for path in (
             K1_FUSED_DIR
-            / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1.s",
-            K1_FUSED_DIR
             / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s",
         )
     )
@@ -162,12 +160,16 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
         encoding="utf-8"
     )
     k3_py = (K3_FUSED_DIR / "k3_fused.py").read_text(encoding="utf-8")
+    k3_asm_ext = (K3_FUSED_DIR / "k3_fused_ext.cu").read_text(encoding="utf-8")
     k3_ext = (K3_FUSED_DIR / "k3_v3_fused_ext.cu").read_text(encoding="utf-8")
     k3_header = (K3_FUSED_DIR / "k3_v3_pack5_groupgemm_impl.cuh").read_text(
         encoding="utf-8"
     )
 
     assert "FUSED_L1_ASM_PACK5_CO" in k1_py
+    assert "def k1_symm_fused_l1_asm(" not in k1_py
+    assert "def k1_symm_fused_l1_asm_graph(" not in k1_py
+    assert "ensure_fused_l1_asm_code_object" not in k1_py
     assert "def k1_symm_fused_l1_v3_asm_pack5(" in k1_py
     assert "def k1_symm_fused_l1_v3_asm_pack5_graph(" in k1_py
     assert "def k1_symm_fused_l1_v3(" in k1_py
@@ -175,6 +177,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "ext.k1_symm_fused_l1_v3_asm_pack5" in k1_py
     assert "k1_symm_fused_l1_v3_pack5" in k1_py
     assert "k1_symm_fused_l1_v3_asm_pack5" in k1_asm_ext
+    assert 'm.def("k1_symm_fused_l1"' not in k1_asm_ext
     assert "k1_symm_fused_l1_asm_impl" in k1_asm_ext
     assert "use_absolute_x_ptrs" not in k1_asm_ext
     assert "prob.reserved_c0 |= 4u" in k1_asm_ext
@@ -194,12 +197,13 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO" in k3_py
     assert "k3_l2_combine_asm_pack5_out" in k3_py
     assert "k3_l2_combine_asm_tail_reduce_pack5_out" in k3_py
-    asm_k3_signature = k3_py.split("def k3_l2_fused_asm_to_combine(", 1)[1].split(
-        ") -> torch.Tensor | None:",
-        1,
-    )[0]
-    assert "ll_block_m" not in asm_k3_signature
-    assert "graph_runtime_num_tokens" not in asm_k3_signature
+    assert "k3_l2_combine_asm_out" not in k3_asm_ext
+    assert "k3_l2_combine_asm_tail_reduce_out" not in k3_asm_ext
+    assert "k3_l2_combine_asm_pack5_out" in k3_asm_ext
+    assert "k3_l2_combine_asm_tail_reduce_pack5_out" in k3_asm_ext
+    assert "def k3_l2_fused_asm_to_combine(" not in k3_py
+    assert "ensure_k3_combine_asm_code_object" not in k3_py
+    assert "ensure_k3_combine_tail_reduce_asm_code_object" not in k3_py
     assert "k3_v3_ll_combine(" in k3_py
     assert "k3_v3_ll_combine_tail(" in k3_py
     assert "graph_runtime_num_tokens" in k3_py
@@ -261,3 +265,97 @@ def test_v3_ll_capacity_headroom_covers_256_and_512_exact_buckets():
     assert "kLlHeadroomRows = 64" in k1_ext
     assert "ll_expected_rows_per_expert >= kLlHeadroomExpectedRowsThreshold" in k1_ext
     assert "ll_expected_rows_per_expert >= 160 ? 64 : 0" not in k1_ext
+
+
+def test_v3_normal_graph_runtime_work_is_limited_without_d2h():
+    k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+    k2_ext = (ROOT / "megamoe" / "dcu_megamoe_large_opt" / "K2_fused" / "k2_fused_ext.cu").read_text(encoding="utf-8")
+    large_opt_source = LARGE_OPT_PATH.read_text(encoding="utf-8")
+
+    assert "runtime_limited_init" in k1_ext
+    assert "const int init_rows = runtime_limited_init != 0 ? active_rows : capacity_rows;" in k1_ext
+    assert "runtime_num_tokens == nullptr ? 0 : 1" in k1_ext
+    assert "runtime_num_tokens != nullptr\n            ? 12" in k1_ext
+    assert "if (!has_actual_m && active_tiles != nullptr && active_tile_m > 0)" in k2_ext
+    assert "K_K2_GRAPH_ROW_BLOCKS = 8192" in large_opt_source
+    assert "active_tiles=k2_active_tiles" in large_opt_source
+    assert "state.scratch.k1_active_tiles if v3_backend != V3_BACKEND_LL else None" in large_opt_source
+
+
+def test_public_capacity_token_and_graph_backend_contract_is_explicit():
+    api_source = (ROOT / "megamoe" / "__init__.py").read_text(encoding="utf-8")
+    c_api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
+    test_source = (ROOT / "tests" / "test_mega_moe_dcu.py").read_text(encoding="utf-8")
+    large_opt_source = LARGE_OPT_PATH.read_text(encoding="utf-8")
+
+    assert "megamoe_backend: str = V3_BACKEND_NORMAL" in api_source
+    assert "graph: bool = False" in api_source
+    assert "capacity_num_tokens: Optional[int] = None" in api_source
+    assert "dispatch_num_tokens: Optional[int] = None" not in api_source
+    assert "ll_cuda_graph" not in api_source
+    assert "normal_cuda_graph" not in api_source
+    assert "big_fused_cuda_graph" not in api_source
+    assert "stages_fused_cuda_graph" not in api_source
+    assert "v3_shape" not in api_source
+    assert "v3_backend = normalize_v3_backend(megamoe_backend)" in api_source
+    assert "select_v3_backend(" not in api_source
+    assert "_C.fp8_mega_moe" not in api_source
+    assert "fp8_mega_moe_with_graph_tokens" not in c_api_source
+    assert "launch_mega_moe_multirank_persistent" not in c_api_source
+
+    graph_signature = large_opt_source.split("def _run_large_opt_3stage_graph(", 1)[1].split(
+        ") -> None:",
+        1,
+    )[0]
+    assert "dispatch_num_tokens" not in graph_signature
+    assert "capacity_num_tokens" not in graph_signature
+    assert "v3_backend: str" in graph_signature
+
+    assert "--megamoe-backend" in test_source
+    assert "--cuda-graph" in test_source
+    assert "--ll-cuda-graph" not in test_source
+    assert "--normal-cuda-graph" not in test_source
+    assert "--big-fused-cuda-graph" not in test_source
+    assert "--stages-fused-cuda-graph" not in test_source
+    assert "--dispatch-num-tokens" not in test_source
+    run_fused_call = test_source.split("def run_fused(", 1)[1].split(
+        "def fill_graph_inputs",
+        1,
+    )[0]
+    graph_call = test_source.split("def run_graph_bucket_once(", 1)[1].split(
+        "fill_graph_inputs(capture_tokens)",
+        1,
+    )[0]
+    assert "megamoe_backend=v3_backend" in run_fused_call
+    assert "capacity_num_tokens=backend_selector_tokens" in run_fused_call
+    assert "dispatch_num_tokens=" not in run_fused_call
+    assert "megamoe_backend=v3_backend" in graph_call
+    assert "graph=True" in graph_call
+    assert "dispatch_num_tokens=" not in graph_call
+    assert "capacity_num_tokens=" not in graph_call
+
+
+def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
+    api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
+
+    assert "staged_pack5_shape" in api_source
+    assert "num_ranks == 8 && num_experts == 256 && num_topk == 6" in api_source
+    assert "hidden == 4096 && intermediate_hidden == 2048" in api_source
+    assert "return legacy_route_scratch_bytes();" not in api_source
+    assert "dcu_route_scratch_bytes(" not in api_source
+    assert "MEGAMOE_DCU_NORMAL" not in api_source
+    assert "get_normal_token_threshold_for_mega_moe()" not in api_source
+    assert "kK1AsmLaunchArgsBytes = 256" in api_source
+    assert "capacity_rows" in api_source
+    assert "static_cast<int64_t>(intermediate_hidden) * 2" in api_source
+    assert "kProbStorageBytes = 256" in api_source
+    assert "tail_signal_addrs_offset" in api_source
+    assert "dcu_route_tile_scratch_layout(" not in api_source
+    assert "std::max(v3_staged" not in api_source
+
+    large_opt_source = LARGE_OPT_PATH.read_text(encoding="utf-8")
+    assert "def _v3_staged_capacity_rows(" in large_opt_source
+    assert "normal_token_threshold()" not in large_opt_source
+    assert "normal_backend_forced()" not in large_opt_source
+    assert "K_K1_ASM_LAUNCH_ARGS_BYTES = 256" in large_opt_source
+    assert "capacity_rows * intermediate_hidden * 2" in large_opt_source

@@ -23,6 +23,11 @@ def swiglu_quant_channelwise_out(
     output_bf16: bool = False,
     clamp_value: float | None = 10.0,
     row_combine_ptrs: torch.Tensor | None = None,
+    max_row_blocks: int | None = None,
+    actual_m: torch.Tensor | None = None,
+    m_per_expert: int = 0,
+    active_tiles: torch.Tensor | None = None,
+    active_tile_m: int = 0,
     verbose_build: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
@@ -51,6 +56,11 @@ def swiglu_quant_channelwise_out(
         clamp_value is not None,
         float(clamp_value or 0.0),
         row_combine_ptrs.contiguous() if row_combine_ptrs is not None else None,
+        -1 if max_row_blocks is None else int(max_row_blocks),
+        actual_m.contiguous() if actual_m is not None else None,
+        int(m_per_expert),
+        active_tiles.contiguous() if active_tiles is not None else None,
+        int(active_tile_m),
     )
     out_scale_view = out_scale.view(1, x.shape[0])
     if output_bf16:

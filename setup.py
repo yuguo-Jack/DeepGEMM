@@ -55,7 +55,6 @@ if IS_HIP_EXTENSION:
     accelerator_home = ROCM_HOME or os.environ.get('ROCM_HOME') or os.environ.get('ROCM_PATH') or os.environ.get('HIP_PATH') or '/opt/dtk'
     sources = [
         'csrc/python_api_hip.cpp',
-        'csrc/kernels/mega_moe_fused_hip.cu',
         'csrc/kernels/mega_moe_baseline_hip.cu',
     ]
     build_include_dirs = [
@@ -241,21 +240,6 @@ LARGE_OPT_ASM_CODE_OBJECTS = [
             'megamoe',
             'dcu_megamoe_large_opt',
             'K1_fused',
-            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1.s',
-        ),
-        os.path.join(
-            'megamoe',
-            'dcu_megamoe_large_opt',
-            'K1_fused',
-            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1.co',
-        ),
-        'K1_CLANG',
-    ),
-    (
-        project_path(
-            'megamoe',
-            'dcu_megamoe_large_opt',
-            'K1_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s',
         ),
         os.path.join(
@@ -271,21 +255,6 @@ LARGE_OPT_ASM_CODE_OBJECTS = [
             'megamoe',
             'dcu_megamoe_large_opt',
             'K3_fused',
-            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE.s',
-        ),
-        os.path.join(
-            'megamoe',
-            'dcu_megamoe_large_opt',
-            'K3_fused',
-            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE.co',
-        ),
-        'K3_CLANG',
-    ),
-    (
-        project_path(
-            'megamoe',
-            'dcu_megamoe_large_opt',
-            'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.s',
         ),
         os.path.join(
@@ -293,21 +262,6 @@ LARGE_OPT_ASM_CODE_OBJECTS = [
             'dcu_megamoe_large_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co',
-        ),
-        'K3_CLANG',
-    ),
-    (
-        project_path(
-            'megamoe',
-            'dcu_megamoe_large_opt',
-            'K3_fused',
-            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE.s',
-        ),
-        os.path.join(
-            'megamoe',
-            'dcu_megamoe_large_opt',
-            'K3_fused',
-            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE.co',
         ),
         'K3_CLANG',
     ),

@@ -8,24 +8,28 @@ import torch
 
 from .dcu_megamoe_large_opt.K1_fused.k1_fused import (
     k1_graph_flag_reset_layout,
-    k1_symm_fused_l1_asm,
-    k1_symm_fused_l1_asm_graph,
     k1_symm_fused_l1_v3,
     k1_symm_fused_l1_v3_graph,
 )
 from .dcu_megamoe_large_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
 from .dcu_megamoe_large_opt.K3_fused.k3_fused import (
     build_asm_tail_signal_addrs,
-    k3_l2_fused_asm_to_combine,
     k3_l2_fused_v3_to_combine,
     rank_barrier,
     reduce_local_combine,
     reduce_local_combine_graph,
 )
-from .dcu_megamoe_large_opt.v3_config import get_v3_backend, v3_enabled
+from .dcu_megamoe_large_opt.v3_config import V3_BACKEND_LL, normalize_v3_backend
 
 
-K_DCU_ROUTE_TILE_M = 32
+K_K1_ROUTE_TILE_M = 256
+K_K1_ALIGNMENT = 256
+K_K1_ROUTE_CAPACITY_SLACK = 64
+K_K1_LL_ROW_TILE = 64
+K_K1_LL_HEADROOM_EXPECTED_ROWS_THRESHOLD = 48
+K_K1_LL_HEADROOM_ROWS = 64
+K_K1_ASM_LAUNCH_ARGS_BYTES = 256
+K_K2_GRAPH_ROW_BLOCKS = 8192
 K_PROB_STORAGE_BYTES = 256
 K_TAIL_DONE_COUNTER_RING_SLOTS = 16
 K_POST_K3_BARRIER_SIGNAL_SLOT_BASE = 20
@@ -61,15 +65,6 @@ class _LargeOptState:
     asm_signal_generation: int = 0
 
 
-_LARGE_OPT_FORCE_VALUES = {"1", "true", "yes", "on", "large_opt", "3stage"}
-_LARGE_OPT_AUTO_VALUES = {"auto", "threshold", "adaptive"}
-
-
-def env_enabled() -> bool:
-    value = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "auto").strip().lower()
-    return value in _LARGE_OPT_FORCE_VALUES or value in _LARGE_OPT_AUTO_VALUES
-
-
 def k3_tail_reduce_enabled() -> bool:
     value = os.getenv("K3_USE_ASM_TAIL_REDUCE", "1").strip().lower()
     return value in {"1", "true", "yes", "on", "tail-reduce"}
@@ -80,14 +75,12 @@ def k2_skip_inactive_rows_enabled(num_tokens: int) -> bool:
     return num_tokens >= min_tokens
 
 
-def _selected_v3_backend() -> str | None:
-    if not v3_enabled():
-        return None
-    return get_v3_backend()
-
-
 def _align(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
 
 
 def _route_task_workspace_bytes(*, num_ranks: int, num_experts: int, num_max_tokens: int) -> int:
@@ -99,7 +92,7 @@ def _route_task_workspace_bytes(*, num_ranks: int, num_experts: int, num_max_tok
     return _align(bytes_, 16)
 
 
-def _route_scratch_capacity_tiles(
+def _v3_staged_capacity_rows(
     *,
     num_ranks: int,
     num_experts: int,
@@ -107,8 +100,36 @@ def _route_scratch_capacity_tiles(
     num_topk: int,
 ) -> int:
     local_experts = num_experts // num_ranks
-    max_route_tasks = num_ranks * num_max_tokens * num_topk
-    return local_experts + (max_route_tasks + K_DCU_ROUTE_TILE_M - 1) // K_DCU_ROUTE_TILE_M
+    ll_expected_rows_per_expert = max(
+        1,
+        _ceil_div(num_max_tokens * num_topk, local_experts),
+    )
+    ll_rows_per_expert = _align(ll_expected_rows_per_expert, K_K1_LL_ROW_TILE)
+    min_slack = (
+        K_K1_LL_HEADROOM_ROWS
+        if ll_expected_rows_per_expert >= K_K1_LL_HEADROOM_EXPECTED_ROWS_THRESHOLD
+        else 0
+    )
+    if ll_rows_per_expert - ll_expected_rows_per_expert < min_slack:
+        ll_rows_per_expert = _align(
+            ll_expected_rows_per_expert + min_slack,
+            K_K1_LL_ROW_TILE,
+        )
+    ll_capacity_rows = local_experts * ll_rows_per_expert
+    total_tasks = num_ranks * num_max_tokens * num_topk
+    expected_per_expert = _ceil_div(total_tasks, num_experts)
+    rows_per_expert_target = max(
+        K_K1_ALIGNMENT,
+        expected_per_expert + K_K1_ROUTE_CAPACITY_SLACK,
+    )
+    fixed_capacity_tiles_per_expert = _ceil_div(
+        rows_per_expert_target,
+        K_K1_ROUTE_TILE_M,
+    )
+    normal_capacity_rows = (
+        local_experts * fixed_capacity_tiles_per_expert * K_K1_ROUTE_TILE_M
+    )
+    return max(ll_capacity_rows, normal_capacity_rows)
 
 
 def _route_tile_offsets(
@@ -120,18 +141,25 @@ def _route_tile_offsets(
     hidden: int,
     intermediate_hidden: int,
 ) -> tuple[int, int, int, int, int]:
-    max_route_tiles = _route_scratch_capacity_tiles(
+    capacity_rows = _v3_staged_capacity_rows(
         num_ranks=num_ranks,
         num_experts=num_experts,
         num_max_tokens=num_max_tokens,
         num_topk=num_topk,
     )
-    capacity_rows = max_route_tiles * K_DCU_ROUTE_TILE_M
     offset = 0
     offset += capacity_rows * hidden
     offset = _align(offset, 16)
+    k1_row_tiles = _ceil_div(capacity_rows, K_K1_ROUTE_TILE_M)
+    k1_l1_tiles = _ceil_div(intermediate_hidden * 2, K_K1_ROUTE_TILE_M)
+    offset += k1_row_tiles * k1_l1_tiles * K_DTYPE_SIZES[torch.int32]
+    offset = _align(offset, 16)
+    offset += k1_row_tiles * K_DTYPE_SIZES[torch.int32]
+    offset = _align(offset, 16)
+    offset += K_K1_ASM_LAUNCH_ARGS_BYTES
+    offset = _align(offset, 16)
     act_bf16_offset = offset
-    offset += capacity_rows * intermediate_hidden * K_DTYPE_SIZES[torch.bfloat16]
+    offset += capacity_rows * intermediate_hidden * 2 * K_DTYPE_SIZES[torch.bfloat16]
     offset = _align(offset, 16)
     act_fp8_offset = offset
     offset += capacity_rows * intermediate_hidden * K_DTYPE_SIZES[torch.float8_e4m3fn]
@@ -336,8 +364,6 @@ def _state(
 
 
 def prepare_large_opt_3stage(sym_buffer, *, verbose_build: bool = False) -> None:
-    if not env_enabled():
-        return
     _check_shape(
         num_ranks=sym_buffer.group.size(),
         num_experts=sym_buffer.num_experts,
@@ -380,7 +406,7 @@ def _check_shape(
         or num_tokens > num_max_tokens_per_rank
     ):
         raise ValueError(
-            "MEGAMOE_DCU_USE_LARGE_OPT_3STAGE supports only DeepSeek-V4-Flash "
+            "DCU MegaMoE V3 staged path supports only DeepSeek-V4-Flash "
             "EP8 shape: experts=256, topk=6, hidden=4096, intermediate=2048, "
             "and 0<=num_tokens_per_rank<=num_max_tokens_per_rank"
         )
@@ -399,6 +425,8 @@ def fp8_mega_moe_large_opt_3stage(
     num_topk: int,
     activation_clamp: Optional[float],
     fast_math: bool,
+    v3_backend: str,
+    capacity_num_tokens: Optional[int] = None,
 ) -> None:
     if not fast_math:
         raise RuntimeError("large-opt DCU MegaMoE path requires fast_math")
@@ -409,6 +437,18 @@ def fp8_mega_moe_large_opt_3stage(
     hidden = int(y.size(1))
     intermediate_hidden = int(l1_scale.size(1) // 2)
     num_max_tokens_per_rank = int(sym_buffer.num_max_tokens_per_rank)
+    v3_backend = normalize_v3_backend(v3_backend)
+    route_capacity_num_tokens = (
+        num_tokens if capacity_num_tokens is None else int(capacity_num_tokens)
+    )
+    if (
+        route_capacity_num_tokens < num_tokens
+        or route_capacity_num_tokens > num_max_tokens_per_rank
+    ):
+        raise ValueError(
+            "capacity_num_tokens must be in "
+            f"[num_tokens, {num_max_tokens_per_rank}] for eager DCU MegaMoE"
+        )
     _check_shape(
         num_ranks=num_ranks,
         num_experts=num_experts,
@@ -422,7 +462,6 @@ def fp8_mega_moe_large_opt_3stage(
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_LARGE_OPT_VERBOSE_BUILD", "0") == "1"
     use_tail_reduce = k3_tail_reduce_enabled()
-    v3_backend = _selected_v3_backend()
     state = _state(
         sym_buffer,
         rank_idx=rank_idx,
@@ -454,8 +493,8 @@ def fp8_mega_moe_large_opt_3stage(
         verbose_build=verbose_build,
     )
 
-    force_safe_compact = num_tokens == 0
-    k1_launcher = k1_symm_fused_l1_v3 if v3_backend is not None else k1_symm_fused_l1_asm
+    force_safe_compact = num_tokens == 0 or route_capacity_num_tokens > num_tokens
+    k1_launcher = k1_symm_fused_l1_v3
     k1_kwargs = dict(
         rank_idx=rank_idx,
         num_ranks=num_ranks,
@@ -467,12 +506,12 @@ def fp8_mega_moe_large_opt_3stage(
         l1_out_workspace=state.scratch.l1_out,
         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
         force_compact_prebuild=force_safe_compact,
+        capacity_num_tokens=route_capacity_num_tokens,
         verbose_build=verbose_build,
     )
-    if v3_backend is not None:
-        k1_kwargs["backend"] = v3_backend
-        if v3_backend == "ll":
-            k1_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+    k1_kwargs["backend"] = v3_backend
+    if v3_backend == V3_BACKEND_LL:
+        k1_kwargs["ll_block_m"] = V3_LL_BLOCK_M
     l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_launcher(
         sym_buffer,
         (l1_weight, l1_scale),
@@ -482,6 +521,8 @@ def fp8_mega_moe_large_opt_3stage(
 
     act_fp8 = state.scratch.act_fp8[:rows]
     act_scale = state.scratch.act_scale[:rows]
+    k2_actual_m = m_indices if v3_backend == V3_BACKEND_LL else None
+    k2_m_per_expert = rows // (num_experts // num_ranks) if k2_actual_m is not None else 0
     swiglu_quant_channelwise_out(
         l1_out,
         route_weights,
@@ -496,13 +537,14 @@ def fp8_mega_moe_large_opt_3stage(
             if (force_safe_compact or k2_skip_inactive_rows_enabled(num_tokens))
             else None
         ),
+        actual_m=k2_actual_m,
+        m_per_expert=k2_m_per_expert,
         verbose_build=verbose_build,
     )
 
     if use_tail_reduce:
         total_wgs = ((rows + 255) // 256) * ((hidden + 255) // 256)
-        use_v3_k3_tail = v3_backend in ("normal", "ll")
-        k3_launcher = k3_l2_fused_v3_to_combine if use_v3_k3_tail else k3_l2_fused_asm_to_combine
+        k3_launcher = k3_l2_fused_v3_to_combine
         k3_kwargs = dict(
             asm_done_counter=state.scratch.asm_tail_done_counter,
             asm_signal_addrs=state.scratch.asm_tail_signal_addrs,
@@ -520,10 +562,9 @@ def fp8_mega_moe_large_opt_3stage(
             prob_storage=state.scratch.k3_prob_storage,
             verbose_build=verbose_build,
         )
-        if use_v3_k3_tail:
-            k3_kwargs["backend"] = v3_backend
-            if v3_backend == "ll":
-                k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+        k3_kwargs["backend"] = v3_backend
+        if v3_backend == V3_BACKEND_LL:
+            k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
         k3_launcher(
             act_fp8,
             act_scale,
@@ -533,17 +574,15 @@ def fp8_mega_moe_large_opt_3stage(
             **k3_kwargs,
         )
     else:
-        use_v3_k3_no_tail = v3_backend in ("normal", "ll")
-        k3_launcher = k3_l2_fused_v3_to_combine if use_v3_k3_no_tail else k3_l2_fused_asm_to_combine
+        k3_launcher = k3_l2_fused_v3_to_combine
         k3_kwargs = dict(
             output_workspace=l1_out,
             prob_storage=state.scratch.k3_prob_storage,
             verbose_build=verbose_build,
         )
-        if use_v3_k3_no_tail:
-            k3_kwargs["backend"] = v3_backend
-            if v3_backend == "ll":
-                k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+        k3_kwargs["backend"] = v3_backend
+        if v3_backend == V3_BACKEND_LL:
+            k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
         k3_launcher(
             act_fp8,
             act_scale,
@@ -585,6 +624,7 @@ def _run_large_opt_3stage_graph(
     activation_clamp: Optional[float],
     fast_math: bool,
     graph_max_tokens: Optional[int] = None,
+    v3_backend: str,
 ) -> None:
     if not fast_math:
         raise RuntimeError("large-opt DCU MegaMoE graph path requires fast_math")
@@ -602,8 +642,9 @@ def _run_large_opt_3stage_graph(
     if int(y.size(0)) < graph_max_tokens:
         raise ValueError(
             "large-opt graph path requires y to have at least graph_max_tokens rows"
-        )
+    )
     num_max_tokens_per_rank = int(sym_buffer.num_max_tokens_per_rank)
+    v3_backend = normalize_v3_backend(v3_backend)
     _check_shape(
         num_ranks=num_ranks,
         num_experts=num_experts,
@@ -617,11 +658,6 @@ def _run_large_opt_3stage_graph(
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_LARGE_OPT_VERBOSE_BUILD", "0") == "1"
     use_tail_reduce = k3_tail_reduce_enabled()
-    v3_backend = _selected_v3_backend()
-    if v3_backend is not None and v3_backend not in ("normal", "ll"):
-        raise NotImplementedError(
-            "V3 staged graph path supports normal or LL backend only."
-        )
     state = _state(
         sym_buffer,
         rank_idx=rank_idx,
@@ -635,7 +671,7 @@ def _run_large_opt_3stage_graph(
     )
 
     k1_graph_reset_layout = None
-    if v3_backend in (None, "normal"):
+    if v3_backend != V3_BACKEND_LL:
         flags_offset, flags_numel, meta_flags_offset, meta_flags_numel, _, _ = (
             k1_graph_flag_reset_layout(
                 num_ranks=num_ranks,
@@ -675,11 +711,7 @@ def _run_large_opt_3stage_graph(
     )
 
     runtime_num_tokens = sym_buffer.cuda_graph_num_tokens
-    k1_graph_launcher = (
-        k1_symm_fused_l1_v3_graph
-        if v3_backend is not None
-        else k1_symm_fused_l1_asm_graph
-    )
+    k1_graph_launcher = k1_symm_fused_l1_v3_graph
     k1_kwargs = dict(
         rank_idx=rank_idx,
         num_ranks=num_ranks,
@@ -692,10 +724,9 @@ def _run_large_opt_3stage_graph(
         l1_out_workspace=state.scratch.l1_out,
         verbose_build=verbose_build,
     )
-    if v3_backend is not None:
-        k1_kwargs["backend"] = v3_backend
-        if v3_backend == "ll":
-            k1_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+    k1_kwargs["backend"] = v3_backend
+    if v3_backend == V3_BACKEND_LL:
+        k1_kwargs["ll_block_m"] = V3_LL_BLOCK_M
     l1_out, route_weights, m_indices, output_index, row_combine_ptrs = (
         k1_graph_launcher(
             sym_buffer,
@@ -707,6 +738,11 @@ def _run_large_opt_3stage_graph(
 
     act_fp8 = state.scratch.act_fp8[:rows]
     act_scale = state.scratch.act_scale[:rows]
+    k2_actual_m = m_indices if v3_backend == V3_BACKEND_LL else None
+    k2_m_per_expert = rows // (num_experts // num_ranks) if k2_actual_m is not None else 0
+    k2_active_tiles = (
+        state.scratch.k1_active_tiles if v3_backend != V3_BACKEND_LL else None
+    )
     swiglu_quant_channelwise_out(
         l1_out,
         route_weights,
@@ -717,6 +753,11 @@ def _run_large_opt_3stage_graph(
         output_bf16=False,
         clamp_value=activation_clamp,
         row_combine_ptrs=row_combine_ptrs,
+        max_row_blocks=K_K2_GRAPH_ROW_BLOCKS,
+        actual_m=k2_actual_m,
+        m_per_expert=k2_m_per_expert,
+        active_tiles=k2_active_tiles,
+        active_tile_m=K_K1_ROUTE_TILE_M if k2_active_tiles is not None else 0,
         verbose_build=verbose_build,
     )
 
@@ -726,8 +767,7 @@ def _run_large_opt_3stage_graph(
             state.scratch.graph_runtime_num_tokens.data_ptr()
             - state.scratch.k1_active_tiles.data_ptr()
         )
-        use_v3_k3_tail = v3_backend in ("normal", "ll")
-        k3_launcher = k3_l2_fused_v3_to_combine if use_v3_k3_tail else k3_l2_fused_asm_to_combine
+        k3_launcher = k3_l2_fused_v3_to_combine
         k3_kwargs = dict(
             asm_done_counter=state.scratch.asm_tail_done_counter,
             asm_signal_addrs=state.scratch.asm_tail_signal_addrs,
@@ -748,11 +788,10 @@ def _run_large_opt_3stage_graph(
             graph_runtime_offset_from_active_tiles=graph_runtime_offset,
             verbose_build=verbose_build,
         )
-        if use_v3_k3_tail:
-            k3_kwargs["backend"] = v3_backend
-            if v3_backend == "ll":
-                k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
-                k3_kwargs["graph_runtime_num_tokens"] = state.scratch.graph_runtime_num_tokens
+        k3_kwargs["backend"] = v3_backend
+        if v3_backend == V3_BACKEND_LL:
+            k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+            k3_kwargs["graph_runtime_num_tokens"] = state.scratch.graph_runtime_num_tokens
         k3_launcher(
             act_fp8,
             act_scale,
@@ -766,8 +805,7 @@ def _run_large_opt_3stage_graph(
             state.scratch.graph_runtime_num_tokens.data_ptr()
             - state.scratch.k1_active_tiles.data_ptr()
         )
-        use_v3_k3_no_tail = v3_backend in ("normal", "ll")
-        k3_launcher = k3_l2_fused_v3_to_combine if use_v3_k3_no_tail else k3_l2_fused_asm_to_combine
+        k3_launcher = k3_l2_fused_v3_to_combine
         k3_kwargs = dict(
             output_workspace=l1_out,
             prob_storage=state.scratch.k3_prob_storage,
@@ -775,10 +813,9 @@ def _run_large_opt_3stage_graph(
             graph_runtime_offset_from_active_tiles=graph_runtime_offset,
             verbose_build=verbose_build,
         )
-        if use_v3_k3_no_tail:
-            k3_kwargs["backend"] = v3_backend
-            if v3_backend == "ll":
-                k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+        k3_kwargs["backend"] = v3_backend
+        if v3_backend == V3_BACKEND_LL:
+            k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
         k3_launcher(
             act_fp8,
             act_scale,

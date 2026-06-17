@@ -29,7 +29,13 @@ from triton_ops import (
     triton_ep_gather_channelwise,
     triton_ep_scatter_channelwise,
 )
-from megamoe.dcu_megamoe_large_opt.v3_config import get_v3_backend, v3_requested
+from megamoe.dcu_megamoe_large_opt.v3_config import (
+    BACKEND_ENV,
+    NORMAL_LL_TOKEN_THRESHOLD_ENV,
+    V3_BACKEND_AUTO,
+    select_v3_backend,
+    v3_backend_mode,
+)
 from megamoe.dcu_megamoe_large_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
 
 
@@ -432,29 +438,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
 
-    large_opt_enabled_for_weights = False
-    if args.stages_fused_cuda_graph:
-        fused_execution = "large_opt_3stage_graph"
-        large_opt_enabled_for_weights = True
-    elif args.big_fused_cuda_graph:
-        fused_execution = "persistent_fused_graph"
-    else:
-        dispatch_num_tokens_for_display = (
-            args.dispatch_num_tokens if args.dispatch_num_tokens >= 0 else num_tokens
-        )
-        large_opt_value = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "auto").strip().lower()
-        large_opt_threshold = int(
-            os.getenv("MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD", "128")
-        )
-        large_opt_enabled = (
-            large_opt_value in {"1", "true", "yes", "on", "large_opt", "3stage"}
-            or (
-                large_opt_value in {"auto", "threshold", "adaptive"}
-                and dispatch_num_tokens_for_display > large_opt_threshold
-            )
-        )
-        large_opt_enabled_for_weights = large_opt_enabled
-        fused_execution = "large_opt_3stage" if large_opt_enabled else "persistent_fused"
+    backend_selector_tokens = num_tokens
+    if exact_num_tokens_per_rank is not None:
+        backend_selector_tokens = max(exact_num_tokens_per_rank)
+    elif args.num_tokens == 0 and args.num_max_removed_tokens > 0:
+        backend_selector_tokens = num_max_tokens_per_rank
+
+    backend_mode = v3_backend_mode(args.megamoe_backend)
+    v3_backend = select_v3_backend(backend_selector_tokens, backend_mode)
+    fused_execution = f"v3_{v3_backend}_graph" if args.cuda_graph else "v3_staged"
     print_once(rank, "DCU MegaMoE channelwise W8A8 test:")
     print_once(rank, f" > megamoe: {getattr(megamoe, '__file__', None)}")
     print_once(rank, f" > deep_ep: {getattr(deep_ep, '__file__', None)}")
@@ -474,7 +466,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         args.correctness_iters > 0
         or not args.skip_bench
         or (
-            (args.big_fused_cuda_graph or args.stages_fused_cuda_graph)
+            args.cuda_graph
             and not args.cuda_graph_skip_baseline
         )
     )
@@ -509,26 +501,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     fused_l1_weights = baseline_l1_weights
     fused_l2_weights = baseline_l2_weights
-    if large_opt_enabled_for_weights and v3_requested():
-        from megamoe.dcu_megamoe_large_opt import v3_layout
+    from megamoe.dcu_megamoe_large_opt import v3_layout
 
-        v3_backend = get_v3_backend()
-        l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
-        l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
-        if v3_backend == "normal":
-            fused_l1_weights = (
-                v3_layout.flatten_pack5_weight_asm_normal(l1_fp8),
-                l1_scale,
-            )
-            fused_l2_weights = (
-                v3_layout.flatten_pack5_weight_asm_normal(l2_fp8),
-                l2_scale,
-            )
-            print_once(rank, " > V3 staged layout: L1/L2 normal ASM plain-pack5")
-        else:
-            fused_l1_weights = (v3_layout.flatten_pack5_weight(l1_fp8), l1_scale)
-            fused_l2_weights = (v3_layout.flatten_pack5_weight(l2_fp8), l2_scale)
-            print_once(rank, " > V3 staged layout: L1/L2 pack5")
+    l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
+    l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
+    if v3_backend == "normal":
+        fused_l1_weights = (
+            v3_layout.flatten_pack5_weight_asm_normal(l1_fp8),
+            l1_scale,
+        )
+        fused_l2_weights = (
+            v3_layout.flatten_pack5_weight_asm_normal(l2_fp8),
+            l2_scale,
+        )
+        print_once(rank, " > V3 staged layout: L1/L2 normal ASM plain-pack5")
+    else:
+        fused_l1_weights = (v3_layout.flatten_pack5_weight(l1_fp8), l1_scale)
+        fused_l2_weights = (v3_layout.flatten_pack5_weight(l2_fp8), l2_scale)
+        print_once(rank, " > V3 staged layout: L1/L2 pack5")
     stats_initial = torch.randint(0, 100, (num_experts_per_rank,), dtype=torch.int32, device="cuda")
     stats_fused = stats_initial.clone()
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
@@ -544,7 +534,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if reset_stats:
             stats_fused.copy_(stats_initial)
         copy_inputs_to_sym_buffer()
-        dispatch_num_tokens = args.dispatch_num_tokens if args.dispatch_num_tokens >= 0 else None
         megamoe.fp8_w8a8_mega_moe(
             y_fused,
             fused_l1_weights,
@@ -553,7 +542,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             cumulative_local_expert_recv_stats=stats_fused,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math),
-            dispatch_num_tokens=dispatch_num_tokens,
+            megamoe_backend=v3_backend,
+            capacity_num_tokens=backend_selector_tokens,
         )
         return y_fused, stats_fused
 
@@ -645,8 +635,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 cumulative_local_expert_recv_stats=None,
                 activation_clamp=args.activation_clamp,
                 fast_math=bool(args.fast_math),
-                big_fused_cuda_graph=args.big_fused_cuda_graph,
-                stages_fused_cuda_graph=args.stages_fused_cuda_graph,
+                megamoe_backend=v3_backend,
+                graph=True,
             )
 
         fill_graph_inputs(capture_tokens)
@@ -785,8 +775,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     print_once(rank, "Config:")
     print_once(rank, f" > ranks={num_ranks}, tokens={num_tokens}/{sym_buffer.num_max_tokens_per_rank}")
-    if args.dispatch_num_tokens >= 0:
-        print_once(rank, f" > eager dispatch_num_tokens={args.dispatch_num_tokens}")
+    print_once(rank, f" > megamoe_backend={v3_backend} (mode={backend_mode}, selector_tokens={backend_selector_tokens})")
     print_once(rank, f" > hidden={hidden}, intermediate={intermediate_hidden}")
     print_once(rank, f" > experts={num_experts}, topk={num_topk}, local_experts={num_experts_per_rank}")
     print_once(rank, f" > scale modes=input/weight/l2_act channelwise fp32")
@@ -825,7 +814,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     cuda_graph_timing_rows = (
         run_cuda_graph_bucket_check()
-        if (args.big_fused_cuda_graph or args.stages_fused_cuda_graph)
+        if args.cuda_graph
         else []
     )
 
@@ -837,7 +826,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "reason": "--skip-bench",
                 "num_ranks": num_ranks,
                 "num_tokens_per_rank": num_tokens,
-                "dispatch_num_tokens": args.dispatch_num_tokens if args.dispatch_num_tokens >= 0 else None,
+                "backend_selector_tokens": backend_selector_tokens,
+                "megamoe_backend": v3_backend,
+                "megamoe_backend_mode": backend_mode,
                 "hidden": hidden,
                 "intermediate_hidden": intermediate_hidden,
                 "num_experts": num_experts,
@@ -937,7 +928,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "metric_scope": "per-card rank average",
             "num_ranks": num_ranks,
             "num_tokens_per_rank": num_tokens,
-            "dispatch_num_tokens": args.dispatch_num_tokens if args.dispatch_num_tokens >= 0 else None,
+            "backend_selector_tokens": backend_selector_tokens,
+            "megamoe_backend": v3_backend,
+            "megamoe_backend_mode": backend_mode,
             "hidden": hidden,
             "intermediate_hidden": intermediate_hidden,
             "num_experts": num_experts,
@@ -1008,9 +1001,6 @@ def parse_args():
     parser.add_argument("--num-tokens", type=int, default=32)
     parser.add_argument("--num-tokens-per-rank-list", type=str, default="",
                         help="comma/space separated exact local token count per rank")
-    parser.add_argument("--dispatch-num-tokens", type=int, default=-1,
-                        help="uniform token count used only for eager auto big-vs-staged dispatch; "
-                             "set to EP-group max local tokens for uneven-rank framework cases")
     parser.add_argument("--num-max-removed-tokens", type=int, default=0,
                         help="when --num-tokens=0, each rank uses max_tokens-random(0, this), clamped to at least 0")
     parser.add_argument("--hidden", type=int, default=128)
@@ -1028,11 +1018,13 @@ def parse_args():
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--skip-bench", action="store_true")
     parser.add_argument("--large-opt-3stage", action="store_true",
-                        help="route megamoe.fp8_w8a8_mega_moe through K1/K2/K3 staged large-shape path")
-    parser.add_argument("--big-fused-cuda-graph", action="store_true",
-                        help="capture the public API big fused graph path")
-    parser.add_argument("--stages-fused-cuda-graph", action="store_true",
-                        help="capture the public API staged K1/K2/K3 graph path")
+                        help="compatibility no-op; DCU DSV4 MegaMoE now uses the V3 staged path by default")
+    parser.add_argument("--megamoe-backend", choices=("auto", "ll", "normal"),
+                        default=os.getenv(BACKEND_ENV, V3_BACKEND_AUTO),
+                        help=f"V3 backend selector used by this test; defaults to {BACKEND_ENV}=auto. "
+                             f"auto compares the per-run selector token bucket with {NORMAL_LL_TOKEN_THRESHOLD_ENV}.")
+    parser.add_argument("--cuda-graph", action="store_true",
+                        help="capture the selected V3 staged backend as a CUDA graph")
     parser.add_argument("--cuda-graph-test-tokens", type=str, default="",
                         help="comma/space separated token counts to replay against one captured graph")
     parser.add_argument("--cuda-graph-warmup", type=int, default=1)
@@ -1047,10 +1039,6 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.big_fused_cuda_graph and args.stages_fused_cuda_graph:
-        raise ValueError("choose only one of --big-fused-cuda-graph and --stages-fused-cuda-graph")
-    if args.large_opt_3stage:
-        os.environ["MEGAMOE_DCU_USE_LARGE_OPT_3STAGE"] = "1"
     if args.local_rank_idx is not None:
         test(args.local_rank_idx, args.num_processes, args)
     else:

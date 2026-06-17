@@ -5341,3 +5341,34 @@
   - tail `8/32/64/128/256/512 = 0.553/0.649/0.706/0.849/1.283/2.241 ms`;
   - all graph buckets were correctness-clean.
 - K2 remains graph-shape fixed, but graph path passes `row_combine_ptrs` and K2 kernels early-return on inactive rows. Fully shrinking K2 grid is a larger graph-update/compact-row-list design item, not a safe local fix.
+
+## 2026-06-17 Normal eager true-uneven K1 capacity contract
+
+- Normal eager uniform path can safely size K1 route capacity from local `num_tokens`, because every peer rank contributes the same number of routed rows.
+- True uneven path cannot use local `num_tokens` as the owner-rank capacity bound:
+  - each owner rank receives routes for its local experts from all source ranks;
+  - a small-token owner rank can still receive rows from an 8192-token source rank;
+  - therefore local `y.size(0)` can under-estimate `capacity_total_tasks` and truncate K1 rows.
+- Graph normal avoids this class because graph K1 is captured with a fixed
+  bucket capacity and already uses graph-safe compact prebuild; replay changes
+  the runtime token scalar, not the host-side route capacity.
+- The production eager contract is a host-side capacity/global-max token scalar:
+  - callers may pass `capacity_num_tokens=max(tokens_per_rank)` for the current
+    EP group request;
+  - K1 uses that value only to size host-side route capacity and compact
+    metadata, while the kernels still read each source rank's actual token count
+    from symmetric-buffer metadata;
+  - it is not a backend selector and is not passed to graph replay;
+  - this avoids adding a new kernel or D2H sync.  Falling back to
+    `num_max_tokens_per_rank` is correctness-safe but can over-expand eager K1
+    work versus the current request's real global max.
+- Large uneven regression harness:
+  - `--num-max-tokens-per-rank 8192 --num-tokens-per-rank-list 8192,4097,4096,3072,2050,2048,1025,256 --megamoe-backend normal`;
+  - both `K3_USE_ASM_TAIL_REDUCE=0` and `1` must remain correctness-clean.
+# 2026-06-17 graph replay token 与测试侧 setup token
+
+- graph 生产语义：capture capacity 来自 `num_max_tokens_per_rank` / `cuda_graph_max_tokens_per_rank`；replay 的实际 token 前缀来自 device scalar `sym_buffer.cuda_graph_num_tokens`。在测试脚本中，这个 scalar 由 `--cuda-graph-test-tokens` 的每个 bucket 写入。
+- `--num-tokens` 在 graph bucket sweep 中不应被理解为 replay token；它主要影响测试脚本的普通 eager correctness 输入大小、auto selector 展示，以及未提供 `--cuda-graph-test-tokens` 时的默认 bucket。
+- 当前测到 LL graph capture8192 replay8：当 graph 性能命令使用 `--num-tokens 8192` 时稳定约 `0.556 ms`；使用 `--num-tokens 513` 时可出现约 `0.607 ms`。两者 replay token 都是 8，差异来自测试脚本辅助 tensor/权重分配顺序对小 token 计时的地址/allocator 扰动，不是 graph runtime-token 语义差异。
+- README 的 graph 性能示例使用 `--num-tokens 8192`，并明确实际 replay work 由 `--cuda-graph-test-tokens` 控制。
+- K2 graph capture8192 小 token 固定开销通过现有 K2 reg kernel 的 grid-stride row loop 与内部 `max_row_blocks=2048` 收敛；未新增 kernel，未新增 D2H sync。

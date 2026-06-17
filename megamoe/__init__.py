@@ -6,6 +6,10 @@ import torch
 import torch.distributed as dist
 
 from . import _C
+from .dcu_megamoe_large_opt.v3_config import (
+    V3_BACKEND_NORMAL,
+    normalize_v3_backend,
+)
 
 
 def _align(value: int, alignment: int) -> int:
@@ -16,41 +20,46 @@ def _is_hip_backend() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
-_LARGE_OPT_FORCE_VALUES = {"1", "true", "yes", "on", "large_opt", "3stage"}
-_LARGE_OPT_AUTO_VALUES = {"auto", "threshold", "adaptive"}
-_LARGE_OPT_THRESHOLD_ENV = "MEGAMOE_DCU_LARGE_OPT_3STAGE_TOKEN_THRESHOLD"
-_LARGE_OPT_DEFAULT_THRESHOLD = 128
+def _staged_pack5_shape_supported(
+    *,
+    num_ranks: int,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> bool:
+    return (num_ranks, num_experts, num_topk, hidden, intermediate_hidden) == (
+        8,
+        256,
+        6,
+        4096,
+        2048,
+    )
 
 
-def _large_opt_3stage_mode() -> str:
-    value = os.getenv("MEGAMOE_DCU_USE_LARGE_OPT_3STAGE", "auto").strip().lower()
-    if value in _LARGE_OPT_FORCE_VALUES:
-        return "force"
-    if value in _LARGE_OPT_AUTO_VALUES:
-        return "auto"
-    return "off"
+def _check_staged_pack5_shape(
+    *,
+    num_ranks: int,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> None:
+    if not _staged_pack5_shape_supported(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+    ):
+        raise ValueError(
+            "DCU MegaMoE staged LL/normal path currently supports only "
+            "EP8 experts=256 topk=6 hidden=4096 intermediate=2048. "
+            "Add a shape-specific staged layout before enabling new model sizes."
+        )
 
 
-def _large_opt_3stage_threshold() -> int:
-    return int(os.getenv(_LARGE_OPT_THRESHOLD_ENV, str(_LARGE_OPT_DEFAULT_THRESHOLD)))
-
-
-def _large_opt_3stage_selected(num_tokens: int, mode: str, threshold: int) -> bool:
-    if mode == "force":
-        return True
-    if mode == "auto":
-        return num_tokens > threshold
-    return False
-
-
-def _env_flag_enabled(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None or value.strip() == "":
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _v3_normal_symm_warmup_enabled(
+def _symm_warmup_alloc_enabled(
     requested_num_max_tokens_per_rank: int,
     num_experts: int,
     num_topk: int,
@@ -59,18 +68,11 @@ def _v3_normal_symm_warmup_enabled(
 ) -> bool:
     if not _is_hip_backend():
         return False
-    if _large_opt_3stage_mode() != "force":
-        return False
-    if not _env_flag_enabled("USE_MEGAMOE_V3"):
-        return False
-    backend = os.getenv("MEGAMOE_DCU_V3_BACKEND", "normal").strip().lower() or "normal"
-    if backend != "normal":
-        return False
     if requested_num_max_tokens_per_rank < 512:
         return False
     if (num_experts, num_topk, hidden, intermediate_hidden) != (256, 6, 4096, 2048):
         return False
-    return _env_flag_enabled("MEGAMOE_DCU_V3_SYMM_WARMUP_ALLOC", True)
+    return True
 
 
 def _is_current_stream_capturing() -> bool:
@@ -130,13 +132,16 @@ def weight8bit_nt_kpack2_marlin(
 
 def get_mega_moe_hip_build_config():
     config = _C.get_mega_moe_hip_build_config()
-    config["large_opt_3stage_env"] = "MEGAMOE_DCU_USE_LARGE_OPT_3STAGE"
-    config["large_opt_3stage_auto_values"] = sorted(_LARGE_OPT_AUTO_VALUES)
-    config["large_opt_3stage_threshold_env"] = _LARGE_OPT_THRESHOLD_ENV
-    config["large_opt_3stage_default_threshold"] = _LARGE_OPT_DEFAULT_THRESHOLD
-    config["large_opt_3stage_shape"] = "EP8 experts=256 topk=6 hidden=4096 intermediate=2048"
+    config["dcu_megamoe_main_path"] = "v3_staged"
+    config["v3_backend_policy"] = (
+        "caller supplies megamoe_backend='ll' or 'normal'; "
+        "auto selection belongs to the framework/test layer"
+    )
+    config["supported_staged_shape"] = (
+        "EP8 experts=256 topk=6 hidden=4096 intermediate=2048"
+    )
     config["cuda_graph_max_tokens_source"] = "requested num_max_tokens_per_rank"
-    config["cuda_graph_execution"] = "explicit_big_fused_or_large_opt_3stage"
+    config["cuda_graph_execution"] = "graph=True captures the selected v3_staged backend"
     return config
 
 
@@ -163,8 +168,6 @@ class SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
-        self._large_opt_3stage_mode = _large_opt_3stage_mode()
-        self._large_opt_3stage_threshold = _large_opt_3stage_threshold()
         self.cuda_graph_max_tokens_per_rank = int(
             cuda_graph_max_tokens_per_rank
             if cuda_graph_max_tokens_per_rank is not None
@@ -178,6 +181,13 @@ class SymmBuffer:
                 "cuda_graph_max_tokens_per_rank must be in "
                 f"1..{self.num_max_tokens_per_rank}"
             )
+        _check_staged_pack5_shape(
+            num_ranks=group.size(),
+            num_experts=num_experts,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=intermediate_hidden,
+        )
 
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(),
@@ -246,7 +256,7 @@ class SymmBuffer:
         self.cuda_graph_num_tokens = slices[8]
         self.cuda_graph_num_tokens.fill_(self.cuda_graph_max_tokens_per_rank)
 
-        if prepare_large_opt_3stage and self._large_opt_3stage_mode in {"force", "auto"}:
+        if prepare_large_opt_3stage:
             from .large_opt import prepare_large_opt_3stage
 
             prepare_large_opt_3stage(
@@ -295,7 +305,7 @@ def get_symm_buffer_for_mega_moe(
         num_max_tokens_per_rank,
         _C.get_token_alignment_for_mega_moe(),
     )
-    if _v3_normal_symm_warmup_enabled(
+    if _symm_warmup_alloc_enabled(
         requested_num_max_tokens_per_rank,
         num_experts,
         num_topk,
@@ -391,16 +401,35 @@ def fp8_mega_moe(
     activation: str = "swiglu",
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
-    big_fused_cuda_graph: bool = False,
-    stages_fused_cuda_graph: bool = False,
-    dispatch_num_tokens: Optional[int] = None,
+    megamoe_backend: str = V3_BACKEND_NORMAL,
+    graph: bool = False,
+    capacity_num_tokens: Optional[int] = None,
 ):
     call_y = y
-    if big_fused_cuda_graph and stages_fused_cuda_graph:
-        raise ValueError("choose only one of big_fused_cuda_graph or stages_fused_cuda_graph")
+    v3_backend = normalize_v3_backend(megamoe_backend)
+    if recipe != (1, 1, 32):
+        raise ValueError("DCU W8A8 MegaMoE expects recipe=(1, 1, 32)")
+    if activation != "swiglu":
+        raise ValueError("DCU W8A8 MegaMoE supports swiglu only")
 
-    graph_mode = big_fused_cuda_graph or stages_fused_cuda_graph
-    if graph_mode:
+    intermediate_hidden = int(l1_weights[1].size(1) // 2)
+    staged_shape_supported = _staged_pack5_shape_supported(
+        num_ranks=sym_buffer.group.size(),
+        num_experts=sym_buffer.num_experts,
+        num_topk=sym_buffer.num_topk,
+        hidden=int(y.size(1)),
+        intermediate_hidden=intermediate_hidden,
+    )
+    if not staged_shape_supported:
+        _check_staged_pack5_shape(
+            num_ranks=sym_buffer.group.size(),
+            num_experts=sym_buffer.num_experts,
+            num_topk=sym_buffer.num_topk,
+            hidden=int(y.size(1)),
+            intermediate_hidden=intermediate_hidden,
+        )
+
+    if graph:
         graph_max_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
         capture_rows = int(y.size(0))
         if capture_rows < graph_max_tokens:
@@ -411,98 +440,49 @@ def fp8_mega_moe(
             )
         if cumulative_local_expert_recv_stats is not None:
             raise ValueError("CUDA graph mode does not support cumulative_local_expert_recv_stats")
-        if stages_fused_cuda_graph:
-            large_opt_mode = getattr(sym_buffer, "_large_opt_3stage_mode", None)
-            if large_opt_mode is None:
-                large_opt_mode = _large_opt_3stage_mode()
-            if large_opt_mode == "off":
-                raise RuntimeError(
-                    "stages_fused_cuda_graph=True requires "
-                    "MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=auto or 1"
-                )
-            from .large_opt import _run_large_opt_3stage_graph
+        from .large_opt import _run_large_opt_3stage_graph
 
-            _run_large_opt_3stage_graph(
-                y,
-                l1_weights,
-                l2_weights,
-                None,
-                sym_buffer,
-                rank_idx=sym_buffer.group.rank(),
-                num_ranks=len(sym_buffer.handle.buffer_ptrs),
-                num_experts=sym_buffer.num_experts,
-                graph_max_tokens=graph_max_tokens,
-                num_topk=sym_buffer.num_topk,
-                activation_clamp=activation_clamp,
-                fast_math=fast_math,
-            )
-            return
-        call_y = y[:graph_max_tokens] if capture_rows != graph_max_tokens else y
+        _run_large_opt_3stage_graph(
+            y,
+            l1_weights,
+            l2_weights,
+            None,
+            sym_buffer,
+            rank_idx=sym_buffer.group.rank(),
+            num_ranks=len(sym_buffer.handle.buffer_ptrs),
+            num_experts=sym_buffer.num_experts,
+            graph_max_tokens=graph_max_tokens,
+            num_topk=sym_buffer.num_topk,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+            v3_backend=v3_backend,
+        )
+        return
     else:
         if _is_current_stream_capturing():
             raise RuntimeError(
                 "DCU MegaMoE CUDA Graph capture requires an explicit graph mode: "
-                "pass big_fused_cuda_graph=True for the persistent fused path or "
-                "stages_fused_cuda_graph=True for the staged K1/K2/K3 path. "
-                "Capturing the eager auto-dispatch path is not graph-bucket safe."
+                "pass graph=True with megamoe_backend='ll' or 'normal' "
+                "to capture the V3 staged K1/K2/K3 path."
             )
-        large_opt_mode = getattr(sym_buffer, "_large_opt_3stage_mode", None)
-        large_opt_threshold = getattr(sym_buffer, "_large_opt_3stage_threshold", None)
-        if large_opt_mode is None or large_opt_threshold is None:
-            large_opt_mode = _large_opt_3stage_mode()
-            large_opt_threshold = _large_opt_3stage_threshold()
-        dispatch_tokens = int(y.size(0)) if dispatch_num_tokens is None else int(dispatch_num_tokens)
-        if dispatch_tokens < 0 or dispatch_tokens > int(sym_buffer.num_max_tokens_per_rank):
-            raise ValueError(
-                "dispatch_num_tokens must be in "
-                f"0..{int(sym_buffer.num_max_tokens_per_rank)}"
-            )
-        if _large_opt_3stage_selected(dispatch_tokens, large_opt_mode, large_opt_threshold):
-            if _is_current_stream_capturing():
-                raise RuntimeError(
-                    "DCU MegaMoE staged K1/K2/K3 path does not support CUDA Graph capture; "
-                    "use big_fused_cuda_graph=True or stages_fused_cuda_graph=True with "
-                    "a fixed graph-bucket output buffer, or run staged path outside graph replay"
-                )
-            from .large_opt import fp8_mega_moe_large_opt_3stage
+        from .large_opt import fp8_mega_moe_large_opt_3stage
 
-            fp8_mega_moe_large_opt_3stage(
-                y,
-                l1_weights,
-                l2_weights,
-                cumulative_local_expert_recv_stats,
-                sym_buffer,
-                rank_idx=sym_buffer.group.rank(),
-                num_ranks=len(sym_buffer.handle.buffer_ptrs),
-                num_experts=sym_buffer.num_experts,
-                num_topk=sym_buffer.num_topk,
-                activation_clamp=activation_clamp,
-                fast_math=fast_math,
-            )
-            return
-
-    common_args = (
-        call_y,
-        l1_weights,
-        l2_weights,
-        cumulative_local_expert_recv_stats,
-        sym_buffer.buffer,
-        sym_buffer.route_scratch,
-        sym_buffer.handle.buffer_ptrs,
-        sym_buffer.handle.signal_ptrs,
-        sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_experts,
-        sym_buffer.num_topk,
-        recipe,
-        activation,
-        activation_clamp,
-        fast_math,
-    )
-    if big_fused_cuda_graph:
-        _C.fp8_mega_moe_with_graph_tokens(*common_args, sym_buffer.cuda_graph_num_tokens)
-    else:
-        _C.fp8_mega_moe(*common_args)
+        fp8_mega_moe_large_opt_3stage(
+            call_y,
+            l1_weights,
+            l2_weights,
+            cumulative_local_expert_recv_stats,
+            sym_buffer,
+            rank_idx=sym_buffer.group.rank(),
+            num_ranks=len(sym_buffer.handle.buffer_ptrs),
+            num_experts=sym_buffer.num_experts,
+            num_topk=sym_buffer.num_topk,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+            v3_backend=v3_backend,
+            capacity_num_tokens=capacity_num_tokens,
+        )
+        return
 
 
 fp8_w8a8_mega_moe = fp8_mega_moe

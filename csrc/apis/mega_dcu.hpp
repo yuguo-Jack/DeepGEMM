@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
-#include <limits>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -18,8 +17,6 @@
 #include <deep_gemm/layout/mega_moe_dcu.cuh>
 
 namespace deep_gemm::mega {
-
-static constexpr int kMaxCandidateBlockM = 192;
 
 static int get_token_alignment_for_mega_moe() {
     return kTokenAlignment;
@@ -37,22 +34,6 @@ static pybind11::dict get_mega_moe_hip_build_config() {
     config["fusion_boundary"] = "dispatch_pool_l1_swiglu_quant_l2_combine";
     return config;
 }
-
-void launch_mega_moe_multirank_persistent_hip_w8a8_channelwise(
-    void* y,
-    const void* l1_weights, const float* l1_weights_sf,
-    const void* l2_weights, const float* l2_weights_sf,
-    int* cumulative_local_expert_recv_stats,
-    const int64_t* sym_buffer_ptrs,
-    void* route_scratch,
-    int rank_idx, int num_ranks,
-    int num_max_tokens_per_rank,
-    int num_experts_per_rank,
-    int num_tokens, int num_topk,
-    int hidden, int intermediate_hidden,
-    float activation_clamp,
-    bool fast_math,
-    const int* runtime_num_tokens = nullptr);
 
 void launch_mega_moe_deepep_scatter_channelwise_hip(
     void* grouped_x,
@@ -162,10 +143,88 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
     TORCH_CHECK(hidden > 0 && intermediate_hidden > 0, "hidden sizes must be positive");
 
-    constexpr int route_tile_m = 1 << kDcuRouteTileMDefaultLog2;
-    return dcu_route_scratch_bytes(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-        route_tile_m, hidden, intermediate_hidden);
+    const bool staged_pack5_shape =
+        num_ranks == 8 && num_experts == 256 && num_topk == 6 &&
+        hidden == 4096 && intermediate_hidden == 2048;
+    TORCH_CHECK(
+        staged_pack5_shape,
+        "DCU MegaMoE staged LL/normal route_scratch currently supports only "
+        "EP8 experts=256 topk=6 hidden=4096 intermediate=2048");
+
+    constexpr int64_t kK1RouteTileM = 256;
+    constexpr int64_t kK1Alignment = 256;
+    constexpr int64_t kK1RouteCapacitySlack = 64;
+    constexpr int64_t kK1LlRowTile = 64;
+    constexpr int64_t kK1LlHeadroomExpectedRowsThreshold = 48;
+    constexpr int64_t kK1LlHeadroomRows = 64;
+    constexpr int64_t kK1AsmLaunchArgsBytes = 256;
+    const auto ceil_div_i64 = [](const int64_t value, const int64_t divisor) {
+        return (value + divisor - 1) / divisor;
+    };
+    const int64_t local_experts = num_experts / num_ranks;
+    const int64_t ll_expected_rows_per_expert = std::max<int64_t>(
+        1, ceil_div_i64(
+               static_cast<int64_t>(num_max_tokens_per_rank) * num_topk,
+               local_experts));
+    int64_t ll_rows_per_expert =
+        align_i64(ll_expected_rows_per_expert, kK1LlRowTile);
+    const int64_t min_slack =
+        ll_expected_rows_per_expert >= kK1LlHeadroomExpectedRowsThreshold
+            ? kK1LlHeadroomRows
+            : 0;
+    if (ll_rows_per_expert - ll_expected_rows_per_expert < min_slack) {
+        ll_rows_per_expert = align_i64(
+            ll_expected_rows_per_expert + min_slack, kK1LlRowTile);
+    }
+    const int64_t ll_capacity_rows = local_experts * ll_rows_per_expert;
+    const int64_t total_tasks =
+        static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank * num_topk;
+    const int64_t expected_per_expert =
+        ceil_div_i64(total_tasks, num_experts);
+    const int64_t rows_per_expert_target = std::max<int64_t>(
+        kK1Alignment, expected_per_expert + kK1RouteCapacitySlack);
+    const int64_t fixed_capacity_tiles_per_expert =
+        ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
+    const int64_t normal_capacity_rows =
+        local_experts * fixed_capacity_tiles_per_expert * kK1RouteTileM;
+    const int64_t capacity_rows = std::max(ll_capacity_rows, normal_capacity_rows);
+
+    int64_t offset = 0;
+    offset += capacity_rows * static_cast<int64_t>(hidden);
+    offset = align_i64(offset, 16);
+    const int64_t k1_row_tiles = ceil_div_i64(capacity_rows, kK1RouteTileM);
+    const int64_t k1_l1_tiles =
+        ceil_div_i64(static_cast<int64_t>(intermediate_hidden) * 2, kK1RouteTileM);
+    offset += k1_row_tiles * k1_l1_tiles * static_cast<int64_t>(sizeof(int32_t));
+    offset = align_i64(offset, 16);
+    offset += k1_row_tiles * static_cast<int64_t>(sizeof(int32_t));
+    offset = align_i64(offset, 16);
+    offset += kK1AsmLaunchArgsBytes;
+    offset = align_i64(offset, 16);
+    offset += capacity_rows * static_cast<int64_t>(intermediate_hidden) * 2 *
+              static_cast<int64_t>(sizeof(uint16_t));
+    offset = align_i64(offset, 16);
+    offset += capacity_rows * static_cast<int64_t>(intermediate_hidden);
+    offset = align_i64(offset, 16);
+    offset += capacity_rows * static_cast<int64_t>(sizeof(float));
+    offset = align_i64(offset, 16);
+
+    constexpr int64_t kProbStorageBytes = 256;
+    constexpr int64_t kTailDoneCounterRingSlots = 16;
+    constexpr int64_t kTailSignalAddrs = 16;
+    const int64_t route_base =
+        route_task_workspace_bytes(num_ranks, num_experts, num_max_tokens_per_rank);
+    const int64_t prob_offset = route_base + offset;
+    const int64_t tail_done_offset =
+        align_i64(prob_offset + kProbStorageBytes, sizeof(int32_t));
+    const int64_t tail_signal_addrs_offset = align_i64(
+        tail_done_offset + 2 * kTailDoneCounterRingSlots *
+                               static_cast<int64_t>(sizeof(int32_t)),
+        sizeof(int64_t));
+    return align_i64(
+        tail_signal_addrs_offset +
+            kTailSignalAddrs * static_cast<int64_t>(sizeof(int64_t)),
+        16);
 }
 
 static void set_mega_moe_peer_ptrs(
@@ -335,188 +394,6 @@ static void deepep_deepgemm_postprocess_channelwise(
         apply_topk_weights);
 }
 
-static void fp8_mega_moe_impl(
-    const torch::Tensor& y,
-    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
-    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
-    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-    const torch::Tensor& sym_buffer,
-    const torch::Tensor& route_scratch,
-    const std::vector<int64_t>& sym_buffer_ptrs,
-    const std::vector<int64_t>& signal_ptrs,
-    const int& rank_idx,
-    const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk,
-    const std::tuple<int, int, int>& recipe,
-    const std::string& activation,
-    const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math,
-    const std::optional<torch::Tensor>& runtime_num_tokens) {
-    const auto [rm, rn, rk] = recipe;
-    TORCH_CHECK(rm == 1 && rn == 1 && rk == 32, "DCU W8A8 MegaMoE expects recipe=(1,1,32)");
-    TORCH_CHECK(activation == "swiglu", "DCU W8A8 MegaMoE supports swiglu only");
-    TORCH_CHECK(y.scalar_type() == torch::kBFloat16, "y must be BF16");
-    TORCH_CHECK(sym_buffer.scalar_type() == torch::kInt8, "sym_buffer must be int8");
-    TORCH_CHECK(route_scratch.is_cuda(), "route_scratch must be CUDA/HIP memory");
-    TORCH_CHECK(route_scratch.scalar_type() == torch::kInt8, "route_scratch must be int8");
-    TORCH_CHECK(route_scratch.is_contiguous(), "route_scratch must be contiguous");
-
-    const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
-    const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
-    TORCH_CHECK(l1_weights.scalar_type() == torch::kFloat8_e4m3fn,
-                "DCU MegaMoE expects FP8 E4M3 L1 weights");
-    TORCH_CHECK(l2_weights.scalar_type() == torch::kFloat8_e4m3fn,
-                "DCU MegaMoE expects FP8 E4M3 L2 weights");
-    TORCH_CHECK(l1_weights_sf.scalar_type() == torch::kFloat32 &&
-                l2_weights_sf.scalar_type() == torch::kFloat32,
-                "DCU MegaMoE expects FP32 channelwise weight scales");
-    TORCH_CHECK(l1_weights.dim() == 3 && l2_weights.dim() == 3, "weights must be grouped 3D tensors");
-    TORCH_CHECK(l1_weights_sf.dim() == 2 && l2_weights_sf.dim() == 2, "weight scales must be [expert,row]");
-
-    const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
-    TORCH_CHECK(signal_ptrs.size() == sym_buffer_ptrs.size(), "signal_ptrs must match sym_buffer_ptrs");
-    const int num_experts_per_rank = static_cast<int>(l1_weights.size(0));
-    const int num_tokens = static_cast<int>(y.size(0));
-    const int hidden = static_cast<int>(y.size(1));
-    TORCH_CHECK(l1_weights_sf.size(1) % 2 == 0, "invalid L1 scale shape");
-    const int intermediate_hidden = static_cast<int>(l1_weights_sf.size(1) / 2);
-    const int l1_rows = intermediate_hidden * 2;
-    const int l2_rows = hidden;
-
-    TORCH_CHECK(num_ranks > 0, "invalid num_ranks");
-    TORCH_CHECK(num_experts == num_experts_per_rank * num_ranks, "invalid expert count");
-    TORCH_CHECK(l1_rows % 16 == 0 && hidden % 16 == 0 && l2_rows % 16 == 0 &&
-                intermediate_hidden % 16 == 0,
-                "DCU MegaMoE Marlin weights require rows and K divisible by 16");
-    TORCH_CHECK(l1_weights.size(1) == l1_rows / 16 &&
-                l1_weights.size(2) == hidden * 16,
-                "invalid Marlin L1 weight shape, expected [expert, rows/16, K*16]");
-    TORCH_CHECK(l2_weights.size(1) == l2_rows / 16 &&
-                l2_weights.size(2) == intermediate_hidden * 16,
-                "invalid Marlin L2 weight shape, expected [expert, rows/16, K*16]");
-    TORCH_CHECK(l1_weights_sf.size(0) == num_experts_per_rank &&
-                l1_weights_sf.size(1) == l1_rows,
-                "invalid L1 scale shape");
-    TORCH_CHECK(l2_weights_sf.size(0) == num_experts_per_rank &&
-                l2_weights_sf.size(1) == l2_rows,
-                "invalid L2 scale shape");
-    TORCH_CHECK(num_tokens <= num_max_tokens_per_rank, "too many tokens");
-    const int64_t num_required_bytes = std::get<0>(get_symm_buffer_size_for_mega_moe(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden, true, activation));
-    TORCH_CHECK(static_cast<int64_t>(sym_buffer.nbytes()) >= num_required_bytes,
-                "sym_buffer is too small for the requested DCU MegaMoE capacity");
-    const int64_t route_scratch_required_bytes = get_mega_moe_route_scratch_size_for_mega_moe(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden, true, activation);
-    TORCH_CHECK(static_cast<int64_t>(route_scratch.nbytes()) >= route_scratch_required_bytes,
-                "route_scratch is too small for the requested DCU MegaMoE capacity");
-
-    int* stats_ptr = nullptr;
-    if (cumulative_local_expert_recv_stats.has_value()) {
-        TORCH_CHECK(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt,
-                    "stats must be int32");
-        TORCH_CHECK(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank,
-                    "stats must have num_experts_per_rank elements");
-        stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
-    }
-    const int* runtime_num_tokens_ptr = nullptr;
-    if (runtime_num_tokens.has_value()) {
-        TORCH_CHECK(runtime_num_tokens->is_cuda(), "runtime_num_tokens must be CUDA/HIP memory");
-        TORCH_CHECK(runtime_num_tokens->scalar_type() == torch::kInt,
-                    "runtime_num_tokens must be int32");
-        TORCH_CHECK(runtime_num_tokens->is_contiguous(),
-                    "runtime_num_tokens must be contiguous");
-        TORCH_CHECK(runtime_num_tokens->numel() == 1,
-                    "runtime_num_tokens must contain exactly one element");
-        runtime_num_tokens_ptr = runtime_num_tokens->data_ptr<int>();
-    }
-
-    const float activation_clamp = activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
-    launch_mega_moe_multirank_persistent_hip_w8a8_channelwise(
-        y.data_ptr(),
-        l1_weights.data_ptr(), l1_weights_sf.data_ptr<float>(),
-        l2_weights.data_ptr(), l2_weights_sf.data_ptr<float>(),
-        stats_ptr, sym_buffer_ptrs.data(), route_scratch.data_ptr(),
-        rank_idx, num_ranks, num_max_tokens_per_rank,
-        num_experts_per_rank, num_tokens, num_topk,
-        hidden, intermediate_hidden, activation_clamp, fast_math,
-        runtime_num_tokens_ptr);
-}
-
-static void fp8_mega_moe(
-    const torch::Tensor& y,
-    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
-    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
-    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-    const torch::Tensor& sym_buffer,
-    const torch::Tensor& route_scratch,
-    const std::vector<int64_t>& sym_buffer_ptrs,
-    const std::vector<int64_t>& signal_ptrs,
-    const int& rank_idx,
-    const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk,
-    const std::tuple<int, int, int>& recipe,
-    const std::string& activation,
-    const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math) {
-    fp8_mega_moe_impl(
-        y,
-        l1_weights_tuple,
-        l2_weights_tuple,
-        cumulative_local_expert_recv_stats,
-        sym_buffer,
-        route_scratch,
-        sym_buffer_ptrs,
-        signal_ptrs,
-        rank_idx,
-        num_max_tokens_per_rank,
-        num_experts,
-        num_topk,
-        recipe,
-        activation,
-        activation_clamp_opt,
-        fast_math,
-        std::nullopt);
-}
-
-static void fp8_mega_moe_with_graph_tokens(
-    const torch::Tensor& y,
-    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
-    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
-    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-    const torch::Tensor& sym_buffer,
-    const torch::Tensor& route_scratch,
-    const std::vector<int64_t>& sym_buffer_ptrs,
-    const std::vector<int64_t>& signal_ptrs,
-    const int& rank_idx,
-    const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk,
-    const std::tuple<int, int, int>& recipe,
-    const std::string& activation,
-    const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math,
-    const torch::Tensor& runtime_num_tokens) {
-    fp8_mega_moe_impl(
-        y,
-        l1_weights_tuple,
-        l2_weights_tuple,
-        cumulative_local_expert_recv_stats,
-        sym_buffer,
-        route_scratch,
-        sym_buffer_ptrs,
-        signal_ptrs,
-        rank_idx,
-        num_max_tokens_per_rank,
-        num_experts,
-        num_topk,
-        recipe,
-        activation,
-        activation_clamp_opt,
-        fast_math,
-        runtime_num_tokens);
-}
-
 static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
@@ -529,9 +406,6 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("num_groups") = std::nullopt,
           pybind11::arg("is_sfa") = std::nullopt,
           pybind11::arg("disable_ue8m0_cast") = false);
-    m.def("fp8_mega_moe", &fp8_mega_moe);
-    m.def("fp8_w8a8_mega_moe", &fp8_mega_moe);
-    m.def("fp8_mega_moe_with_graph_tokens", &fp8_mega_moe_with_graph_tokens);
     m.def("deepep_deepgemm_preprocess_channelwise", &deepep_deepgemm_preprocess_channelwise,
           pybind11::arg("recv_x"),
           pybind11::arg("recv_x_scale"),
