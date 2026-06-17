@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,12 @@ def load_module(name: str, path: Path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def source_int(source: str, name: str) -> int:
+    match = re.search(rf"\b{name}\s*=\s*([0-9]+)\b", source)
+    assert match is not None, f"missing integer constant {name}"
+    return int(match.group(1))
 
 
 def test_v3_backend_auto_policy(monkeypatch):
@@ -201,6 +208,8 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "k3_l2_combine_asm_tail_reduce_out" not in k3_asm_ext
     assert "k3_l2_combine_asm_pack5_out" in k3_asm_ext
     assert "k3_l2_combine_asm_tail_reduce_pack5_out" in k3_asm_ext
+    assert "debug_d" not in k3_asm_ext
+    assert "row_combine_ptrs_i32" in k3_asm_ext
     assert "def k3_l2_fused_asm_to_combine(" not in k3_py
     assert "ensure_k3_combine_asm_code_object" not in k3_py
     assert "ensure_k3_combine_tail_reduce_asm_code_object" not in k3_py
@@ -337,6 +346,7 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
 
 def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
+    large_opt_source = LARGE_OPT_PATH.read_text(encoding="utf-8")
 
     assert "staged_pack5_shape" in api_source
     assert "num_ranks == 8 && num_experts == 256 && num_topk == 6" in api_source
@@ -353,9 +363,36 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     assert "dcu_route_tile_scratch_layout(" not in api_source
     assert "std::max(v3_staged" not in api_source
 
-    large_opt_source = LARGE_OPT_PATH.read_text(encoding="utf-8")
     assert "def _v3_staged_capacity_rows(" in large_opt_source
     assert "normal_token_threshold()" not in large_opt_source
     assert "normal_backend_forced()" not in large_opt_source
     assert "K_K1_ASM_LAUNCH_ARGS_BYTES = 256" in large_opt_source
     assert "capacity_rows * intermediate_hidden * 2" in large_opt_source
+
+    for py_name, cpp_name in (
+        ("K_K1_ROUTE_TILE_M", "kK1RouteTileM"),
+        ("K_K1_ALIGNMENT", "kK1Alignment"),
+        ("K_K1_ROUTE_CAPACITY_SLACK", "kK1RouteCapacitySlack"),
+        ("K_K1_LL_ROW_TILE", "kK1LlRowTile"),
+        (
+            "K_K1_LL_HEADROOM_EXPECTED_ROWS_THRESHOLD",
+            "kK1LlHeadroomExpectedRowsThreshold",
+        ),
+        ("K_K1_LL_HEADROOM_ROWS", "kK1LlHeadroomRows"),
+        ("K_K1_ASM_LAUNCH_ARGS_BYTES", "kK1AsmLaunchArgsBytes"),
+        ("K_PROB_STORAGE_BYTES", "kProbStorageBytes"),
+        ("K_TAIL_DONE_COUNTER_RING_SLOTS", "kTailDoneCounterRingSlots"),
+    ):
+        assert source_int(large_opt_source, py_name) == source_int(api_source, cpp_name)
+
+    for mirrored_name in (
+        "ll_capacity_rows",
+        "normal_capacity_rows",
+        "capacity_rows",
+        "route_task_workspace_bytes",
+        "tail_signal_addrs_offset",
+    ):
+        assert mirrored_name in api_source
+        assert mirrored_name in large_opt_source
+    assert "capacity_rows * static_cast<int64_t>(hidden)" in api_source
+    assert "capacity_rows * hidden" in large_opt_source

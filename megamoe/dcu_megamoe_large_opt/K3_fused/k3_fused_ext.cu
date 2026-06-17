@@ -100,7 +100,7 @@ struct __attribute__((packed)) KernelArgs {
     uint32_t kipWgTableGen;
     uint32_t gsu;
     int32_t* m_indics;
-    int32_t* debug_d;
+    int32_t* row_combine_ptrs_i32;
 };
 
 struct LoadedAsmKernel {
@@ -404,7 +404,7 @@ void launch_l2_deepgemm_original_asm(
     args.kipWgTableGen = 0;
     args.gsu = 1;
     args.m_indics = m_indices.data_ptr<int32_t>();
-    args.debug_d = row_combine_ptrs == nullptr
+    args.row_combine_ptrs_i32 = row_combine_ptrs == nullptr
         ? nullptr
         : reinterpret_cast<int32_t*>(row_combine_ptrs->data_ptr<int64_t>());
 
