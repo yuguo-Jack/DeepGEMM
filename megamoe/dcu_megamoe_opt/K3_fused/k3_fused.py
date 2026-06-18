@@ -202,7 +202,7 @@ def k3_l2_fused_v3_to_combine(
     ll_block_m: int = 32,
     verbose_build: bool = False,
 ) -> torch.Tensor | None:
-    """V3 K3 dispatch point for staged large_opt.
+    """V3 K3 dispatch point for staged opt.
 
     Phase 3 wires staged combine paths. V3 LL pack5 kernels consume the
     per-expert row counts returned by K1 so graph replay can keep a fixed
@@ -240,7 +240,7 @@ def k3_l2_fused_v3_to_combine(
             return None
         if sym_buffer is None or asm_done_counter is None or asm_signal_addrs is None:
             raise ValueError("V3 K3 ASM-pack5 tail path requires sym_buffer, done counter, and signal addrs")
-        if not num_ranks or not num_experts or not num_tokens or not num_topk or not hidden:
+        if not num_ranks or not num_experts or num_tokens < 0 or not num_topk or not hidden:
             raise ValueError("V3 K3 ASM-pack5 tail path requires shape metadata")
         code_object = ensure_k3_combine_tail_reduce_pack5_asm_code_object()
         ext.k3_l2_combine_asm_tail_reduce_pack5_out(
@@ -279,7 +279,7 @@ def k3_l2_fused_v3_to_combine(
         if asm_reduce_y is not None:
             if sym_buffer is None or asm_done_counter is None or asm_signal_addrs is None:
                 raise ValueError("V3 K3 LL tail path requires sym_buffer, done counter, and signal addrs")
-            if not num_ranks or not num_experts or not num_tokens or not num_topk or not hidden:
+            if not num_ranks or not num_experts or num_tokens < 0 or not num_topk or not hidden:
                 raise ValueError("V3 K3 LL tail path requires shape metadata")
             ext.k3_v3_ll_combine_tail(
                 output_workspace,

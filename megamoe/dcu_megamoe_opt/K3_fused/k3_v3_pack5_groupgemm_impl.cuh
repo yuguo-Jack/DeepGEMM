@@ -1,8 +1,7 @@
 #pragma once
 
-// Stage-owned V3 K3 LL pack5 group GEMM and tail-reduce core derived from
-// hygon_tmp/K1_groupgemm_fp8/k1_gemm.cpp. V3 normal combine uses the separate
-// ASM-pack5 path.
+// Stage-owned V3 K3 LL pack5 group GEMM and tail-reduce core. V3 normal
+// combine uses the separate ASM-pack5 path.
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_ext.h>
@@ -13,8 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include <deep_gemm/common/mega_moe_dcu.cuh>
-#include <deep_gemm/comm/mega_moe_dcu.cuh>
+#include <mega_moe_dcu/common.cuh>
+#include <mega_moe_dcu/comm.cuh>
 
 using int32x2_t = int __attribute__((ext_vector_type(2)));
 using int32x4_t = int32_t __attribute__((ext_vector_type(4)));

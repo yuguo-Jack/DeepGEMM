@@ -1,6 +1,6 @@
 """V3 pack5 weight layout helpers for offline fixtures.
 
-These helpers are intentionally not used by the large-opt runtime path. V3
+These helpers are intentionally not used by the opt runtime path. V3
 execution expects callers/tests to provide weights that are already in this
 pack5 layout.
 """

@@ -322,8 +322,8 @@ void k3_v3_ll_combine_tail(
                 "num_ranks must be in [1, 8]");
     TORCH_CHECK(num_experts > 0 && num_experts % num_ranks == 0,
                 "num_experts must be divisible by num_ranks");
-    TORCH_CHECK(num_topk > 0 && num_tokens > 0,
-                "num_tokens and num_topk must be positive");
+    TORCH_CHECK(num_topk > 0 && num_tokens >= 0,
+                "num_topk must be positive and num_tokens must be non-negative");
     TORCH_CHECK(num_max_tokens_per_rank >= num_tokens,
                 "num_max_tokens_per_rank must cover num_tokens");
     TORCH_CHECK(done_counter.numel() >= 2,

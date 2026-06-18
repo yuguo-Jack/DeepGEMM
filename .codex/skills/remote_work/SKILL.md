@@ -15,7 +15,7 @@ Follow this rule for all downstream remote skills:
 - Every `docker exec` command that runs inside the container must source DTK first with `source /opt/dtk/env.sh && ...`.
 - Host-side Docker management commands such as `docker ps`, `docker inspect`, and `docker start` do not run inside the container and do not source `/opt/dtk/env.sh`.
 - Avoid direct remote-host compilation and testing outside Docker unless explicitly requested.
-- Put temporary logs, status files, profiler output, and debug artifacts under the repo's `hygon_tmp/` tree, for example `$CONTAINER_REPO/hygon_tmp/sglang_debug/`; do not scatter project artifacts under `/tmp`.
+- Put temporary logs, status files, profiler output, and debug artifacts under the repo's `hygon_tmp/` tree, for example `$CONTAINER_REPO/hygon_tmp/debug/`; do not scatter project artifacts under `/tmp`.
 - For this workspace, the host mount root is `/home/hg/yuguo` and the container mount root is `/workspace`.
 - The local project may not be uploaded yet. Before first upload, remote `/home/hg/yuguo/DeepGEMM` and container `/workspace/DeepGEMM` may be missing; treat that as setup state, not an environment failure.
 

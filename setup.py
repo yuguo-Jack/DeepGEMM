@@ -53,13 +53,15 @@ project_path = lambda *parts: os.path.join(current_dir, *parts)
 if IS_HIP_EXTENSION:
     package_name = os.getenv('DG_HIP_PACKAGE_NAME', 'megamoe')
     accelerator_home = ROCM_HOME or os.environ.get('ROCM_HOME') or os.environ.get('ROCM_PATH') or os.environ.get('HIP_PATH') or '/opt/dtk'
+    dcu_opt_root = project_path('megamoe', 'dcu_megamoe_opt')
     sources = [
-        'csrc/python_api_hip.cpp',
-        'csrc/kernels/mega_moe_baseline_hip.cu',
+        os.path.join(dcu_opt_root, 'csrc', 'python_api_hip.cpp'),
+        os.path.join(dcu_opt_root, 'csrc', 'kernels', 'mega_moe_baseline_hip.cu'),
     ]
     build_include_dirs = [
         f'{accelerator_home}/include',
-        project_path('deep_gemm', 'include'),
+        os.path.join(dcu_opt_root, 'include'),
+        os.path.join(dcu_opt_root, 'csrc'),
         project_path('third-party', 'fmt', 'include'),
     ]
     build_libraries = []
@@ -147,30 +149,30 @@ def get_ext_modules():
                              library_dirs=build_library_dirs,
                              extra_compile_args={'cxx': cxx_flags, 'nvcc': hipcc_flags})]
     if IS_HIP_EXTENSION and package_name == 'megamoe':
-        large_opt_root = project_path('megamoe', 'dcu_megamoe_large_opt')
-        large_opt_k1_hipcc_flags = hipcc_flags + [
+        opt_root = dcu_opt_root
+        opt_k1_hipcc_flags = hipcc_flags + [
             '-DNDEBUG',
             '-mllvm',
             '-enable-num-vgprs-768=true',
         ]
         modules.extend([
             CUDAExtension(
-                name='megamoe.dcu_megamoe_large_opt.K1_fused.k1_fused_ext',
+                name='megamoe.dcu_megamoe_opt.K1_fused.k1_fused_ext',
                 sources=[
-                    os.path.join(large_opt_root, 'K1_fused', 'k1_fused_ext.cu'),
-                    os.path.join(large_opt_root, 'K1_fused', 'k1_v3_fused_ext.cu'),
+                    os.path.join(opt_root, 'K1_fused', 'k1_fused_ext.cu'),
+                    os.path.join(opt_root, 'K1_fused', 'k1_v3_fused_ext.cu'),
                 ],
                 include_dirs=build_include_dirs,
                 libraries=build_libraries,
                 library_dirs=build_library_dirs,
                 extra_compile_args={
                     'cxx': cxx_flags,
-                    'nvcc': large_opt_k1_hipcc_flags,
+                    'nvcc': opt_k1_hipcc_flags,
                 },
             ),
             CUDAExtension(
-                name='megamoe.dcu_megamoe_large_opt.K2_fused.k2_fused_ext',
-                sources=[os.path.join(large_opt_root, 'K2_fused', 'k2_fused_ext.cu')],
+                name='megamoe.dcu_megamoe_opt.K2_fused.k2_fused_ext',
+                sources=[os.path.join(opt_root, 'K2_fused', 'k2_fused_ext.cu')],
                 include_dirs=build_include_dirs,
                 libraries=build_libraries,
                 library_dirs=build_library_dirs,
@@ -180,8 +182,8 @@ def get_ext_modules():
                 },
             ),
             CUDAExtension(
-                name='megamoe.dcu_megamoe_large_opt.K3_fused.k3_fused_ext',
-                sources=[os.path.join(large_opt_root, 'K3_fused', 'k3_fused_ext.cu')],
+                name='megamoe.dcu_megamoe_opt.K3_fused.k3_fused_ext',
+                sources=[os.path.join(opt_root, 'K3_fused', 'k3_fused_ext.cu')],
                 include_dirs=build_include_dirs,
                 libraries=build_libraries,
                 library_dirs=build_library_dirs,
@@ -191,8 +193,8 @@ def get_ext_modules():
                 },
             ),
             CUDAExtension(
-                name='megamoe.dcu_megamoe_large_opt.K3_fused.k3_v3_fused_ext',
-                sources=[os.path.join(large_opt_root, 'K3_fused', 'k3_v3_fused_ext.cu')],
+                name='megamoe.dcu_megamoe_opt.K3_fused.k3_v3_fused_ext',
+                sources=[os.path.join(opt_root, 'K3_fused', 'k3_v3_fused_ext.cu')],
                 include_dirs=build_include_dirs,
                 libraries=build_libraries,
                 library_dirs=build_library_dirs,
@@ -209,10 +211,10 @@ def get_python_packages():
     if IS_HIP_EXTENSION and package_name == 'megamoe':
         return [
             'megamoe',
-            'megamoe.dcu_megamoe_large_opt',
-            'megamoe.dcu_megamoe_large_opt.K1_fused',
-            'megamoe.dcu_megamoe_large_opt.K2_fused',
-            'megamoe.dcu_megamoe_large_opt.K3_fused',
+            'megamoe.dcu_megamoe_opt',
+            'megamoe.dcu_megamoe_opt.K1_fused',
+            'megamoe.dcu_megamoe_opt.K2_fused',
+            'megamoe.dcu_megamoe_opt.K3_fused',
         ]
     return find_packages('.')
 
@@ -227,24 +229,32 @@ def get_package_data():
     }
     if IS_HIP_EXTENSION and package_name == 'megamoe':
         data.update({
-            'megamoe.dcu_megamoe_large_opt.K1_fused': ['*.cu', '*.cuh', '*.s', '*.co'],
-            'megamoe.dcu_megamoe_large_opt.K2_fused': ['*.cu'],
-            'megamoe.dcu_megamoe_large_opt.K3_fused': ['*.cu', '*.cuh', '*.s', '*.co'],
+            'megamoe.dcu_megamoe_opt': [
+                'include/mega_moe_dcu/*.cuh',
+                'csrc/*.cpp',
+                'csrc/apis/*.hpp',
+                'csrc/kernels/*.cu',
+                'tests/*.py',
+                'scripts/*.sh',
+            ],
+            'megamoe.dcu_megamoe_opt.K1_fused': ['*.cu', '*.cuh', '*.s', '*.co'],
+            'megamoe.dcu_megamoe_opt.K2_fused': ['*.cu'],
+            'megamoe.dcu_megamoe_opt.K3_fused': ['*.cu', '*.cuh', '*.s', '*.co'],
         })
     return data
 
 
-LARGE_OPT_ASM_CODE_OBJECTS = [
+OPT_ASM_CODE_OBJECTS = [
     (
         project_path(
             'megamoe',
-            'dcu_megamoe_large_opt',
+            'dcu_megamoe_opt',
             'K1_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s',
         ),
         os.path.join(
             'megamoe',
-            'dcu_megamoe_large_opt',
+            'dcu_megamoe_opt',
             'K1_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co',
         ),
@@ -253,13 +263,13 @@ LARGE_OPT_ASM_CODE_OBJECTS = [
     (
         project_path(
             'megamoe',
-            'dcu_megamoe_large_opt',
+            'dcu_megamoe_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.s',
         ),
         os.path.join(
             'megamoe',
-            'dcu_megamoe_large_opt',
+            'dcu_megamoe_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co',
         ),
@@ -268,13 +278,13 @@ LARGE_OPT_ASM_CODE_OBJECTS = [
     (
         project_path(
             'megamoe',
-            'dcu_megamoe_large_opt',
+            'dcu_megamoe_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.s',
         ),
         os.path.join(
             'megamoe',
-            'dcu_megamoe_large_opt',
+            'dcu_megamoe_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.co',
         ),
@@ -283,7 +293,7 @@ LARGE_OPT_ASM_CODE_OBJECTS = [
 ]
 
 
-def _large_opt_asm_clang(env_name):
+def _opt_asm_clang(env_name):
     clang = os.environ.get(env_name) or os.environ.get('MEGAMOE_DCU_AOT_CLANG')
     if clang:
         return clang
@@ -292,17 +302,17 @@ def _large_opt_asm_clang(env_name):
     return candidate if candidate and os.path.exists(candidate) else 'clang'
 
 
-def build_large_opt_asm_code_objects(output_root, temp_root):
+def build_opt_asm_code_objects(output_root, temp_root):
     if not (IS_HIP_EXTENSION and package_name == 'megamoe') or DG_SKIP_CUDA_BUILD:
         return
-    for src, rel_dst, clang_env in LARGE_OPT_ASM_CODE_OBJECTS:
+    for src, rel_dst, clang_env in OPT_ASM_CODE_OBJECTS:
         if not os.path.exists(src):
-            raise FileNotFoundError(f'large-opt asm source not found: {src}')
+            raise FileNotFoundError(f'opt asm source not found: {src}')
         dst = os.path.join(output_root, rel_dst)
-        obj = os.path.join(temp_root, 'large_opt_asm', os.path.basename(rel_dst) + '.o')
+        obj = os.path.join(temp_root, 'opt_asm', os.path.basename(rel_dst) + '.o')
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         os.makedirs(os.path.dirname(obj), exist_ok=True)
-        clang = _large_opt_asm_clang(clang_env)
+        clang = _opt_asm_clang(clang_env)
         subprocess.run(
             [
                 clang,
@@ -336,7 +346,7 @@ class CustomBuildExt(BuildExtension):
     def run(self):
         super().run()
         output_root = current_dir if self.inplace else self.build_lib
-        build_large_opt_asm_code_objects(output_root, self.build_temp)
+        build_opt_asm_code_objects(output_root, self.build_temp)
 
 
 class CustomBuildPy(build_py):
@@ -354,7 +364,9 @@ class CustomBuildPy(build_py):
         build_py.run(self)
 
     def generate_pyi_file(self):
-        generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
+        pyi_root = './megamoe/dcu_megamoe_opt/csrc' \
+            if IS_HIP_EXTENSION and package_name == 'megamoe' else './csrc'
+        generate_pyi_file(name='_C', root=pyi_root, output_dir='./stubs')
         pyi_source = os.path.join(current_dir, 'stubs', '_C.pyi')
         pyi_target = os.path.join(self.build_lib, package_name, '_C.pyi')
 
@@ -384,8 +396,7 @@ class CustomBuildPy(build_py):
         )
         os.makedirs(build_include_dir, exist_ok=True)
 
-        include_sources = [(project_path('deep_gemm', 'include', 'deep_gemm'), 'deep_gemm')] \
-            if IS_HIP_EXTENSION and package_name == 'megamoe' else []
+        include_sources = []
         include_sources.extend((os.path.join(current_dir, d), d.split('/')[-1]) for d in third_party_include_dirs)
 
         # Copy JIT includes to the build directory.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$repo_dir"
 
 num_processes="${NUM_PROCESSES:-8}"
@@ -9,7 +9,7 @@ max_tokens="${NUM_MAX_TOKENS_PER_RANK:-2048}"
 warmup="${WARMUP:-3}"
 repeat="${REPEAT:-8}"
 correctness_iters="${CORRECTNESS_ITERS:-1}"
-out_dir="${OUT_DIR:-hygon_tmp/large_opt/integrated}"
+out_dir="${OUT_DIR:-hygon_tmp/opt/integrated}"
 tokens_list="${TOKENS_LIST:-512 1024 1025 1280 1441 1442 2048}"
 skip_bench="${SKIP_BENCH:-0}"
 
@@ -36,7 +36,7 @@ for tokens in $tokens_list; do
         extra_args+=(--skip-bench)
     fi
 
-    python tests/test_mega_moe_dcu.py \
+    python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
         --num-processes "$num_processes" \
         --num-max-tokens-per-rank "$max_tokens" \
         --num-tokens "$tokens" \
@@ -47,6 +47,6 @@ for tokens in $tokens_list; do
         --correctness-iters "$correctness_iters" \
         --warmup "$warmup" \
         --repeat "$repeat" \
-        --out "$out_dir/dsv4_flash_large_opt_${tokens}.json" \
+        --out "$out_dir/dsv4_flash_opt_${tokens}.json" \
         "${extra_args[@]}"
 done

@@ -11,7 +11,7 @@ import torch.distributed as dist
 import megamoe
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "third-party"))
 
 DEEPEP_BUFFER_BYTES = int(2.0e9)
@@ -29,14 +29,14 @@ from triton_ops import (
     triton_ep_gather_channelwise,
     triton_ep_scatter_channelwise,
 )
-from megamoe.dcu_megamoe_large_opt.v3_config import (
+from megamoe.dcu_megamoe_opt.v3_config import (
     BACKEND_ENV,
     NORMAL_LL_TOKEN_THRESHOLD_ENV,
     V3_BACKEND_AUTO,
     select_v3_backend,
     v3_backend_mode,
 )
-from megamoe.dcu_megamoe_large_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
+from megamoe.dcu_megamoe_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
 
 
 def print_once(rank: int, msg: str = ""):
@@ -501,7 +501,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     fused_l1_weights = baseline_l1_weights
     fused_l2_weights = baseline_l2_weights
-    from megamoe.dcu_megamoe_large_opt import v3_layout
+    from megamoe.dcu_megamoe_opt import v3_layout
 
     l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
     l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
@@ -1017,7 +1017,7 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--skip-bench", action="store_true")
-    parser.add_argument("--large-opt-3stage", action="store_true",
+    parser.add_argument("--opt-3stage", action="store_true",
                         help="compatibility no-op; DCU DSV4 MegaMoE now uses the V3 staged path by default")
     parser.add_argument("--megamoe-backend", choices=("auto", "ll", "normal"),
                         default=os.getenv(BACKEND_ENV, V3_BACKEND_AUTO),

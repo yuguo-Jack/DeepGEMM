@@ -77,7 +77,7 @@ Build on a DTK 26.04 environment:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-./build_dcu_megamoe.sh
+./megamoe/dcu_megamoe_opt/scripts/build_dcu_megamoe.sh
 ```
 
 The build script keeps intermediate files under `build/` and writes the wheel to
@@ -96,22 +96,22 @@ pip install -e .
 
 Editable installs point Python back to this checkout, so they use the in-place
 `megamoe/_C*.so`, staged `k1/k2/k3_fused_ext*.so`, and staged `.co` files
-created by `build_dcu_megamoe.sh`.  Python-only edits are picked up directly;
-after changing HIP, asm, or `setup.py`, rerun `build_dcu_megamoe.sh`.  If you
-run from an installed wheel instead, reinstall the newly generated wheel after
-rebuilding.
+created by `megamoe/dcu_megamoe_opt/scripts/build_dcu_megamoe.sh`.
+Python-only edits are picked up directly; after changing HIP, asm, or
+`setup.py`, rerun that build script.  If you run from an installed wheel
+instead, reinstall the newly generated wheel after rebuilding.
 
-The optional large-token staged path is built ahead of time as part of the
+The staged LL/normal opt path is built ahead of time as part of the
 `megamoe` wheel.  Wheel installation places the staged extension modules and asm
 code objects under the Python package directory, alongside the original
 MegaMoE fused extension:
 
 - `megamoe/_C*.so`
-- `megamoe/dcu_megamoe_large_opt/K1_fused/k1_fused_ext*.so`
-- `megamoe/dcu_megamoe_large_opt/K2_fused/k2_fused_ext*.so`
-- `megamoe/dcu_megamoe_large_opt/K3_fused/k3_fused_ext*.so`
-- `megamoe/dcu_megamoe_large_opt/K1_fused/*.co`
-- `megamoe/dcu_megamoe_large_opt/K3_fused/*.co`
+- `megamoe/dcu_megamoe_opt/K1_fused/k1_fused_ext*.so`
+- `megamoe/dcu_megamoe_opt/K2_fused/k2_fused_ext*.so`
+- `megamoe/dcu_megamoe_opt/K3_fused/k3_fused_ext*.so`
+- `megamoe/dcu_megamoe_opt/K1_fused/*.co`
+- `megamoe/dcu_megamoe_opt/K3_fused/*.co`
 
 If any staged HIP or asm source changes, rebuild and reinstall the wheel.  The
 `hygon_tmp` directory is only used by test scripts for temporary reports or
@@ -136,8 +136,8 @@ EP-group maximum local token count for the current request with their threshold
 so every rank chooses the same backend.  In this repository's test script, that
 framework-side policy is modeled by `MEGAMOE_DCU_BACKEND=auto|ll|normal` and
 `MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD` with a default threshold of 256 tokens.
-Those two environment variables only affect `tests/test_mega_moe_dcu.py`; they
-are not consumed by the production library call, `large_opt.py`, or the C++
+Those two environment variables only affect `megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py`; they
+are not consumed by the production library call, `opt.py`, or the C++
 workspace size API.
 
 For eager uneven-rank requests, pass the same EP-group maximum local token count
@@ -151,7 +151,7 @@ request max, the conservative fallback is the symmetric-buffer
 necessary.
 
 The V3 staged path keeps all K1/K2/K3 implementation files under
-`megamoe.dcu_megamoe_large_opt`.  Its temporary activations reuse the DCU
+`megamoe.dcu_megamoe_opt`.  Its temporary activations reuse the DCU
 MegaMoE `route_scratch` allocation; the integration does not allocate a second
 staged LL/normal L1/K2/K3 activation workspace.  `SymmBuffer` prepares the staged path
 during initialization by creating tensor views into the same `route_scratch`
@@ -220,7 +220,7 @@ graph with `megamoe_backend="normal"` for larger replay.  The choice of which
 graph to capture or replay should use the same global token-bucket rule as
 eager mode, so uneven ranks still agree on LL vs normal.
 
-In `tests/test_mega_moe_dcu.py`, the CUDA Graph test options separate capacity,
+In `megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py`, the CUDA Graph test options separate capacity,
 ordinary correctness input, and replay buckets:
 
 - `--num-max-tokens-per-rank` is the symmetric-buffer capacity and graph capture
@@ -252,7 +252,7 @@ Example eager uneven-rank check with a uniform auto-dispatch decision:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-python tests/test_mega_moe_dcu.py \
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 256 \
   --num-tokens-per-rank-list 0,133,0,0,0,0,0,0 \
@@ -285,7 +285,7 @@ Run the DSV4-Flash correctness and performance check:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-python tests/test_mega_moe_dcu.py \
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 2048 \
   --num-tokens 512 \
@@ -307,7 +307,7 @@ ranks with zero local tokens:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-python tests/test_mega_moe_dcu.py \
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 512 \
   --num-tokens 512 \
@@ -328,7 +328,7 @@ representatives around 1025..1441 as well as the main 512/1024/2048 sizes:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-bash scripts/run_dcu_megamoe_large_opt.sh
+bash megamoe/dcu_megamoe_opt/scripts/run_dcu_megamoe_opt.sh
 ```
 
 For a correctness-only smoke run, set `SKIP_BENCH=1`.  The staged test keeps
@@ -340,7 +340,7 @@ Check one captured LL graph bucket across several token prefixes:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-python tests/test_mega_moe_dcu.py \
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 8192 \
   --num-tokens 8192 \
@@ -359,7 +359,7 @@ Check one captured normal K1/K2/K3 graph bucket across token prefixes with a
 
 ```bash
 source /opt/dtk-26.04/env.sh
-python tests/test_mega_moe_dcu.py \
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 8192 \
   --num-tokens 8192 \
@@ -377,7 +377,7 @@ Force one staged-path size directly:
 
 ```bash
 source /opt/dtk-26.04/env.sh
-python tests/test_mega_moe_dcu.py \
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 2048 \
   --num-tokens 1024 \
@@ -388,7 +388,7 @@ python tests/test_mega_moe_dcu.py \
   --correctness-iters 1 \
   --warmup 3 \
   --repeat 8 \
-  --out hygon_tmp/large_opt/integrated/dsv4_flash_large_opt_1024.json
+  --out hygon_tmp/opt/integrated/dsv4_flash_opt_1024.json
 ```
 
 Run a small-token LL sweep and a larger normal sweep with the same public API:
@@ -397,7 +397,7 @@ Run a small-token LL sweep and a larger normal sweep with the same public API:
 source /opt/dtk-26.04/env.sh
 mkdir -p hygon_tmp/megamoe_dcu_dsv4_flash
 for tokens in 8 32 33 64 128 129 256 257 512 513; do
-  python tests/test_mega_moe_dcu.py \
+  python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
     --num-processes 8 \
     --num-max-tokens-per-rank 8192 \
     --num-tokens "${tokens}" \
@@ -412,7 +412,7 @@ for tokens in 8 32 33 64 128 129 256 257 512 513; do
     --out "hygon_tmp/megamoe_dcu_dsv4_flash/ll_${tokens}.json"
 done
 for tokens in 256 512 1024 1025 2048 2050 3072 4096 4097 8192; do
-  python tests/test_mega_moe_dcu.py \
+  python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
     --num-processes 8 \
     --num-max-tokens-per-rank 8192 \
     --num-tokens "${tokens}" \

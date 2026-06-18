@@ -6,20 +6,20 @@ from typing import Optional, Tuple
 
 import torch
 
-from .dcu_megamoe_large_opt.K1_fused.k1_fused import (
+from .dcu_megamoe_opt.K1_fused.k1_fused import (
     k1_graph_flag_reset_layout,
     k1_symm_fused_l1_v3,
     k1_symm_fused_l1_v3_graph,
 )
-from .dcu_megamoe_large_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
-from .dcu_megamoe_large_opt.K3_fused.k3_fused import (
+from .dcu_megamoe_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
+from .dcu_megamoe_opt.K3_fused.k3_fused import (
     build_asm_tail_signal_addrs,
     k3_l2_fused_v3_to_combine,
     rank_barrier,
     reduce_local_combine,
     reduce_local_combine_graph,
 )
-from .dcu_megamoe_large_opt.v3_config import V3_BACKEND_LL, normalize_v3_backend
+from .dcu_megamoe_opt.v3_config import V3_BACKEND_LL, normalize_v3_backend
 
 
 K_K1_ROUTE_TILE_M = 256
@@ -58,7 +58,7 @@ class _RouteScratchViews:
 
 
 @dataclass
-class _LargeOptState:
+class _OptState:
     scratch: _RouteScratchViews
     empty_bf16: torch.Tensor
     asm_tail_signal_addrs_ready: bool = False
@@ -189,7 +189,7 @@ def _route_scratch_tensor(
     if required_bytes > byte_capacity:
         raise RuntimeError(f"route_scratch view {shape} exceeds reserved {dtype} region")
     if byte_offset + required_bytes > route_scratch.numel():
-        raise RuntimeError("route_scratch is too small for large-opt scratch views")
+        raise RuntimeError("route_scratch is too small for opt scratch views")
     return route_scratch.narrow(0, byte_offset, required_bytes).view(dtype).view(shape)
 
 
@@ -312,7 +312,7 @@ def _state(
     intermediate_hidden: int,
     init_tail_reduce: bool,
     verbose_build: bool,
-) -> _LargeOptState:
+) -> _OptState:
     device = sym_buffer.buffer.device
     key = (
         int(device.index or 0),
@@ -325,7 +325,7 @@ def _state(
         hidden,
         intermediate_hidden,
     )
-    cached = getattr(sym_buffer, "_large_opt_3stage_state", None)
+    cached = getattr(sym_buffer, "_opt_3stage_state", None)
     if cached is not None and cached[0] == key:
         state = cached[1]
         if init_tail_reduce and not state.asm_tail_signal_addrs_ready:
@@ -339,7 +339,7 @@ def _state(
             state.asm_tail_signal_addrs_ready = True
         return state
 
-    state = _LargeOptState(
+    state = _OptState(
         scratch=_route_scratch_views(
             sym_buffer,
             num_ranks=num_ranks,
@@ -359,11 +359,11 @@ def _state(
             verbose_build=verbose_build,
         )
         state.asm_tail_signal_addrs_ready = True
-    setattr(sym_buffer, "_large_opt_3stage_state", (key, state))
+    setattr(sym_buffer, "_opt_3stage_state", (key, state))
     return state
 
 
-def prepare_large_opt_3stage(sym_buffer, *, verbose_build: bool = False) -> None:
+def prepare_opt_3stage(sym_buffer, *, verbose_build: bool = False) -> None:
     _check_shape(
         num_ranks=sym_buffer.group.size(),
         num_experts=sym_buffer.num_experts,
@@ -412,7 +412,7 @@ def _check_shape(
         )
 
 
-def fp8_mega_moe_large_opt_3stage(
+def fp8_mega_moe_opt_3stage(
     y: torch.Tensor,
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -429,7 +429,7 @@ def fp8_mega_moe_large_opt_3stage(
     capacity_num_tokens: Optional[int] = None,
 ) -> None:
     if not fast_math:
-        raise RuntimeError("large-opt DCU MegaMoE path requires fast_math")
+        raise RuntimeError("opt DCU MegaMoE path requires fast_math")
 
     l1_weight, l1_scale = l1_weights
     l2_weight, l2_scale = l2_weights
@@ -460,7 +460,7 @@ def fp8_mega_moe_large_opt_3stage(
     )
 
     alignment = 256
-    verbose_build = os.getenv("MEGAMOE_DCU_LARGE_OPT_VERBOSE_BUILD", "0") == "1"
+    verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
     use_tail_reduce = k3_tail_reduce_enabled()
     state = _state(
         sym_buffer,
@@ -610,7 +610,7 @@ def fp8_mega_moe_large_opt_3stage(
         )
 
 
-def _run_large_opt_3stage_graph(
+def _run_opt_3stage_graph(
     y: torch.Tensor,
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -627,9 +627,9 @@ def _run_large_opt_3stage_graph(
     v3_backend: str,
 ) -> None:
     if not fast_math:
-        raise RuntimeError("large-opt DCU MegaMoE graph path requires fast_math")
+        raise RuntimeError("opt DCU MegaMoE graph path requires fast_math")
     if cumulative_local_expert_recv_stats is not None:
-        raise ValueError("large-opt DCU MegaMoE graph path does not support stats")
+        raise ValueError("opt DCU MegaMoE graph path does not support stats")
     l1_weight, l1_scale = l1_weights
     l2_weight, l2_scale = l2_weights
     hidden = int(y.size(1))
@@ -641,7 +641,7 @@ def _run_large_opt_3stage_graph(
         raise ValueError("graph_max_tokens must be positive")
     if int(y.size(0)) < graph_max_tokens:
         raise ValueError(
-            "large-opt graph path requires y to have at least graph_max_tokens rows"
+            "opt graph path requires y to have at least graph_max_tokens rows"
     )
     num_max_tokens_per_rank = int(sym_buffer.num_max_tokens_per_rank)
     v3_backend = normalize_v3_backend(v3_backend)
@@ -656,7 +656,7 @@ def _run_large_opt_3stage_graph(
     )
 
     alignment = 256
-    verbose_build = os.getenv("MEGAMOE_DCU_LARGE_OPT_VERBOSE_BUILD", "0") == "1"
+    verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
     use_tail_reduce = k3_tail_reduce_enabled()
     state = _state(
         sym_buffer,

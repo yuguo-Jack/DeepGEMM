@@ -14,7 +14,7 @@
 #include <hip/hip_runtime.h>
 #include <torch/python.h>
 
-#include <deep_gemm/layout/mega_moe_dcu.cuh>
+#include <mega_moe_dcu/layout.cuh>
 
 namespace deep_gemm::mega {
 

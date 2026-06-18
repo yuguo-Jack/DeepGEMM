@@ -7373,3 +7373,27 @@
   - normal graph 的主要异常已经收敛；`2048+` 与 eager 持平或更快，`256/512/1024` 剩余差距来自 single capture8192 下 K1/K3 ASM fixed launch-grid/early-return 成本；
   - 在“不新增 kernel、不 D2H、不做多 bucket graph、不重写 ASM launch-grid 合同”的约束下，继续追平小 normal graph 需要高风险 ASM/grid redesign，当前不建议作为本轮生产修复继续推进；
   - 生产默认 `<=256` 走 LL，因此 256 档 normal graph 只是 boundary/forced-normal 覆盖；512/1024 差距已缩到可接受范围，功能和大 token 性能稳定。
+
+## 2026-06-18 - opt self-contained refactor remote smoke
+
+- 远端 `/workspace/DeepGEMM` 已同步当前本地重构工作区；DCU MegaMoE 生产代码、测试、脚本和专属 include/csrc 已集中到 `megamoe/dcu_megamoe_opt/`，外层 `csrc/`、`deep_gemm/include/deep_gemm/*/mega_moe_dcu.cuh`、旧 `tests/`、旧 `scripts/`、旧 `large_opt.py` 生产依赖已从工作区移除。
+- 远端卡状态：测试前后 `hy-smi --showpids` 均显示无 KFD PID，8 卡 VRAM/HCU 均为 0%。
+- 编译/静态验证：
+  - `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过；
+  - `PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 通过，`9/9`。
+- 代表性 smoke：LL/normal eager 与 graph 主路径通过；LL graph capture8192 replay 8 token 为 `0.560 ms`，仍在历史 `~0.55 ms` 量级。
+- 新发现并修复：LL eager uneven 中 zero-token rank 会让 K3 LL tail wrapper 把 `num_tokens==0` 误判为缺 shape metadata。修复方式仅放宽 Python/C++ 参数检查，允许合法 zero-token reduce prefix；没有新增 kernel，没有新增 D2H/H2D 同步，也不改变非 zero-token 路径。
+- 修复验证：`--num-tokens-per-rank-list 512,257,128,64,32,7,0,0 --megamoe-backend ll --skip-bench` 通过，`max_abs=0.000488281`；normal uneven graph `2048,1025,512,256,128,64,7,0` replay `512,2048` 通过。
+
+### representative smoke after refactor
+
+| case | backend | tokens/rank | result |
+| --- | --- | ---: | --- |
+| ll eager | ll | 32 | correct, `0.643 ms` |
+| ll eager | ll | 512 | correct, `2.302 ms` |
+| normal eager | normal | 512 | correct, `1.743 ms` |
+| normal eager | normal | 4096 | correct, `5.843 ms` |
+| ll graph capture8192 | ll | replay 8/256/512 | correct, `0.560/1.291/2.249 ms` |
+| normal graph capture8192 | normal | replay 512/4096/8192 | correct, `1.874/5.665/10.516 ms` |
+| ll uneven eager | ll | 512 bucket | correct after zero-token fix |
+| normal uneven graph | normal | replay 512/2048 | correct |

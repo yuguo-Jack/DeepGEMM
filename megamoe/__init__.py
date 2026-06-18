@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 
 from . import _C
-from .dcu_megamoe_large_opt.v3_config import (
+from .dcu_megamoe_opt.v3_config import (
     V3_BACKEND_NORMAL,
     normalize_v3_backend,
 )
@@ -157,7 +157,7 @@ class SymmBuffer:
         use_fp8_dispatch: bool = True,
         activation: str = "swiglu",
         cuda_graph_max_tokens_per_rank: Optional[int] = None,
-        prepare_large_opt_3stage: bool = True,
+        prepare_opt_3stage: bool = True,
     ):
         if not _is_hip_backend():
             raise RuntimeError("megamoe is the HIP/DCU MegaMoE package")
@@ -256,12 +256,12 @@ class SymmBuffer:
         self.cuda_graph_num_tokens = slices[8]
         self.cuda_graph_num_tokens.fill_(self.cuda_graph_max_tokens_per_rank)
 
-        if prepare_large_opt_3stage:
-            from .large_opt import prepare_large_opt_3stage
+        if prepare_opt_3stage:
+            from .opt import prepare_opt_3stage
 
-            prepare_large_opt_3stage(
+            prepare_opt_3stage(
                 self,
-                verbose_build=os.getenv("MEGAMOE_DCU_LARGE_OPT_VERBOSE_BUILD", "0") == "1",
+                verbose_build=os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1",
             )
 
     def destroy(self):
@@ -325,7 +325,7 @@ def get_symm_buffer_for_mega_moe(
                 use_fp8_dispatch,
                 activation,
                 cuda_graph_max_tokens_per_rank=1,
-                prepare_large_opt_3stage=False,
+                prepare_opt_3stage=False,
             )
         finally:
             if dummy_buffer is not None:
@@ -440,9 +440,9 @@ def fp8_mega_moe(
             )
         if cumulative_local_expert_recv_stats is not None:
             raise ValueError("CUDA graph mode does not support cumulative_local_expert_recv_stats")
-        from .large_opt import _run_large_opt_3stage_graph
+        from .opt import _run_opt_3stage_graph
 
-        _run_large_opt_3stage_graph(
+        _run_opt_3stage_graph(
             y,
             l1_weights,
             l2_weights,
@@ -465,9 +465,9 @@ def fp8_mega_moe(
                 "pass graph=True with megamoe_backend='ll' or 'normal' "
                 "to capture the V3 staged K1/K2/K3 path."
             )
-        from .large_opt import fp8_mega_moe_large_opt_3stage
+        from .opt import fp8_mega_moe_opt_3stage
 
-        fp8_mega_moe_large_opt_3stage(
+        fp8_mega_moe_opt_3stage(
             call_y,
             l1_weights,
             l2_weights,

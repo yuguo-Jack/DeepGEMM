@@ -19,8 +19,8 @@
 #include <string>
 #include <tuple>
 
-#include <deep_gemm/comm/mega_moe_dcu.cuh>
-#include <deep_gemm/layout/mega_moe_dcu.cuh>
+#include <mega_moe_dcu/comm.cuh>
+#include <mega_moe_dcu/layout.cuh>
 
 void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
     hip_bfloat16* out,
@@ -74,7 +74,7 @@ static constexpr int kK1RouteCapacitySlack = 64;
 static constexpr int64_t kK1RowPointerPadding = 512;
 static constexpr double kK1AutoCompactMinSaving = 0.05;
 static constexpr double kK1AutoCompactMinLocalTileSaving = 8.0;
-static constexpr int64_t kK1AutoCompactLargeTilesPerExpert = 7;
+static constexpr int64_t kK1AutoCompactHighTilesPerExpert = 7;
 static constexpr double kK1CompactTightMarginMinSaving = 0.45;
 static constexpr const char* kK1ShapeContract =
     "K1_fused dispatch-pull L1 asm is currently specialized for ranks=8, "
@@ -123,7 +123,7 @@ bool should_auto_compact_routes(
     if (asm_tiles_per_expert <= 1) {
         return false;
     }
-    if (asm_tiles_per_expert >= kK1AutoCompactLargeTilesPerExpert) {
+    if (asm_tiles_per_expert >= kK1AutoCompactHighTilesPerExpert) {
         return true;
     }
     const double compact_tiles =
@@ -1207,14 +1207,14 @@ k1_symm_fused_l1_v3_pack5(
                 route_capacity_tokens_per_rank * num_topk,
                 local_experts));
     constexpr int64_t kLlHeadroomExpectedRowsThreshold = 48;
-    constexpr int64_t kLlLargeHeadroomExpectedRowsThreshold = 512;
+    constexpr int64_t kLlHighHeadroomExpectedRowsThreshold = 512;
     constexpr int64_t kLlHeadroomRows = 64;
-    constexpr int64_t kLlLargeHeadroomRows = 128;
+    constexpr int64_t kLlHighHeadroomRows = 128;
     // Preserve tiny LL buckets exactly, but reserve enough per-expert headroom
-    // for large buckets: random routing can exceed the mean per-expert count.
+    // for high-token buckets: random routing can exceed the mean per-expert count.
     const int64_t ll_min_slack =
-        ll_expected_rows_per_expert >= kLlLargeHeadroomExpectedRowsThreshold
-            ? kLlLargeHeadroomRows
+        ll_expected_rows_per_expert >= kLlHighHeadroomExpectedRowsThreshold
+            ? kLlHighHeadroomRows
             : (ll_expected_rows_per_expert >= kLlHeadroomExpectedRowsThreshold
                    ? kLlHeadroomRows
                    : 0);

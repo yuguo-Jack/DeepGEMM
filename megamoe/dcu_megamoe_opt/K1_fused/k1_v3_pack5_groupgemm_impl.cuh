@@ -1,7 +1,6 @@
 #pragma once
 
-// Stage-owned V3 K1 LL pack5 group GEMM core derived from
-// hygon_tmp/K1_groupgemm_fp8/k1_gemm.cpp. V3 normal uses the separate
+// Stage-owned V3 K1 LL pack5 group GEMM core. V3 normal uses the separate
 // ASM-pack5 dispatch path.
 
 #include <hip/hip_bfloat16.h>
@@ -11,8 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <deep_gemm/comm/mega_moe_dcu.cuh>
-#include <deep_gemm/layout/mega_moe_dcu.cuh>
+#include <mega_moe_dcu/comm.cuh>
+#include <mega_moe_dcu/layout.cuh>
 using int32x2_t = int __attribute__((ext_vector_type(2)));
 using int32x4_t = int32_t __attribute__((ext_vector_type(4)));
 using float32x2_t = float __attribute__((ext_vector_type(2)));

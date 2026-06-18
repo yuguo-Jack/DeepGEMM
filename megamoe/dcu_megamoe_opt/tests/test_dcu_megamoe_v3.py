@@ -8,15 +8,15 @@ import pytest
 import torch
 
 
-ROOT = Path(__file__).resolve().parents[1]
-V3_CONFIG_PATH = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "v3_config.py"
-V3_LAYOUT_PATH = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "v3_layout.py"
-LARGE_OPT_PATH = ROOT / "megamoe" / "large_opt.py"
+ROOT = Path(__file__).resolve().parents[3]
+V3_CONFIG_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "v3_config.py"
+V3_LAYOUT_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "v3_layout.py"
+OPT_PATH = ROOT / "megamoe" / "opt.py"
 SETUP_PATH = ROOT / "setup.py"
-MEGA_DCU_API_PATH = ROOT / "csrc" / "apis" / "mega_dcu.hpp"
-K1_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "K1_fused"
-K2_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "K2_fused"
-K3_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_large_opt" / "K3_fused"
+MEGA_DCU_API_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "csrc" / "apis" / "mega_dcu.hpp"
+K1_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_opt" / "K1_fused"
+K2_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_opt" / "K2_fused"
+K3_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_opt" / "K3_fused"
 
 
 def load_module(name: str, path: Path):
@@ -145,9 +145,9 @@ def test_v3_build_surface_is_minimal_and_explicit():
         "k3_v3_stub_ext.cu",
         "DG_BUILD_MEGAMOE_V3_K1_RAW_KERNELS",
         "DG_BUILD_MEGAMOE_V3_K3_RAW_KERNELS",
-        "large_opt_k1_sources",
-        "large_opt_k3_sources",
-        "large_opt_k3_v3_ext",
+        "opt_k1_sources",
+        "opt_k3_sources",
+        "opt_k3_v3_ext",
     ):
         assert retired not in setup_source
 
@@ -190,7 +190,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "prob.reserved_c0 |= 4u" in k1_asm_ext
     assert "use_compact_prebuild ? 2u : 4u" not in k1_asm_ext
     assert "kK1AutoCompactMinLocalTileSaving" in k1_asm_ext
-    assert "kK1AutoCompactLargeTilesPerExpert" in k1_asm_ext
+    assert "kK1AutoCompactHighTilesPerExpert" in k1_asm_ext
     assert "label_SymmRouteStoreAbsolutePtr" not in k1_asm_sources
     assert "label_SymmStageLoadAbsolutePtr" not in k1_asm_sources
     assert "absolute 64-bit" not in k1_asm_sources
@@ -237,7 +237,7 @@ def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
     production_sources = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (
-            LARGE_OPT_PATH,
+            OPT_PATH,
             K1_FUSED_DIR / "k1_v3_fused_ext.cu",
             K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh",
             K2_FUSED_DIR / "k2_fused.py",
@@ -278,24 +278,26 @@ def test_v3_ll_capacity_headroom_covers_256_and_512_exact_buckets():
 
 def test_v3_normal_graph_runtime_work_is_limited_without_d2h():
     k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
-    k2_ext = (ROOT / "megamoe" / "dcu_megamoe_large_opt" / "K2_fused" / "k2_fused_ext.cu").read_text(encoding="utf-8")
-    large_opt_source = LARGE_OPT_PATH.read_text(encoding="utf-8")
+    k2_ext = (ROOT / "megamoe" / "dcu_megamoe_opt" / "K2_fused" / "k2_fused_ext.cu").read_text(encoding="utf-8")
+    opt_source = OPT_PATH.read_text(encoding="utf-8")
 
     assert "runtime_limited_init" in k1_ext
     assert "const int init_rows = runtime_limited_init != 0 ? active_rows : capacity_rows;" in k1_ext
     assert "runtime_num_tokens == nullptr ? 0 : 1" in k1_ext
     assert "runtime_num_tokens != nullptr\n            ? 12" in k1_ext
     assert "if (!has_actual_m && active_tiles != nullptr && active_tile_m > 0)" in k2_ext
-    assert "K_K2_GRAPH_ROW_BLOCKS = 8192" in large_opt_source
-    assert "active_tiles=k2_active_tiles" in large_opt_source
-    assert "state.scratch.k1_active_tiles if v3_backend != V3_BACKEND_LL else None" in large_opt_source
+    assert "K_K2_GRAPH_ROW_BLOCKS = 8192" in opt_source
+    assert "active_tiles=k2_active_tiles" in opt_source
+    assert "state.scratch.k1_active_tiles if v3_backend != V3_BACKEND_LL else None" in opt_source
 
 
 def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     api_source = (ROOT / "megamoe" / "__init__.py").read_text(encoding="utf-8")
     c_api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
-    test_source = (ROOT / "tests" / "test_mega_moe_dcu.py").read_text(encoding="utf-8")
-    large_opt_source = LARGE_OPT_PATH.read_text(encoding="utf-8")
+    test_source = (
+        ROOT / "megamoe" / "dcu_megamoe_opt" / "tests" / "test_mega_moe_dcu.py"
+    ).read_text(encoding="utf-8")
+    opt_source = OPT_PATH.read_text(encoding="utf-8")
 
     assert "megamoe_backend: str = V3_BACKEND_NORMAL" in api_source
     assert "graph: bool = False" in api_source
@@ -312,7 +314,7 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "fp8_mega_moe_with_graph_tokens" not in c_api_source
     assert "launch_mega_moe_multirank_persistent" not in c_api_source
 
-    graph_signature = large_opt_source.split("def _run_large_opt_3stage_graph(", 1)[1].split(
+    graph_signature = opt_source.split("def _run_opt_3stage_graph(", 1)[1].split(
         ") -> None:",
         1,
     )[0]
@@ -346,7 +348,7 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
 
 def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
-    large_opt_source = LARGE_OPT_PATH.read_text(encoding="utf-8")
+    opt_source = OPT_PATH.read_text(encoding="utf-8")
 
     assert "staged_pack5_shape" in api_source
     assert "num_ranks == 8 && num_experts == 256 && num_topk == 6" in api_source
@@ -363,11 +365,11 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     assert "dcu_route_tile_scratch_layout(" not in api_source
     assert "std::max(v3_staged" not in api_source
 
-    assert "def _v3_staged_capacity_rows(" in large_opt_source
-    assert "normal_token_threshold()" not in large_opt_source
-    assert "normal_backend_forced()" not in large_opt_source
-    assert "K_K1_ASM_LAUNCH_ARGS_BYTES = 256" in large_opt_source
-    assert "capacity_rows * intermediate_hidden * 2" in large_opt_source
+    assert "def _v3_staged_capacity_rows(" in opt_source
+    assert "normal_token_threshold()" not in opt_source
+    assert "normal_backend_forced()" not in opt_source
+    assert "K_K1_ASM_LAUNCH_ARGS_BYTES = 256" in opt_source
+    assert "capacity_rows * intermediate_hidden * 2" in opt_source
 
     for py_name, cpp_name in (
         ("K_K1_ROUTE_TILE_M", "kK1RouteTileM"),
@@ -383,7 +385,7 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
         ("K_PROB_STORAGE_BYTES", "kProbStorageBytes"),
         ("K_TAIL_DONE_COUNTER_RING_SLOTS", "kTailDoneCounterRingSlots"),
     ):
-        assert source_int(large_opt_source, py_name) == source_int(api_source, cpp_name)
+        assert source_int(opt_source, py_name) == source_int(api_source, cpp_name)
 
     for mirrored_name in (
         "ll_capacity_rows",
@@ -393,6 +395,6 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
         "tail_signal_addrs_offset",
     ):
         assert mirrored_name in api_source
-        assert mirrored_name in large_opt_source
+        assert mirrored_name in opt_source
     assert "capacity_rows * static_cast<int64_t>(hidden)" in api_source
-    assert "capacity_rows * hidden" in large_opt_source
+    assert "capacity_rows * hidden" in opt_source

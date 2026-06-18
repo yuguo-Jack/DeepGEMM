@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$repo_dir"
 
 python_bin="python"
@@ -14,7 +14,7 @@ wheel_dir="$build_dir/whl"
 
 rm -rf "$build_dir" dist ./*.egg-info
 rm -f megamoe/_C*.so deep_gemm/_C*.so
-find megamoe/dcu_megamoe_large_opt -type f \( -name '*_ext*.so' -o -name '*.co' -o -name '*.o' -o -name '*.hip' \) -delete 2>/dev/null || true
+find megamoe/dcu_megamoe_opt -type f \( -name '*_ext*.so' -o -name '*.co' -o -name '*.o' -o -name '*.hip' \) -delete 2>/dev/null || true
 mkdir -p "$wheel_dir"
 
 "$python_bin" setup.py \

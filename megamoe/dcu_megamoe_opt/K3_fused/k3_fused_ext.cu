@@ -16,9 +16,9 @@
 #include <string>
 #include <vector>
 
-#include <deep_gemm/common/mega_moe_dcu.cuh>
-#include <deep_gemm/comm/mega_moe_dcu.cuh>
-#include <deep_gemm/layout/mega_moe_dcu.cuh>
+#include <mega_moe_dcu/common.cuh>
+#include <mega_moe_dcu/comm.cuh>
+#include <mega_moe_dcu/layout.cuh>
 
 #define K3_HIP_CHECK(expr)                                                       \
     do {                                                                        \
