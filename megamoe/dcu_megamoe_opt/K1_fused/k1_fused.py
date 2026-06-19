@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from ..v3_config import normalize_v3_backend
+from ..v3_config import normalize_v3_backend, unified_weight_layout_enabled
 from . import k1_fused_ext as _ext
 
 
@@ -16,6 +16,8 @@ FUSED_L1_ASM_NAME = (
 )
 FUSED_L1_ASM_PACK5_NAME = f"{FUSED_L1_ASM_NAME}_PACK5"
 FUSED_L1_ASM_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_PACK5_NAME}.co"
+FUSED_L1_ASM_UNIFIED_PACK5_NAME = f"{FUSED_L1_ASM_NAME}_UNIFIED_PACK5"
+FUSED_L1_ASM_UNIFIED_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_UNIFIED_PACK5_NAME}.co"
 
 K1_SUPPORTED_RANKS = 8
 K1_SUPPORTED_EXPERTS = 256
@@ -52,12 +54,17 @@ def _check_fused_l1_shape(
 
 
 def ensure_fused_l1_asm_pack5_code_object() -> Path:
-    if not FUSED_L1_ASM_PACK5_CO.exists():
+    co = (
+        FUSED_L1_ASM_UNIFIED_PACK5_CO
+        if unified_weight_layout_enabled()
+        else FUSED_L1_ASM_PACK5_CO
+    )
+    if not co.exists():
         raise FileNotFoundError(
-            f"prebuilt K1 V3 pack5 asm code object not found: {FUSED_L1_ASM_PACK5_CO}. "
+            f"prebuilt K1 V3 pack5 asm code object not found: {co}. "
             "Rebuild and reinstall the megamoe wheel."
         )
-    return FUSED_L1_ASM_PACK5_CO
+    return co
 
 
 def load_extension(verbose: bool = False):

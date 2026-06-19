@@ -7397,3 +7397,265 @@
 | normal graph capture8192 | normal | replay 512/4096/8192 | correct, `1.874/5.665/10.516 ms` |
 | ll uneven eager | ll | 512 bucket | correct after zero-token fix |
 | normal uneven graph | normal | replay 512/2048 | correct |
+
+## 2026-06-18 - single V3 pack5 weight ABI investigation
+
+- 框架接入发现重大 ABI 问题：normal 与 LL 曾分别使用
+  `flatten_pack5_weight_asm_normal()` 和 `flatten_pack5_weight()`，这会要求显存里保留两套 L1/L2 weight，不能作为生产接口。
+- 当前目标：normal/LL 必须复用一套 pack5 weight layout；统一后各场景性能不能劣化，只能持平或更好。
+- 历史原因复核：normal ASM bring-up 为了复用原 ASM lane/store schedule，引入了 plain `ni` 的 `pack5_weight_asm_normal()`；LL/C pack5 则使用 transposed physical-`ni` layout 来匹配其 B load / MMAC lane 映射。这是临时 bring-up 分叉，不是可接受的框架 ABI。
+- 已验证方案 A（normal/plain layout 作为单 ABI）：
+  - source guard/py_compile/build 均可过；
+  - normal eager 512/4096 correctness 与性能正常；
+  - LL correctness 可过，但 32/128/256/512 token 性能明显回退：plain direct-mapped 约 `0.865/3.346 ms`（32/512），对比 old-like LL transposed 约 `0.645/0.846/1.277/2.292 ms`。
+- 当前正在验证方案 A 的最小优化：保持 plain layout 的连续 B load，在寄存器里按 `(ld_row & 3) * 4 + (ld_row >> 2)` 做 B-side `__shfl`，避免之前 direct mapped load 破坏 coalescing。该方案不新增 kernel，不引入 D2H/H2D 同步。
+- 若寄存器 shuffle 仍无法恢复 LL 历史性能，则切换到方案 B：以 LL transposed layout 作为单 ABI，修改 normal K1/K3 ASM 的 pack5 `ni` 地址映射来消费该 layout；若仍不满足，再评估第三种共同 layout。
+- 方案 A 结果：B-side register shuffle correctness 通过，但 LL `32/128/256/512` 为 `0.690/0.902/1.376/2.501 ms`，仍慢于 old-like transposed `0.645/0.846/1.277/2.292 ms`，不满足 LL 不劣化。
+- 当前切换到方案 B：保留唯一 public helper `flatten_pack5_weight()` 作为 LL transposed single ABI；`pack5_weight_asm_normal()` / `flatten_pack5_weight_asm_normal()` alias 已删除，source test 负向断言防止再次出现第二套 helper。normal K1/K3 ASM pack5 offset 初始化增加 `logical ni -> physical ni` 映射，目标是在不改 LL 热循环的前提下让 normal 消费同一套 weight。
+- 方案 B 当前安全版本：normal K1/K3 ASM 只在 global weight offset 初始化处增加 `logical ni -> physical ni` 映射，local-read/LDS fragment schedule 保持原 ASM 形态；normal tail smoke 512 correctness 通过、fused `1.783 ms`，4096 correctness 通过、fused `6.276 ms`。
+- 已证伪方案 B 的 local-read / LDS fragment remap 变体：512 tail `2.224 ms`、4096 tail `7.674 ms`、4096 no-tail `7.589 ms`，明显慢于 global-offset 映射。结合 DCU KB 对 MMAC/LDS fragment layout 敏感性的提示，该方向不再作为生产候选继续推进。
+- 当前 Phase 14 不是固定押注某个 layout：normal/plain ABI 与 LL/transposed ABI 都可继续 A/B；只有最终单 ABI 且 LL/normal 全场景性能不明显劣化才算收口。若 A/B 都不能满足，再进入共同 layout 重新设计。
+- CUDA MegaMoE 参考结论：本工程 CUDA 路径对外只暴露一套 transformed MegaMoE weight ABI，内部 fused pipeline 消费同一权重合同；DCU 也应保持单 public pack5 ABI，不能让框架保存 normal/LL 两套权重。
+- 2026-06-18 复核：远端卡空后同步当前工作区，强制删除 PACK5 `.co` 并重编，`MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，`PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 9/9 通过。
+- 当前 single-ABI/global-offset 代表 smoke：
+  - LL eager 32/512 correctness 通过，`0.637/2.275 ms`，守住 transposed 历史基线；
+  - LL graph capture8192 replay 32/512 correctness 通过；使用 `--num-tokens 8192` 跑 graph baseline 会因测试侧 DeepGEMM baseline 分配触发 OOM，需与 kernel/ABI 问题区分；
+  - normal 512 no-tail/tail correctness 通过，复测 `1.746/1.775 ms`；首轮 `1.902 ms` 判定为抖动，不作为回归结论；
+  - normal 4096 tail correctness 通过，`6.260 ms`，与当前 global-offset 方案一致。
+- 继续复核后的当前候选 B 代表 smoke（远端 `hygon_tmp/debug/single_abi_smoke_current/`）：
+  - LL eager 32 correctness 通过，`0.643 ms`；
+  - LL eager 512 correctness 通过，`2.293 ms`；
+  - normal tail 512 correctness 通过，`1.776 ms`；
+  - normal tail 4096 correctness 通过，`6.259 ms`。
+- 额外 plain-layout 反证：临时只把 `pack5_weight()` 改回 plain `ni`，LL kernel 保持连续 B load 和原 store 合同不动，LL 32 correctness 失败，`max_abs=0.089599609375`。说明 LL transposed layout 不是单纯的输出列命名差异，B operand lane/MMAC 合同会被破坏。
+- plain-layout 若继续靠输出列 remap 修复，K1/K3 都需要把当前 `bf16x4` 连续写拆成按 `ni` permutation 的非连续标量/散写；这会直接破坏当前 LL/normal 热路径的向量 store 形态，不满足“性能不能劣化”的生产约束，除非后续有新的 MMAC C-fragment layout 证据。
+- helper surface cleanup：`v3_layout.py` 已删除 `pack5_weight_asm_normal()` / `flatten_pack5_weight_asm_normal()`，source guard 改为负向断言；远端 `PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 通过，`9/9`。
+- full matrix 暂缓：准备继续跑 Phase 14 LL/normal eager+graph 全矩阵时，远端 8 卡被 SGLang 服务占用，`hy-smi` 显示 8 卡 VRAM `88%`、HCU `0%`，进程为 `/usr/local/bin/sglang serve ... --mem-fraction-static 0.82`；按约束不 kill 他人进程，等待卡空后继续。
+- 当前结论：LL transposed single ABI 是当前唯一守住 LL 的方向；normal 已功能可用且小档位稳定，大 token 仍比旧双-layout normal 最优有差距。下一步只评估低风险 normal ASM global-load/LDS-write remap 或 fragment schedule 恢复点；local-read fragment remap 已证伪，不再重复。
+- 继续工作复核：
+  - 本地 `git diff --check` 通过；
+  - 远端已同步当前 9 个改动文件；
+  - 远端 `PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 通过，`9/9`；
+  - 远端 `python3 -m compileall megamoe/__init__.py megamoe/opt.py megamoe/dcu_megamoe_opt/v3_layout.py megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py megamoe/dcu_megamoe_opt/K1_fused/k1_fused.py megamoe/dcu_megamoe_opt/K3_fused/k3_fused.py` 通过；
+  - 源码扫描确认生产目录/README/setup 内无 `dcu_megamoe_large_opt`、旧 `large_opt`、`MEGAMOE_DCU_V3_BACKEND`、`USE_MEGAMOE_V3`、`sglang_debug` 残留；`*asm_normal*` 只在负向 source test 中出现；
+  - ASM patch 复核：新增 `logical ni -> physical ni` 只在 K1/K3 pack5 weight global offset 初始化处，且复用同一段随后 `GLOBAL_OFFSET_A ..., 10` 已作为 scratch 使用的 `v10` 临时寄存器，没有扩散到 GEMM 主循环或 epilogue。
+- 当前远端仍不适合跑性能矩阵：`hy-smi` 显示 8 卡 VRAM `91-92%`、HCU `0%`；宿主进程显示 SGLang serve/bench 仍在占用显存。按用户约束不清理他人进程，等待卡空后继续 Phase 14 全矩阵。
+
+## 2026-06-18 - Phase 14 single ABI full matrix refresh
+
+- 远端卡空后继续 Phase 14，输出目录：
+  `hygon_tmp/debug/phase14_single_abi_20260618_173220`。
+- 当前候选仍为 LL transposed single ABI：`v3_layout.flatten_pack5_weight()` 是唯一 public pack5 helper，normal K1/K3 ASM 在 weight global offset 初始化处做 `logical ni -> physical ni` 映射；LL 热循环不改。
+- 已完成补测：
+  - LL eager `8,32,33,64,128,129,256,257,512,513`；
+  - LL graph capture8192 replay `8,32,33,64,128,129,256,257,512,513`；
+  - normal eager `256,512,1024,1025,2048,2050,3072,4096,4097,8192`；
+  - normal graph capture8192 replay 同一 normal 列表；
+  - LL/normal eager uneven、LL/normal graph uneven smoke；
+  - README script smoke、README LL graph smoke、README normal graph smoke。
+- 正确性结论：上述所有 case 均 `correct=True`，graph bucket 每个 replay token 的 baseline 对照均通过；测试后 `hy-smi --showpids` 显示无 KFD 残留进程。
+
+### Phase 14 LL matrix
+
+| tokens/rank | eager ms | graph ms (capture8192) |
+| ---: | ---: | ---: |
+| 8 | 0.600 | 0.562 |
+| 32 | 0.643 | 0.652 |
+| 33 | 0.651 | 0.663 |
+| 64 | 0.693 | 0.703 |
+| 128 | 0.846 | 0.844 |
+| 129 | 0.853 | 0.856 |
+| 256 | 1.260 | 1.298 |
+| 257 | 1.262 | 1.306 |
+| 512 | 2.294 | 2.275 |
+| 513 | 2.264 | 2.282 |
+
+### Phase 14 normal matrix
+
+| tokens/rank | eager ms | graph ms (capture8192) |
+| ---: | ---: | ---: |
+| 256 | 1.668 | 1.710 |
+| 512 | 1.769 | 1.859 |
+| 1024 | 2.061 | 2.197 |
+| 1025 | 2.193 | 2.173 |
+| 2048 | 3.585 | 3.625 |
+| 2050 | 3.547 | 3.621 |
+| 3072 | 5.069 | 4.890 |
+| 4096 | 6.283 | 6.107 |
+| 4097 | 6.260 | 6.120 |
+| 8192 | 11.776 | 11.355 |
+
+### Phase 14 functional smoke
+
+| case | correct | backend | execution |
+| --- | :---: | --- | --- |
+| ll_eager_uneven | true | ll | v3_staged |
+| ll_graph_uneven | true | ll | v3_ll_graph |
+| normal_eager_uneven | true | normal | v3_staged |
+| normal_graph_uneven | true | normal | v3_normal_graph |
+| readme script 128 | true | ll | v3_staged |
+| readme script 512 | true | normal | v3_staged |
+| readme LL graph | true | ll | v3_ll_graph |
+| readme normal graph | true | normal | v3_normal_graph |
+
+- 性能判断：
+  - LL single ABI 基本守住历史 transposed 基线：8-token graph 仍在 `~0.56 ms`，512/513 eager/graph 仍在 `~2.26-2.29 ms` 档。
+  - normal single ABI 正确性完整，但 4096/8192 相比旧双-layout normal 最优仍有明显 gap：当前 4096 eager `6.283 ms`、8192 eager `11.776 ms`，旧最新矩阵约 `5.83 ms`、`10.88 ms`；graph 同样比旧最新矩阵慢。
+  - 因此 Phase 14 不能直接标记为“性能不劣化 complete”。当前候选 B 解决了框架单 weight ABI 的大问题，但 normal ASM 仍需要继续找低风险恢复点，或承认 single ABI 下 normal 有性能代价后再由用户决策。
+- 已证伪方向仍保持不变：
+  - plain layout + LL direct mapped load 慢；
+  - plain layout + LL B-side register shuffle 慢；
+  - plain layout + 不改 LL 合同会直接 correctness fail；
+  - transposed layout + normal local-read/LDS fragment remap 慢。
+- 下一步推荐：
+  - 不再重复上述已证伪变体；
+  - 只继续看 normal ASM 在 single transposed ABI 下能否恢复 global-load/LDS-write/fragment schedule 的吞吐，且必须保持 LL 不动；
+  - 若没有低风险证据，则进入共同 layout 重新设计评估，而不是在 LL 热循环加稳定 shuffle 成本。
+
+## 2026-06-18 - Phase 14 normal gap code-object check
+
+- 远端对三份 PACK5 ASM code object 解析 AMDGPU metadata：
+  - K1 dispatch-pull pack5：`.text=78028 bytes`，`SGPR=102`，`VGPR=255`，`spill=0`，`LDS=65536`；
+  - K3 combine pack5：`.text=84820 bytes`，`SGPR=102`，`VGPR=255`，`spill=0`，`LDS=65536`；
+  - K3 combine tail-reduce pack5：`.text=89856 bytes`，`SGPR=102`，`VGPR=255`，`spill=0`，`LDS=65536`。
+- 结论：single ABI 的 normal 性能差距不来自寄存器数、spill、LDS 或 occupancy 级资源退化；当前 ASM patch 只在 global weight offset 初始化处增加 `logical ni -> physical ni` 映射，主循环资源形态保持原 ASM 上限。
+- 更可能的根因：normal ASM 原先按 plain pack5 `ni=0..15` 做连续 global load；切到 LL-transposed single ABI 后，normal lane 访问 physical `ni=((ni&3)<<2)+(ni>>2)`，形成 `0,4,8,12,1,5,9,13,...` 的跨组顺序，削弱 global load locality/coalescing。
+- 后续只做有证据的 normal 恢复点：
+  - 尝试恢复 global-load coalescing 时，必须同时保证 LDS write / local-read / MMAC fragment 合同仍成立；
+  - 不再重复 local-read/LDS fragment remap、LL hot-loop shuffle、plain layout direct load 或标量散写补救；
+  - 验收至少覆盖 LL `32/512` 与 normal `512/4096/8192`，并以 Phase 13/latest matrix 作为不劣化基线。
+
+## 2026-06-18 - Phase 14 store-side remap candidate rejected
+
+- 目的：在保留 LL-transposed single ABI 的前提下，尝试让 normal ASM 恢复连续 physical `ni` 取数，再在 epilogue/store 侧做 physical->logical remap，试图追回 normal 4096/8192 的 global-load locality。
+- 结果：candidate 编译通过，但 normal tail 4096 correctness 失败，`max_abs=0.114990234375 > 0.0035`；说明问题不是简单的输出列排列，global load、LDS/MMAC fragment、scale/epilogue store 之间存在更紧的合同。
+- 恢复：已回退该 candidate，只保留当前安全的 global-offset `logical ni -> physical ni` 映射；远端重新同步三份 ASM、强制重编 PACK5 code object 后，normal tail 4096 smoke correctness 通过，`max_abs=0.000488281`，fused `6.271457 ms`。
+- DCU KB 侧证据：Hygon matrix-load / MMAC 相关资料强调 LDS layout 是指令 fragment 合同的一部分；当前 ASM 的 `buffer_load_dwordx4 ... lds` 使用 scalar `m0` 作为 LDS destination，无法低成本按 lane 做 LDS write remap。若改回连续 global load，仍要重新证明 LDS write/local-read/MMAC fragment/scale 的完整合同。
+- 结论：store-side remap 方向标记为反证，不再重复；下一步若继续优化 normal，只考虑有 profiling/ISA 或 source-backed fragment 合同证据的方案，不能靠单点 permutation 猜测推进。
+
+## 2026-06-18 - CUDA MegaMoE reference checked for single ABI
+
+- 复核本工程 CUDA MegaMoE：CUDA 侧 L1/L2 GEMM 根据 phase 选择一套 tensor-map weight descriptor，框架接口不暴露 normal/LL 两套权重；其 scheduler、workspace 和 combine metadata 都围绕单 ABI 组织。
+- CUDA epilogue 里存在“shared memory store layout 与 remote combine read/write layout 不同”的结构，但它依赖 SM100 TMA/TMEM/STSM 和 CUDA-specific swizzle；不能直接迁移到 DCU ASM 的 `buffer_load_dwordx4 ... lds` / `ds_read_b128` / MMAC fragment 合同。
+- 结论：CUDA 参考支持“接口必须单 ABI”的设计，不支持直接照搬一个低风险 DCU normal remap patch。DCU 继续优化必须基于 Hygon/DCU ISA、KB 或最小正确性/性能实验证据。
+
+## 2026-06-18 - Phase 14 single ABI decision accepted
+
+- 决策：采用当前 LL transposed single ABI + normal ASM global-offset `logical ni -> physical ni` 映射版本作为生产候选；这是 4096 normal 约 `6.2 ms` 的安全版本。
+- 取舍：框架侧只需保存一套 pack5 L1/L2 weight，避免 normal/LL 双 layout 显存成本；LL eager/graph 基本守住历史基线，normal 相比旧双-layout 最优有小幅回退但已接受。
+- 保留边界：已证伪的 plain ABI + LL direct mapped load、plain ABI + LL B-side shuffle、normal local-read/LDS fragment remap、normal store-side remap 均不再重复；后续只作为有证据的性能 backlog 继续看 global-load coalescing、LDS write/fragment 合同或共同 layout 设计。
+
+## 2026-06-18 - Phase 14 extended normal eager degradation sweep
+
+- 输出目录：`hygon_tmp/debug/phase14_degradation_sweep_20260618_212444`。
+- 口径：normal eager，uniform tokens，`num_max_tokens_per_rank=8192`，`hidden=4096`，`intermediate=2048`，`experts=256`，`topk=6`，`correctness_iters=1`，`warmup=3`，`repeat=8`。
+- 目的：在用户接受 4096 `~6.2 ms` single ABI 版本后，补更多 size 看相对 Phase 13/latest 双-layout normal eager 的劣化比例。
+
+| tokens/rank | current single ABI eager ms | Phase 13/latest eager ms | delta |
+| ---: | ---: | ---: | ---: |
+| 256 | 1.650 | 1.632 | +1.1% |
+| 384 | 1.713 | n/a | n/a |
+| 512 | 1.796 | 1.757 | +2.2% |
+| 768 | 1.918 | n/a | n/a |
+| 1024 | 2.079 | 2.035 | +2.2% |
+| 1280 | 2.338 | n/a | n/a |
+| 1536 | 3.213 | n/a | n/a |
+| 1792 | 3.369 | n/a | n/a |
+| 2048 | 3.550 | 3.348 | +6.0% |
+| 2560 | 4.132 | n/a | n/a |
+| 3072 | 5.038 | 4.774 | +5.5% |
+| 3584 | 5.499 | n/a | n/a |
+| 4096 | 6.303 | 5.832 | +8.1% |
+| 5120 | correctness fail | n/a | blocker |
+| 6144 | 9.461 | n/a | n/a |
+| 7168 | 10.940 | n/a | n/a |
+| 8192 | 11.749 | 10.875 | +8.0% |
+
+- 5120 correctness 复现：
+  - initial perf sweep 在 5120 失败，rank7 `max_abs=0.059478759765625 > 0.0035`；
+  - `--skip-bench --correctness-iters 3` 复现，rank5 `max_abs=0.0093536376953125`；
+  - cap5120/cap8192、tail/no-tail 均失败；
+  - `K1_PREBUILD_MODE=asm` 与 `compact` 均失败；
+  - 6144/7168/8192 correctness-only 与 perf 单次均通过。
+- 当前判断：5120 不是单纯性能劣化，也不是 K1 prebuild auto、tail-reduce 或 8192 capacity 的单点问题；需要作为 Phase 14 必做 follow-up 定位，不能把当前 single ABI 结论外推到所有 normal token size。
+
+## 2026-06-18 - Phase 14 normal 5120 route-capacity fix
+
+- 根因确认：normal K1 route capacity 原先使用固定 `expected_per_expert + 64` slack。5120 tokens/rank 时 `expected_per_expert=960`，加 64 后刚好是 1024 rows/expert（4 个 256-row tile），随机 topk 路由可让部分 expert 超过 1024，从而掉行并造成 correctness failure。
+- 关键证据：5120 uniform 在 tail/no-tail、`K1_PREBUILD_MODE=asm/compact` 下均可失败；而轻微 uneven `5121,5120,...` 可通过，因为 `expected_per_expert` 从 960 跳到 961，`961+64=1025` 后 tile 对齐到 1280 rows/expert。
+- 修复：K1 执行侧和 `mega_dcu.hpp` route_scratch size 估算统一改为动态 headroom：`max(64, ceil(expected_per_expert / 10))`。这不会特化 5120，也不新增 kernel、D2H 或 H2D sync；4096/8192 等已验证档位的 tile 档基本不变，5120 这类边界会自然获得下一档容量。
+- 远端 build：同步 `k1_fused_ext.cu` 和 `mega_dcu.hpp` 到 `/workspace/DeepGEMM`，`python3 setup.py build_ext --inplace` 通过。
+- 远端验证：
+
+| case | result | fused median ms |
+| --- | --- | ---: |
+| normal 5120 tail | correct, max_abs=0.000488281 | correctness-only |
+| normal 5120 no-tail | correct, max_abs=0.000488281 | correctness-only |
+| normal 5120 tail perf | correct, max_abs=0.000488281 | 8.182 |
+| normal graph capture8192 replay5120 | correct, max_abs=0.000488281 | 8.032 replay-only |
+| normal 4096 tail perf | correct, max_abs=0.000488281 | 6.248 |
+| normal 8192 tail perf | correct, max_abs=0.000488281 | 11.712 |
+| LL 512 eager | correct, max_abs=0.000488281 | 2.283 |
+| LL 513 eager | correct, max_abs=0.000488281 | 2.303 |
+
+- 结论：5120 correctness blocker 已修复；LL 不走 normal K1 ASM 的同一路由容量边界，但本次 smoke 也确认 LL 512/513 未受影响。normal 5120 性能处于 4096 与 8192 之间，趋势合理。
+
+## 2026-06-19 - Phase 14 default dual layout restored
+
+- 用户重新明确：当前 unified/single layout 可通过环境变量保留，但默认状态应使用 LL/normal 双 layout，框架 PD 分离时可以加载两份 weight；目标回到“各自 layout/kernel 追极致性能”，性能不能低于历史最佳。
+- 代码策略：
+  - 默认 `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=0`：LL 使用 `flatten_pack5_weight()` transposed pack5，normal 使用 `flatten_pack5_weight_asm_normal()` plain pack5；
+  - `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1`：LL/normal 共享 transposed pack5，并加载 `_UNIFIED_PACK5` ASM code object；
+  - public API 支持 weight dict：`{"ll": ..., "normal": ...}` 或 `{"unified": ...}`，按 `megamoe_backend` / env 选择。
+- 构建验证：
+  - 同步远端 `/workspace/DeepGEMM`；
+  - `python3 -m compileall megamoe setup.py` 通过；
+  - `PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 通过，`9/9`；
+  - 删除旧 `*PACK5.co` 后 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，6 个 PACK5/UNIFIED_PACK5 code object 均刷新。
+- 远端卡状态：测试前 `hy-smi --showpids` 显示无 KFD 进程，8 卡 HCU/VRAM 均空闲。
+- 默认 dual layout eager 代表结果，输出目录 `hygon_tmp/debug/dual_layout_recheck_20260619_075247`：
+
+| case | correct | fused median ms |
+| --- | :---: | ---: |
+| LL 32 | true | 0.641 |
+| LL 512 | true | 2.297 |
+| normal 512 | true | 1.753 |
+| normal 4096 | true | 5.798 |
+| normal 5120 | true | 7.403 |
+| normal 8192 | true | 10.886 |
+| unified normal 4096 | true | 6.274 |
+
+- graph 代表结果，输出目录 `hygon_tmp/debug/dual_layout_graph_recheck_20260619_075839`：
+
+| case | replay tokens | correct | replay median ms |
+| --- | ---: | :---: | ---: |
+| dual LL graph capture8192 | 32 | true | 0.661 |
+| dual LL graph capture8192 | 512 | true | 2.258 |
+| dual normal graph capture8192 | 4096 | true | 5.687 |
+| dual normal graph capture8192 | 8192 | true | 10.485 |
+| unified normal graph capture8192 | 4096 | true | 6.180 |
+
+- 结论：
+  - 默认 dual layout 恢复 normal 历史最佳档位：4096 回到 `~5.8 ms`，8192 回到 `~10.9 ms`；
+  - LL transposed 路径没有回退，32/512 仍在历史 `~0.64/~2.29 ms` 档；
+  - unified/single layout 功能正确但 normal 4096 仍约 `6.2 ms`，因此只作为单权重/显存兼容开关，不作为默认性能路径；
+  - 后续如果继续挖 layout，默认允许 LL/normal 两套 kernel/code object 隔离，不强制复用；任何候选必须同时过 LL 32/512 与 normal 512/4096/5120/8192 的 correctness/perf gate。
+
+## 2026-06-19 - Phase 14 dual-layout re-exploration checkpoint
+
+- 目标：按用户要求重新评估“双 layout 的各自 layout 是否仍是最优”，允许 LL/normal kernel/code object 完全隔离，默认性能路径不强求复用。
+- 本轮证据：
+  - DCU KB 检索 `matrix-load / ds_read / MMAC` 相关条目，结论强调 LDS layout 是 matrix/MMAC 指令合同的一部分，global-to-LDS、LDS read、MMAC fragment、epilogue store 不能只靠单点 `ni` permutation 猜测；
+  - optimizer KB 也提示 FP8/MMAC 路径中 operand packing/rearrangement cost 会直接进入性能账本；
+  - 本工程 CUDA MegaMoE 复核显示 CUDA 侧使用 tensor-map/descriptor 管理 weight layout 和 epilogue layout，但依赖 SM100 TMA/TMEM/STSM 合同，不能直接迁移为 DCU `buffer_load_dwordx4 ... lds` / `ds_read_b128` 的低风险 remap。
+- 当前判断：
+  - LL transposed pack5 仍是 LL C pack5 的最佳已知安全 layout；把 LL 改成 plain layout 或在 LL B-side 做寄存器 shuffle 已经有 correctness/perf 反证；
+  - normal plain pack5 仍是 normal ASM 的最佳已知安全 layout；它保留原 ASM 连续 `ni` global load locality，代表性能已回到 4096 `~5.8 ms`、8192 `~10.9 ms` 档；
+  - unified/single layout 保留为显存/单 ABI 兼容开关，但 normal 4096 `~6.2 ms` 证明它不是默认性能路径。
+- 下一步只允许进入有证据的候选：
+  - LL 方向：必须保持当前 B operand load/MMAC/store 合同，不能为了统一 layout 在热循环加入稳定 shuffle；
+  - normal 方向：如果要改 layout，必须同时闭合 contiguous global load、LDS write、local-read/MMAC fragment 与 scale/epilogue 合同；
+  - 共同 layout 方向：仅在 profiler/ISA/source-backed 证明有机会同时不劣化 LL 和 normal 时再做，不再重复已证伪的 plain-layout LL shuffle、normal local-read/LDS remap、store-side remap。
+- 当前不改生产代码：默认 dual layout 是当前最佳已知性能基线；继续挖掘前优先做 code-object/profiler 证据收集和最小隔离分支，避免把 correctness 风险带回主路径。
+- source-backed 深挖补充：已解析并阅读 `dcu_microbenchmark-instruction_demo/core/tensor_lat_ds_read_matrix/` 中的 `ds_read_m32x16_b16_normalxalt.cpp`、`ds_read_m32x16_b16_altxalt.cpp` 和 `ds_read_m32x16_b16_swizzle.cpp`。这些例子证明 normal/alt/sizzle 可以作为完整 LDS/matrix-read 合同存在，但它们同时改 LDS 写入、读 offset、MMAC operand 解释和 C store 形态，不是可直接套到当前 ASM 的几行 `ni` remap。
+- 当前 normal ASM 仍使用 `buffer_load_dwordx4 ... lds` 通过 `m0` 步进落 LDS，并在主循环中用 `ds_read_b128` 消费 A/B fragments；下一轮如果要尝试 `ds_read_m32x16_b16[_alt]` 或 swizzle，必须作为隔离 code object 分支重建该段 LDS/feed 合同，而不是在默认 PACK5 ASM 上做局部 patch。

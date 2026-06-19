@@ -264,6 +264,21 @@ OPT_ASM_CODE_OBJECTS = [
         project_path(
             'megamoe',
             'dcu_megamoe_opt',
+            'K1_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.s',
+        ),
+        os.path.join(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K1_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.co',
+        ),
+        'K1_CLANG',
+    ),
+    (
+        project_path(
+            'megamoe',
+            'dcu_megamoe_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.s',
         ),
@@ -280,6 +295,21 @@ OPT_ASM_CODE_OBJECTS = [
             'megamoe',
             'dcu_megamoe_opt',
             'K3_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_UNIFIED_PACK5.s',
+        ),
+        os.path.join(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K3_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_UNIFIED_PACK5.co',
+        ),
+        'K3_CLANG',
+    ),
+    (
+        project_path(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.s',
         ),
         os.path.join(
@@ -287,6 +317,21 @@ OPT_ASM_CODE_OBJECTS = [
             'dcu_megamoe_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.co',
+        ),
+        'K3_CLANG',
+    ),
+    (
+        project_path(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K3_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_UNIFIED_PACK5.s',
+        ),
+        os.path.join(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K3_fused',
+            'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_UNIFIED_PACK5.co',
         ),
         'K3_CLANG',
     ),

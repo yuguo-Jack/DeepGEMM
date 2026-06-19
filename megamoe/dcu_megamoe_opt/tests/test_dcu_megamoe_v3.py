@@ -37,9 +37,11 @@ def test_v3_backend_auto_policy(monkeypatch):
     config = load_module("dcu_megamoe_v3_config", V3_CONFIG_PATH)
     monkeypatch.delenv("MEGAMOE_DCU_BACKEND", raising=False)
     monkeypatch.delenv("MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD", raising=False)
+    monkeypatch.delenv("MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT", raising=False)
 
     assert config.BACKEND_ENV == "MEGAMOE_DCU_BACKEND"
     assert config.NORMAL_LL_TOKEN_THRESHOLD_ENV == "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
+    assert config.UNIFIED_WEIGHT_LAYOUT_ENV == "MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT"
     assert config.DEFAULT_NORMAL_LL_TOKEN_THRESHOLD == 256
     for tokens in (0, 1, 8, 32, 128, 256):
         assert config.select_v3_backend(tokens) == "ll"
@@ -62,6 +64,10 @@ def test_v3_backend_auto_policy(monkeypatch):
         config.normal_ll_token_threshold("-1")
     with pytest.raises(ValueError, match="MEGAMOE_DCU_BACKEND"):
         config.select_v3_backend(8, "bogus")
+    assert config.unified_weight_layout_enabled() is False
+    assert config.unified_weight_layout_enabled("1") is True
+    monkeypatch.setenv("MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT", "true")
+    assert config.unified_weight_layout_enabled() is True
 
 
 def reference_pack5_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -84,7 +90,7 @@ def reference_pack5_weight(weight: torch.Tensor) -> torch.Tensor:
     return out.reshape(experts, k // 64, n // 256, 16, 4, 16, 16)
 
 
-def reference_pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
+def reference_plain_pack5_weight(weight: torch.Tensor) -> torch.Tensor:
     experts, n, k = weight.shape
     assert n % 256 == 0 and k % 64 == 0
     out = torch.empty_like(weight).flatten()
@@ -111,17 +117,14 @@ def test_v3_pack5_layout_matches_reference():
         v3_layout.pack5_weight(weight), reference_pack5_weight(weight)
     )
     torch.testing.assert_close(
-        v3_layout.pack5_weight_asm_normal(weight),
-        reference_pack5_weight_asm_normal(weight),
-    )
-    assert not torch.equal(
-        v3_layout.pack5_weight(weight), v3_layout.pack5_weight_asm_normal(weight)
+        v3_layout.pack5_weight_asm_normal(weight), reference_plain_pack5_weight(weight)
     )
     assert v3_layout.flatten_pack5_weight(weight).shape == (2, 512 * 128)
     assert v3_layout.flatten_pack5_weight_asm_normal(weight).shape == (2, 512 * 128)
     assert v3_layout.pack5_shape(2, 512, 128) == (2, 2, 2, 16, 4, 16, 16)
     offset = v3_layout.pack5_flat_offset(expert=1, n=512, k=128, row=257, col=65)
     assert reference_pack5_weight(weight).flatten()[offset] == weight[1, 257, 65]
+    assert not torch.equal(v3_layout.pack5_weight(weight), reference_plain_pack5_weight(weight))
 
 
 def test_v3_build_surface_is_minimal_and_explicit():
@@ -131,8 +134,11 @@ def test_v3_build_surface_is_minimal_and_explicit():
         "k1_v3_fused_ext.cu",
         "k3_v3_fused_ext.cu",
         "MEGAMOE_DISPATCH_PULL_L1_PACK5.s",
+        "MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.s",
         "K3COMBINE_PACK5.s",
+        "K3COMBINE_UNIFIED_PACK5.s",
         "K3COMBINE_TAILREDUCE_PACK5.s",
+        "K3COMBINE_TAILREDUCE_UNIFIED_PACK5.s",
         "'*.cuh'",
     ):
         assert required in setup_source
@@ -174,6 +180,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     )
 
     assert "FUSED_L1_ASM_PACK5_CO" in k1_py
+    assert "FUSED_L1_ASM_UNIFIED_PACK5_CO" in k1_py
     assert "def k1_symm_fused_l1_asm(" not in k1_py
     assert "def k1_symm_fused_l1_asm_graph(" not in k1_py
     assert "ensure_fused_l1_asm_code_object" not in k1_py
@@ -202,6 +209,8 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
 
     assert "K3_COMBINE_PACK5_ASM_CO" in k3_py
     assert "K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO" in k3_py
+    assert "K3_COMBINE_UNIFIED_PACK5_ASM_CO" in k3_py
+    assert "K3_COMBINE_TAIL_REDUCE_UNIFIED_PACK5_ASM_CO" in k3_py
     assert "k3_l2_combine_asm_pack5_out" in k3_py
     assert "k3_l2_combine_asm_tail_reduce_pack5_out" in k3_py
     assert "k3_l2_combine_asm_out" not in k3_asm_ext

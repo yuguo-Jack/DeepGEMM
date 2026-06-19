@@ -1648,7 +1648,7 @@ v_lshrrev_b32 v[vgprPack5OffsetBaseA], 10, v8 // pack5 ko64
 v_lshlrev_b32 v[vgprPack5OffsetBaseA], 18, v[vgprPack5OffsetBaseA] // ko64 * (4096 * 64)
 v_and_b32 v[vgprPack5OffsetTmpA], 0x300, v8 // ks16 * 256
 _v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
-v_and_b32 v[vgprPack5OffsetTmpA], 15, v[vgprSerial] // physical ni for plain ASM-pack5
+v_and_b32 v[vgprPack5OffsetTmpA], 15, v[vgprSerial] // plain pack5 ni for normal ASM
 v_lshlrev_b32 v[vgprPack5OffsetTmpA], 4, v[vgprPack5OffsetTmpA]
 _v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
 

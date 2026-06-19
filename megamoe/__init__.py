@@ -1,6 +1,6 @@
 import os
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -9,6 +9,7 @@ from . import _C
 from .dcu_megamoe_opt.v3_config import (
     V3_BACKEND_NORMAL,
     normalize_v3_backend,
+    unified_weight_layout_enabled,
 )
 
 
@@ -355,6 +356,18 @@ def transform_fp8_weights_for_mega_moe(
     )
 
 
+def _select_v3_weight_layout(weights: Any, backend: str):
+    if isinstance(weights, dict):
+        key = "unified" if unified_weight_layout_enabled() else backend
+        if key not in weights:
+            raise KeyError(
+                f"missing V3 weight layout {key!r}; provide keys 'll'/'normal' "
+                "or 'unified' when MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1"
+            )
+        return weights[key]
+    return weights
+
+
 def deepep_deepgemm_preprocess_channelwise(
     recv_x: torch.Tensor,
     recv_x_scale: torch.Tensor,
@@ -393,8 +406,8 @@ def deepep_deepgemm_postprocess_channelwise(
 
 def fp8_mega_moe(
     y: torch.Tensor,
-    l1_weights: Tuple[torch.Tensor, torch.Tensor],
-    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    l1_weights: Any,
+    l2_weights: Any,
     sym_buffer: SymmBuffer,
     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
     recipe: Tuple[int, int, int] = (1, 1, 32),
@@ -407,6 +420,8 @@ def fp8_mega_moe(
 ):
     call_y = y
     v3_backend = normalize_v3_backend(megamoe_backend)
+    l1_weights = _select_v3_weight_layout(l1_weights, v3_backend)
+    l2_weights = _select_v3_weight_layout(l2_weights, v3_backend)
     if recipe != (1, 1, 32):
         raise ValueError("DCU W8A8 MegaMoE expects recipe=(1, 1, 32)")
     if activation != "swiglu":

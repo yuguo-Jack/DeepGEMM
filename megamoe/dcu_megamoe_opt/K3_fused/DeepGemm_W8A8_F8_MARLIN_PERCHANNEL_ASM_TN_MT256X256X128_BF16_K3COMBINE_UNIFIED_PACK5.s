@@ -2045,7 +2045,11 @@ v_lshrrev_b32 v[vgprPack5OffsetBaseA], 10, v8 // pack5 ko64
 v_lshlrev_b32 v[vgprPack5OffsetBaseA], 18, v[vgprPack5OffsetBaseA] // ko64 * (4096 * 64)
 v_and_b32 v[vgprPack5OffsetTmpA], 0x300, v8 // ks16 * 256
 _v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
-v_and_b32 v[vgprPack5OffsetTmpA], 15, v[vgprSerial] // plain pack5 ni for normal ASM
+v_and_b32 v[vgprPack5OffsetTmpA], 15, v[vgprSerial] // logical ni for ASM lanes
+v_lshrrev_b32 v10, 2, v[vgprPack5OffsetTmpA]
+v_and_b32 v[vgprPack5OffsetTmpA], 3, v[vgprPack5OffsetTmpA]
+v_lshlrev_b32 v[vgprPack5OffsetTmpA], 2, v[vgprPack5OffsetTmpA]
+_v_add_u32 v[vgprPack5OffsetTmpA], v[vgprPack5OffsetTmpA], v10 // physical ni in shared transposed pack5
 v_lshlrev_b32 v[vgprPack5OffsetTmpA], 4, v[vgprPack5OffsetTmpA]
 _v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
 

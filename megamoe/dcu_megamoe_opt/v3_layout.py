@@ -2,7 +2,9 @@
 
 These helpers are intentionally not used by the opt runtime path. V3
 execution expects callers/tests to provide weights that are already in this
-pack5 layout.
+pack5 layout.  The default performance path may provide separate LL and
+normal-ASM pack5 tensors; set MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1 only when
+the caller intentionally uses the shared transposed LL layout for both.
 """
 
 from __future__ import annotations
@@ -91,14 +93,7 @@ def flatten_pack5_weight(weight: torch.Tensor) -> torch.Tensor:
 
 
 def pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
-    """Pack L2 weights for the isolated normal K3 ASM-pack5 experiment.
-
-    The original K3 ASM epilogue stores accumulator lanes in logical `ni`
-    order. The default V3 C/LL pack5 layout uses a transposed physical `ni`
-    order and compensates with an accumulator-lane shuffle before store. This
-    helper keeps the same 5pack tile nesting but leaves `ni` in plain order so
-    the isolated no-tail ASM path can reuse the original store schedule.
-    """
+    """Pack weights in plain ni order for the isolated normal ASM path."""
     if weight.dim() != 3:
         raise ValueError("pack5_weight_asm_normal expects [expert, n, k]")
     experts, n, k = weight.shape
@@ -106,6 +101,7 @@ def pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             "pack5_weight_asm_normal expects n divisible by 256 and k divisible by 64"
         )
+
     view = weight.reshape(
         experts,
         n // PACK5_N256,
@@ -157,6 +153,13 @@ def _pack_fp8_weight_and_scale(weight: torch.Tensor) -> tuple[torch.Tensor, torc
     return flatten_pack5_weight(fp8), scale
 
 
+def _pack_fp8_weight_and_scale_asm_normal(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8, scale = _cast_weight_to_fp8(weight)
+    return flatten_pack5_weight_asm_normal(fp8), scale
+
+
 def transform_fp8_weights_for_mega_moe_v3_pack5(
     l1_bf16: torch.Tensor,
     l2_bf16: torch.Tensor,
@@ -167,3 +170,14 @@ def transform_fp8_weights_for_mega_moe_v3_pack5(
     benchmark execution path.
     """
     return _pack_fp8_weight_and_scale(l1_bf16), _pack_fp8_weight_and_scale(l2_bf16)
+
+
+def transform_fp8_weights_for_mega_moe_v3_pack5_asm_normal(
+    l1_bf16: torch.Tensor,
+    l2_bf16: torch.Tensor,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Transform BF16 L1/L2 weights into normal-ASM plain pack5 layout."""
+    return (
+        _pack_fp8_weight_and_scale_asm_normal(l1_bf16),
+        _pack_fp8_weight_and_scale_asm_normal(l2_bf16),
+    )

@@ -458,16 +458,6 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    v_lshlrev_b32 v159, 3, v158
    buffer_load_dwordx2 v[138:139], v159, s[92:95], 0, offen, offset:\rowptr_offset
 
-   v_add_u32 v163, 16, v151
-   _v_add_co_u32 v164, vcc, v163, s56
-   v_lshlrev_b32 v164, 3, v164
-   buffer_load_dwordx2 v[140:141], v164, s[92:95], 0, offen, offset:\rowptr_offset
-
-   v_add_u32 v165, 24, v151
-   _v_add_co_u32 v166, vcc, v165, s56
-   v_lshlrev_b32 v166, 3, v166
-   buffer_load_dwordx2 v[142:143], v166, s[92:95], 0, offen, offset:\rowptr_offset
-
    v_lshlrev_b32 v148, 9, v151
    v_and_b32 v154, 31, v150
    v_lshlrev_b32 v154, 4, v154
@@ -478,30 +468,16 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    v_add_u32 v161, v161, v154
    ds_read_b128 v[236:239], v161
 
-   v_lshlrev_b32 v163, 9, v163
-   v_add_u32 v163, v163, v154
-   ds_read_b128 v[240:243], v163
-
-   v_lshlrev_b32 v165, 9, v165
-   v_add_u32 v165, v165, v154
-   ds_read_b128 v[244:247], v165
-
    s_waitcnt vmcnt(0)
    s_waitcnt lgkmcnt(0)
    v_or_b32 v155, v136, v137
    v_or_b32 v161, v138, v139
-   v_or_b32 v163, v140, v141
-   v_or_b32 v165, v142, v143
    v_add_u32 v162, v154, s54
    v_mov_b32 v156, 0
    _v_add_co_u32 v136, vcc, v136, v162
    v_addc_co_u32 v137, vcc, v137, v156, vcc
    _v_add_co_u32 v138, vcc, v138, v162
    v_addc_co_u32 v139, vcc, v139, v156, vcc
-   _v_add_co_u32 v140, vcc, v140, v162
-   v_addc_co_u32 v141, vcc, v141, v156, vcc
-   _v_add_co_u32 v142, vcc, v142, v162
-   v_addc_co_u32 v143, vcc, v143, v156, vcc
    v_cmp_ne_u32 vcc, 0, v155
    s_and_saveexec_b64 s[82:83], vcc
    global_store_dwordx4 v[136:137], v[232:235], off
@@ -509,14 +485,6 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    v_cmp_ne_u32 vcc, 0, v161
    s_and_saveexec_b64 s[82:83], vcc
    global_store_dwordx4 v[138:139], v[236:239], off
-   s_mov_b64 exec, s[82:83]
-   v_cmp_ne_u32 vcc, 0, v163
-   s_and_saveexec_b64 s[82:83], vcc
-   global_store_dwordx4 v[140:141], v[240:243], off
-   s_mov_b64 exec, s[82:83]
-   v_cmp_ne_u32 vcc, 0, v165
-   s_and_saveexec_b64 s[82:83], vcc
-   global_store_dwordx4 v[142:143], v[244:247], off
    s_mov_b64 exec, s[82:83]
    s_mov_b64 exec, s[80:81]
    v_add_u32 v150, \step, v150
@@ -540,9 +508,157 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    s_and_saveexec_b64 s[66:67], vcc
    s_cbranch_execz .L_k3_tail_atomic_skip_\@
    v_mov_b32 v238, \value
-   global_atomic_add v240, v[136:137], v238, off glc
+   global_atomic_umax v240, v[136:137], v238, off glc
 .L_k3_tail_atomic_skip_\@:
    s_mov_b64 exec, s[66:67]
+.endm
+
+.macro K3_TAIL_WAIT_SIGNAL offset:req
+   v_mov_b32 v153, s56
+   v_mov_b32 v154, s57
+   v_mov_b32 v156, \offset
+   _v_add_co_u32 v153, vcc, v153, v156
+   v_mov_b32 v156, 0
+   v_addc_co_u32 v154, vcc, v154, v156, vcc
+   global_load_dwordx2 v[136:137], v[153:154], off glc
+   s_waitcnt vmcnt(0)
+   v_or_b32 v155, v136, v137
+   v_cmp_ne_u32 vcc, 0, v155
+   s_and_saveexec_b64 s[66:67], vcc
+   s_cbranch_execz .L_k3_tail_wait_skip_\@
+.L_k3_tail_wait_loop_\@:
+   global_load_dword v238, v[136:137], off glc slc
+   s_waitcnt vmcnt(0)
+   buffer_wbinvl1_vol
+   v_cmp_lt_u32 vcc, v238, s78
+   s_cbranch_vccnz .L_k3_tail_wait_loop_\@
+.L_k3_tail_wait_skip_\@:
+   s_mov_b64 exec, s[66:67]
+.endm
+
+.macro K3_TAIL_ADDR_FROM_BASE base_lo:req, base_hi:req
+   v_lshlrev_b32 v153, 4, v250
+   v_mov_b32 v154, 0
+   v_mov_b32 v156, \base_lo
+   _v_add_co_u32 v153, vcc, v153, v156
+   v_mov_b32 v156, \base_hi
+   v_addc_co_u32 v154, vcc, v154, v156, vcc
+.endm
+
+.macro K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   v_mov_b32 v156, s77
+   _v_add_co_u32 v153, vcc, v153, v156
+   v_mov_b32 v156, 0
+   v_addc_co_u32 v154, vcc, v154, v156, vcc
+.endm
+
+.macro K3_TAIL_ACCUM_DWORD packed:req, sum_lo:req, sum_hi:req
+   v_and_b32 v160, 0xffff, \packed
+   v_lshlrev_b32 v160, 16, v160
+   v_lshrrev_b32 v161, 16, \packed
+   v_lshlrev_b32 v161, 16, v161
+   v_add_f32 \sum_lo, \sum_lo, v160
+   v_add_f32 \sum_hi, \sum_hi, v161
+.endm
+
+.macro K3_TAIL_ACCUM_VEC d0:req, d1:req, d2:req, d3:req
+   K3_TAIL_ACCUM_DWORD \d0, v180, v181
+   K3_TAIL_ACCUM_DWORD \d1, v182, v183
+   K3_TAIL_ACCUM_DWORD \d2, v184, v185
+   K3_TAIL_ACCUM_DWORD \d3, v186, v187
+.endm
+
+.macro K3_TAIL_LOAD_ACCUM_SLOT
+   global_load_dwordx4 v[232:235], v[153:154], off
+   s_waitcnt vmcnt(0)
+   K3_TAIL_ACCUM_VEC v232, v233, v234, v235
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+.endm
+
+.macro K3_TAIL_LOAD_ACCUM_SIX
+   global_load_dwordx4 v[200:203], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[204:207], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[208:211], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[212:215], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[216:219], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   global_load_dwordx4 v[220:223], v[153:154], off
+   K3_TAIL_ADDR_ADD_SLOT_STRIDE
+   s_waitcnt vmcnt(0)
+   K3_TAIL_ACCUM_VEC v200, v201, v202, v203
+   K3_TAIL_ACCUM_VEC v204, v205, v206, v207
+   K3_TAIL_ACCUM_VEC v208, v209, v210, v211
+   K3_TAIL_ACCUM_VEC v212, v213, v214, v215
+   K3_TAIL_ACCUM_VEC v216, v217, v218, v219
+   K3_TAIL_ACCUM_VEC v220, v221, v222, v223
+.endm
+
+.macro K3_TAIL_APPLY_GRAPH_RUNTIME_STATE
+   s_mov_b32 s89, 0
+   s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
+   s_cbranch_scc1 .L_k3_graph_runtime_done_\@
+   s_load_dword s86, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc4
+   s_waitcnt lgkmcnt(0)
+   s_cmp_eq_u32 s86, 0
+   s_cbranch_scc1 .L_k3_graph_runtime_done_\@
+   s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
+   s_waitcnt lgkmcnt(0)
+   s_cmp_eq_u64 s[90:91], 0
+   s_cbranch_scc1 .L_k3_graph_runtime_done_\@
+   s_load_dword s88, s[90:91], 0x0
+   s_add_u32 s90, s90, s86
+   s_addc_u32 s91, s91, 0
+   s_load_dword s76, s[90:91], 0x0
+   s_waitcnt lgkmcnt(0)
+   s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xd0
+   s_waitcnt lgkmcnt(0)
+   s_cmp_eq_u64 s[90:91], 0
+   s_cbranch_scc1 .L_k3_graph_signal_generation_done_\@
+   s_load_dword s78, s[90:91], 0x0
+   s_mov_b32 s89, 1
+   s_waitcnt lgkmcnt(0)
+   s_cmp_gt_u32 s78, 0
+   s_cbranch_scc1 .L_k3_graph_signal_generation_done_\@
+   s_mov_b32 s78, 1
+.L_k3_graph_signal_generation_done_\@:
+   s_cmp_gt_u32 s88, 0
+   s_cbranch_scc1 .L_k3_graph_active_nonzero_\@
+   s_mov_b32 s88, 1
+.L_k3_graph_active_nonzero_\@:
+   s_lshl_b32 s60, s88, 4
+   s_lshl_b32 s76, s76, 9
+.L_k3_graph_runtime_done_\@:
+.endm
+
+.macro K3_TAIL_F32_TO_BF16 out:req, value:req
+   v_lshrrev_b32 \out, 16, \value
+   v_and_b32 v161, 1, \out
+   v_add_u32 \out, 0x7fff, \value
+   v_add_u32 \out, v161, \out
+   v_lshrrev_b32 \out, 16, \out
+.endm
+
+.macro K3_TAIL_PACK_REDUCE_OUT
+   K3_TAIL_F32_TO_BF16 v232, v180
+   K3_TAIL_F32_TO_BF16 v233, v181
+   v_lshlrev_b32 v233, 16, v233
+   v_or_b32 v232, v232, v233
+   K3_TAIL_F32_TO_BF16 v233, v182
+   K3_TAIL_F32_TO_BF16 v234, v183
+   v_lshlrev_b32 v234, 16, v234
+   v_or_b32 v233, v233, v234
+   K3_TAIL_F32_TO_BF16 v234, v184
+   K3_TAIL_F32_TO_BF16 v235, v185
+   v_lshlrev_b32 v235, 16, v235
+   v_or_b32 v234, v234, v235
+   K3_TAIL_F32_TO_BF16 v235, v186
+   K3_TAIL_F32_TO_BF16 v236, v187
+   v_lshlrev_b32 v236, 16, v236
+   v_or_b32 v235, v235, v236
 .endm
 
 .macro K3_INC_C_COL
@@ -1774,6 +1890,106 @@ s_mul_i32 s20, s20, s21
 s_mul_i32 s20, s20, s14
 s_mul_i32 s20, s20, s[sgprGSU]
 s_add_u32 s23, s23, s20
+s_cmp_lt_u32 s[sgprWorkGroup0], s23
+s_cbranch_scc1 label_FOUND
+s_sub_u32 s52, s[sgprWorkGroup0], s23
+
+label_K3_ExtraReducerWG:
+s_load_dwordx2 s[56:57], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x88
+s_load_dwordx4 s[60:63], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x90
+s_load_dwordx2 s[72:73], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa0
+s_load_dwordx2 s[74:75], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa8
+s_load_dwordx4 s[76:79], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb0
+s_load_dword s80, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc0
+s_waitcnt lgkmcnt(0)
+K3_TAIL_APPLY_GRAPH_RUNTIME_STATE
+s_cmp_eq_u32 s62, 1
+s_cbranch_scc0 .L_k3_extra_reduce_endpgm
+s_cmp_eq_u32 s79, 1
+s_cbranch_scc0 .L_k3_extra_reduce_endpgm
+s_cmp_eq_u64 s[56:57], 0
+s_cbranch_scc1 .L_k3_extra_reduce_endpgm
+s_cmp_eq_u64 s[72:73], 0
+s_cbranch_scc1 .L_k3_extra_reduce_endpgm
+s_cmp_eq_u64 s[74:75], 0
+s_cbranch_scc1 .L_k3_extra_reduce_endpgm
+s_cmp_eq_u32 s80, 0
+s_cbranch_scc1 .L_k3_extra_reduce_endpgm
+s_cmp_ge_u32 s52, s80
+s_cbranch_scc1 .L_k3_extra_reduce_endpgm
+
+v_cmp_eq_u32 vcc, v[vgprSerial], 0
+s_and_saveexec_b64 s[64:65], vcc
+s_cbranch_execz .L_k3_extra_wait_done
+s_cmp_gt_u32 s61, 0
+s_cbranch_scc0 .L_k3_extra_wait_rank0_done
+K3_TAIL_WAIT_SIGNAL 64
+.L_k3_extra_wait_rank0_done:
+s_cmp_gt_u32 s61, 1
+s_cbranch_scc0 .L_k3_extra_wait_rank1_done
+K3_TAIL_WAIT_SIGNAL 72
+.L_k3_extra_wait_rank1_done:
+s_cmp_gt_u32 s61, 2
+s_cbranch_scc0 .L_k3_extra_wait_rank2_done
+K3_TAIL_WAIT_SIGNAL 80
+.L_k3_extra_wait_rank2_done:
+s_cmp_gt_u32 s61, 3
+s_cbranch_scc0 .L_k3_extra_wait_rank3_done
+K3_TAIL_WAIT_SIGNAL 88
+.L_k3_extra_wait_rank3_done:
+s_cmp_gt_u32 s61, 4
+s_cbranch_scc0 .L_k3_extra_wait_rank4_done
+K3_TAIL_WAIT_SIGNAL 96
+.L_k3_extra_wait_rank4_done:
+s_cmp_gt_u32 s61, 5
+s_cbranch_scc0 .L_k3_extra_wait_rank5_done
+K3_TAIL_WAIT_SIGNAL 104
+.L_k3_extra_wait_rank5_done:
+s_cmp_gt_u32 s61, 6
+s_cbranch_scc0 .L_k3_extra_wait_rank6_done
+K3_TAIL_WAIT_SIGNAL 112
+.L_k3_extra_wait_rank6_done:
+s_cmp_gt_u32 s61, 7
+s_cbranch_scc0 .L_k3_extra_wait_rank7_done
+K3_TAIL_WAIT_SIGNAL 120
+.L_k3_extra_wait_rank7_done:
+.L_k3_extra_wait_done:
+   s_mov_b64 exec, s[64:65]
+   s_barrier
+   s_waitcnt vmcnt(0) lgkmcnt(0)
+   buffer_wbinvl1_vol
+   s_waitcnt vmcnt(0)
+
+s_lshl_b32 s77, s77, 4
+s_mul_i32 s81, s80, 0x300
+s_mul_i32 s82, s52, 0x300
+v_add_u32 v250, s82, v[vgprSerial]
+.L_k3_extra_reduce_loop:
+v_cmp_lt_u32 vcc, v250, s76
+s_and_saveexec_b64 s[84:85], vcc
+s_cbranch_execz .L_k3_extra_reduce_done
+v_mov_b32 v180, 0
+v_mov_b32 v181, 0
+v_mov_b32 v182, 0
+v_mov_b32 v183, 0
+v_mov_b32 v184, 0
+v_mov_b32 v185, 0
+v_mov_b32 v186, 0
+v_mov_b32 v187, 0
+
+K3_TAIL_ADDR_FROM_BASE s74, s75
+K3_TAIL_LOAD_ACCUM_SIX
+K3_TAIL_PACK_REDUCE_OUT
+K3_TAIL_ADDR_FROM_BASE s72, s73
+global_store_dwordx4 v[153:154], v[232:235], off
+s_mov_b64 exec, s[84:85]
+v_add_u32 v250, s81, v250
+s_branch .L_k3_extra_reduce_loop
+.L_k3_extra_reduce_done:
+s_waitcnt vmcnt(0)
+s_mov_b64 exec, s[84:85]
+.L_k3_extra_reduce_endpgm:
+s_endpgm
 
 /* Grouped Gemm:: gemmIndex found */
 label_FOUND:
@@ -1891,8 +2107,14 @@ label_EarlyStop_if_wg_exceed:
 s_endpgm
 label_NoEarlyStop_wgExceed:
 
-/* K3 graph bucket: skip row tiles beyond K1 compact runtime active tile count. */
+/* K3 graph bucket: skip row tiles beyond K1 compact runtime active tile count.
+ * Keep one dummy row tile alive so ranks with no local routes can still publish
+ * their tail-reduce signal. */
 s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
+s_cbranch_scc1 .L_k3_active_tile_gate_done
+s_load_dword s86, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc4
+s_waitcnt lgkmcnt(0)
+s_cmp_eq_u32 s86, 0
 s_cbranch_scc1 .L_k3_active_tile_gate_done
 s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
 s_waitcnt lgkmcnt(0)
@@ -1900,9 +2122,13 @@ s_cmp_eq_u64 s[90:91], 0
 s_cbranch_scc1 .L_k3_active_tile_gate_done
 s_load_dword s88, s[90:91], 0x0
 s_waitcnt lgkmcnt(0)
+s_cmp_gt_u32 s88, 0
+s_cbranch_scc1 .L_k3_active_tile_nonzero
+s_mov_b32 s88, 1
+.L_k3_active_tile_nonzero:
 s_cmp_ge_u32 s[sgprWorkGroup1], s88
 s_cbranch_scc0 .L_k3_active_tile_gate_done
-s_branch label_GW_End_20
+s_endpgm
 .L_k3_active_tile_gate_done:
 
 s_sub_u32 s[sgprAddressA+0], s[sgprAddressA+0], 16 // pre-pad to make room for possible pointer shift
@@ -2045,7 +2271,11 @@ v_lshrrev_b32 v[vgprPack5OffsetBaseA], 10, v8 // pack5 ko64
 v_lshlrev_b32 v[vgprPack5OffsetBaseA], 18, v[vgprPack5OffsetBaseA] // ko64 * (4096 * 64)
 v_and_b32 v[vgprPack5OffsetTmpA], 0x300, v8 // ks16 * 256
 _v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
-v_and_b32 v[vgprPack5OffsetTmpA], 15, v[vgprSerial] // plain pack5 ni for normal ASM
+v_and_b32 v[vgprPack5OffsetTmpA], 15, v[vgprSerial] // logical ni for ASM lanes
+v_lshrrev_b32 v10, 2, v[vgprPack5OffsetTmpA]
+v_and_b32 v[vgprPack5OffsetTmpA], 3, v[vgprPack5OffsetTmpA]
+v_lshlrev_b32 v[vgprPack5OffsetTmpA], 2, v[vgprPack5OffsetTmpA]
+_v_add_u32 v[vgprPack5OffsetTmpA], v[vgprPack5OffsetTmpA], v10 // physical ni in shared transposed pack5
 v_lshlrev_b32 v[vgprPack5OffsetTmpA], 4, v[vgprPack5OffsetTmpA]
 _v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
 
@@ -2962,14 +3192,12 @@ s_barrier
 s_cmp_le_i32 s[sgprWaveiD], 3
 s_cbranch_scc0 .L_k3_store_h0_skip
 v_mov_b32 v150, v[vgprSerial]
-K3_STORE_STAGED_HALF 0, 1024
+K3_STORE_STAGED_HALF 0, 512
 .L_k3_store_h0_skip:
 s_barrier
 
 s_cmp_le_i32 s[sgprWaveiD], 3
 s_cbranch_scc1 .L_k3_stage_h1_skip
-s_cmp_le_i32 s[sgprWaveiD], 7
-s_cbranch_scc0 .L_k3_stage_h1_skip
 v_mov_b32 v201, 128
 K3_STAGE_TILE_H1
 .L_k3_stage_h1_skip:
@@ -2978,11 +3206,9 @@ s_barrier
 
 s_cmp_le_i32 s[sgprWaveiD], 3
 s_cbranch_scc1 .L_k3_store_h1_skip
-s_cmp_le_i32 s[sgprWaveiD], 7
-s_cbranch_scc0 .L_k3_store_h1_skip
 v_mov_b32 v201, 256
 v_sub_u32 v150, v[vgprSerial], v201
-K3_STORE_STAGED_HALF 1024, 1024
+K3_STORE_STAGED_HALF 1024, 512
 .L_k3_store_h1_skip:
 s_waitcnt vmcnt(0)
 s_branch label_GW_End_20
@@ -3058,9 +3284,177 @@ K3_INC_ADDR4
 K3_STORE4 v124, v125, v126, v127
 s_branch label_GW_End_20                           // jump to end
 label_GW_End_20:
+   s_waitcnt vmcnt(0) lgkmcnt(0)
+   buffer_wbinvl1_vol
+   s_waitcnt vmcnt(0)
+   s_barrier
+
+/* K3COMBINE tail reduce experiment. Every WG increments the per-rank done
+ * counter after remote combine stores. Only the last local WG publishes this
+ * rank's generation to peer signal slots and then uses its own 768 lanes to
+ * reduce the local combine buffer into y. This avoids an in-kernel global wait
+ * across all WGs, which would deadlock when the GEMM grid is larger than the
+ * resident WG count. */
+s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x80
+s_load_dwordx2 s[56:57], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x88
+s_load_dwordx4 s[60:63], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x90
+s_load_dwordx2 s[72:73], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa0
+s_load_dwordx2 s[74:75], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa8
+s_load_dwordx4 s[76:79], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb0
+s_load_dword s80, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc0
+s_waitcnt lgkmcnt(0)
+K3_TAIL_APPLY_GRAPH_RUNTIME_STATE
+s_cmp_eq_u32 s89, 0
+s_cbranch_scc1 .L_k3_tail_main_done_counter_ready
+s_and_b32 s87, s78, 15
+s_lshl_b32 s87, s87, 3
+s_add_u32 s52, s52, s87
+s_addc_u32 s53, s53, 0
+.L_k3_tail_main_done_counter_ready:
+s_cmp_eq_u32 s62, 1
+s_cbranch_scc0 .L_k3_tail_signal_done
+s_cmp_eq_u64 s[52:53], 0
+s_cbranch_scc1 .L_k3_tail_signal_done
+s_cmp_eq_u64 s[56:57], 0
+s_cbranch_scc1 .L_k3_tail_signal_done
+
+v_cmp_eq_u32 vcc, v[vgprSerial], 0
+s_and_saveexec_b64 s[64:65], vcc
+s_cbranch_execz .L_k3_tail_lane0_done
+v_mov_b32 v253, 0
+ds_write_b32 v253, v253, offset:0
+v_mov_b32 v238, 1
+global_atomic_add v240, v253, v238, s[52:53] glc
+s_waitcnt vmcnt(0)
+v_add_u32 v240, 1, v240
+v_cmp_eq_u32 vcc, v240, s60
+s_and_saveexec_b64 s[68:69], vcc
+s_cbranch_execz .L_k3_tail_not_last
 s_waitcnt vmcnt(0) lgkmcnt(0)
 buffer_wbinvl1_vol
 s_waitcnt vmcnt(0)
+
+s_cmp_gt_u32 s61, 0
+s_cbranch_scc0 .L_k3_tail_rank0_done
+K3_TAIL_ATOMIC_SIGNAL 0, s78
+.L_k3_tail_rank0_done:
+s_cmp_gt_u32 s61, 1
+s_cbranch_scc0 .L_k3_tail_rank1_done
+K3_TAIL_ATOMIC_SIGNAL 8, s78
+.L_k3_tail_rank1_done:
+s_cmp_gt_u32 s61, 2
+s_cbranch_scc0 .L_k3_tail_rank2_done
+K3_TAIL_ATOMIC_SIGNAL 16, s78
+.L_k3_tail_rank2_done:
+s_cmp_gt_u32 s61, 3
+s_cbranch_scc0 .L_k3_tail_rank3_done
+K3_TAIL_ATOMIC_SIGNAL 24, s78
+.L_k3_tail_rank3_done:
+s_cmp_gt_u32 s61, 4
+s_cbranch_scc0 .L_k3_tail_rank4_done
+K3_TAIL_ATOMIC_SIGNAL 32, s78
+.L_k3_tail_rank4_done:
+s_cmp_gt_u32 s61, 5
+s_cbranch_scc0 .L_k3_tail_rank5_done
+K3_TAIL_ATOMIC_SIGNAL 40, s78
+.L_k3_tail_rank5_done:
+s_cmp_gt_u32 s61, 6
+s_cbranch_scc0 .L_k3_tail_rank6_done
+K3_TAIL_ATOMIC_SIGNAL 48, s78
+.L_k3_tail_rank6_done:
+s_cmp_gt_u32 s61, 7
+s_cbranch_scc0 .L_k3_tail_rank7_done
+K3_TAIL_ATOMIC_SIGNAL 56, s78
+.L_k3_tail_rank7_done:
+s_waitcnt vmcnt(0)
+s_cmp_gt_u32 s80, 0
+s_cbranch_scc1 .L_k3_tail_signal_done
+
+/* Debug/safety variant: avoid cross-wave LDS handoff. The wave that observed
+ * the last-WG counter restores its full EXEC mask and performs the tail reduce
+ * with 64 lanes. Other waves and non-last WGs exit below. */
+s_mov_b64 exec, s[64:65]
+s_cmp_eq_u32 s79, 1
+s_cbranch_scc0 .L_k3_tail_signal_done
+s_cmp_eq_u64 s[72:73], 0
+s_cbranch_scc1 .L_k3_tail_signal_done
+s_cmp_eq_u64 s[74:75], 0
+s_cbranch_scc1 .L_k3_tail_signal_done
+
+v_cmp_eq_u32 vcc, v[vgprSerial], 0
+s_and_saveexec_b64 s[68:69], vcc
+s_cbranch_execz .L_k3_tail_wait_done
+s_cmp_gt_u32 s61, 0
+s_cbranch_scc0 .L_k3_tail_wait_rank0_done
+K3_TAIL_WAIT_SIGNAL 64
+.L_k3_tail_wait_rank0_done:
+s_cmp_gt_u32 s61, 1
+s_cbranch_scc0 .L_k3_tail_wait_rank1_done
+K3_TAIL_WAIT_SIGNAL 72
+.L_k3_tail_wait_rank1_done:
+s_cmp_gt_u32 s61, 2
+s_cbranch_scc0 .L_k3_tail_wait_rank2_done
+K3_TAIL_WAIT_SIGNAL 80
+.L_k3_tail_wait_rank2_done:
+s_cmp_gt_u32 s61, 3
+s_cbranch_scc0 .L_k3_tail_wait_rank3_done
+K3_TAIL_WAIT_SIGNAL 88
+.L_k3_tail_wait_rank3_done:
+s_cmp_gt_u32 s61, 4
+s_cbranch_scc0 .L_k3_tail_wait_rank4_done
+K3_TAIL_WAIT_SIGNAL 96
+.L_k3_tail_wait_rank4_done:
+s_cmp_gt_u32 s61, 5
+s_cbranch_scc0 .L_k3_tail_wait_rank5_done
+K3_TAIL_WAIT_SIGNAL 104
+.L_k3_tail_wait_rank5_done:
+s_cmp_gt_u32 s61, 6
+s_cbranch_scc0 .L_k3_tail_wait_rank6_done
+K3_TAIL_WAIT_SIGNAL 112
+.L_k3_tail_wait_rank6_done:
+s_cmp_gt_u32 s61, 7
+s_cbranch_scc0 .L_k3_tail_wait_rank7_done
+K3_TAIL_WAIT_SIGNAL 120
+.L_k3_tail_wait_rank7_done:
+.L_k3_tail_wait_done:
+   s_mov_b64 exec, s[68:69]
+   s_waitcnt vmcnt(0) lgkmcnt(0)
+   buffer_wbinvl1_vol
+   s_waitcnt vmcnt(0)
+
+   s_lshl_b32 s77, s77, 4
+v_mov_b32 v250, v[vgprSerial]
+.L_k3_tail_reduce_loop:
+v_cmp_lt_u32 vcc, v250, s76
+s_and_saveexec_b64 s[84:85], vcc
+s_cbranch_execz .L_k3_tail_reduce_done
+v_mov_b32 v180, 0
+v_mov_b32 v181, 0
+v_mov_b32 v182, 0
+v_mov_b32 v183, 0
+v_mov_b32 v184, 0
+v_mov_b32 v185, 0
+v_mov_b32 v186, 0
+v_mov_b32 v187, 0
+
+K3_TAIL_ADDR_FROM_BASE s74, s75
+K3_TAIL_LOAD_ACCUM_SIX
+K3_TAIL_PACK_REDUCE_OUT
+K3_TAIL_ADDR_FROM_BASE s72, s73
+global_store_dwordx4 v[153:154], v[232:235], off
+s_mov_b64 exec, s[84:85]
+v_add_u32 v250, 64, v250
+s_branch .L_k3_tail_reduce_loop
+.L_k3_tail_reduce_done:
+s_waitcnt vmcnt(0)
+s_mov_b64 exec, s[84:85]
+s_endpgm
+
+.L_k3_tail_not_last:
+s_mov_b64 exec, s[68:69]
+.L_k3_tail_lane0_done:
+s_mov_b64 exec, s[64:65]
+.L_k3_tail_signal_done:
 s_endpgm                                           // Kernel End
 
 

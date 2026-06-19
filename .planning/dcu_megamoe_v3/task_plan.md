@@ -367,6 +367,20 @@ DCU MegaMoE V3 已转为主路径；当前目标是把 DCU MegaMoE 生产代码�
 - [✅] 2026-06-17 latest matrix：K2 actual_m replay pruning 与 LL 8192 headroom 修复后，重刷 LL `8,32,33,64,128,129,256,257,512,513` eager/graph、normal `256,512,1024,1025,2048,2050,3072,4096,4097,8192` eager/graph，graph 均 capture8192；LL/normal eager/graph uneven smoke 均 `correct=True`，README smoke v2 通过。结果落盘 `hygon_tmp/debug/full_matrix_latest_20260617_191221`，表格已写入 `progress.md`。
 - 状态：✅ complete（最终回归矩阵通过，8192 轻微性能漂移已记录为后续观察项）
 
+### Phase 14: V3 pack5 weight layout policy
+- [✅] 已验证：single/unified ABI（LL transposed layout + normal ASM `logical ni -> physical ni` 映射）功能完整，但 normal 4096/8192 相比历史双-layout 最优有约 `8%` 回退；该路径不再作为默认性能路径。
+- [✅] 默认策略改为 dual layout：LL 继续使用 transposed pack5，normal ASM 使用 plain pack5；public API 可接收 `{ "ll": ..., "normal": ... }` 权重 dict，由 `megamoe_backend` 选择对应 layout。框架 PD 分离或显存允许时用该默认路径追极致性能。
+- [✅] 兼容策略：新增 `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1`，打开后使用 `{ "unified": ... }` 或旧 tuple 权重，并加载 `_UNIFIED_PACK5` code object，保留单 ABI/单权重占用路径；该开关不是默认性能路径。
+- [✅] 构建面：新增 K1/K3 no-tail/tail `_UNIFIED_PACK5.s` 和对应 setup code-object build；默认 PACK5 ASM 恢复 plain `ni`，unified PACK5 ASM 保留 transposed physical `ni` 映射。
+- [✅] 代表验证：远端 `build_ext --inplace`、source pytest `9/9` 通过；默认 dual layout eager LL 32/512 为 `0.641/2.297 ms`，normal 512/4096/5120/8192 为 `1.753/5.798/7.403/10.886 ms`；unified normal4096 为 `6.274 ms`。
+- [✅] graph 代表验证：默认 dual layout graph capture8192 下 LL replay 32/512 为 `0.661/2.258 ms`，normal replay 4096/8192 为 `5.687/10.485 ms`；unified normal4096 replay 为 `6.180 ms`。
+- [✅] 第一轮重新挖掘结论：DCU KB 与本工程 CUDA MegaMoE 参考均支持“layout 是 global-load/LDS/MMAC fragment 合同”的判断；当前 LL transposed 与 normal plain 分别匹配各自 kernel 热路径，是默认双 layout 下的最佳已知安全基线。暂未找到可低风险替换的第三种共同 layout 或单侧新 layout。
+- [✅] source-backed 参考已读：`ds_read_m32x16_b16_{normalxalt,altxalt,swizzle}.cpp` 可作为后续 normal 新 code object 的 LDS/matrix-read 合同参考，但它要求同步改 LDS write/read/MMAC/store，不能作为默认 ASM 的几行局部 remap。
+- [🚫] 已证伪方向仍不重复：plain layout + LL direct mapped load、plain layout + LL B-side register shuffle、plain layout + 不改 LL 合同、transposed layout + normal local-read/LDS fragment remap、normal store-side remap。
+- [ ] 后续必做：在 dual layout 默认策略下继续重新挖掘 LL/normal 各自最佳 layout/kernel 组合；允许隔离两套 kernel/code object，不强求复用。下一轮只进入有 profiler/ISA/source-backed 证据的分支，例如 LL B-load/MMAC 合同保持不变的 layout 变体、normal 连续 global load 与 LDS/MMAC 合同同时闭合的变体。任一新候选必须同时覆盖 LL `32/512` 与 normal `512/4096/8192/5120`，并不得低于当前默认 dual-layout 代表性能。
+- [🧭] 可选长期方向：如果双 layout 仍有显存压力或 PD 分离之外也需要单权重，可重新设计第三种共同 layout；进入条件是有 profiler/ISA/source-backed 证据，不再靠单点 permutation 猜测。
+- 状态：[ ] active（默认 dual layout 已恢复历史性能档位；unified 作为兼容开关保留。下一步围绕双 layout 各自最佳性能继续挖掘，而不是强行单 ABI。）
+
 ## 讨论用接口对照草案
 
 | 项目 | 原 staged fused ASM | V2/V3 C pack5 参考 | 迁移关注点 |

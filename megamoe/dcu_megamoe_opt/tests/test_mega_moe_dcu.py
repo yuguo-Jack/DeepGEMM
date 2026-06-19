@@ -34,6 +34,7 @@ from megamoe.dcu_megamoe_opt.v3_config import (
     NORMAL_LL_TOKEN_THRESHOLD_ENV,
     V3_BACKEND_AUTO,
     select_v3_backend,
+    unified_weight_layout_enabled,
     v3_backend_mode,
 )
 from megamoe.dcu_megamoe_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
@@ -505,20 +506,23 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
     l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
-    if v3_backend == "normal":
-        fused_l1_weights = (
-            v3_layout.flatten_pack5_weight_asm_normal(l1_fp8),
-            l1_scale,
-        )
-        fused_l2_weights = (
-            v3_layout.flatten_pack5_weight_asm_normal(l2_fp8),
-            l2_scale,
-        )
-        print_once(rank, " > V3 staged layout: L1/L2 normal ASM plain-pack5")
+    ll_l1_weights = (v3_layout.flatten_pack5_weight(l1_fp8), l1_scale)
+    ll_l2_weights = (v3_layout.flatten_pack5_weight(l2_fp8), l2_scale)
+    if unified_weight_layout_enabled():
+        fused_l1_weights = {"unified": ll_l1_weights}
+        fused_l2_weights = {"unified": ll_l2_weights}
+        layout_desc = "single transposed pack5"
     else:
-        fused_l1_weights = (v3_layout.flatten_pack5_weight(l1_fp8), l1_scale)
-        fused_l2_weights = (v3_layout.flatten_pack5_weight(l2_fp8), l2_scale)
-        print_once(rank, " > V3 staged layout: L1/L2 pack5")
+        fused_l1_weights = {
+            "ll": ll_l1_weights,
+            "normal": (v3_layout.flatten_pack5_weight_asm_normal(l1_fp8), l1_scale),
+        }
+        fused_l2_weights = {
+            "ll": ll_l2_weights,
+            "normal": (v3_layout.flatten_pack5_weight_asm_normal(l2_fp8), l2_scale),
+        }
+        layout_desc = "dual pack5 (LL transposed, normal ASM plain)"
+    print_once(rank, f" > V3 staged layout: {layout_desc}")
     stats_initial = torch.randint(0, 100, (num_experts_per_rank,), dtype=torch.int32, device="cuda")
     stats_fused = stats_initial.clone()
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")

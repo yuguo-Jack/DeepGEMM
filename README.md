@@ -140,6 +140,29 @@ Those two environment variables only affect `megamoe/dcu_megamoe_opt/tests/test_
 are not consumed by the production library call, `opt.py`, or the C++
 workspace size API.
 
+By default, LL and normal use separate optimized pack5 weight layouts.  Pass
+the weights as a layout dictionary so the production API can select the right
+one from the explicit `megamoe_backend`:
+
+```python
+l1_weights = {
+    "ll": (l1_pack5_ll, l1_scale),
+    "normal": (l1_pack5_normal, l1_scale),
+}
+l2_weights = {
+    "ll": (l2_pack5_ll, l2_scale),
+    "normal": (l2_pack5_normal, l2_scale),
+}
+```
+
+The LL layout uses `v3_layout.flatten_pack5_weight(...)`; the normal ASM layout
+uses `v3_layout.flatten_pack5_weight_asm_normal(...)`.  This dual-layout mode
+is the default performance path.  If a deployment must keep a single transformed
+weight layout, set `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` and provide a
+`{"unified": (weight, scale)}` dictionary, or the legacy tuple.  The unified
+mode loads `_UNIFIED_PACK5` ASM code objects and is intended as a compatibility
+path, not the default best-performance path.
+
 For eager uneven-rank requests, pass the same EP-group maximum local token count
 as the optional host scalar `capacity_num_tokens`.  This value is not a backend
 selector, does not affect graph replay, and is not a runtime token tensor; it

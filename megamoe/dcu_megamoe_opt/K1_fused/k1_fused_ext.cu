@@ -71,6 +71,7 @@ static constexpr int kK1SupportedL1Rows = 4096;
 static constexpr int kK1RouteTileM = 256;
 static constexpr int kK1SupportedAlignment = 256;
 static constexpr int kK1RouteCapacitySlack = 64;
+static constexpr int kK1RouteCapacitySlackDivisor = 10;
 static constexpr int64_t kK1RowPointerPadding = 512;
 static constexpr double kK1AutoCompactMinSaving = 0.05;
 static constexpr double kK1AutoCompactMinLocalTileSaving = 8.0;
@@ -84,6 +85,12 @@ static constexpr const char* kK1ShapeContract =
 
 int64_t ceil_div_i64(const int64_t a, const int64_t b) {
     return (a + b - 1) / b;
+}
+
+int64_t route_capacity_headroom_rows(const int64_t expected_per_expert) {
+    return std::max<int64_t>(
+        kK1RouteCapacitySlack,
+        ceil_div_i64(expected_per_expert, kK1RouteCapacitySlackDivisor));
 }
 
 double estimate_compact_tiles_per_expert(
@@ -899,7 +906,8 @@ k1_symm_fused_l1_asm_impl(
     const int64_t rows_per_expert_target =
         std::max<int64_t>(
             alignment,
-            expected_per_expert + kK1RouteCapacitySlack);
+            expected_per_expert +
+                route_capacity_headroom_rows(expected_per_expert));
     const int64_t fixed_capacity_tiles_per_expert =
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
     bool use_compact_prebuild = force_compact_prebuild;
@@ -1181,7 +1189,8 @@ k1_symm_fused_l1_v3_pack5(
     const int64_t rows_per_expert_target =
         std::max<int64_t>(
             alignment,
-            expected_per_expert + kK1RouteCapacitySlack);
+            expected_per_expert +
+                route_capacity_headroom_rows(expected_per_expert));
     const int64_t fixed_capacity_tiles_per_expert =
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
     const int64_t fixed_capacity_tiles =
@@ -1433,7 +1442,10 @@ k1_graph_flag_reset_layout(
     const int64_t expected_per_expert =
         (total_tasks + num_experts - 1) / num_experts;
     const int64_t rows_per_expert_target =
-        std::max<int64_t>(alignment, expected_per_expert + kK1RouteCapacitySlack);
+        std::max<int64_t>(
+            alignment,
+            expected_per_expert +
+                route_capacity_headroom_rows(expected_per_expert));
     const int64_t fixed_capacity_tiles_per_expert =
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
     const int64_t fixed_capacity_tiles =

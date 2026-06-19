@@ -154,6 +154,7 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     constexpr int64_t kK1RouteTileM = 256;
     constexpr int64_t kK1Alignment = 256;
     constexpr int64_t kK1RouteCapacitySlack = 64;
+    constexpr int64_t kK1RouteCapacitySlackDivisor = 10;
     constexpr int64_t kK1LlRowTile = 64;
     constexpr int64_t kK1LlHeadroomExpectedRowsThreshold = 48;
     constexpr int64_t kK1LlHeadroomRows = 64;
@@ -161,6 +162,13 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     const auto ceil_div_i64 = [](const int64_t value, const int64_t divisor) {
         return (value + divisor - 1) / divisor;
     };
+    const auto route_capacity_headroom_rows =
+        [&](const int64_t expected_per_expert) {
+            return std::max<int64_t>(
+                kK1RouteCapacitySlack,
+                ceil_div_i64(expected_per_expert,
+                             kK1RouteCapacitySlackDivisor));
+        };
     const int64_t local_experts = num_experts / num_ranks;
     const int64_t ll_expected_rows_per_expert = std::max<int64_t>(
         1, ceil_div_i64(
@@ -182,7 +190,9 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     const int64_t expected_per_expert =
         ceil_div_i64(total_tasks, num_experts);
     const int64_t rows_per_expert_target = std::max<int64_t>(
-        kK1Alignment, expected_per_expert + kK1RouteCapacitySlack);
+        kK1Alignment,
+        expected_per_expert +
+            route_capacity_headroom_rows(expected_per_expert));
     const int64_t fixed_capacity_tiles_per_expert =
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
     const int64_t normal_capacity_rows =

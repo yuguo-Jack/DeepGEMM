@@ -5372,3 +5372,110 @@
 - 当前测到 LL graph capture8192 replay8：当 graph 性能命令使用 `--num-tokens 8192` 时稳定约 `0.556 ms`；使用 `--num-tokens 513` 时可出现约 `0.607 ms`。两者 replay token 都是 8，差异来自测试脚本辅助 tensor/权重分配顺序对小 token 计时的地址/allocator 扰动，不是 graph runtime-token 语义差异。
 - README 的 graph 性能示例使用 `--num-tokens 8192`，并明确实际 replay work 由 `--cuda-graph-test-tokens` 控制。
 - K2 graph capture8192 小 token 固定开销通过现有 K2 reg kernel 的 grid-stride row loop 与内部 `max_row_blocks=2048` 收敛；未新增 kernel，未新增 D2H sync。
+
+## 2026-06-18 V3 normal/LL weight layout 分叉不是生产 ABI
+
+- 现象：normal 路径使用 `flatten_pack5_weight_asm_normal()`，LL 路径使用 `flatten_pack5_weight()`；框架侧如果按此接入，需要同时持有两套 pack5 weight，显存成本不可接受。
+- 根因：V3 normal ASM 初版为了复用原 ASM 的 pack5 lane 地址/accumulator store schedule，使用 plain `ni` order；LL/C pack5 为了匹配 B load 与 MMAC lane 映射，使用 transposed physical-`ni` order。两者都是同一 5pack tile nesting，但 `ni` 子维顺序不同。
+- 约束：统一 layout 不允许通过 runtime weight transpose kernel 解决；不能新增 kernel，不能引入 D2H sync，性能不能劣化。
+- 已证伪的简单方案：把统一 ABI 改成 normal/plain layout，并在 LL C kernel 直接按 mapped row 读 B，功能正确但 LL 小 token 性能明显回退；这是 B load coalescing/访存形态问题，不是单点 token 抖动。
+- 已证伪的补救方案：plain layout 下保留连续 B load，并在寄存器中对 B 做 lane shuffle，正确性通过但 LL `32/128/256/512` 仍比 transposed layout 慢约 `7-9%`。额外 B shuffle 是稳定热循环成本，不适合作为生产路径。
+- 当前方向：统一 ABI 回到 LL transposed layout；normal ASM 只需在 pack5 offset 初始化处把 logical `ni` 映射为 physical `ni=((ni&3)<<2)+(ni>>2)`，该映射不在 GEMM 主循环内，风险和性能成本都低于让 LL 热循环承担 B shuffle。
+- 当前源码收敛：`v3_layout.py` 只保留 `pack5_weight()` / `flatten_pack5_weight()` 这一套 public helper；`pack5_weight_asm_normal()` / `flatten_pack5_weight_asm_normal()` 已删除，避免框架接入时再次误解为 normal/LL 两套权重 layout。
+- 2026-06-18 复核：LL transposed single ABI + normal ASM global-offset remap 后，LL eager 32/512 为 `0.637/2.275 ms`，normal 512 no-tail/tail 为 `1.746/1.775 ms`，normal 4096 tail 为 `6.260 ms`；功能均正确。
+- local-read/LDS fragment remap 在 normal 上正确但慢，512 tail `2.224 ms`、4096 tail `7.674 ms`、4096 no-tail `7.589 ms`。该方向会破坏 ASM 原有 MMAC/LDS fragment 性能形态，不再作为生产候选。
+- 2026-06-18 额外反证：只把离线 pack5 helper 临时改成 plain `ni`，LL C kernel 保持连续 B load 和原 store 合同不动，LL 32 correctness 失败，`max_abs=0.089599609375`。因此 plain ABI 不能通过“不改 LL 热循环、只复用当前 coalesced load”直接成立。
+- plain ABI 的输出列 remap 补救会把 K1/K3 当前 `bf16x4` 连续写退化为 permutation 下的非连续标量/散写；K3 remote combine 当前依赖向量 store cadence，历史上 lane-pair/vector-store/shuffle 类改动也多次显示额外 shuffle/pack/store 调度成本会吃掉收益。除非后续有新的 MMAC C-fragment layout 证据，否则不作为生产候选继续推进。
+- normal ASM 恢复 transposed layout 下全局连续读的低风险点暂未找到：当前 K1/K3 ASM 的 pack5 权重路径一部分是 `buffer_load_dwordx4 ... lds` 通过 `m0` 固定步进直接落 LDS，另一部分是 `vgprG2LA` 打包后 `ds_write_b128`；global offset、LDS 写入位置、local-read/MMAC fragment 顺序共同构成合同。若把 global read 改回连续 physical `ni`，仍需在 LDS 写入或 fragment 读出阶段恢复 logical 顺序，这会落入已证伪的 local-read/LDS fragment remap 风险域。
+- graph 性能命令若用 `--num-tokens 8192` 同时要求 DeepGEMM baseline，会在测试侧分配 baseline 中间张量并可能 OOM；这不是 graph replay 或 weight ABI 的 correctness 问题。graph replay correctness 应用较小 setup token 覆盖，性能用 skip-baseline 模式或 README 约定脚本单独跑。
+- ASM offset patch 寄存器安全复核：K1/K3 三个 PACK5 ASM 里新增映射使用 `v10` 做 scratch；该位置后续原本就以 `GLOBAL_OFFSET_A ..., 10` 形式把 `v10` 作为地址计算临时寄存器使用，因此当前 patch 没有引入新的长期 live-range，也没有触碰主循环 accumulator / epilogue store schedule。
+
+## 2026-06-18 Phase 14 single ABI full matrix conclusion
+
+- LL transposed single ABI + normal ASM global-offset `ni` remap 的完整功能矩阵已通过：
+  - LL eager/graph 覆盖 `8,32,33,64,128,129,256,257,512,513`；
+  - normal eager/graph 覆盖 `256,512,1024,1025,2048,2050,3072,4096,4097,8192`；
+  - LL/normal eager uneven、LL/normal graph uneven、README script/graph smoke 均通过。
+- LL 性能基本守住历史基线：
+  - eager `8/32/128/256/512 = 0.600/0.643/0.846/1.260/2.294 ms`；
+  - graph capture8192 replay `8/32/128/256/512 = 0.562/0.652/0.844/1.298/2.275 ms`。
+- normal 性能仍是当前 single ABI 的主要未达标点：
+  - eager `4096/8192 = 6.283/11.776 ms`；
+  - graph capture8192 `4096/8192 = 6.107/11.355 ms`；
+  - 对比 Phase 13/latest matrix 旧双-layout normal 约 `5.83/10.88 ms`，说明 single ABI 功能已通但 normal 吞吐尚未完全恢复。
+- 当前不能把 normal gap 归因于 graph 特有问题：
+  - eager 和 graph 都比旧双-layout normal 慢；
+  - graph 相对当前 eager 在 3072+ 反而略好；
+  - 因此主要问题是 normal ASM 消费 LL-transposed weight layout 后的 global/LDS/fragment 访存合同，而不是 K2 graph 或 replay runtime-token。
+- 后续优化边界：
+  - 不再重复 plain layout + LL direct mapped load、plain layout + LL B-side shuffle、plain layout + 不改 LL 合同、transposed layout + normal local-read/LDS fragment remap；
+  - 若继续优化，必须围绕 normal ASM 的 global-load coalescing、LDS write remap 或共同 layout 设计展开，并用 512/4096/8192 + LL 32/512 双侧性能门槛验收；
+  - 任何方案不得新增 kernel、不得引入 D2H sync，且不能让 LL 热循环承担稳定 shuffle 成本。
+
+## 2026-06-18 Phase 14 code-object metadata and normal gap attribution
+
+- 远端 code object metadata 复核：
+  - K1 dispatch-pull pack5：`SGPR=102`、`VGPR=255`、`spill=0`、`LDS=65536`、`.text=78028 bytes`；
+  - K3 combine pack5：`SGPR=102`、`VGPR=255`、`spill=0`、`LDS=65536`、`.text=84820 bytes`；
+  - K3 combine tail-reduce pack5：`SGPR=102`、`VGPR=255`、`spill=0`、`LDS=65536`、`.text=89856 bytes`。
+- 这说明当前 normal single ABI gap 不是由新增 `logical ni -> physical ni` 映射导致的 register pressure、spill 或 LDS 占用变化造成；三份 ASM 仍维持原有 255 VGPR / 0 spill / 64 KiB LDS 的资源边界。
+- 更可信的性能来源是 weight global-load locality：normal ASM 原 plain pack5 对 `ni` 子维连续取数；单 ABI 使用 LL-transposed layout 后，normal lane 必须按 physical `ni=((ni&3)<<2)+(ni>>2)` 取数，访问顺序从连续 `0..15` 变成跨组 `0,4,8,12,1,5,9,13,...`，影响 global memory coalescing/预取形态。
+- 进一步优化如果要恢复 normal 吞吐，需要在不动 LL hot loop 的前提下重新设计 normal 的 global-load/LDS-write/fragment 合同；这比继续试局部 local-read shuffle 更接近根因，但风险也更高，必须用 LL+normal 双侧矩阵验收。
+
+## 2026-06-18 Phase 14 store-side remap 反证
+
+- 尝试过“normal ASM 连续 physical `ni` global load + epilogue/store physical->logical remap”的候选，目标是恢复 normal 旧 plain-layout 下的 global-load locality。
+- 该候选不是性能不佳，而是 correctness 直接失败：normal tail 4096 `max_abs=0.114990234375`，远超现有容忍；回退到当前 global-offset remap 后同 case `max_abs=0.000488281`。
+- 这说明当前 normal ASM 的 pack5 权重顺序不能只在输出 store 端修正；B operand 的 global load 顺序、LDS 落点、local-read/MMAC fragment 以及 scale/epilogue 共同构成合同。
+- 当前 `buffer_load_dwordx4 ... lds` 路径的 LDS destination 由 scalar `m0` 控制，不能像 VGPR offset 那样廉价地做 per-lane LDS write permutation。要恢复连续 global load，需要更完整的 LDS/fragment 合同设计，而不是单点 offset/store patch。
+- 因此本方向与此前 local-read/LDS fragment remap、plain ABI + LL shuffle 一样标为反证；后续优化 normal 只能基于 profiler/ISA 或明确的 source-backed MMAC fragment 证据继续。
+
+## 2026-06-18 CUDA MegaMoE 单 ABI 参考边界
+
+- 本工程 CUDA MegaMoE 对外只使用一套 weight tensor-map/descriptor 合同：L1/L2 根据 phase 选择对应 descriptor，内部 scheduler 和 epilogue 用同一套 workspace/source metadata 做 dispatch/combine。
+- CUDA epilogue 会先按 tensorcore/STSM 友好的 shared-memory layout 写入，再由远端 combine writer 按另一套 shared-memory 读法取出并写 peer buffer；这证明“内部 fragment layout 可与最终 store layout 不同”，但它依赖 SM100 TMA/TMEM/STSM 合同，不能直接作为 DCU `buffer_load ... lds` + MMAC lane permutation 的证据。
+- 对 DCU 的可借鉴点仅限接口原则：框架只应持有一套 transformed weight ABI，normal/LL 内部各自适配该 ABI；不能把 CUDA 的 shared-memory reorder 机制直接移植为 DCU ASM patch。
+- 当前 DCU single ABI 选择 LL-transposed layout 是因为它守住 LL 性能；normal 的剩余性能 gap 应通过 DCU-specific global-to-LDS/MMAC fragment 合同继续找证据，而不是回到双 layout 或让 LL 热循环承担稳定 shuffle。
+
+## 2026-06-18 Phase 14 accepted single ABI finding
+
+- 当前接受版本是 LL-transposed pack5 作为唯一 weight ABI，normal ASM 在 pack5 global offset 初始化处做 `logical ni -> physical ni` 映射；该映射不进入 GEMM 主循环，且不改变 LL hot loop。
+- 该版本功能矩阵已覆盖 LL/normal eager/graph、uniform/uneven 与 README smoke；normal 4096 约 `6.2 ms`，相比旧双-layout normal 最优有小幅性能代价，但换来框架侧不再持有两套 L1/L2 weight。
+- 后续若继续追 normal 性能，必须建立在 profiler/ISA/source-backed MMAC fragment 合同证据上；不得回到双 weight ABI，也不得重复已反证的 LL 热循环 shuffle、normal local-read/LDS remap 或 store-side remap。
+
+## 2026-06-18 extended-size normal finding
+
+- 扩展 normal eager sweep 显示，当前 single ABI 在已对齐历史基线的 size 上劣化大致随 token 变大而加重：256/512/1024 约 `+1-2%`，2048/3072 约 `+5-6%`，4096/8192 约 `+8%`。
+- 5120 uniform normal 曾暴露 correctness blocker：cap5120/cap8192、tail/no-tail、K1 `asm/compact` prebuild 都失败，而 4096、6144、7168、8192 通过。该问题最终定位为 K1 route capacity 固定 slack 在 5120 点恰好卡到 1024 rows/expert 边界，随机路由可越界掉行。
+- 已修复：K1 执行侧和 route_scratch 估算侧统一使用基于 cap/capacity tokens 的动态 rows/expert headroom。5120 tail/no-tail correctness 通过，5120 tail perf 为 `8.182 ms`，LL 512/513 smoke 未受影响。
+- 当前风险边界：single ABI arbitrary normal token size 的主要 correctness blocker 已清除；后续仍需在完整 release matrix 中继续覆盖非 2k/4k 边界 token（如 5120、6144、7168）以防新的容量或 layout 边界回归。
+
+## 2026-06-19 dual layout becomes default performance policy
+
+- 用户重新放宽“框架只保存一套 weight”的约束：PD 分离或显存允许时可以加载两份 weight，因此默认策略应改回 LL/normal 双 layout，并以各自最佳性能为目标。
+- 设计结论：
+  - 默认双 layout 是性能路径：LL 用 transposed pack5，normal ASM 用 plain pack5；
+  - unified/single layout 仅作为兼容/显存路径，通过 `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` opt-in；
+  - 这比继续在单 ABI 下补 normal global-load/LDS 合同更稳，因为现有实测已经证明 default dual layout 直接恢复历史最佳性能档位。
+- 代表数据：
+  - default dual eager：LL 32/512 `0.641/2.297 ms`，normal 4096/8192 `5.798/10.886 ms`，normal 5120 correctness/perf 正常 `7.403 ms`；
+  - default dual graph capture8192：LL replay 32/512 `0.661/2.258 ms`，normal replay 4096/8192 `5.687/10.485 ms`；
+  - unified opt-in：normal 4096 eager/graph replay `6.274/6.180 ms`，功能正确但仍慢于 default dual。
+- 后续 layout 挖掘边界：
+  - 可以把 LL/normal kernel/code object 完全隔离，不再为了复用牺牲性能；
+  - 仍可以重新设计各自 layout 或共同 layout，但任何新候选必须不低于当前 default dual 代表性能；
+  - 已反证的 plain-layout LL shuffle、normal store-side remap、normal local-read/LDS fragment remap 不再重复；
+  - 不新增 runtime weight transform kernel，不引入 D2H sync；layout 变化仍应发生在离线/fixture/框架权重准备阶段。
+
+## 2026-06-19 dual layout re-exploration finding
+
+- 第一轮重新挖掘没有发现比当前默认双 layout 更安全的立即替换方案。当前 dual layout 不是随意分叉，而是分别贴合两条热路径：
+  - LL C pack5 使用 transposed physical-`ni`，匹配现有 B operand load、MMAC lane 映射和向量 store 合同；
+  - normal ASM 使用 plain `ni`，匹配原 ASM 对 pack5 weight 的连续 global load / LDS feed 形态。
+- DCU KB 与 Hygon optimizer 证据都指向同一条原则：matrix-load / LDS / MMAC fragment 是一个整体合同。单独改 weight global offset、local-read 顺序或 epilogue store 顺序，很容易出现 correctness fail 或吞吐回退；这与此前 4096 store-side remap fail、LL plain layout direct-load fail、LL register shuffle 慢的实验一致。
+- 本工程 CUDA MegaMoE 的可借鉴点是接口与 workspace 组织，不是具体 layout remap。CUDA 侧 tensor-map / TMA / STSM 可以把内部 fragment layout 和最终 store layout 分开；DCU 当前 ASM 使用 `buffer_load_dwordx4 ... lds`、`ds_read_b128` 与手写 MMAC fragment 约束，不能把 CUDA reorder 机制直接移植。
+- 因此后续 layout 优化的进入条件应提高：
+  - LL 新 layout 必须先证明不破坏 B operand load/MMAC/store 合同，且 LL `32/512` 不低于当前 `~0.64/~2.29 ms`；
+  - normal 新 layout 必须先证明 contiguous global load 与 LDS/MMAC fragment 同时闭合，且 normal `512/4096/5120/8192` 不低于当前 `~1.75/~5.8/~7.4/~10.9 ms`；
+  - 共同 layout 只有在 profiler/ISA/source-backed 证据足够强时才恢复，不再靠单点 permutation 试错。
+- source-backed 候选边界：`ds_read_m32x16_b16_normalxalt.cpp`、`altxalt.cpp`、`swizzle.cpp` 说明 DCU 上 normal/alt/sizzle 的 LDS matrix-read 合同是可表达的，但需要同时设计 LDS write layout、read offset、operand fragment 解释和 C store。它可以作为后续“normal ASM 新 code object”方向的参考，不适合作为当前默认 PACK5 ASM 的局部热补丁。

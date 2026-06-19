@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from ..v3_config import normalize_v3_backend
+from ..v3_config import normalize_v3_backend, unified_weight_layout_enabled
 from . import k3_fused_ext as _ext
 
 
@@ -13,6 +13,10 @@ THIS_DIR = Path(__file__).resolve().parent
 K3_COMBINE_ASM_NAME = "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE"
 K3_COMBINE_PACK5_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_PACK5.co"
 K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_TAILREDUCE_PACK5.co"
+K3_COMBINE_UNIFIED_PACK5_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_UNIFIED_PACK5.co"
+K3_COMBINE_TAIL_REDUCE_UNIFIED_PACK5_ASM_CO = (
+    THIS_DIR / f"{K3_COMBINE_ASM_NAME}_TAILREDUCE_UNIFIED_PACK5.co"
+)
 
 
 def _ensure_prebuilt_code_object(co: Path, label: str) -> Path:
@@ -25,12 +29,22 @@ def _ensure_prebuilt_code_object(co: Path, label: str) -> Path:
 
 
 def ensure_k3_combine_pack5_asm_code_object() -> Path:
-    return _ensure_prebuilt_code_object(K3_COMBINE_PACK5_ASM_CO, "K3 V3 pack5 combine")
+    co = (
+        K3_COMBINE_UNIFIED_PACK5_ASM_CO
+        if unified_weight_layout_enabled()
+        else K3_COMBINE_PACK5_ASM_CO
+    )
+    return _ensure_prebuilt_code_object(co, "K3 V3 pack5 combine")
 
 
 def ensure_k3_combine_tail_reduce_pack5_asm_code_object() -> Path:
+    co = (
+        K3_COMBINE_TAIL_REDUCE_UNIFIED_PACK5_ASM_CO
+        if unified_weight_layout_enabled()
+        else K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO
+    )
     return _ensure_prebuilt_code_object(
-        K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO,
+        co,
         "K3 V3 pack5 tail-reduce",
     )
 
