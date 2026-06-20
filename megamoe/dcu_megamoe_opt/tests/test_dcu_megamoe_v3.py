@@ -393,6 +393,7 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
         ("K_K1_ASM_LAUNCH_ARGS_BYTES", "kK1AsmLaunchArgsBytes"),
         ("K_PROB_STORAGE_BYTES", "kProbStorageBytes"),
         ("K_TAIL_DONE_COUNTER_RING_SLOTS", "kTailDoneCounterRingSlots"),
+        ("K_TAIL_DONE_COUNTER_INTS", "kTailDoneCounterInts"),
     ):
         assert source_int(opt_source, py_name) == source_int(api_source, cpp_name)
 

@@ -538,6 +538,9 @@ __global__ void rank_barrier_kernel(
     if (thread_id == 0 && asm_done_counter != nullptr) {
         asm_done_counter[0] = 0;
         asm_done_counter[1] = 0;
+        constexpr int kTailDoneCounterRingSlots = 16;
+        constexpr int kTailPeerReadyOffset = 2 * kTailDoneCounterRingSlots;
+        asm_done_counter[kTailPeerReadyOffset] = 0;
     }
     if (thread_id == 0 && graph_runtime_num_tokens != nullptr &&
         graph_runtime_num_tokens_out != nullptr) {
@@ -613,9 +616,11 @@ __global__ void rank_barrier_kernel(
             graph_tail_signal_generation_out[0] = barrier_generation;
             if (asm_done_counter != nullptr) {
                 constexpr int kTailDoneCounterRingSlots = 16;
+                constexpr int kTailPeerReadyOffset = 2 * kTailDoneCounterRingSlots;
                 const int slot = barrier_generation & (kTailDoneCounterRingSlots - 1);
                 asm_done_counter[2 * slot] = 0;
                 asm_done_counter[2 * slot + 1] = 0;
+                asm_done_counter[kTailPeerReadyOffset + slot] = 0;
             }
             __threadfence_system();
         }

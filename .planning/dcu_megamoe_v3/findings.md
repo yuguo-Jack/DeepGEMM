@@ -5493,3 +5493,43 @@
   - LL tail graph capture256 replay 8/32/128/256 correctness 通过，replay median 约 `0.526/0.627/0.831/1.281 ms`；
   - LL no-tail eager 32 smoke 通过，median `0.623 ms`。
 - 性能解释：graph replay 几乎不变是合理的，因为 graph replay 侧没有独立 CPU launch overhead；收益应主要体现在 eager 或真实框架 trace 中 `megamoe_rank_barrier` launch/category 消失。下一步如果用户关心端到端 decode，需要用框架 profiler 对比 tail-reduce1 前后 category，而不是只看 graph replay。
+
+## 2026-06-20 LL K1/K2/K3 overlap boundary finding
+
+- K1/K2 的安全融合边界是 metadata 级，而不是直接把 K2 计算塞进 K1 epilogue：
+  - K1 已经有 route scan、stage copy、GEMM 的内部 pipeline 和 grid barrier；
+  - K2 需要对 SwiGLU 输出做 row-wise amax/scale 并写 FP8，这个 reduction 需要完整 hidden row，而 K1 GEMM 是 N tile 分块输出；
+  - 直接融合会引入跨 N tile row reduction、额外寄存器/共享内存或额外同步，容易得不偿失。
+- 本轮保留的低风险融合是 K1 写 `actual_m_max`，K2 直接读取：
+  - 去掉 K2 每个 block 重新扫描 32 个 local experts 的小开销；
+  - 同时把 `actual_m` clamp 到 `m_per_expert`，和 K1/K3 的容量截断合同一致；
+  - 不新增 kernel，不引入 D2H/H2D，不改变 public API。
+- K3 tail-reduce 的安全细粒度优化是 runtime-token 级 reducer worker 收缩：
+  - capture8192 时 grid 仍固定，保持 graph contract；
+  - replay tokens <= 256 时只让 64 个 reducer 真正等 peer signal/参与 reduce，512+ 仍使用 128；
+  - 小 token graph replay 8/32/256 分别约 `0.547/0.643/1.276 ms`，相对最近基线 `0.560/0.658/1.291 ms` 有小幅收益；512 仍在历史噪声带内。
+- 更深的 K3 fine-grained overlap 不是局部 patch：
+  - 当前 tail path 是“64 个 GEMM CTA 全部完成 -> owner signal peers -> reducer blocks wait peer signals -> reduce”；
+  - 如果要让 combine store 与 reduce 更早重叠，需要 per-chunk/per-expert readiness，类似 DeepEP/Flux 的细粒度 comp/signal 合同；
+  - 这会改变 peer signal、combine buffer 可见性和 reducer 分片语义，必须作为单独设计/验证任务，不应混入本轮 LL 小优化。
+
+## 2026-06-20 LL aggressive overlap close-out
+
+- K1+K2 不能用“尾部附加 pass”方式真融合：实测 correctness 虽通过，但 `8/32/128/256` 全档慢于默认 LL tail。原因不是缺少一个小分支，而是 K2 的 row-wise amax/quant 需要完整 hidden row，K1 GEMM 是 N tile 分块输出；如果没有 paired-N schedule 或明确的 row-wise amax/量化写回合同，融合只会多一个同步和 pass。
+- K3 per-row chunk-ready 也不是正确的细粒度方向：per combine row、per hidden tile 发布 ready counter 的 atomic/wait 成本太高。即使用 `{source_rank, partial_row}` descriptor 省掉 K3 反扫 peer sym buffer，性能仍低于默认 peer-ready tail-reduce。
+- 可借鉴 DeepEP/Flux 的是 chunk-level readiness 合同，而不是 row-level atomic：
+  - 需要 per-expert/per-token-chunk 的 expected-count；
+  - 需要 compute 侧低频发布 `comp_signal`，reducer 按 token chunk 消费；
+  - 可能要求 K1 route/order metadata 或 combine row layout 重新组织，让 reducer 能知道“某个 destination token chunk 的 topk rows 已经齐了”。
+- 因此本轮生产代码只保留低风险且已验证的四项：K1 inline start barrier、K3 peer-ready ring、runtime active reducer trim、K2 `actual_m_max` compact fast path。`combine_ready`、row descriptor、`MEGAMOE_DCU_LL_K3_CHUNK_READY` 和 naive fused-K2 均不保留。
+
+## 2026-06-20 LL redundant sync ablation finding
+
+- K1 LL 的多数 grid barrier 是数据合同，不是冗余：start-rank barrier 后放行、zero/init 后 route scan、route scan 后 max/metadata/stage-copy、stage-copy 后 GEMM 消费都需要全 grid 可见性。
+- 可安全裁剪的是 stage-copy 末尾紧挨 grid barrier 前的额外 `__threadfence()`：后续 `v3_k1_ll_grid_barrier_device()` 已包含 `__syncthreads()` 和 device fence，实测 LL eager/graph/uneven/no-tail 均正确。
+- K3 LL tail signal helper 末尾的 block barrier 可以裁剪：signal 由 thread0 完成且该 compute CTA 后续没有依赖“全线程都完成 signal helper”的生产逻辑；inline fallback 仍在后续 wait helper 中同步。
+- 不能继续轻易裁剪的点：
+  - combine buffer store 完成后的 `wait_vmem_lds_store + block_barrier + __threadfence_system` 是跨 rank reduce 可见性的核心；
+  - reducer 的 peer signal/peer-ready wait 后同步与 invalidate 虽保守，但直接删会重新暴露历史 remote visibility 风险；
+  - K1 grid barrier primitive 内部 fence 影响全 kernel ordering，不能和单个局部 fence 等价看待。
+- 实测结论：同步裁剪没有带来大幅收益，但保持或略优于历史噪声区间；继续压 LL 延迟应转向 K1/K2 合同级融合或 K3 chunk-level readiness，而不是继续剥离 wait-side 可见性同步。

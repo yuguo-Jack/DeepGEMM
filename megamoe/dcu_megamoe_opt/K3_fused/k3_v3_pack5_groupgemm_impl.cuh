@@ -732,7 +732,6 @@ __device__ static inline void v3_k3_tail_signal_peers_device(
             }
         }
     }
-    block_barrier_device();
 }
 
 __device__ static inline void v3_k3_tail_wait_peer_signals_device(
@@ -791,6 +790,80 @@ __device__ static inline void v3_k3_wait_peer_signals_thread0_device(
         }
     }
     invalidate_l1_device();
+}
+
+__device__ static inline int v3_k3_tail_runtime_signal_generation_device(
+    int signal_generation,
+    const int32_t* signal_generation_ptr) {
+    int runtime_signal_generation = signal_generation;
+    if (signal_generation_ptr != nullptr) {
+        runtime_signal_generation = signal_generation_ptr[0];
+        if (runtime_signal_generation <= 0)
+            runtime_signal_generation = 1;
+    }
+    return runtime_signal_generation;
+}
+
+__device__ static inline int v3_k3_tail_done_counter_slot_device(
+    int runtime_signal_generation,
+    const int32_t* signal_generation_ptr) {
+    constexpr int kTailDoneCounterRingSlots = 16;
+    return signal_generation_ptr != nullptr
+               ? (runtime_signal_generation & (kTailDoneCounterRingSlots - 1))
+               : 0;
+}
+
+__device__ static inline int* v3_k3_tail_peer_ready_counter_device(
+    int32_t* done_counter,
+    int slot) {
+    constexpr int kTailDoneCounterRingSlots = 16;
+    constexpr int kTailPeerReadyOffset = 2 * kTailDoneCounterRingSlots;
+    return done_counter == nullptr ? nullptr
+                                   : done_counter + kTailPeerReadyOffset + slot;
+}
+
+__device__ static inline void v3_k3_tail_publish_peer_ready_device(
+    int* peer_ready_counter,
+    int signal_generation) {
+    if (threadIdx.x == 0) {
+        __hip_atomic_store(peer_ready_counter, signal_generation,
+                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    block_barrier_device();
+}
+
+__device__ static inline void v3_k3_tail_wait_peer_ready_device(
+    int* peer_ready_counter,
+    int signal_generation) {
+    if (threadIdx.x == 0) {
+        auto* ready = reinterpret_cast<volatile int*>(peer_ready_counter);
+        const auto start_time = clock64();
+        while (load_signal_system_acquire_device(ready) < signal_generation) {
+            invalidate_l1_device();
+            if (clock64() - start_time > deep_gemm::mega::kBarrierTimeoutCycles)
+                abort();
+        }
+        invalidate_l1_device();
+    }
+    block_barrier_device();
+    invalidate_l1_device();
+}
+
+__device__ static inline int v3_k3_tail_active_reduce_blocks_device(
+    int num_tokens,
+    const int32_t* runtime_num_tokens,
+    int reduce_blocks) {
+    if (reduce_blocks <= 64)
+        return reduce_blocks;
+    int effective_num_tokens = num_tokens;
+    if (runtime_num_tokens != nullptr) {
+        effective_num_tokens = runtime_num_tokens[0];
+        if (effective_num_tokens < 0)
+            effective_num_tokens = 0;
+        if (effective_num_tokens > num_tokens)
+            effective_num_tokens = num_tokens;
+    }
+    return effective_num_tokens <= 256 ? 64 : reduce_blocks;
 }
 
 __device__ static inline void v3_k3_tail_reduce_worker_device(
@@ -925,15 +998,41 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
     constexpr int kPipeStage = 2;
     constexpr int kMRepeats = kBlockM / 16;
     if constexpr (kTailReduce) {
+        const int active_reduce_blocks =
+            v3_k3_tail_active_reduce_blocks_device(
+                num_tokens, runtime_num_tokens, reduce_blocks);
         if (static_cast<int>(blockIdx.x) >= kCUs) {
             const int reducer_idx = static_cast<int>(blockIdx.x) - kCUs;
-            if (reducer_idx < reduce_blocks) {
-                v3_k3_tail_wait_peer_signals_device(
-                    signal_addrs, num_ranks, signal_generation);
+            if (reducer_idx < active_reduce_blocks) {
+                const int runtime_signal_generation =
+                    v3_k3_tail_runtime_signal_generation_device(
+                        signal_generation, signal_generation_ptr);
+                const int slot = v3_k3_tail_done_counter_slot_device(
+                    runtime_signal_generation, signal_generation_ptr);
+                int* peer_ready_counter =
+                    v3_k3_tail_peer_ready_counter_device(done_counter, slot);
+                if (peer_ready_counter != nullptr &&
+                    active_reduce_blocks > 1) {
+                    if (reducer_idx == 0) {
+                        v3_k3_tail_wait_peer_signals_device(
+                            signal_addrs, num_ranks,
+                            runtime_signal_generation);
+                        v3_k3_tail_publish_peer_ready_device(
+                            peer_ready_counter,
+                            runtime_signal_generation);
+                    } else {
+                        v3_k3_tail_wait_peer_ready_device(
+                            peer_ready_counter,
+                            runtime_signal_generation);
+                    }
+                } else {
+                    v3_k3_tail_wait_peer_signals_device(
+                        signal_addrs, num_ranks, runtime_signal_generation);
+                }
                 v3_k3_tail_reduce_worker_device(
-                    reduce_y, sym_buffer, reducer_idx, reduce_blocks,
-                    num_ranks, num_experts, num_max_tokens_per_rank,
-                    num_tokens, runtime_num_tokens, num_topk, kN,
+                    reduce_y, sym_buffer, reducer_idx, active_reduce_blocks,
+                    num_ranks, num_experts, num_max_tokens_per_rank, num_tokens,
+                    runtime_num_tokens, num_topk, kN,
                     static_cast<int>(blockDim.x));
             }
             return;
@@ -1161,17 +1260,11 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
         __shared__ int tail_signal_generation_shared;
         __shared__ int* tail_done_counter_shared;
         if (threadIdx.x == 0) {
-            int runtime_signal_generation = signal_generation;
-            if (signal_generation_ptr != nullptr) {
-                runtime_signal_generation = signal_generation_ptr[0];
-                if (runtime_signal_generation <= 0)
-                    runtime_signal_generation = 1;
-            }
-            constexpr int kTailDoneCounterRingSlots = 16;
-            const int slot =
-                signal_generation_ptr != nullptr
-                    ? (runtime_signal_generation & (kTailDoneCounterRingSlots - 1))
-                    : 0;
+            const int runtime_signal_generation =
+                v3_k3_tail_runtime_signal_generation_device(
+                    signal_generation, signal_generation_ptr);
+            const int slot = v3_k3_tail_done_counter_slot_device(
+                runtime_signal_generation, signal_generation_ptr);
             tail_signal_generation_shared = runtime_signal_generation;
             tail_done_counter_shared = done_counter + 2 * slot;
         }

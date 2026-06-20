@@ -221,6 +221,9 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
 
     constexpr int64_t kProbStorageBytes = 256;
     constexpr int64_t kTailDoneCounterRingSlots = 16;
+    constexpr int64_t kTailDoneCounterInts = 48;
+    static_assert(kTailDoneCounterInts == 3 * kTailDoneCounterRingSlots,
+                  "tail done counter scratch layout changed");
     constexpr int64_t kTailSignalAddrs = 16;
     const int64_t route_base =
         route_task_workspace_bytes(num_ranks, num_experts, num_max_tokens_per_rank);
@@ -228,8 +231,8 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     const int64_t tail_done_offset =
         align_i64(prob_offset + kProbStorageBytes, sizeof(int32_t));
     const int64_t tail_signal_addrs_offset = align_i64(
-        tail_done_offset + 2 * kTailDoneCounterRingSlots *
-                               static_cast<int64_t>(sizeof(int32_t)),
+        tail_done_offset +
+            kTailDoneCounterInts * static_cast<int64_t>(sizeof(int32_t)),
         sizeof(int64_t));
     return align_i64(
         tail_signal_addrs_offset +

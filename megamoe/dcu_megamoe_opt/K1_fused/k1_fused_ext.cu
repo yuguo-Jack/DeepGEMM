@@ -1309,7 +1309,8 @@ k1_symm_fused_l1_v3_pack5(
         return offset;
     };
     const int64_t route_scratch_i32_ints =
-        use_ll ? (local_experts + 2 * local_experts * rows_aligned_per_expert)
+        use_ll ? (local_experts + 2 +
+                  2 * local_experts * rows_aligned_per_expert)
                : (local_experts + local_experts + 1 + capacity_tiles_i64 +
                   capacity_tiles_i64 + capacity_tiles_i64 * 16);
     const int64_t grid_barrier_ints =
@@ -1371,9 +1372,10 @@ k1_symm_fused_l1_v3_pack5(
     auto route_scratch_i32 =
         make_i32_view(route_scratch_i32_offset, {route_scratch_i32_ints});
     // K1 LL writes per-local-expert row counts at the head of route_scratch_i32.
-    // Return this view as the LL K3 actual_m contract so graph replay can use
-    // runtime row counts while keeping the captured capacity tensors fixed.
-    auto ll_actual_m = make_i32_view(route_scratch_i32_offset, {local_experts});
+    // The extra slot carries max(actual_m) for K2; K3 only consumes the first
+    // local_experts entries.
+    auto ll_actual_m =
+        make_i32_view(route_scratch_i32_offset, {local_experts + 1});
     auto grid_barrier = make_i32_view(grid_barrier_offset, {grid_barrier_ints});
     auto local_topk_mask =
         torch::from_blob(
@@ -1419,7 +1421,6 @@ k1_symm_fused_l1_v3_pack5(
                     "cumulative_local_expert_recv_stats must be contiguous CUDA int32");
         local_expert_stats = &stats;
     }
-
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int runtime_launch_num_tokens =
         runtime_num_tokens.has_value() ? -1 : static_cast<int>(num_tokens);

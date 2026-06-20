@@ -7764,3 +7764,170 @@
   - graph replay 小 token 仍在历史 `~0.53-0.66 ms` 区间，没有重新出现 capture bucket 固定 work 问题；
   - 该改动不新增 kernel，也不新增 H2D/D2H，同步语义仍由 K1 block0 跨 rank start barrier + K1 内 local grid barrier 承接；
   - graph 收益预期有限，因为 standalone kernel launch 已经在 capture 内；eager/框架低延迟场景更可能从减少一个独立 GPU kernel 中获益。
+
+## 2026-06-20 - LL K1/K2 metadata fusion and K3 runtime reducer trim
+
+- 背景：用户要求继续看 LL K1/K3 kernel 内部细粒度 overlap，并尝试融合 K1/K2；硬约束仍是不新增 kernel、不引入 D2H sync，尽量不增加 H2D。
+- 本轮保守实现：
+  - K1 LL route/stage 阶段在 `actual_m` 后额外写一个 `max(actual_m)` slot，K2 可直接消费，避免每个 K2 block 重新扫描 32 个 local experts；
+  - K2 `actual_m` 消费统一 clamp 到 `m_per_expert`，补齐 K1/K3 已有的容量截断语义，降低随机路由 overflow 后的精度/越界隐患；
+  - K3 LL tail reducer 在 graph capture8192 但 runtime tokens 小于等于 256 时，把有效 reducer worker 从 128 收缩到 64；grid 仍固定，不新增 kernel，不影响 512+ replay 的 reducer 并行度。
+- 暂不做的高风险融合：
+  - 真正把 K2 SwiGLU/row-wise amax/scale/FP8 quant 融入 K1 epilogue，需要跨 N tile 汇总整行 amax 并再量化写回，容易增加寄存器、同步和 occupancy 压力；
+  - 当前历史 K2 stage timing 很小，且 K1/K3/通信同步仍是 LL 低延迟主账本，因此不在没有 profiler 证据时改成大融合 kernel。
+- 构建/静态验证：
+  - 远端 `python3 setup.py build_ext --build-temp build/temp --build-lib build/lib --inplace` 强制重编 K1/K2/K3_v3 通过；
+  - source guard `python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py`：`9 passed`。
+- 远端 LL tail graph capture8192 replay 验证：
+
+| replay tokens/rank | before recent baseline ms | after active<=256 ms | status |
+| ---: | ---: | ---: | --- |
+| 8 | 0.560 | 0.547 | correct |
+| 32 | 0.658 | 0.643 | correct |
+| 128 | ~0.845 | 0.846 | correct |
+| 256 | 1.291 | 1.276 | correct |
+| 512 | 2.249 | 2.277 median / 2.244 min | correct, median within run-to-run noise |
+
+- 远端 LL tail eager 验证（`num_max_tokens_per_rank=8192`）：
+
+| tokens/rank | fused median ms | status |
+| ---: | ---: | --- |
+| 32 | 0.626 | correct |
+| 128 | 0.839 | correct |
+| 256 | 1.262 | correct |
+| 512 | 2.304 | correct, matches historical ~2.30 |
+
+- 远端 LL no-tail smoke：
+  - eager512：correct，`2.206 ms`；
+  - graph capture8192 replay `8/256/512`：correct，`0.566/1.263/2.243 ms`。
+- 结论：
+  - K1/K2 metadata fusion 属于低风险 cleanup/safety：性能中性或小幅正向，主要价值是去掉 K2 redundant scan 并统一 actual_m clamp 合同；
+  - K3 runtime reducer trim 对生产 LL graph 小 token 有稳定收益，且不影响 512+ 的逻辑并行度；阈值已从初版 `<=2048` 收紧到 `<=256`，避免 512 上界被误伤；
+  - 更细粒度的 K3 overlap 需要 per-chunk/per-expert readiness signal，与 DeepEP/Flux 风格更接近，但会触及 K3 store、peer signal、reduce 合同，本轮不进入生产代码。
+
+## 2026-06-20 - LL overlap/fusion follow-up attempt started
+
+- 按用户要求优先尝试两个方向：
+  - K3 tail reduce 方向：参考 DeepEP `combine_sbo` 的 `comp_signal + block_m threshold` 设计，当前生产合同还缺少 per-destination-token-chunk 的精确 expected-count，因此先做低风险 peer-wait sharing：一个 reducer block 等跨 rank signal 并发布本地 ready，其余 reducer block 只等本地 ready ring。
+  - K1+K2 方向：真正把 K2 SwiGLU/amax/FP8 quant 融进 K1 epilogue 需要跨 N tile 汇总整行 amax，寄存器/同步/occupancy 风险较高；当前先用 K1 已输出的 `actual_m/max(actual_m)` 合同让 K2 走 compact fast path，去掉 LL compact 行上的 legacy 防御性 pointer/zero-weight 分支。
+- 约束：
+  - 不新增 kernel；
+  - 不引入 D2H/H2D sync；
+  - 不改变 normal ASM tail done-counter 前两个槽的 ABI，新增 peer-ready ring 放在同一 scratch 后半段；
+  - 修改后必须重新跑 source guard、远端 build、LL tail/no-tail eager+graph correctness/perf smoke。
+
+## 2026-06-20 - LL peer-wait sharing + K2 compact fast path validation
+
+- 代码改动：
+  - `route_scratch` 中 `asm_tail_done_counter` 从 `2 * 16` 个 int32 扩到 `48` 个 int32；前 `32` 个 int32 保持 normal ASM tail done/owner ABI，后 `16` 个 int32 作为 LL C tail reducer peer-ready ring；
+  - K1 LL inline start barrier 与 standalone `rank_barrier` 都 reset 当前 generation 的 peer-ready slot；
+  - K3 LL tail reducer 中 `reducer_idx==0` 等跨 rank signal 并发布本地 ready，其余 reducer blocks 只等本地 ready 后进入 reduce worker；
+  - K2 在 `actual_m` 存在时走 compact-row fast path，跳过 `row_combine_ptrs[row] == 0` 与 zero-route 分支；无 `actual_m` 的 normal/legacy 路径不变。
+- 本地验证：
+  - `python -m py_compile megamoe/opt.py megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 通过；
+  - `git diff --check` 通过；
+  - 本地无 `pytest`，source guard 放到远端跑。
+- 远端验证：
+  - 测试前后 `hy-smi --showpids` 均显示无 KFD 进程残留；
+  - `MAX_JOBS=16 python3 setup.py build_ext --build-temp build/temp --build-lib build/lib --inplace` 通过；
+  - `PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py`：`9 passed`。
+- LL tail eager（`K3_USE_ASM_TAIL_REDUCE=1`, `num_max_tokens_per_rank=8192`, warmup=3, repeat=8）：
+
+| tokens/rank | correct | fused median ms |
+| ---: | :---: | ---: |
+| 32 | true | 0.625 |
+| 128 | true | 0.834 |
+| 256 | true | 1.265 |
+| 512 | true | 2.259 |
+
+- LL no-tail eager（`K3_USE_ASM_TAIL_REDUCE=0`, `num_max_tokens_per_rank=8192`, warmup=3, repeat=8）：
+
+| tokens/rank | correct | fused median ms |
+| ---: | :---: | ---: |
+| 32 | true | 0.621 |
+| 256 | true | 1.222 |
+| 512 | true | 2.210 |
+
+- LL tail graph capture8192（replay-only bench, warmup=3, repeat=8）：
+
+| replay tokens/rank | correct | replay median ms |
+| ---: | :---: | ---: |
+| 8 | true | 0.544 |
+| 32 | true | 0.641 |
+| 128 | true | 0.842 |
+| 256 | true | 1.287 |
+| 512 | true | 2.267 |
+
+- LL no-tail graph capture8192：
+
+| replay tokens/rank | correct | replay median ms |
+| ---: | :---: | ---: |
+| 8 | true | 0.567 |
+| 256 | true | 1.266 |
+| 512 | true | 2.228 |
+
+- 结论：
+  - 两个方向都保持 correctness，性能仍处于历史区间，没有出现 capture bucket 固定 work 或 512 上界回退；
+  - K3 peer-wait sharing 的可见收益有限，说明当前小 token 主账本仍不只是跨 peer signal 轮询，后续若继续做 #1，需要进入 per-destination-token-chunk readiness / store-count 合同，风险和改动都更大；
+  - K2 compact fast path 属于安全的合同收敛：减少 K2 metadata 防御分支，但没有把真正的 K2 SwiGLU/quant 融进 K1。真正 K1+K2 融合仍需解决跨 N tile row amax 与量化写回问题。
+
+## 2026-06-20 - LL aggressive overlap experiments not promoted
+
+- K1+K2 真融合初版已反证并清理：
+  - 原型把 SwiGLU/amax/FP8 quant 塞到 K1 尾部，在 K1 结束后再跑固定 64-block row quant pass；
+  - correctness 通过，但 LL tail eager default `8/32/128/256` 约 `0.579/0.629/0.840/1.272 ms`，fused-K2 约 `0.582/0.634/0.872/1.304 ms`，全档更慢；
+  - 判断：没有真正消除 BF16 输出 traffic，反而引入 K1 end-grid barrier 与额外 row quant pass。后续若重做，必须改成 pair-N schedule 或明确的 row-wise amax/量化写回合同，不能再做尾部附加 pass。
+- K3 per-row chunk-ready 初版也已反证并从生产代码撤出：
+  - 初版在 symm buffer 增加 `combine_ready`，K3 compute 对每个 combine row、每个 hidden tile 发布 ready counter，reducer 等 topk row counter 后 reduce；
+  - pre-descriptor 版本 tail eager `8/32/128/256` 约 `0.616/0.768/0.904/1.335 ms`，明显慢于 default；
+  - descriptor 版本把 K1 `row_combine_ptrs` 改成 `{source_rank, partial_row}` descriptor，避免 K3 反扫 peer sym buffer，chunk-ready 提升到 `0.603/0.747/0.883/1.277 ms`，但仍慢于 default `0.582/0.628/0.847/1.266 ms`；
+  - 判断：per-row/per-hidden-tile atomic readiness 太细，atomic + wait 开销超过 overlap 收益；descriptor ABI 也增加维护面和 symm footprint，不应进默认路径。
+- 知识库/DeepEP 类比结论：
+  - 更合理的 readiness 不是 row 级 atomic，而是 per-expert/per-token-chunk 的 `comp_signal + block_m/threshold` 合同；
+  - 这需要 K1 route/order metadata 或 combine row order 能给出 chunk expected-count，K3 compute 低频发布 chunk progress，reducer 按 token chunk 消费；
+  - 当前 row order 是 expert-grouped 且 token/chunk 分散，若不改 route/order 合同，很难让细粒度 readiness 既正确又便宜。
+- 当前保留的生产改动：
+  - K1 inline start barrier、K3 peer-ready ring、runtime active reducer block trim、K2 `actual_m_max` compact fast path；
+  - 没有保留 `MEGAMOE_DCU_LL_K3_CHUNK_READY`、`combine_ready`、row descriptor 或 K1+K2 fused-K2 env。下一步若继续做 #1/#2，需要新分支设计，而不是在生产热路径继续堆实验逻辑。
+- 清理后验证：
+  - 本地 `compileall`、`git diff --check` 通过，`rg` 确认 chunk-ready/descriptor/fused-K2 符号已清空；
+  - 远端 `PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py`：`9 passed`；
+  - 远端 `MAX_JOBS=16 python3 setup.py build_ext --build-temp build/temp --build-lib build/lib --inplace` 通过；
+  - LL tail eager 32/256 correctness 通过，median `0.628/1.263 ms`；
+  - LL no-tail eager 32 correctness 通过，median `0.622 ms`；
+  - LL tail graph capture8192 replay 8/32/256 correctness 通过，replay median `0.546/0.641/1.275 ms`；
+  - 验证前后 `hy-smi --showpids` 均显示无 KFD 进程残留。
+
+## 2026-06-20 - LL K1/K3 redundant sync ablation
+
+- 本轮只做两处低风险同步裁剪：
+  - K1 LL stage-copy 结束处去掉显式 `__threadfence()`，保留随后的 `v3_k1_ll_grid_barrier_device()`；该 grid barrier 内已有 block-local `__syncthreads()` 和 device fence；
+  - K3 LL tail signal helper 去掉末尾 `block_barrier_device()`；生产 tail path 中发 signal 的 compute CTA 后续不再依赖同 block 全线程同步，inline reduce fallback 仍会在随后的 wait helper 内同步。
+- 保留不动的同步：
+  - K1 start-rank barrier、zero/init 后 barrier、route-scan 后 barrier、GEMM 前 barrier；
+  - K3 combine store 后 `wait_vmem_lds_store + block_barrier + __threadfence_system`、done owner release、peer signal/peer-ready wait 的 acquire/invalidate。
+- 本地验证：
+  - `git diff --check -- megamoe/dcu_megamoe_opt/K1_fused/k1_v3_pack5_groupgemm_impl.cuh megamoe/dcu_megamoe_opt/K3_fused/k3_v3_pack5_groupgemm_impl.cuh` 通过。
+- 远端验证：
+  - 测试前后 `hy-smi --showpids` 无 KFD 进程残留；
+  - `python3 setup.py build_ext --inplace` 通过；
+  - `pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py`：`9 passed`；
+  - 结果目录：`hygon_tmp/debug/ll_sync_ablation_20260620/`。
+
+| case | correct | fused median ms | graph replay median ms |
+| --- | :---: | ---: | --- |
+| LL tail eager 32 | true | 0.624 | - |
+| LL tail eager 256 | true | 1.259 | - |
+| LL tail eager 512 | true | 2.263 | - |
+| LL tail eager 513 | true | 2.283 | - |
+| LL graph capture8192 | true | - | 8: 0.546, 32: 0.644, 128: 0.845, 256: 1.283, 512: 2.268, 513: 2.272 |
+| LL no-tail eager 32 | true | 0.620 | - |
+| LL no-tail eager 256 | true | 1.225 | - |
+| LL uneven eager `0,133,0,0,0,0,0,0` | true | 0.670 | - |
+| LL uneven graph capture256 | true | 0.667 | 32: 0.405, 128: 0.651, 256: 0.664 |
+
+- 与最近 smoke 粗对比：
+  - LL eager 32 历史约 `0.643 ms`，本轮 `0.624 ms`；
+  - LL eager 512 历史约 `2.302 ms`，本轮 `2.263 ms`；
+  - LL graph capture8192 replay 8/256/512 历史约 `0.560/1.291/2.249 ms`，本轮 `0.546/1.283/2.268 ms`，整体在噪声带内，无功能回退。
+- 结论：两处裁剪可保留；进一步删除 K3 wait-side `block_barrier/invalidate` 或 K1 grid barrier 内 fence 风险明显更高，暂不继续在生产路径上削同步。

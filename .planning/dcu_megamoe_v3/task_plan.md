@@ -19,6 +19,13 @@ DCU MegaMoE V3 已转为主路径；当前目标是把 DCU MegaMoE 生产代码�
 - ✅ 将 DCU MegaMoE 测试、脚本迁入 `megamoe/dcu_megamoe_opt/{tests,scripts}/`，外层 DCU 专属残留已清理；两张过时 pipeline PNG 由用户确认删除，不再迁入 assets。
 - [ ] 更新 README、setup package data、source guard，并通过本地 compile/pytest source guard、远端 `build_ext --inplace`、代表性 smoke 与 README smoke。
 
+## 2026-06-20 LL overlap / K1+K2 fusion active items
+
+- ✅ K3 LL tail reduce peer-wait sharing：只让一个 reducer block 等跨 rank tail signal，其他 reducer block 等本地 peer-ready ring；不新增 kernel，不改 normal ASM done-counter 前两个槽 ABI。
+- ✅ K2 compact-row fast path：当 K1 LL 提供 `actual_m` 时，K2 跳过 padded/legacy row 防御检查，复用 K1 compact 合同减少 metadata load/branch；normal/legacy 路径保持原逻辑。
+- ✅ 已完成远端 build/source guard/LL tail+no-tail eager+graph smoke；更激进的 per-chunk readiness 或 K1+K2 真融合继续作为证据驱动 backlog，不能在没有 profiler/正确性闭环时直接进生产。
+- ✅ per-row chunk-ready 与 naive K1+K2 fused-K2 原型已反证并撤出生产代码；后续若重启，必须改成 per-expert/per-token-chunk readiness 或 paired-N/row-wise amax 合同级设计。
+
 ## 2026-06-16 V3 转正目标更新
 
 本节 supersedes 上述历史 gate 目标：V3 不再作为 `USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND` 隔离实验路径，而要转为 DCU MegaMoE 主路径。
@@ -331,10 +338,11 @@ DCU MegaMoE V3 已转为主路径；当前目标是把 DCU MegaMoE 生产代码�
 - [✅] 必做/BUG：V3 LL tail reduce/signal graph replay 已改为 runtime-token 化。K3 tail reducer 现在从 graph runtime token tensor 读取 replay tokens 并 clamp 到 capture bucket，capture1024/replay8..512 不再按 1024 token 做 reduce；capture8192 下 K2 graph 固定-row block 开销已通过现有 K2 reg kernel 的 grid-stride row loop + 内部 `max_row_blocks=2048` 收敛，不新增 kernel、不引入 D2H sync，LL replay 8 token 已恢复到 `~0.56 ms`。
 - [✅] 2026-06-17 cleanup follow-up：LL tail eager 不再误传 graph runtime token output；eager 128/512 with `num_max_tokens_per_rank=1024` tail correctness 通过，graph capture1024 replay 32/96/128/256/512 tail correctness 通过。确认 eager 有效 rows 不被 max 放大，max 只作为 symm combine stride / scratch capacity 合同。
 - [✅] 2026-06-20 latency follow-up：LL tail-reduce=1 的 K1 前 standalone `rank_barrier` launch 已内联进 K1 C pack5 start path；同步语义仍保留在 K1 block0 + existing local grid barrier 中。LL tail eager 8/32/128/256、LL tail graph capture256 replay 8/32/128/256、LL no-tail eager 32 smoke 均通过。normal/no-tail/post-K3 external reduce 不在本轮移除范围内。
+- [✅] 2026-06-20 LL overlap follow-up：K1/K2 已完成 metadata 级融合，K1 在 `actual_m` 后写 `max(actual_m)`，K2 直接消费并统一 clamp actual rows；K3 tail reducer 增加 runtime-token active reducer worker 收缩，capture8192 replay `<=256` 使用 64 worker、512+ 保持 128 worker。LL tail/no-tail eager/graph representative smoke 均通过，未新增 kernel/D2H/H2D。
 - [✅] 必做：V3 normal 使用 eager 模式刷 uniform tokens per rank `256,512,1024,1025,2048,2050,4096,4097,8192`；不把 graph 结果代替本轮 normal eager sweep。
 - [✅] 必做：V3 normal eager sweep 同时覆盖 no-tail/tail；所有档位 correctness 通过，1024/1025、2048/2050、4096/4097 边界点未见 correctness 异常或明显性能台阶。
 - [✅] 必做：normal eager 结果落盘到 `hygon_tmp/debug/phase10_v3_sweep_20260615_196S/`；最终 LL graph 补测结果落盘到 `hygon_tmp/debug/ll_graph_dynamic_verify_20260615_235731/`，包含日志、case status、JSON 和 `summary.csv`；已回写 `progress.md` / `findings.md` / 本 Phase 状态。
-- [🧭] optional backlog：K2 融入 K1 只在后续 profiler 证明 K2 + `l1_out` 中间读写占 LL graph replay 的显著比例时再恢复；当前 K2 约 `0.028 ms` 的历史 stage timing 表明它不是 32/128 小 token 主瓶颈，直接把 SwiGLU/row-wise scale/FP8 quant 塞进 K1 epilogue 有较高 occupancy 和跨 N tile reduction 风险。
+- [🧭] optional backlog：K2 计算级融入 K1 只在后续 profiler 证明 K2 + `l1_out` 中间读写占 LL graph replay 的显著比例时再恢复；当前保留 metadata 级融合。直接把 SwiGLU/row-wise scale/FP8 quant 塞进 K1 epilogue 有较高 occupancy 和跨 N tile reduction 风险，暂不作为生产优化。
 - 状态：✅ complete for required sweep（normal eager sweep、LL 1024 row-capacity bug fix、LL graph `8..1024` no-tail/tail runtime-row replay sweep 均已完成；LL 1024 仍只作为 graph capture/correctness 覆盖，不作为大 token 生产推荐路径）
 
 ### Phase 11: V3 转正为 DCU MegaMoE 主路径

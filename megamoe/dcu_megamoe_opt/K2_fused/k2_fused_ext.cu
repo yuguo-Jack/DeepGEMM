@@ -151,6 +151,29 @@ __device__ __forceinline__ uint32_t pack4_e4m3fn(
     return lo | (hi << 16);
 }
 
+__device__ __forceinline__ int clamp_actual_m_count(
+    const int count,
+    const int m_per_expert) {
+    if (count <= 0)
+        return 0;
+    return count > m_per_expert ? m_per_expert : count;
+}
+
+__device__ __forceinline__ int actual_m_max_or_scan(
+    const int32_t* __restrict__ actual_m,
+    const int32_t* __restrict__ actual_m_max,
+    const int local_experts,
+    const int m_per_expert) {
+    if (actual_m_max != nullptr)
+        return clamp_actual_m_count(actual_m_max[0], m_per_expert);
+    int max_m = 0;
+    for (int expert = 0; expert < local_experts; ++expert) {
+        const int count = clamp_actual_m_count(actual_m[expert], m_per_expert);
+        max_m = count > max_m ? count : max_m;
+    }
+    return max_m;
+}
+
 template <int Threads>
 __global__ __launch_bounds__(Threads)
 void swiglu_quant_channelwise_kernel(
@@ -158,6 +181,7 @@ void swiglu_quant_channelwise_kernel(
     const float* __restrict__ topk_weights,
     const int64_t* __restrict__ row_combine_ptrs,
     const int32_t* __restrict__ actual_m,
+    const int32_t* __restrict__ actual_m_max,
     const int32_t* __restrict__ active_tiles,
     uint8_t* __restrict__ out_fp8,
     float* __restrict__ out_scale,
@@ -179,10 +203,10 @@ void swiglu_quant_channelwise_kernel(
     int logical_m_per_expert = m_per_expert;
     const bool has_actual_m =
         actual_m != nullptr && m_per_expert > 0 && local_experts > 0;
+    const bool compact_active_rows = has_actual_m;
     if (has_actual_m) {
-        int max_m = 0;
-        for (int expert = 0; expert < local_experts; ++expert)
-            max_m = actual_m[expert] > max_m ? actual_m[expert] : max_m;
+        const int max_m = actual_m_max_or_scan(
+            actual_m, actual_m_max, local_experts, m_per_expert);
         logical_m_per_expert = max_m;
         effective_rows = max_m * local_experts;
     }
@@ -199,7 +223,9 @@ void swiglu_quant_channelwise_kernel(
     if (has_actual_m) {
         const int expert = logical_row / logical_m_per_expert;
         const int row_in_expert = logical_row - expert * logical_m_per_expert;
-        if (row_in_expert >= actual_m[expert])
+        const int expert_count =
+            clamp_actual_m_count(actual_m[expert], m_per_expert);
+        if (row_in_expert >= expert_count)
             return;
         row = expert * m_per_expert + row_in_expert;
     }
@@ -207,12 +233,12 @@ void swiglu_quant_channelwise_kernel(
     const int tid = static_cast<int>(threadIdx.x);
     const int stride = hidden * 2;
     const int64_t row_base = static_cast<int64_t>(row) * stride;
-    if (!output_bf16 && row_combine_ptrs != nullptr &&
+    if (!compact_active_rows && !output_bf16 && row_combine_ptrs != nullptr &&
         row_combine_ptrs[row] == 0) {
         return;
     }
     const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
-    if (has_topk_weights && route_weight == 0.0f) {
+    if (!compact_active_rows && has_topk_weights && route_weight == 0.0f) {
         if (tid == 0)
             out_scale[row] = 1.0e-4f / 448.0f;
         const int64_t out_base = static_cast<int64_t>(row) * hidden;
@@ -288,6 +314,7 @@ void swiglu_quant_channelwise_reg_kernel(
     const float* __restrict__ topk_weights,
     const int64_t* __restrict__ row_combine_ptrs,
     const int32_t* __restrict__ actual_m,
+    const int32_t* __restrict__ actual_m_max,
     const int32_t* __restrict__ active_tiles,
     uint8_t* __restrict__ out_fp8,
     float* __restrict__ out_scale,
@@ -309,10 +336,10 @@ void swiglu_quant_channelwise_reg_kernel(
     int logical_m_per_expert = m_per_expert;
     const bool has_actual_m =
         actual_m != nullptr && m_per_expert > 0 && local_experts > 0;
+    const bool compact_active_rows = has_actual_m;
     if (has_actual_m) {
-        int max_m = 0;
-        for (int expert = 0; expert < local_experts; ++expert)
-            max_m = actual_m[expert] > max_m ? actual_m[expert] : max_m;
+        const int max_m = actual_m_max_or_scan(
+            actual_m, actual_m_max, local_experts, m_per_expert);
         logical_m_per_expert = max_m;
         effective_rows = max_m * local_experts;
     }
@@ -330,18 +357,20 @@ void swiglu_quant_channelwise_reg_kernel(
             const int expert = logical_row / logical_m_per_expert;
             const int row_in_expert =
                 logical_row - expert * logical_m_per_expert;
-            if (row_in_expert >= actual_m[expert])
+            const int expert_count =
+                clamp_actual_m_count(actual_m[expert], m_per_expert);
+            if (row_in_expert >= expert_count)
                 continue;
             row = expert * m_per_expert + row_in_expert;
         }
         const int stride = hidden * 2;
         const int64_t row_base = static_cast<int64_t>(row) * stride;
-        if (!output_bf16 && row_combine_ptrs != nullptr &&
+        if (!compact_active_rows && !output_bf16 && row_combine_ptrs != nullptr &&
             row_combine_ptrs[row] == 0) {
             continue;
         }
         const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
-        if (has_topk_weights && route_weight == 0.0f) {
+        if (!compact_active_rows && has_topk_weights && route_weight == 0.0f) {
             if (tid == 0)
                 out_scale[row] = 1.0e-4f / 448.0f;
             const int64_t out_base = static_cast<int64_t>(row) * hidden;
@@ -451,6 +480,7 @@ void launch_swiglu_quant_channelwise(
     const torch::Tensor& topk_weights,
     const int64_t* row_combine_ptrs,
     const int32_t* actual_m,
+    const int32_t* actual_m_max,
     const int32_t* active_tiles,
     torch::Tensor& out_fp8,
     torch::Tensor& out_scale,
@@ -486,6 +516,7 @@ void launch_swiglu_quant_channelwise(
             has_topk_weights ? topk_weights.data_ptr<float>() : nullptr,
             row_combine_ptrs,
             actual_m,
+            actual_m_max,
             active_tiles,
             reinterpret_cast<uint8_t*>(out_fp8.data_ptr()),
             out_scale.data_ptr<float>(),
@@ -510,6 +541,7 @@ void launch_swiglu_quant_channelwise(
             has_topk_weights ? topk_weights.data_ptr<float>() : nullptr,
             row_combine_ptrs,
             actual_m,
+            actual_m_max,
             active_tiles,
             reinterpret_cast<uint8_t*>(out_fp8.data_ptr()),
             out_scale.data_ptr<float>(),
@@ -535,6 +567,7 @@ void launch_swiglu_quant_channelwise(
             has_topk_weights ? topk_weights.data_ptr<float>() : nullptr,
             row_combine_ptrs,
             actual_m,
+            actual_m_max,
             active_tiles,
             reinterpret_cast<uint8_t*>(out_fp8.data_ptr()),
             out_scale.data_ptr<float>(),
@@ -557,6 +590,7 @@ void launch_swiglu_quant_channelwise_auto(
     const torch::Tensor& topk_weights,
     const int64_t* row_combine_ptrs,
     const int32_t* actual_m,
+    const int32_t* actual_m_max,
     const int32_t* active_tiles,
     torch::Tensor& out_fp8,
     torch::Tensor& out_scale,
@@ -571,25 +605,29 @@ void launch_swiglu_quant_channelwise_auto(
     const int hidden = static_cast<int>(x.size(1) / 2);
     if (hidden <= 2048 && !output_bf16) {
         launch_swiglu_quant_channelwise<64>(
-            x, topk_weights, row_combine_ptrs, actual_m, active_tiles,
+            x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
+            active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
     } else if (hidden <= 2048) {
         launch_swiglu_quant_channelwise<128>(
-            x, topk_weights, row_combine_ptrs, actual_m, active_tiles,
+            x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
+            active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
     } else if (hidden == 4096) {
         launch_swiglu_quant_channelwise<128>(
-            x, topk_weights, row_combine_ptrs, actual_m, active_tiles,
+            x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
+            active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
     } else {
         launch_swiglu_quant_channelwise<256>(
-            x, topk_weights, row_combine_ptrs, actual_m, active_tiles,
+            x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
+            active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
@@ -657,6 +695,7 @@ void swiglu_quant_channelwise_out(
         row_combine_ptrs_data = ptrs.data_ptr<int64_t>();
     }
     const int32_t* actual_m_data = nullptr;
+    const int32_t* actual_m_max_data = nullptr;
     int64_t local_experts = 0;
     if (actual_m.has_value()) {
         const auto& actual = actual_m.value();
@@ -670,6 +709,8 @@ void swiglu_quant_channelwise_out(
         TORCH_CHECK(actual.numel() >= local_experts,
                     "actual_m must cover every local expert");
         actual_m_data = actual.data_ptr<int32_t>();
+        if (actual.numel() > local_experts)
+            actual_m_max_data = actual_m_data + local_experts;
     }
     const int32_t* active_tiles_data = nullptr;
     if (active_tiles.has_value()) {
@@ -697,6 +738,7 @@ void swiglu_quant_channelwise_out(
     auto out_bf16_view = out_bf16;
     launch_swiglu_quant_channelwise_auto(
         x, topk_weights, row_combine_ptrs_data, actual_m_data,
+        actual_m_max_data,
         active_tiles_data,
         out_fp8_view, out_scale_view, out_bf16_view,
         output_bf16, has_clamp_value, clamp_value, max_row_blocks,

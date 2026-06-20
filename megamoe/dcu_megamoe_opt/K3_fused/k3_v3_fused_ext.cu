@@ -326,8 +326,10 @@ void k3_v3_ll_combine_tail(
                 "num_topk must be positive and num_tokens must be non-negative");
     TORCH_CHECK(num_max_tokens_per_rank >= num_tokens,
                 "num_max_tokens_per_rank must cover num_tokens");
-    TORCH_CHECK(done_counter.numel() >= 2,
-                "done_counter must have at least two elements: done count and V3 owner slot");
+    constexpr int64_t kTailDoneCounterRingSlots = 16;
+    constexpr int64_t kTailDoneCounterInts = 3 * kTailDoneCounterRingSlots;
+    TORCH_CHECK(done_counter.numel() >= kTailDoneCounterInts,
+                "done_counter must cover LL tail done and peer-ready rings");
     TORCH_CHECK(signal_addrs.numel() >= 16,
                 "signal_addrs must have 16 entries");
     const int32_t* signal_generation_ptr = nullptr;

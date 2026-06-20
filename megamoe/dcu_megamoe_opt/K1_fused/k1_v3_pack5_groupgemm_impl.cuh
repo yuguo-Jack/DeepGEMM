@@ -9,7 +9,6 @@
 
 #include <cstddef>
 #include <cstdint>
-
 #include <mega_moe_dcu/comm.cuh>
 #include <mega_moe_dcu/layout.cuh>
 using int32x2_t = int __attribute__((ext_vector_type(2)));
@@ -515,6 +514,7 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
     constexpr int kTailSignalSlotBase = 8;
     constexpr int kBarrierSignalSlotBase = 18;
     constexpr int kTailDoneCounterRingSlots = 16;
+    constexpr int kTailPeerReadyOffset = 2 * kTailDoneCounterRingSlots;
     const int thread_id = static_cast<int>(threadIdx.x);
     __shared__ int barrier_generation;
     __shared__ int barrier_ticket;
@@ -531,6 +531,7 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
     if (thread_id == 0 && tail_done_counter != nullptr) {
         tail_done_counter[0] = 0;
         tail_done_counter[1] = 0;
+        tail_done_counter[kTailPeerReadyOffset] = 0;
     }
     if (thread_id == 0 && graph_runtime_num_tokens != nullptr &&
         graph_runtime_num_tokens_out != nullptr) {
@@ -594,6 +595,7 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
                     barrier_generation & (kTailDoneCounterRingSlots - 1);
                 tail_done_counter[2 * slot] = 0;
                 tail_done_counter[2 * slot + 1] = 0;
+                tail_done_counter[kTailPeerReadyOffset + slot] = 0;
             }
         }
 
@@ -667,7 +669,7 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
     int graph_max_tokens) {
     int32_t* symm_counts = route_scratch_i32;
     int64_t* symm_src_x_ptrs =
-        reinterpret_cast<int64_t*>(route_scratch_i32 + kExperts);
+        reinterpret_cast<int64_t*>(route_scratch_i32 + kExperts + 2);
     const int row_capacity = kExperts * m_per_expert;
     const int max_output_routes_per_rank = num_max_tokens_per_rank * num_topk;
     const int total_output_routes = num_ranks * max_output_routes_per_rank;
@@ -690,6 +692,10 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
 
     for (int idx = global_tid; idx < kExperts; idx += grid_threads) {
         symm_counts[idx] = 0;
+    }
+    if (global_tid == 0) {
+        symm_counts[kExperts] = 0;
+        symm_counts[kExperts + 1] = 0;
     }
     for (int idx = global_tid; idx < row_capacity; idx += grid_threads) {
         const int expert = idx / m_per_expert;
@@ -815,6 +821,17 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
             }
         }
     v3_k1_ll_grid_barrier_device(grid_barrier, static_cast<int>(gridDim.x));
+
+    if (global_tid == 0) {
+        int max_count = 0;
+        for (int expert = 0; expert < kExperts; ++expert) {
+            const int count = symm_counts[expert] > m_per_expert
+                                  ? m_per_expert
+                                  : symm_counts[expert];
+            max_count = count > max_count ? count : max_count;
+        }
+        symm_counts[kExperts] = max_count;
+    }
 
     if (cumulative_local_expert_recv_stats != nullptr) {
         for (int expert = global_tid; expert < kExperts; expert += grid_threads) {
@@ -944,7 +961,6 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
             }
         }
     }
-    __threadfence();
     v3_k1_ll_grid_barrier_device(grid_barrier, static_cast<int>(gridDim.x));
     return symm_counts;
 }

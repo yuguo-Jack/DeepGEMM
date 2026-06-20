@@ -32,6 +32,7 @@ K_K1_ASM_LAUNCH_ARGS_BYTES = 256
 K_K2_GRAPH_ROW_BLOCKS = 8192
 K_PROB_STORAGE_BYTES = 256
 K_TAIL_DONE_COUNTER_RING_SLOTS = 16
+K_TAIL_DONE_COUNTER_INTS = 48
 K_POST_K3_BARRIER_SIGNAL_SLOT_BASE = 20
 V3_LL_BLOCK_M = 32
 K_DTYPE_SIZES = {
@@ -230,7 +231,7 @@ def _route_scratch_views(
     prob_offset = route_base + act_chunk_amax_offset
     tail_done_offset = _align(prob_offset + K_PROB_STORAGE_BYTES, K_DTYPE_SIZES[torch.int32])
     tail_signal_addrs_offset = _align(
-        tail_done_offset + 2 * K_TAIL_DONE_COUNTER_RING_SLOTS * K_DTYPE_SIZES[torch.int32],
+        tail_done_offset + K_TAIL_DONE_COUNTER_INTS * K_DTYPE_SIZES[torch.int32],
         K_DTYPE_SIZES[torch.int64],
     )
 
@@ -287,9 +288,9 @@ def _route_scratch_views(
         asm_tail_done_counter=_route_scratch_tensor(
             route_scratch,
             byte_offset=tail_done_offset,
-            byte_capacity=2 * K_TAIL_DONE_COUNTER_RING_SLOTS * K_DTYPE_SIZES[torch.int32],
+            byte_capacity=K_TAIL_DONE_COUNTER_INTS * K_DTYPE_SIZES[torch.int32],
             dtype=torch.int32,
-            shape=(2 * K_TAIL_DONE_COUNTER_RING_SLOTS,),
+            shape=(K_TAIL_DONE_COUNTER_INTS,),
         ),
         asm_tail_signal_addrs=_route_scratch_tensor(
             route_scratch,
