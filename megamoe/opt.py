@@ -478,20 +478,22 @@ def fp8_mega_moe_opt_3stage(
         state.asm_signal_generation = (state.asm_signal_generation % 0x3fffffff) + 1
         asm_signal_generation = state.asm_signal_generation
 
-    # Make symmetric-buffer input copies visible to the asm dispatch-pull stage.
-    rank_barrier(
-        sym_buffer,
-        rank_idx=rank_idx,
-        num_ranks=num_ranks,
-        asm_done_counter=(
-            state.scratch.asm_tail_done_counter
-            if use_tail_reduce
-            else None
-        ),
-        reset_tail_signal_slots=use_tail_reduce,
-        graph_max_tokens=num_tokens,
-        verbose_build=verbose_build,
-    )
+    inline_ll_start = v3_backend == V3_BACKEND_LL
+    if not inline_ll_start:
+        # Make symmetric-buffer input copies visible to the dispatch stage.
+        rank_barrier(
+            sym_buffer,
+            rank_idx=rank_idx,
+            num_ranks=num_ranks,
+            asm_done_counter=(
+                state.scratch.asm_tail_done_counter
+                if use_tail_reduce
+                else None
+            ),
+            reset_tail_signal_slots=use_tail_reduce,
+            graph_max_tokens=num_tokens,
+            verbose_build=verbose_build,
+        )
 
     force_safe_compact = num_tokens == 0 or route_capacity_num_tokens > num_tokens
     k1_launcher = k1_symm_fused_l1_v3
@@ -512,6 +514,9 @@ def fp8_mega_moe_opt_3stage(
     k1_kwargs["backend"] = v3_backend
     if v3_backend == V3_BACKEND_LL:
         k1_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+        if inline_ll_start:
+            k1_kwargs["enable_start_rank_barrier"] = True
+            k1_kwargs["tail_done_counter"] = state.scratch.asm_tail_done_counter
     l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_launcher(
         sym_buffer,
         (l1_weight, l1_scale),
@@ -690,25 +695,27 @@ def _run_opt_3stage_graph(
             meta_flags_offset,
             meta_flags_numel,
         )
-    rank_barrier(
-        sym_buffer,
-        rank_idx=rank_idx,
-        num_ranks=num_ranks,
-        asm_done_counter=(
-            state.scratch.asm_tail_done_counter
-            if use_tail_reduce
-            else None
-        ),
-        reset_tail_signal_slots=use_tail_reduce,
-        k1_graph_reset_layout=k1_graph_reset_layout,
-        graph_runtime_num_tokens=sym_buffer.cuda_graph_num_tokens,
-        graph_runtime_num_tokens_out=state.scratch.graph_runtime_num_tokens,
-        graph_tail_signal_generation_out=(
-            state.scratch.graph_tail_signal_generation if use_tail_reduce else None
-        ),
-        graph_max_tokens=graph_max_tokens,
-        verbose_build=verbose_build,
-    )
+    inline_ll_start = v3_backend == V3_BACKEND_LL
+    if not inline_ll_start:
+        rank_barrier(
+            sym_buffer,
+            rank_idx=rank_idx,
+            num_ranks=num_ranks,
+            asm_done_counter=(
+                state.scratch.asm_tail_done_counter
+                if use_tail_reduce
+                else None
+            ),
+            reset_tail_signal_slots=use_tail_reduce,
+            k1_graph_reset_layout=k1_graph_reset_layout,
+            graph_runtime_num_tokens=sym_buffer.cuda_graph_num_tokens,
+            graph_runtime_num_tokens_out=state.scratch.graph_runtime_num_tokens,
+            graph_tail_signal_generation_out=(
+                state.scratch.graph_tail_signal_generation if use_tail_reduce else None
+            ),
+            graph_max_tokens=graph_max_tokens,
+            verbose_build=verbose_build,
+        )
 
     runtime_num_tokens = sym_buffer.cuda_graph_num_tokens
     k1_graph_launcher = k1_symm_fused_l1_v3_graph
@@ -727,6 +734,16 @@ def _run_opt_3stage_graph(
     k1_kwargs["backend"] = v3_backend
     if v3_backend == V3_BACKEND_LL:
         k1_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+        if inline_ll_start:
+            k1_kwargs["enable_start_rank_barrier"] = True
+            k1_kwargs["tail_done_counter"] = state.scratch.asm_tail_done_counter
+            k1_kwargs["graph_runtime_num_tokens_out"] = (
+                state.scratch.graph_runtime_num_tokens
+            )
+            if use_tail_reduce:
+                k1_kwargs["graph_tail_signal_generation_out"] = (
+                    state.scratch.graph_tail_signal_generation
+                )
     l1_out, route_weights, m_indices, output_index, row_combine_ptrs = (
         k1_graph_launcher(
             sym_buffer,

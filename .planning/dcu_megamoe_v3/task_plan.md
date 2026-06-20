@@ -330,6 +330,7 @@ DCU MegaMoE V3 已转为主路径；当前目标是把 DCU MegaMoE 生产代码�
 - [✅] 必做：V3 LL graph sweep 同时覆盖 `K3_USE_ASM_TAIL_REDUCE=0` no-tail 与 `K3_USE_ASM_TAIL_REDUCE=1` tail；K1 row-capacity correctness 和 K3 graph fixed-row 性能问题均已修复，全档位均通过，graph replay 性能已落盘。
 - [✅] 必做/BUG：V3 LL tail reduce/signal graph replay 已改为 runtime-token 化。K3 tail reducer 现在从 graph runtime token tensor 读取 replay tokens 并 clamp 到 capture bucket，capture1024/replay8..512 不再按 1024 token 做 reduce；capture8192 下 K2 graph 固定-row block 开销已通过现有 K2 reg kernel 的 grid-stride row loop + 内部 `max_row_blocks=2048` 收敛，不新增 kernel、不引入 D2H sync，LL replay 8 token 已恢复到 `~0.56 ms`。
 - [✅] 2026-06-17 cleanup follow-up：LL tail eager 不再误传 graph runtime token output；eager 128/512 with `num_max_tokens_per_rank=1024` tail correctness 通过，graph capture1024 replay 32/96/128/256/512 tail correctness 通过。确认 eager 有效 rows 不被 max 放大，max 只作为 symm combine stride / scratch capacity 合同。
+- [✅] 2026-06-20 latency follow-up：LL tail-reduce=1 的 K1 前 standalone `rank_barrier` launch 已内联进 K1 C pack5 start path；同步语义仍保留在 K1 block0 + existing local grid barrier 中。LL tail eager 8/32/128/256、LL tail graph capture256 replay 8/32/128/256、LL no-tail eager 32 smoke 均通过。normal/no-tail/post-K3 external reduce 不在本轮移除范围内。
 - [✅] 必做：V3 normal 使用 eager 模式刷 uniform tokens per rank `256,512,1024,1025,2048,2050,4096,4097,8192`；不把 graph 结果代替本轮 normal eager sweep。
 - [✅] 必做：V3 normal eager sweep 同时覆盖 no-tail/tail；所有档位 correctness 通过，1024/1025、2048/2050、4096/4097 边界点未见 correctness 异常或明显性能台阶。
 - [✅] 必做：normal eager 结果落盘到 `hygon_tmp/debug/phase10_v3_sweep_20260615_196S/`；最终 LL graph 补测结果落盘到 `hygon_tmp/debug/ll_graph_dynamic_verify_20260615_235731/`，包含日志、case status、JSON 和 `summary.csv`；已回写 `progress.md` / `findings.md` / 本 Phase 状态。
@@ -399,7 +400,7 @@ DCU MegaMoE V3 已转为主路径；当前目标是把 DCU MegaMoE 生产代码�
 ## 风险
 - V2 C pack5 real-flow 包装路径性能已知不适合作为 V3 core；若继续复用会偏离保护原始 pure kernel 流水的目标，必须移除 V2-derived K1 core 依赖。
 - K3 tail reduce 的跨 rank 同步语义比普通 combine 更敏感，不能只看本地 correctness。
-- K1 前 rank barrier 若直接消掉，可能破坏 sym buffer 输入 copy 可见性；必须用 A/B correctness、跨 rank route、性能数据决定。
+- K1 前 rank barrier 若直接消掉，可能破坏 sym buffer 输入 copy 可见性；LL tail path 2026-06-20 的安全做法是把 start barrier/reset 内联进 K1 C pack5，而不是删除同步语义。normal ASM 和 no-tail post-K3 外部 reduce 仍不能直接消。
 - graph 支持需要额外处理 capture-safe launch argument、runtime token、active_tiles 和 signal reset，不建议在第一步和 eager 混做。
 - V3 layout 与原始 DCU MegaMoE layout 不同，最容易在测试准备和 wrapper 参数复用处产生隐性错配；不能通过 runtime 权重处理 kernel 掩盖 layout 问题。
 - pure normal/LL 的性能优势来自 5pack C groupgemm 本体；扩成 fused 后新增的 dispatch-pull、row pointer、combine/tail-reduce 逻辑如果耦合过重，可能稀释 pure 优势，需要按 K1/K3 分项量化劣化来源。

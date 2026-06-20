@@ -291,6 +291,10 @@ def k1_symm_fused_l1_v3(
     capacity_num_tokens: int | None = None,
     ll_block_m: int = 32,
     ll_asm_compatible_layout: bool = False,
+    enable_start_rank_barrier: bool = False,
+    tail_done_counter: torch.Tensor | None = None,
+    graph_runtime_num_tokens_out: torch.Tensor | None = None,
+    graph_tail_signal_generation_out: torch.Tensor | None = None,
     verbose_build: bool = False,
 ):
     backend = normalize_v3_backend(backend)
@@ -343,6 +347,10 @@ def k1_symm_fused_l1_v3(
         64,
         bool(ll_asm_compatible_layout),
         -1 if capacity_num_tokens is None else int(capacity_num_tokens),
+        bool(enable_start_rank_barrier),
+        tail_done_counter,
+        graph_runtime_num_tokens_out,
+        graph_tail_signal_generation_out,
     )
 
 
@@ -362,6 +370,10 @@ def k1_symm_fused_l1_v3_graph(
     l1_out_workspace: torch.Tensor | None = None,
     ll_block_m: int = 32,
     ll_asm_compatible_layout: bool = False,
+    enable_start_rank_barrier: bool = False,
+    tail_done_counter: torch.Tensor | None = None,
+    graph_runtime_num_tokens_out: torch.Tensor | None = None,
+    graph_tail_signal_generation_out: torch.Tensor | None = None,
     verbose_build: bool = False,
 ):
     backend = normalize_v3_backend(backend)
@@ -412,4 +424,8 @@ def k1_symm_fused_l1_v3_graph(
         64,
         bool(ll_asm_compatible_layout),
         -1,
+        bool(enable_start_rank_barrier),
+        tail_done_counter,
+        graph_runtime_num_tokens_out,
+        graph_tail_signal_generation_out,
     )

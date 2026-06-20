@@ -50,6 +50,12 @@ void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
     uint8_t* local_topk_mask,
     int32_t* tail_tokens,
     int32_t* cumulative_local_expert_recv_stats,
+    bool enable_start_rank_barrier,
+    int32_t* tail_done_counter,
+    const int32_t* graph_runtime_num_tokens_for_barrier,
+    int32_t* graph_runtime_num_tokens_out,
+    int32_t* graph_tail_signal_generation_out,
+    int graph_max_tokens,
     hipStream_t stream);
 
 #define K1_HIP_CHECK(expr)                                                       \
@@ -1125,7 +1131,11 @@ k1_symm_fused_l1_v3_pack5(
     const int64_t ll_block_m,
     const int64_t ll_cus,
     const bool ll_asm_compatible_layout,
-    const int64_t capacity_num_tokens) {
+    const int64_t capacity_num_tokens,
+    const bool enable_start_rank_barrier,
+    const std::optional<torch::Tensor>& tail_done_counter,
+    const std::optional<torch::Tensor>& graph_runtime_num_tokens_out,
+    const std::optional<torch::Tensor>& graph_tail_signal_generation_out) {
     TORCH_CHECK(sym_buffer.is_cuda() && route_scratch.is_cuda() &&
                     l1_weight_pack5.is_cuda() && l1_scale.is_cuda(),
                 "V3 K1 tensors must be CUDA/HIP tensors");
@@ -1171,6 +1181,41 @@ k1_symm_fused_l1_v3_pack5(
                         runtime.numel() == 1,
                     "runtime_num_tokens must be a contiguous CUDA int32 scalar");
     }
+    const torch::Tensor* tail_done_counter_tensor = nullptr;
+    if (tail_done_counter.has_value()) {
+        const auto& counter = tail_done_counter.value();
+        TORCH_CHECK(counter.is_cuda() && counter.is_contiguous() &&
+                        counter.scalar_type() == torch::kInt &&
+                        counter.numel() >= 32,
+                    "tail_done_counter must be a contiguous CUDA int32 tensor "
+                    "with at least 32 elements");
+        tail_done_counter_tensor = &counter;
+    }
+    const torch::Tensor* graph_runtime_num_tokens_out_tensor = nullptr;
+    if (graph_runtime_num_tokens_out.has_value()) {
+        const auto& runtime_out = graph_runtime_num_tokens_out.value();
+        TORCH_CHECK(runtime_out.is_cuda() && runtime_out.is_contiguous() &&
+                        runtime_out.scalar_type() == torch::kInt &&
+                        runtime_out.numel() >= 1,
+                    "graph_runtime_num_tokens_out must be a contiguous CUDA "
+                    "int32 tensor");
+        graph_runtime_num_tokens_out_tensor = &runtime_out;
+    }
+    const torch::Tensor* graph_tail_signal_generation_out_tensor = nullptr;
+    if (graph_tail_signal_generation_out.has_value()) {
+        const auto& generation_out = graph_tail_signal_generation_out.value();
+        TORCH_CHECK(generation_out.is_cuda() && generation_out.is_contiguous() &&
+                        generation_out.scalar_type() == torch::kInt &&
+                        generation_out.numel() >= 1,
+                    "graph_tail_signal_generation_out must be a contiguous CUDA "
+                    "int32 tensor");
+        graph_tail_signal_generation_out_tensor = &generation_out;
+    }
+    TORCH_CHECK(!enable_start_rank_barrier || tail_done_counter_tensor != nullptr,
+                "LL start rank barrier requires tail_done_counter");
+    TORCH_CHECK(!graph_runtime_num_tokens_out.has_value() ||
+                    runtime_num_tokens.has_value(),
+                "graph_runtime_num_tokens_out requires runtime_num_tokens");
 
     const bool use_ll = true;
     const int64_t ll_row_tile =
@@ -1412,6 +1457,20 @@ k1_symm_fused_l1_v3_pack5(
         local_expert_stats == nullptr
             ? nullptr
             : local_expert_stats->data_ptr<int32_t>(),
+        enable_start_rank_barrier,
+        tail_done_counter_tensor == nullptr
+            ? nullptr
+            : tail_done_counter_tensor->data_ptr<int32_t>(),
+        runtime_num_tokens.has_value()
+            ? runtime_num_tokens.value().data_ptr<int32_t>()
+            : nullptr,
+        graph_runtime_num_tokens_out_tensor == nullptr
+            ? nullptr
+            : graph_runtime_num_tokens_out_tensor->data_ptr<int32_t>(),
+        graph_tail_signal_generation_out_tensor == nullptr
+            ? nullptr
+            : graph_tail_signal_generation_out_tensor->data_ptr<int32_t>(),
+        enable_start_rank_barrier ? static_cast<int>(num_tokens) : -1,
         stream);
     K1_HIP_CHECK(hipGetLastError());
 
@@ -1531,7 +1590,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("ll_block_m") = 32,
           pybind11::arg("ll_cus") = 64,
           pybind11::arg("ll_asm_compatible_layout") = false,
-          pybind11::arg("capacity_num_tokens") = -1);
+          pybind11::arg("capacity_num_tokens") = -1,
+          pybind11::arg("enable_start_rank_barrier") = false,
+          pybind11::arg("tail_done_counter") = std::nullopt,
+          pybind11::arg("graph_runtime_num_tokens_out") = std::nullopt,
+          pybind11::arg("graph_tail_signal_generation_out") = std::nullopt);
     m.def("k1_graph_flag_reset_layout", &k1_graph_flag_reset_layout,
           pybind11::arg("num_ranks"),
           pybind11::arg("num_experts"),

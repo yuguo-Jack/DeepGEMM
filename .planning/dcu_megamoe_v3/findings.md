@@ -5479,3 +5479,17 @@
   - normal 新 layout 必须先证明 contiguous global load 与 LDS/MMAC fragment 同时闭合，且 normal `512/4096/5120/8192` 不低于当前 `~1.75/~5.8/~7.4/~10.9 ms`；
   - 共同 layout 只有在 profiler/ISA/source-backed 证据足够强时才恢复，不再靠单点 permutation 试错。
 - source-backed 候选边界：`ds_read_m32x16_b16_normalxalt.cpp`、`altxalt.cpp`、`swizzle.cpp` 说明 DCU 上 normal/alt/sizzle 的 LDS matrix-read 合同是可表达的，但需要同时设计 LDS write layout、read offset、operand fragment 解释和 C store。它可以作为后续“normal ASM 新 code object”方向的参考，不适合作为当前默认 PACK5 ASM 的局部热补丁。
+
+## 2026-06-20 LL tail-reduce rank barrier finding
+
+- DeepEP/Flux/CUDA MegaMoE 没有当前 DCU LL-tail 路径这种独立 `rank_barrier` launch，但这不等于可以无同步删除。当前 K1 前 barrier 负责的是 start contract：peer sym-buffer input visibility、runtime token slot、tail signal slot reset、done counter reset、graph generation、uniform runtime-token 判定。
+- 可删除的不是同步语义，而是独立 kernel launch。LL K1 C pack5 已有 `v3_k1_ll_grid_barrier_device()`，因此可让 K1 block0 执行跨 rank start barrier/reset，再用已有本地 grid barrier 放行所有 CTA。这样和 DeepEP/Flux 的“把 readiness 融入 compute/dispatch kernel”更接近。
+- 该方案仅适合 LL C pack5 tail path：
+  - normal K1 是 ASM host path，没有同等可安全插入的全-grid本地 barrier，不在本轮处理；
+  - no-tail 仍需要 post-K3 `rank_barrier + reduce_local_combine`；
+  - graph normal 的 K1 flags/meta reset 仍由原 rank_barrier 维护。
+- 初版验证：
+  - LL tail eager 8/32/128/256 correctness 通过，median 约 `0.597/0.639/0.843/1.271 ms`；
+  - LL tail graph capture256 replay 8/32/128/256 correctness 通过，replay median 约 `0.526/0.627/0.831/1.281 ms`；
+  - LL no-tail eager 32 smoke 通过，median `0.623 ms`。
+- 性能解释：graph replay 几乎不变是合理的，因为 graph replay 侧没有独立 CPU launch overhead；收益应主要体现在 eager 或真实框架 trace 中 `megamoe_rank_barrier` launch/category 消失。下一步如果用户关心端到端 decode，需要用框架 profiler 对比 tail-reduce1 前后 category，而不是只看 graph replay。

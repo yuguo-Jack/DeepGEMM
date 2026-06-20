@@ -33,6 +33,12 @@ void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
     uint8_t* local_topk_mask,
     int32_t* tail_tokens,
     int32_t* local_expert_stats,
+    bool enable_start_rank_barrier,
+    int32_t* tail_done_counter,
+    const int32_t* graph_runtime_num_tokens_for_barrier,
+    int32_t* graph_runtime_num_tokens_out,
+    int32_t* graph_tail_signal_generation_out,
+    int graph_max_tokens,
     hipStream_t stream) {
     const bool mask_tiny_store = valid_rows_per_expert <= 16;
 #define DCU_MEGAMOE_V3_LAUNCH_K1_LL(                                            \
@@ -46,7 +52,10 @@ void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
             route_scratch_i32, grid_barrier, barrier_epoch, rank_idx,           \
             num_ranks, num_global_experts, num_max_tokens_per_rank, num_topk,    \
             runtime_num_tokens, route_weights, m_indices, output_index,          \
-            row_combine_ptrs, local_topk_mask, tail_tokens, local_expert_stats)
+            row_combine_ptrs, local_topk_mask, tail_tokens, local_expert_stats,  \
+            enable_start_rank_barrier, tail_done_counter,                        \
+            graph_runtime_num_tokens_for_barrier, graph_runtime_num_tokens_out,  \
+            graph_tail_signal_generation_out, graph_max_tokens)
 
     if (ll_block_m == 32 && ll_cus == 64) {
         if (mask_tiny_store) {

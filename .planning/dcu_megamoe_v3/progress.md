@@ -7659,3 +7659,108 @@
 - 当前不改生产代码：默认 dual layout 是当前最佳已知性能基线；继续挖掘前优先做 code-object/profiler 证据收集和最小隔离分支，避免把 correctness 风险带回主路径。
 - source-backed 深挖补充：已解析并阅读 `dcu_microbenchmark-instruction_demo/core/tensor_lat_ds_read_matrix/` 中的 `ds_read_m32x16_b16_normalxalt.cpp`、`ds_read_m32x16_b16_altxalt.cpp` 和 `ds_read_m32x16_b16_swizzle.cpp`。这些例子证明 normal/alt/sizzle 可以作为完整 LDS/matrix-read 合同存在，但它们同时改 LDS 写入、读 offset、MMAC operand 解释和 C store 形态，不是可直接套到当前 ASM 的几行 `ni` remap。
 - 当前 normal ASM 仍使用 `buffer_load_dwordx4 ... lds` 通过 `m0` 步进落 LDS，并在主循环中用 `ds_read_b128` 消费 A/B fragments；下一轮如果要尝试 `ds_read_m32x16_b16[_alt]` 或 swizzle，必须作为隔离 code object 分支重建该段 LDS/feed 合同，而不是在默认 PACK5 ASM 上做局部 patch。
+
+## 2026-06-20 - LL tail-reduce K1 start barrier inline prototype
+
+- 目标：分析并尝试去掉 LL `K3_USE_ASM_TAIL_REDUCE=1` 路径 K1 前的独立 `rank_barrier` kernel。动机是框架延迟敏感场景中该 kernel 占比可见，而 DeepEP/Flux/CUDA MegaMoE 没有同形态的独立 barrier launch。
+- 结论边界：
+  - 不能简单删除 K1 前 `rank_barrier`，它仍承担 peer symmetric-buffer input visibility、runtime token 写入、tail signal reset、done counter reset、graph tail generation 输出、uniform runtime-token 判定；
+  - LL K1 C pack5 已有全 CTA 的 `grid_barrier`，因此可以把“block0 做跨 rank start barrier + reset，所有 CTA 本地等待”内联进 K1 kernel，不新增 kernel、不引入 D2H/H2D sync；
+  - normal ASM、no-tail post-K3 external reduce、K1 graph flags/meta reset 仍保留原 `rank_barrier` kernel，不在本轮改动。
+- 代码改动：
+  - `K1_fused/k1_v3_pack5_groupgemm_impl.cuh` 新增 `v3_k1_ll_start_rank_barrier_device()`，复刻 LL-tail 必需的 start-sync/reset/uniform-token 语义；
+  - K1 LL launch/pybind/Python wrapper 增加 internal optional 参数：`enable_start_rank_barrier`、`tail_done_counter`、`graph_runtime_num_tokens_out`、`graph_tail_signal_generation_out`；
+  - `opt.py` 仅在 `v3_backend == "ll" && K3_USE_ASM_TAIL_REDUCE=1` 时跳过 standalone pre-K1 `rank_barrier()`，改由 K1 内联执行；其他路径保持原逻辑。
+- 本地静态验证：
+  - `python -m py_compile megamoe/opt.py megamoe/dcu_megamoe_opt/K1_fused/k1_fused.py` 通过。
+- 远端状态与构建：
+  - 测试前 `rocm-smi --showpids` 显示无 KFD 进程；
+  - 通过 `scp` 同步改动到 `/workspace/DeepGEMM`；
+  - `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过，K1 extension 重新编译。
+- 远端验证：
+
+| case | result | fused / replay median ms |
+| --- | --- | ---: |
+| LL tail eager 8 | correct, max_abs=0.000244141 | 0.597 |
+| LL tail eager 32 | correct, max_abs=0.000244141 | 0.639 |
+| LL tail eager 128 | correct, max_abs=0.000244141 | 0.843 |
+| LL tail eager 256 | correct, max_abs=0.000244141 | 1.271 |
+| LL tail graph capture256 replay8 | correct, max_abs=0.000244141 | 0.526 |
+| LL tail graph capture256 replay32 | correct, max_abs=0.000244141 | 0.627 |
+| LL tail graph capture256 replay128 | correct, max_abs=0.000244141 | 0.831 |
+| LL tail graph capture256 replay256 | correct, max_abs=0.000244141 | 1.281 |
+| LL no-tail eager 32 smoke | correct, max_abs=0.000244141 | 0.623 |
+
+- 观察：
+  - graph replay 8/32 与历史 capture256 数据 `~0.522/0.627 ms` 基本一致，说明去掉 standalone launch 对 graph replay 没有明显收益；这是预期，因为 graph replay 本身已没有 per-kernel CPU launch overhead；
+  - eager 功能正确，且 standalone pre-K1 barrier launch 已从 LL-tail Python 调用链移除；后续需要用框架/hip trace 进一步确认 profiler 中 `megamoe_rank_barrier` category 是否下降；
+  - no-tail smoke 仍过，说明保留路径未被 pybind/signature 扩展误伤。
+
+## 2026-06-20 - K1 LL pure groupgemm vs DeepGEMM masked balanced refresh
+
+- 目的：按用户要求复测 `hygon_tmp/K1_groupgemm_fp8` 中最初 LL 非融合 pure groupgemm，与同 harness 内保留的 DeepGEMM masked balanced groupgemm code object 在相同 size 下的性能。
+- 测试环境：
+  - 远端容器 `/workspace/DeepGEMM`，测试前 `rocm-smi --showpids` 显示无 KFD 进程；
+  - `make hipcc` 重新生成 `k1_gemm` 与 `deepgemm_groupgemm_masked_fp8_marlin_balanced_256x64x128_TN_BF16_WGM8.co`；
+  - 公共参数：`topk=6, experts=32, n=4096, k=4096, warmup=20, repeat=100, measure_rounds=5, realistic_values=1`；
+  - 日志：`hygon_tmp/debug/k1_pure_vs_deepgemm_masked_20260620_093136.log`。
+- 说明：当前容器的 Python `deep_gemm` 模块无法 import `_C`，因此本轮不是 Python pybind API 对比；使用的是 `k1_gemm.cpp` 内同一数据生成/计时框架下的 `--mode c-ll` vs `--mode balanced`。
+
+| tokens/rank | pure `c-ll` median / best ms | DeepGEMM masked balanced median / best ms | balanced / pure | winner |
+| ---: | ---: | ---: | ---: | :--- |
+| 8 | 0.295262 / 0.295176 | 0.304711 / 0.304393 | 1.032x | pure |
+| 32 | 0.300776 / 0.300282 | 0.305561 / 0.305325 | 1.016x | pure |
+| 64 | 0.295357 / 0.294906 | 0.307624 / 0.307376 | 1.042x | pure |
+| 128 | 0.308792 / 0.308451 | 0.312576 / 0.312411 | 1.012x | pure |
+| 256 | 0.323081 / 0.322758 | 0.321686 / 0.321477 | 0.996x | balanced |
+
+- 结论：
+  - `c-ll` pure 在 8/32/64/128 tokens/rank 仍略快或持平，特别是 64 档约快 `4.2%`；
+  - 256 档本轮 DeepGEMM balanced 略快 `~0.4%`，属于非常接近的档位；
+  - 这组数据支持继续把 pure `c-ll` 作为 LL K1 非融合参考下界，256 档后续需要和实际 fused LL e2e 一起看，不单独因此切换 backbone。
+
+## 2026-06-20 - LL start barrier inline extended to all LL backend
+
+- 背景：用户要求继续参考 CUDA MegaMoE / Flux / DeepEP low-latency 方向压 LL 延迟，且硬约束是不新增 kernel、不引入 D2H/H2D sync。
+- 本轮选择的低风险方向：
+  - 复用 LL K1 C pack5 内已有 grid barrier，把 K1 前的 standalone `rank_barrier()` start-sync/reset 逻辑内联到 K1；
+  - 之前 prototype 只覆盖 `K3_USE_ASM_TAIL_REDUCE=1`，本轮扩展到 LL backend 的 no-tail/tail eager/graph；
+  - normal ASM、no-tail post-K3 external reduce、K3 tail reducer 本身不在本轮改动范围内。
+- 代码变化：
+  - `megamoe/opt.py`：当 `v3_backend == "ll"` 时跳过 K1 前 standalone `rank_barrier()`，改传 `enable_start_rank_barrier=True` 给 K1；
+  - eager LL 传入 `tail_done_counter` 作为 start barrier reset scratch；
+  - graph LL 同时传入 `graph_runtime_num_tokens_out`，tail 模式再传 `graph_tail_signal_generation_out`，保持 replay runtime-token 合同。
+- 本地静态验证：
+  - `python -m py_compile megamoe/opt.py` 通过；
+  - `git diff --check` 通过。
+- 远端状态：
+  - 测试前 `hy-smi --showpids` 显示无 KFD 进程；
+  - 已同步 `megamoe/opt.py` 到 `/workspace/DeepGEMM`。
+- 远端 eager smoke（`num_max_tokens_per_rank=512`）：
+
+| case | result | fused median ms |
+| --- | --- | ---: |
+| LL no-tail eager 32 | correct, max_abs=0.000244141 | 0.623 |
+| LL no-tail eager 128 | correct, max_abs=0.000488281 | 0.817 |
+| LL tail eager 32 | correct, max_abs=0.000244141 | 0.628 |
+| LL tail eager 128 | correct, max_abs=0.000488281 | 0.840 |
+
+- 远端 graph bench（capture512，replay-only，`8,32,128,256`）：
+
+| case | replay 8 ms | 32 ms | 128 ms | 256 ms |
+| --- | ---: | ---: | ---: | ---: |
+| LL no-tail graph capture512 | 0.541 | 0.638 | 0.814 | 1.195 |
+| LL tail graph capture512 | 0.531 | 0.633 | 0.832 | 1.224 |
+
+- 框架式大 bucket smoke（capture8192，只 replay `8,32`）：
+
+| case | replay 8 ms | 32 ms |
+| --- | ---: | ---: |
+| LL no-tail graph capture8192 | 0.566 | 0.663 |
+| LL tail graph capture8192 | 0.565 | 0.658 |
+
+- 结论：
+  - no-tail/tail graph correctness 均通过，`max_abs <= 0.000488281`；
+  - graph replay 小 token 仍在历史 `~0.53-0.66 ms` 区间，没有重新出现 capture bucket 固定 work 问题；
+  - 该改动不新增 kernel，也不新增 H2D/D2H，同步语义仍由 K1 block0 跨 rank start barrier + K1 内 local grid barrier 承接；
+  - graph 收益预期有限，因为 standalone kernel launch 已经在 capture 内；eager/框架低延迟场景更可能从减少一个独立 GPU kernel 中获益。

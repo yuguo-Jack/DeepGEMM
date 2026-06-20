@@ -300,8 +300,14 @@ def get_symm_buffer_for_mega_moe(
     intermediate_hidden: int,
     use_fp8_dispatch: bool = True,
     activation: str = "swiglu",
+    cuda_graph_max_tokens_per_rank: Optional[int] = None,
 ) -> SymmBuffer:
     requested_num_max_tokens_per_rank = int(num_max_tokens_per_rank)
+    requested_cuda_graph_max_tokens = (
+        int(cuda_graph_max_tokens_per_rank)
+        if cuda_graph_max_tokens_per_rank is not None
+        else requested_num_max_tokens_per_rank
+    )
     num_max_tokens_per_rank = _align(
         num_max_tokens_per_rank,
         _C.get_token_alignment_for_mega_moe(),
@@ -340,7 +346,7 @@ def get_symm_buffer_for_mega_moe(
         intermediate_hidden,
         use_fp8_dispatch,
         activation,
-        cuda_graph_max_tokens_per_rank=requested_num_max_tokens_per_rank,
+        cuda_graph_max_tokens_per_rank=requested_cuda_graph_max_tokens,
     )
 
 
