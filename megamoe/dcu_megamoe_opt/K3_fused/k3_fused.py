@@ -290,47 +290,45 @@ def k3_l2_fused_v3_to_combine(
 
     ext = load_v3_ll_extension(verbose=verbose_build)
     if backend == "ll":
-        if asm_reduce_y is not None:
-            if sym_buffer is None or asm_done_counter is None or asm_signal_addrs is None:
-                raise ValueError("V3 K3 LL tail path requires sym_buffer, done counter, and signal addrs")
-            if not num_ranks or not num_experts or num_tokens < 0 or not num_topk or not hidden:
-                raise ValueError("V3 K3 LL tail path requires shape metadata")
-            ext.k3_v3_ll_combine_tail(
-                output_workspace,
-                act_fp8.contiguous(),
-                act_scale.contiguous(),
-                m_indices.contiguous(),
-                l2_weight.contiguous(),
-                l2_scale.contiguous(),
-                row_combine_ptrs.contiguous(),
-                sym_buffer.buffer,
-                asm_done_counter.contiguous(),
-                asm_signal_addrs.contiguous(),
-                asm_reduce_y.contiguous(),
-                int(num_ranks),
-                int(num_experts),
-                int(sym_buffer.num_max_tokens_per_rank),
-                int(num_tokens),
-                int(num_topk),
-                int(ll_block_m),
-                asm_signal_generation_tensor.contiguous()
-                if asm_signal_generation_tensor is not None
-                else None,
-                graph_runtime_num_tokens.contiguous()
-                if graph_runtime_num_tokens is not None
-                else None,
-            )
-        else:
-            ext.k3_v3_ll_combine(
-                output_workspace,
-                act_fp8.contiguous(),
-                act_scale.contiguous(),
-                m_indices.contiguous(),
-                l2_weight.contiguous(),
-                l2_scale.contiguous(),
-                row_combine_ptrs.contiguous(),
-                False,
-                int(ll_block_m),
-            )
+        if asm_reduce_y is None:
+            raise RuntimeError("V3 K3 LL no-tail / tail-reduce-0 path has been retired")
+        if sym_buffer is None or asm_done_counter is None or asm_signal_addrs is None:
+            raise ValueError("V3 K3 LL tail path requires sym_buffer, done counter, and signal addrs")
+        if not num_ranks or not num_experts or num_tokens < 0 or not num_topk or not hidden:
+            raise ValueError("V3 K3 LL tail path requires shape metadata")
+        signal_generation_arg = (
+            asm_signal_generation_tensor.contiguous()
+            if asm_signal_generation_tensor is not None
+            else None
+        )
+        runtime_tokens_arg = (
+            graph_runtime_num_tokens.contiguous()
+            if graph_runtime_num_tokens is not None
+            else None
+        )
+        common_args = (
+            output_workspace,
+            act_fp8.contiguous(),
+            act_scale.contiguous(),
+            m_indices.contiguous(),
+            l2_weight.contiguous(),
+            l2_scale.contiguous(),
+            row_combine_ptrs.contiguous(),
+            sym_buffer.buffer,
+            asm_done_counter.contiguous(),
+            asm_signal_addrs.contiguous(),
+            asm_reduce_y.contiguous(),
+            int(num_ranks),
+            int(num_experts),
+            int(sym_buffer.num_max_tokens_per_rank),
+            int(num_tokens),
+            int(num_topk),
+            int(ll_block_m),
+        )
+        ext.k3_v3_ll_combine_tail(
+            *common_args,
+            signal_generation_arg,
+            runtime_tokens_arg,
+        )
         return None
     raise NotImplementedError(f"unsupported V3 K3 backend: {backend}")

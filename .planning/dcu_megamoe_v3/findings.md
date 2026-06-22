@@ -5533,3 +5533,247 @@
   - reducer 的 peer signal/peer-ready wait 后同步与 invalidate 虽保守，但直接删会重新暴露历史 remote visibility 风险；
   - K1 grid barrier primitive 内部 fence 影响全 kernel ordering，不能和单个局部 fence 等价看待。
 - 实测结论：同步裁剪没有带来大幅收益，但保持或略优于历史噪声区间；继续压 LL 延迟应转向 K1/K2 合同级融合或 K3 chunk-level readiness，而不是继续剥离 wait-side 可见性同步。
+
+## 2026-06-20 LL K3 true split-tail finding
+
+- 语义修正：真正有价值的 split-tail 不是复用 post-K3 `rank_barrier + reduce_local_combine`，而是把 K3 拆成两个职责清晰的 kernel：
+  - local K3 groupgemm：不读写 `row_combine_ptrs`，不做 peer 通信，只写本地 `output_workspace`；
+  - combine/reduce kernel：读取本地 K3 BF16 输出，按 `row_combine_ptrs` 写 peer combine buffer，并在同 kernel 内完成 tail reduce。
+- 这个形态符合用户目标：GEMM 计算回到最接近 pure groupgemm 的状态，通信和 reduce 后续可以只围绕 combine kernel 做 peer write locality、active rows、chunk readiness、reduce 分片优化。
+- 第一版 true split 的 graph 小 token 很慢，根因不是多 kernel 本身，而是 combine copy 分支按 capture capacity 扫 `total_rows * hidden/8`。改为按 `actual_m[expert]` 只 copy active rows 后，capture8192 replay 小 token 恢复到 fused tail 同级。
+- 代表数据：
+
+| case | fused tail | true split |
+| --- | ---: | ---: |
+| eager 32 | 0.628 | 0.632 |
+| eager 256 | 1.268 | 1.160 |
+| eager 512 | 2.277 | 1.960 |
+| graph capture8192 replay 8 | 0.548 | 0.548 |
+| graph capture8192 replay 32 | 0.645 | 0.646 |
+| graph capture8192 replay 128 | 0.849 | 0.791 |
+| graph capture8192 replay 256 | 1.286 | 1.176 |
+| graph capture8192 replay 512 | 2.281 | 1.981 |
+
+- 当前策略：
+  - 默认生产已按 token policy 收敛：LL eager `<128` 保持 fused tail，`>=128` 使用 true split tail；
+  - LL graph 按 capture bucket 使用 split tail，capture256/capture8192 replay 小 token 已验证不被 capacity 拖慢；
+  - LL tail-reduce-0/no-tail 路径已退休，不再作为 active fallback 或性能路径。
+- 后续优化优先级：
+  - combine/reduce kernel 当前已做到 active-row copy，下一步应看 peer destination locality、每 rank/destination chunk 的写入聚合、reduce worker 分片；
+  - 如果继续参考 DeepEP/Flux，应迁移成低频 per-token-chunk readiness，而不是回到此前已反证的 per-row/per-hidden-tile atomic readiness。
+
+## 2026-06-20 LL K3 true split-tail rowptr-broadcast finding
+
+- 有效改动：combine/reduce copy 分支按 row-major active rows 处理，并将 `row_combine_ptrs[row]` 的 64-bit peer address 从 “每个 16B vec load 一次” 降到 “每个 wave 每 row load 一次 + `__shfl` 广播”。这减少了 metadata load，也保持了 hidden 方向连续 peer write。
+- 完整验证结论：
+  - uniform eager：true split 在 `128/256/512/513` 为 `0.780/1.162/1.951/1.970 ms`，对比 fused tail `0.837/1.257/2.272/2.270 ms` 有稳定收益；
+  - uniform graph capture8192：true split replay `128/256/512/513` 为 `0.794/1.176/1.968/1.968 ms`，对比 fused tail `0.847/1.295/2.287/2.248 ms` 有稳定收益；
+  - uneven edge513：true split eager `1.044 ms`、graph replay513 `1.030 ms`，明显好于 fused tail eager `1.468 ms`、graph replay513 `1.582 ms`；
+  - `8/32` 小 token true split 与 fused tail 基本持平或略慢，因此不建议直接全局默认替换。
+- 反证结论：把 split reduce 的 single-worker 阈值从 256 放宽到 512 没有收益，eager 512 反而从 `~1.951 ms` 回到 `~1.967 ms`，graph 513 抖动变大；512/513 仍需要 128 reducer 分片。
+- 当前策略：
+  - 2026-06-21 框架接入复核后，LL 默认 fused tail；
+  - true split-tail 只在 `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1` 时显式启用；
+  - split-tail cap256/cap8192 的 uniform 与 uneven replay 曾正确，作为 opt-in A/B 证据保留；
+  - 不引入新 D2H/H2D，不新增 runtime weight/layout 变换，不把 per-row readiness 重新塞回生产路径。
+
+## 2026-06-21 LL K3 true split-tail production finding
+
+- LL tail0/no-tail 的定位已从 fallback 降级为 retired：补测显示它比 fused tail 在部分大 token 略好，但仍落后 true split tail，且保留旧 `rank_barrier + reduce_local_combine` 路线会增加维护面。
+- 生产入口已封住两层：
+  - `opt.py` 中 `K3_USE_ASM_TAIL_REDUCE=0` + LL backend 直接 fail-fast；
+  - K3 wrapper 中 `backend='ll'` 且未传 `asm_reduce_y` 直接 fail-fast，不再调用 `ext.k3_v3_ll_combine` no-tail wrapper。
+- 收口矩阵：
+  - uniform eager `8,32,33,64,96,127,128,129,256,257,512,513` 全 correct；
+  - graph cap256 replay `8,32,64,128,256`、graph cap8192 replay `8,32,128,256,512,513` 全 correct；
+  - uneven mix129/edge513 eager 与 graph 全 correct；
+- 框架接入复核后，默认策略改为 LL fused tail；true split-tail 只在 `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1` 时启用。原因是 cap256 graph 的 8-token 框架场景对 split-tail 固定开销更敏感，默认自动按 capture bucket 选 split-tail 不够稳。
+  - normal backend 的 no-tail smoke 保留并通过，说明删除只影响 LL tail0。
+
+## 2026-06-21 DeepEP low-latency baseline finding
+
+- DeepEP low-latency combine 的关键合同不是“少一个 kernel”，而是 `dispatch -> gemm -> combine` 之间的 packed row / count / phase / `comp_signal` 协议：
+  - non-overlap low-latency combine standalone kernel 在 `8/32/64/128/256` tokens/rank 分别约 `56/63/102/94/154 us`；
+  - overlap `combine_sbo` kernel 约 `66/76/92/138/222 us`，只在 64 档比 non-overlap combine kernel 更低，128/256 反而更慢；
+  - 因此 DeepEP SBO 不能直接作为“全档更优 combine”照搬，但它的 per-expert/per-chunk readiness 合同值得借鉴。
+- DeepEP installed package 合同细节：
+  - `topk_idx` 必须是 int64，当前源码断言 `torch::kInt64`；
+  - `enable_combine_overlap=True` 时需要 layered dispatch，否则 `packed_recv_src_info` dtype 与 dispatch kernel contract 不一致，会报 `expected scalar type Int but found Long`。
+- DeepGEMM masked groupgemm + K2 lower-bound 显示：
+  - standalone masked K1/K3 在小 token 档有固定成本，K2 仅约 `31-32 us`；
+  - `DeepEP LL dispatch+combine + masked K1 + K2 + masked K3` 的拆分下限为 `0.700/0.815/0.998/0.838/0.992 ms`；
+  - 当前 MegaMoE LL e2e 为 `0.574/0.624/0.679/0.835/1.266 ms`。
+- 结论：
+  - 8/32/64：MegaMoE LL 已快于拆分 baseline 下限，继续拆 K1/K3 不会自然带来收益；
+  - 128：基本打平，baseline 下限还没计 route-weight packed-row glue，因此 MegaMoE LL 仍更接近可生产方案；
+  - 256：拆分下限有潜在空间，但要落地必须解决 DeepEP packed rows 到 K2 route weight 的 GPU-side mapping，且不能新增 D2H/H2D hot-path；
+  - 下一轮若继续压 LL，应优先设计低频 destination-token-chunk readiness / phase contract，而不是 per-row atomic readiness 或机械 kernel split。
+
+## 2026-06-21 DeepEP full baseline contract correction
+
+- 复核 DeepEP `low_latency_combine` 后确认：combine 接口自身使用 `topk_weights` 做最终 weighted reduce，因此用 DeepEP dispatch/combine 搭全链路 baseline 时，K2 不应该再乘 route weight。
+- 这意味着完整 baseline 可以直接以 DeepEP packed FP8 rows、`packed_recv_count`、DeepGEMM masked K1/K3 和 unweighted K2 组成；不需要先做 GPU-side packed-row route-weight reconstruction。
+- 当前不能继续把 standalone 加和当作最终 baseline：它少了 Python/runtime launch 串联、DeepEP handle 生命周期、K2/K3 scale reshape、以及真实 combine 输出检查。
+- 已新增 scratch 全链路脚本，但远端 DeepEP/RocSHMEM 当前在 QP 初始化阶段报 `modify_qp (RTR): Connection timed out (110)`；同一错误也复现在既有 DeepEP combine 脚本中，说明这是环境/DeepEP runtime 状态，不是新脚本的形状合同错误。
+- 对 MegaMoE LL 优化的直接启发保持不变：DeepEP 值得借鉴的是 coarse chunk readiness 和 phase separation，而不是单纯把 K3 拆成更多 kernel 或引入 per-row readiness。若要迁移到 MegaMoE，需要 K3/down GEMM 显式发布 per-expert/per-destination-chunk ready 信号，combine/reduce 只等待对应 chunk，并保持无 D2H sync、无热路径额外 H2D。
+
+## 2026-06-21 LL K1 split-stage finding
+
+- 反证结论：K1 LL 不能简单拆成 “stage/route/copy kernel + local groupgemm kernel” 来提速。该拆分功能正确，但会丢掉原 fused K1 内 route/stage 与 GEMM 的隐式 overlap，并多一个 graph/eager launch node。
+- stage64 版本：eager 32/256 从默认 K1 fused `0.625/1.259 ms` 变为 `0.629/1.264 ms`；graph cap8192 与 K3 split-tail 叠加后 replay 32/256/512/513 为 `0.647/1.182/2.002/2.001 ms`，没有优于 K3 split-tail 单独路径。
+- stage32 版本：进一步减小 stage grid 反而退化，eager 32/256 为 `0.633/1.350 ms`，graph cap8192 + K3 split replay 32/256/512/513 为 `0.656/1.234/2.164/2.132 ms`。
+- 因此 K1 split-stage 代码和 `MEGAMOE_DCU_LL_K1_SPLIT_STAGE` 实验入口已撤回，不污染生产路径。后续 K1 优化应留在当前 fused K1 kernel 内部，或推进真正的 K1+K2 row-wise amax/quant 合同，而不是增加 standalone stage launch。
+
+## 2026-06-21 DeepEP baseline environment correction
+
+- 复核会话 `019ea71a-4af3-7e01-aa7c-0d26ef937cc0` 与 SGLang `run_decode_mid_profile_backend.sh` 后确认：DeepEP baseline 之前 standalone 失败不是算法/shape 合同失败，而是 RocSHMEM topo/env 未对齐。
+- 本机 `ibv_devices` 只有 `mlx5_0..3`；`hygon_tmp/dcu_deepep_test/topo.config` 仍是旧 `mlx5_2..9` 8-HCA 文件，standalone 直接用会触发 `modify_qp (RTR): Connection timed out`。
+- SGLang 能跑通 deepep backend 的实际环境使用 `hygon_tmp/sglang_debug/deepep_topo/topo_11_4hca.config`，并设置：
+  - `ROCSHMEM_ALLOWED_IBV_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3`
+  - `ROCSHMEM_TOPO_FILE_FORCE=.../topo_11_4hca.config`
+  - `ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX=288`
+  - `ROCSHMEM_MAX_NUM_CONTEXTS=48`
+  - `ROCSHMEM_HEAP_SIZE=3737418240`
+  - `DEEPEP_ENABLE_LL_DISPATCH_OPT=1`
+- 按上述环境复跑：
+  - DeepEP LL dispatch+combine smoke：8 tokens `~228 us`，32 tokens `~193 us`；
+  - full baseline（DeepEP LL dispatch + DeepGEMM masked K1/K3 + unweighted K2 + DeepEP LL combine，runtime capacity=runtime tokens）：8/32/64/128/256 为 `0.731/0.797/1.036/0.992/1.216 ms`；
+  - full baseline 按 SGLang `num_max_dispatch_tokens_per_rank=128` 语义重测：8/32/64/128 为 `0.847/0.908/1.124/0.967 ms`。
+- 因此此前“DeepEP/RocSHMEM 当前不可用”的记录已被修正：baseline 可以跑通，但必须复用 SGLang deepep topo/env。后续对比框架 DeepEP backend 时，需要区分 standalone component/full-chain baseline 与 SGLang dispatcher 的 A/B 阶段、hook/overlap、capacity=128 语义；不能再只用 component 加和作为框架端下界。
+
+## 2026-06-21 SGLang trace vs standalone test scope
+
+- 已解析已有 SGLang step300 trace，实际 MoE runtime size 是 `8 tokens/rank`：DeepEP trace 的 gate kernel 名为 `moe_fused_gate_kernel_small_token<8u>`，同窗口每 rank 约 `172` 个 MoE call。
+- 按 trace 中 kernel duration 均摊到每个 MoE call：
+  - SGLang DeepEP low-latency core MoE 约 `311 us/MoE`；
+  - MegaMoE fused/no-split cap256 约 `349 us/MoE`；
+  - MegaMoE true split cap256 约 `427 us/MoE`。
+- 这解释了用户在 SGLang prof 里看到的结论：框架真实 DeepEP backend 确实比当前 MegaMoE LL 小 token 路径略快，尤其 split-tail 在 8-token/cap256 下不应该默认打开。
+- standalone 单测结果不是同一对照：MegaMoE LL graph cap256 replay8 为 `~0.529 ms`，scratch DeepEP full baseline cap128 replay8 为 `~0.846 ms`；该 baseline 没有复现 SGLang 线上 DeepEP 的 A/B stage、hook/overlap 和框架 graph 调度，因此不能作为继续优化的唯一目标。
+- 后续优化依据应改为框架 trace 分项：K1 `~160 us/MoE`、K3 fused tail `~155 us/MoE`、split combine/reduce `~187 us/MoE`，并用 SGLang 同窗口复核，而不是仅看 standalone 8卡单测。
+
+## 2026-06-22 LL K3 split-tail chunk-ready design finding
+
+- 可安全落地的第一版不是 per-row signal，而是 expert-complete 后发布 destination chunk counts：
+  - 当前 split-tail copy kernel 会用多个 CTA 分段写同一个 expert 的 hidden 向量；
+  - 如果某个 CTA 在自己的 hidden 分段写完后按 row 发 ready，tail reducer 可能读取到其他 CTA 尚未写完的半行；
+  - 因此实验使用 `done_counter[48..79]` 记录 32 个 local expert 的 copy CTA 完成数，最后完成的 CTA 才发布该 expert 的 chunk counts。
+- signal slot 合同：
+  - slot 8..15 继续保留给 K3 tail rank-level completion；
+  - slot 18..21 保留给 staged rank barrier；
+  - slot 22..25 用作 split-tail chunk-ready `comp_signal`；
+  - K1 start barrier / standalone rank barrier 负责每轮 reset，避免热路径新增 H2D 清零。
+- 这个设计当前只覆盖 runtime `num_tokens <= 256` 的档位。2026-06-22 用户确认去掉 split baseline 后，split-tail 不再自动回退到原 peer-signal 等待路径；显式 split 只保留 chunk-ready，超出支持范围应 fail-fast。若要覆盖更大 runtime token，需要扩展更多 signal slots 或复用 generation/epoch，而不是恢复旧 split baseline。
+
+## 2026-06-22 LL K3 split-tail chunk-ready benchmark finding
+
+- standalone cap256 结果支持继续保留 `chunk_expected + comp_signal` 路线：
+  - eager `8/32/64/128/256`：chunk-ready `0.565/0.613/0.647/0.747/1.133 ms`，fused tail `0.569/0.625/0.681/0.836/1.261 ms`；
+  - graph cap256 replay `8/32/64/128/256`：chunk-ready `0.521/0.615/0.655/0.747/1.135 ms`，fused tail `0.526/0.628/0.686/0.826/1.273 ms`；
+  - 对旧 split baseline，chunk-ready 也全档更快：eager split `0.577/0.629/0.667/0.777/1.169 ms`，graph split `0.536/0.630/0.674/0.770/1.164 ms`。
+- 解释：
+  - `expert-complete -> destination chunk count -> reducer chunk wait` 的 coarse readiness 已足以消除一部分 rank-level 等待；
+  - 额外 rescan 与 `atomicAdd_system` 成本在小 token 下没有压过收益，8-token 也略快；
+  - 128/256 的收益最明显，符合“tail reduce 不必等完整 rank copy 全完成”的预期。
+- 生产策略：
+  - 默认 LL 仍是 fused tail；
+  - `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1` 现在直接表示 split + chunk-ready；
+  - `MEGAMOE_DCU_LL_K3_SPLIT_TAIL_CHUNK_READY` 二级开关和 non-chunk split baseline 已退役；
+  - 下一步如要默认打开，仍必须用 SGLang 框架同窗口 trace 验证 8-token decode MoE call 均摊，避免 standalone 快但框架端被调度/graph/输入更新口径抵消。
+
+## 2026-06-22 LL K3 split-tail chunk-ready uneven finding
+
+- uneven 场景验证了一个重要同步边界：chunk readiness 的 copy/publish gating 不能使用 source rank 的 local runtime token。即使某个 rank 本地 token 为 0，它仍可能因为持有对应 expert rows 而向其他 destination rank 的 combine buffer 写数据；如果 copy 侧因此不发布 chunk count，destination reducer 会等待不足并 timeout。
+- 修复原则：
+  - reduce 侧 gating 使用本地有效 token：本 rank 只等待自己要输出的 token chunk；
+  - copy/publish 侧 gating 使用 peer runtime tokens 的最大值：只要任意 destination rank 的 runtime token 在 chunk-ready 支持范围内，copy 侧就应该允许发布；
+  - 发布每一行时再用 destination rank runtime token 精确过滤，避免给无效 token/chunk 多加 count。
+- 首次失败签名可作为后续回归定位依据：
+  - `mix129` chunk eager 报 `chunk-ready timeout: chunk=0 expected=192 seen=140`；
+  - 这类 `seen < expected` 且 correctness 尚未进入数值比较的错误，优先查 signal publish/expected count 合同，而不是查 BF16 reduce 数值路径。
+- uneven A/B 结论：
+  - eager `mix129/edge256`：chunk-ready `0.680/0.757 ms`，优于 fused tail `0.742/1.008 ms` 和 split baseline `0.721/0.794 ms`；
+  - graph cap256 replay128/256：chunk-ready 在两组 uneven 下均最快，`mix129` 为 `0.681/0.679 ms`，`edge256` 为 `0.685/0.735 ms`；
+  - graph cap256 replay32：fused tail 仍略快，chunk-ready 与 split baseline 接近，说明小 token graph 场景仍需要框架 trace 再判定是否默认启用。
+- 构建流程注意：当前 ninja 未跟踪该 `.cuh` header 到 `k3_v3_fused_ext.o` 的完整依赖；只改 header 后可能出现 `ninja: no work to do`。验证 K3 header 变更时应删除对应 object 或使用明确的 force rebuild，否则容易误测旧 kernel。
+
+## 2026-06-22 LL K3 split baseline retirement finding
+
+- 当前代码策略已从“三态：fused / split baseline / split chunk-ready”收敛为“两态：fused / split chunk-ready”：
+  - 默认 LL fused tail 保持不变；
+  - 显式 `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1` 后固定使用 chunk-ready；
+  - pybind、Python wrapper、kernel 参数中不再保留 `use_chunk_ready` 或 `ll_split_tail_chunk_ready`；
+  - split combine/reduce kernel 不再保留 peer-signal baseline wait/reduce fallback 和 rank-level completion/signal。
+- 这样做的理由：
+  - uniform 与 uneven A/B 已证明 chunk-ready 全面优于旧 split baseline 或至少不差；
+  - 继续保留旧 split baseline 会增加同步状态、signal reset 和测试矩阵维护成本；
+  - 对比和调优时只需比较 default fused tail 与 opt-in split chunk-ready，避免框架接入时误开旧 split baseline。
+- 命名澄清：
+  - `graph32` 应写作 `graph capture256 replay32`，表示 capture bucket 仍是 256，只是 replay runtime tokens/rank 为 32；
+  - `mix129` 只是 shorthand，完整 uneven tokens/rank 为 `8,33,64,129,32,0,96,17`。
+- 代表验证：
+  - uniform `graph capture256 replay32/128/256` all correct，replay median `0.611/0.744/1.137 ms`；
+  - uneven `8,33,64,129,32,0,96,17` eager correct，median `0.688 ms`；
+  - uneven `256,129,64,32,16,8,4,0` graph capture256 replay32/128/256 correct，replay median `0.597/0.674/0.719 ms`。
+
+## 2026-06-22 LL K3 split-tail SBO-style two-stream design finding
+
+- 当前 split+chunk-ready 仍只是把 local K3 GEMM 和 combine/reduce 拆成两个 kernel，但它们原先在同一个 stream 上顺序执行；这只能缩短 tail reduce 等待面，不能实现 DeepEP `combine_sbo` 那种 compute/tail overlap。
+- 第一版可验证 SBO 形态采用 expert-granularity compute-ready：
+  - K3 local GEMM 在 compute stream 上运行，继续保持 pure-ish local `output_workspace` 写回；
+  - combine/reduce 在 side stream 上运行，先等 compute stream 的 prior-work event，确保 K1 reset、K2 和输入准备在它之前可见；
+  - K3 GEMM 每完成一个 expert tile 后做 system fence 并 `atomicAdd_system(done_counter[48 + expert])`；
+  - combine copy block 按 `ceil(rows / block_m) * (hidden / 256)` 等待对应 expert 的 GEMM tile done 计数，再读 `output_workspace` 并写 peer combine；
+  - 原 chunk-ready 的 expert copy done 计数迁到 `done_counter[80..111]`，最后一个 copy CTA 仍按 destination token chunk 发布 slot 22..25 的 count。
+- 该设计比 DeepEP per-chunk `comp_signal` 更粗，但风险低：
+  - 不需要重排 row layout 或把 K3 GEMM 主循环改成 destination-token chunk 调度；
+  - 能先验证 graph 多流、device-side GEMM-ready、tail stream overlap 这三个关键合同；
+  - 若性能证据支持，再考虑把 GEMM-ready 从 expert tile count 细化到 expert+destination chunk。
+- 风险点：
+  - 每个 K3 GEMM tile 后新增 system fence + atomic，可能吃掉 overlap 收益；
+  - 多流 graph capture 需要事件依赖正确进入 graph，不能只看 eager；
+  - 若 K1/start barrier 没有清 `48..111`，graph replay 会读到旧计数并导致错误或假 ready。
+
+## 2026-06-22 LL K3 split-tail removal finding
+
+- 当前主线应保持单一 LL fused-tail 行为。split-tail / chunk-ready / SBO 方向已有有价值的实验数据，但代码复杂度横跨 Python dispatch、pybind、多流 host 调度、signal slots、done_counter scratch 和 device reduce kernel；在验证未收敛且框架接入曾报错的状态下，不适合继续留在生产路径里。
+- 移除 split-tail 后的合同更清晰：
+  - LL tail path 只走 `k3_v3_ll_combine_tail` fused-tail；
+  - `route_scratch` 中 tail done counter 只需 fused-tail 的 done ring、owner ring、peer-ready ring，共 `3 * 16 = 48` int；
+  - signal slots 22..25 不再是生产合同，`SymmBuffer` signal allocation 可回到覆盖 0..21；
+  - K1/K3 barrier reset 不再清 split-only expert counters，减少 graph replay 旧状态面。
+- 后续如果重启 split/SBO，应作为隔离实验重新引入，而不是从主线保留 dormant pybind/env 开关。最小重启条件应包括：干净分支、source guard 单独隔离、remote build、eager/graph cap256 `8/32/64/128/256`、uneven、以及框架真实 graph bucket trace。
+
+## 2026-06-22 LL K3 tail env policy finding
+
+- `K3_USE_ASM_TAIL_REDUCE` 的生产含义应限定在 normal backend：`0` 选择旧 combine + 外部 reduce 诊断路径，`1` 选择 integrated tail reduce。
+- LL backend 没有必要因为该 env 为 `0` 抛错。更稳的用户合同是 LL 直接忽略该 env，始终走 fused tail；这样框架或脚本里全局设置 `K3_USE_ASM_TAIL_REDUCE=0` 不会误伤 LL。
+- 低层 K3 LL wrapper 仍要求 tail 调用提供 `asm_reduce_y/sym_buffer/done_counter/signal_addrs`，但高层 `opt.py` 不会再由该 env 进入 LL no-tail 分支。
+
+## 2026-06-22 LL K3 no-tail pybind retirement finding
+
+- `k3_v3_ll_combine` 是历史 direct debug/no-tail API；在 LL tail-reduce-0 退休、`opt.py` 对 LL 强制 fused tail 后，它不再被 Python wrapper 或生产路径引用。
+- 清理应包含两层：
+  - 删除 pybind wrapper/API，避免外部误以为 LL no-tail 仍是支持面；
+  - host launcher 去掉 `tail_reduce=false` 分支，避免继续实例化 dormant LL no-tail kernel specialization。
+- 保留项：
+  - `k3_v3_ll_combine_tail` 是唯一 LL K3 扩展入口；
+  - `V3_K3_LowLatencyMaskedGroupGemmKernel` 内部模板仍保持 tail template 参数形态，避免扩大本轮改动到 device kernel 主体。
+
+## 2026-06-22 Current LL clean rerun finding
+
+- 清理 split-tail/no-tail 后，当前 LL 生产路径回到单一 fused-tail；远端覆盖源码、强制重编和 source guard 后，`8/32/64/128/256` eager 与 graph capture256 replay 均正确，`max_abs=0.000244141`。
+- 当前干净环境下的 fused-tail 性能基线：
+  - eager cap256 median 为 `0.572/0.622/0.683/0.831/1.260 ms`；
+  - graph capture256 replay median 为 `0.521/0.626/0.681/0.828/1.281 ms`。
+- 本轮 HCU0 `4.7%` 低占用不是 MegaMoE 残留，而是另一个 container `dsq_sglang_0517_512` 中的 root 进程 `./oneside_demo -s -d 0 -n mlx5_0`。以后遇到 `hy-smi` 有少量 util 但 `ps` 查不到当前容器进程时，应同时查宿主机与所有 container 的 HCU/网络 demo 进程。
+- 远端 build 注意事项仍然成立：只改 `.cuh` 后 ninja 可能不重编相关 object；验证 LL kernel 变更时应删除对应 K1/K2/K3/K3_v3 object 或显式 force rebuild。
+
+## 2026-06-22 Current LL uneven graph finding
+
+- 当前 LL fused-tail 的 uneven eager/graph 在干净环境下是正常的：
+  - `mix129 = 8,33,64,129,32,0,96,17` eager correct，median `0.741 ms`；
+  - `edge256 = 256,129,64,32,16,8,4,0` eager correct，median `0.988 ms`；
+  - graph capture256 replay `32/128/256` 对两组 uneven 全部 correct，replay median 分别为 `mix129 0.605/0.695/0.701 ms`、`edge256 0.609/0.744/0.932 ms`。
+- 中途看到的 `edge256` graph VMFault 是在 `sglang.launch_server + bench_serving` 已占用 87% VRAM 和高 HCU util 的污染环境下发生；清理该 framework run 并确认 HCU 全 idle 后未复现。
+- 后续结论口径：graph uneven 是否正常必须先确认所有 HCU idle；若有 SGLang/server/bench 常驻占卡，VMFault 或 timing outlier 不应直接归因到 LL kernel。

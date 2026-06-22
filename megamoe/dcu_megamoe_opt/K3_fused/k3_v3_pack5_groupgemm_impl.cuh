@@ -21,6 +21,10 @@ using float32x2_t = float __attribute__((ext_vector_type(2)));
 using float32x4_t = float __attribute__((ext_vector_type(4)));
 using bf16x4_t = uint16_t __attribute__((ext_vector_type(4)));
 
+static constexpr int kV3K3TailDoneCounterRingSlots = 16;
+static constexpr int kV3K3TailPeerReadyOffset =
+    2 * kV3K3TailDoneCounterRingSlots;
+
 __device__ int32x2_t llvm_amdgcn_raw_buffer_load_i32x2(
     int32x4_t resource,
     int voffset,
@@ -758,40 +762,6 @@ __device__ static inline void v3_k3_tail_wait_peer_signals_device(
     invalidate_l1_device();
 }
 
-__device__ static inline void v3_k3_signal_peers_thread0_device(
-    const int64_t* signal_addrs,
-    int num_ranks,
-    int signal_value) {
-    __threadfence_system();
-    for (int rank = 0; rank < num_ranks; ++rank) {
-        const int64_t addr = signal_addrs == nullptr ? 0 : signal_addrs[rank];
-        if (addr != 0) {
-            signal_generation_max_system_device(
-                reinterpret_cast<int*>(addr), signal_value);
-        }
-    }
-}
-
-__device__ static inline void v3_k3_wait_peer_signals_thread0_device(
-    const int64_t* signal_addrs,
-    int num_ranks,
-    int signal_generation) {
-    for (int rank = 0; rank < num_ranks; ++rank) {
-        const int64_t addr = signal_addrs == nullptr ? 0 : signal_addrs[8 + rank];
-        if (addr == 0)
-            continue;
-        auto* signal = reinterpret_cast<volatile int*>(addr);
-        const auto start_time = clock64();
-        while (load_signal_system_acquire_device(signal) < signal_generation) {
-            invalidate_l1_device();
-            if (clock64() - start_time > deep_gemm::mega::kBarrierTimeoutCycles) {
-                abort();
-            }
-        }
-    }
-    invalidate_l1_device();
-}
-
 __device__ static inline int v3_k3_tail_runtime_signal_generation_device(
     int signal_generation,
     const int32_t* signal_generation_ptr) {
@@ -807,19 +777,18 @@ __device__ static inline int v3_k3_tail_runtime_signal_generation_device(
 __device__ static inline int v3_k3_tail_done_counter_slot_device(
     int runtime_signal_generation,
     const int32_t* signal_generation_ptr) {
-    constexpr int kTailDoneCounterRingSlots = 16;
     return signal_generation_ptr != nullptr
-               ? (runtime_signal_generation & (kTailDoneCounterRingSlots - 1))
+               ? (runtime_signal_generation &
+                  (kV3K3TailDoneCounterRingSlots - 1))
                : 0;
 }
 
 __device__ static inline int* v3_k3_tail_peer_ready_counter_device(
     int32_t* done_counter,
     int slot) {
-    constexpr int kTailDoneCounterRingSlots = 16;
-    constexpr int kTailPeerReadyOffset = 2 * kTailDoneCounterRingSlots;
     return done_counter == nullptr ? nullptr
-                                   : done_counter + kTailPeerReadyOffset + slot;
+                                   : done_counter +
+                                         kV3K3TailPeerReadyOffset + slot;
 }
 
 __device__ static inline void v3_k3_tail_publish_peer_ready_device(
@@ -866,6 +835,20 @@ __device__ static inline int v3_k3_tail_active_reduce_blocks_device(
     return effective_num_tokens <= 256 ? 64 : reduce_blocks;
 }
 
+__device__ static inline int v3_k3_tail_effective_tokens_device(
+    int num_tokens,
+    const int32_t* runtime_num_tokens) {
+    int effective_num_tokens = num_tokens;
+    if (runtime_num_tokens != nullptr) {
+        effective_num_tokens = runtime_num_tokens[0];
+        if (effective_num_tokens < 0)
+            effective_num_tokens = 0;
+        if (effective_num_tokens > num_tokens)
+            effective_num_tokens = num_tokens;
+    }
+    return effective_num_tokens;
+}
+
 __device__ static inline void v3_k3_tail_reduce_worker_device(
     uint16_t* reduce_y,
     uint8_t* local_sym_buffer,
@@ -888,14 +871,8 @@ __device__ static inline void v3_k3_tail_reduce_worker_device(
     const int reduce_tid = static_cast<int>(threadIdx.x);
     if (reduce_tid >= reduce_threads)
         return;
-    int effective_num_tokens = num_tokens;
-    if (runtime_num_tokens != nullptr) {
-        effective_num_tokens = runtime_num_tokens[0];
-        if (effective_num_tokens < 0)
-            effective_num_tokens = 0;
-        if (effective_num_tokens > num_tokens)
-            effective_num_tokens = num_tokens;
-    }
+    const int effective_num_tokens =
+        v3_k3_tail_effective_tokens_device(num_tokens, runtime_num_tokens);
     const int vecs_per_token = hidden / kBf16PerVec;
     const int64_t total_reduce_vecs =
         static_cast<int64_t>(effective_num_tokens) * vecs_per_token;

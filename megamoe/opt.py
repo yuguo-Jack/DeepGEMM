@@ -71,6 +71,12 @@ def k3_tail_reduce_enabled() -> bool:
     return value in {"1", "true", "yes", "on", "tail-reduce"}
 
 
+def _tail_reduce_enabled_for_backend(v3_backend: str) -> bool:
+    if v3_backend == V3_BACKEND_LL:
+        return True
+    return k3_tail_reduce_enabled()
+
+
 def k2_skip_inactive_rows_enabled(num_tokens: int) -> bool:
     min_tokens = int(os.getenv("K2_SKIP_INACTIVE_ROWS_MIN_TOKENS", "1536"))
     return num_tokens >= min_tokens
@@ -462,7 +468,7 @@ def fp8_mega_moe_opt_3stage(
 
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
-    use_tail_reduce = k3_tail_reduce_enabled()
+    use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend)
     state = _state(
         sym_buffer,
         rank_idx=rank_idx,
@@ -663,7 +669,7 @@ def _run_opt_3stage_graph(
 
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
-    use_tail_reduce = k3_tail_reduce_enabled()
+    use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend)
     state = _state(
         sym_buffer,
         rank_idx=rank_idx,

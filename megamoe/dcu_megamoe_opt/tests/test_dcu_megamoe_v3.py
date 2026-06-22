@@ -159,6 +159,7 @@ def test_v3_build_surface_is_minimal_and_explicit():
 
 
 def test_v3_runtime_sources_have_clear_backend_boundaries():
+    opt_py = OPT_PATH.read_text(encoding="utf-8")
     k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
     k1_asm_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
     k1_asm_sources = "\n".join(
@@ -203,6 +204,11 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "absolute 64-bit" not in k1_asm_sources
     assert "dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5" in k1_ext
     assert "V3_K1_LowLatencyMaskedGroupGemmKernel" in k1_header
+    assert "tail_chunk_expected" not in k1_py
+    assert "publish_tail_chunk_expected" not in k1_ext
+    assert "v3_k1_publish_tail_chunk_expected_device" not in k1_header
+    assert "kV3K1TailChunkSignalSlotBase" not in k1_header
+    assert "counter.numel() >= 48" in k1_asm_ext
     assert "V3_K1_Fused_DeepGemm" not in k1_header
     assert "v3_k1_build_fixed_route_tile_device" not in k1_header
     assert "V3_K1_Pure" not in k1_header
@@ -222,8 +228,23 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "def k3_l2_fused_asm_to_combine(" not in k3_py
     assert "ensure_k3_combine_asm_code_object" not in k3_py
     assert "ensure_k3_combine_tail_reduce_asm_code_object" not in k3_py
-    assert "k3_v3_ll_combine(" in k3_py
-    assert "k3_v3_ll_combine_tail(" in k3_py
+    assert "ext.k3_v3_ll_combine(" not in k3_py
+    assert "ext.k3_v3_ll_combine_tail" in k3_py
+    assert "ext.k3_v3_ll_combine_tail_split" not in k3_py
+    assert "void k3_v3_ll_combine(" not in k3_ext
+    assert 'm.def("k3_v3_ll_combine",' not in k3_ext
+    assert "k3_v3_ll_combine_tail_split" not in k3_ext
+    assert "MEGAMOE_DCU_LL_K3_SPLIT_TAIL" not in opt_py
+    assert "ll_split_tail" not in opt_py
+    assert "ll_split_tail" not in k3_py
+    assert "def _tail_reduce_enabled_for_backend" in opt_py
+    assert "if v3_backend == V3_BACKEND_LL:\n        return True" in opt_py
+    assert "LL no-tail / tail-reduce-0 path has been retired" not in opt_py
+    assert "DCU MegaMoE LL no-tail path has been retired" not in opt_py
+    assert "MEGAMOE_DCU_LL_K3_SPLIT_TAIL_CHUNK_READY" not in opt_py
+    assert "ll_split_tail_chunk_ready" not in opt_py
+    assert "use_chunk_ready" not in k3_py
+    assert "use_chunk_ready" not in k3_ext
     assert "graph_runtime_num_tokens" in k3_py
     v3_k3_signature = k3_py.split("def k3_l2_fused_v3_to_combine(", 1)[1].split(
         ") -> torch.Tensor | None:",
@@ -235,6 +256,19 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "num_tokens, runtime_num_tokens, num_topk" in k3_ext
     assert "effective_num_tokens" in k3_header
     assert "static_cast<int64_t>(effective_num_tokens) * vecs_per_token" in k3_header
+    assert "V3_K3_LowLatencyCombineReduceKernel" not in k3_header
+    assert "v3_k3_tail_reduce_chunk_worker_device" not in k3_header
+    assert "v3_k3_tail_wait_gemm_expert_ready_device" not in k3_header
+    assert "kV3K3TailGemmExpertDoneOffset" not in k3_header
+    assert "kV3K3TailCopyExpertDoneOffset" not in k3_header
+    assert "publish_gemm_expert_done" not in k3_header
+    assert "const int expected_count = (token_end - token_start) * num_topk" not in k3_header
+    assert "expected=%d seen=%d all_done=%d" not in k3_header
+    assert "at::cuda::getStreamFromPool" not in k3_ext
+    assert "hipEventRecord" not in k3_ext
+    assert "hipStreamWaitEvent" not in k3_ext
+    assert "3 * kTailDoneCounterRingSlots + 2 * 32" not in k3_ext
+    assert "constexpr int64_t kTailDoneCounterInts = 3 * kTailDoneCounterRingSlots" in k3_ext
     assert "k3_v3_ll_reference" not in k3_ext
     assert "V3_K3_LowLatencyMaskedGroupGemmKernel" in k3_header
     assert "V3_K3_Fused_DeepGemm" not in k3_header

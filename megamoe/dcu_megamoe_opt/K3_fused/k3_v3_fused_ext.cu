@@ -8,7 +8,7 @@
 
 #include "k3_v3_pack5_groupgemm_impl.cuh"
 
-template <int kBlockM, bool kTailReduce>
+template <int kBlockM>
 static inline void launch_v3_k3_ll_rowptr(
     hip_bfloat16* output_workspace,
     const uint8_t* act_fp8,
@@ -28,15 +28,15 @@ static inline void launch_v3_k3_ll_rowptr(
     int num_tokens,
     const int32_t* runtime_num_tokens,
     int num_topk,
-    int done_target,
     int reduce_blocks,
     const int32_t* signal_generation_ptr,
     hipStream_t stream) {
     const dim3 block(256);
     constexpr int kCUs = 64;
-    const dim3 grid(kTailReduce ? kCUs + reduce_blocks : kCUs);
+    constexpr int kDoneTarget = 64;
+    const dim3 grid(kCUs + reduce_blocks);
     V3_K3_LowLatencyMaskedGroupGemmKernel<
-        32, 4096, 2048, kBlockM, 256, 64, 4, kCUs, true, false, kTailReduce>
+        32, 4096, 2048, kBlockM, 256, 64, 4, kCUs, true, false, true>
         <<<grid, block, 0, stream>>>(
             output_workspace,
             act_fp8,
@@ -58,7 +58,7 @@ static inline void launch_v3_k3_ll_rowptr(
             num_topk,
             1,
             signal_generation_ptr,
-            done_target,
+            kDoneTarget,
             reduce_blocks);
 }
 
@@ -82,7 +82,6 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5(
     const int32_t* runtime_num_tokens,
     int num_topk,
     int hidden,
-    int tail_reduce,
     int ll_block_m,
     const int32_t* signal_generation_ptr,
     hipStream_t stream) {
@@ -104,35 +103,21 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5(
         local_experts > 0 ? (total_rows / local_experts) : 0;
     if (rows_per_expert <= 0 || total_rows % local_experts != 0)
         return;
-    const int reduce_blocks =
-        tail_reduce ? (num_max_tokens_per_rank <= 2048 ? 64 : 128) : 0;
-    const int done_target = tail_reduce ? 64 : 0;
-#define DCU_MEGAMOE_V3_LAUNCH_LL(BLOCK_M, TAIL)                                \
-    launch_v3_k3_ll_rowptr<(BLOCK_M), (TAIL)>(                                 \
+    const int reduce_blocks = num_max_tokens_per_rank <= 2048 ? 64 : 128;
+#define DCU_MEGAMOE_V3_LAUNCH_LL(BLOCK_M)                                      \
+    launch_v3_k3_ll_rowptr<(BLOCK_M)>(                                         \
         output_workspace, act_fp8, act_scale, row_expert, weight_pack5,         \
         weight_scale,                                                           \
         row_combine_ptrs, rows_per_expert, sym_buffer, done_counter,            \
         signal_addrs, reduce_y, num_ranks, num_experts,                        \
         num_max_tokens_per_rank, num_tokens, runtime_num_tokens, num_topk,      \
-        done_target, reduce_blocks, signal_generation_ptr, stream)
+        reduce_blocks, signal_generation_ptr, stream)
     if (ll_block_m == 64) {
-        if (tail_reduce) {
-            DCU_MEGAMOE_V3_LAUNCH_LL(64, true);
-        } else {
-            DCU_MEGAMOE_V3_LAUNCH_LL(64, false);
-        }
+        DCU_MEGAMOE_V3_LAUNCH_LL(64);
     } else if (ll_block_m == 48) {
-        if (tail_reduce) {
-            DCU_MEGAMOE_V3_LAUNCH_LL(48, true);
-        } else {
-            DCU_MEGAMOE_V3_LAUNCH_LL(48, false);
-        }
+        DCU_MEGAMOE_V3_LAUNCH_LL(48);
     } else {
-        if (tail_reduce) {
-            DCU_MEGAMOE_V3_LAUNCH_LL(32, true);
-        } else {
-            DCU_MEGAMOE_V3_LAUNCH_LL(32, false);
-        }
+        DCU_MEGAMOE_V3_LAUNCH_LL(32);
     }
 #undef DCU_MEGAMOE_V3_LAUNCH_LL
     (void)sym_buffer;
@@ -152,97 +137,6 @@ namespace {
 void check_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
     TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA/HIP");
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
-}
-
-void k3_v3_ll_combine(
-    const torch::Tensor& output_workspace,
-    const torch::Tensor& act_fp8,
-    const torch::Tensor& act_scale,
-    const torch::Tensor& m_indices,
-    const torch::Tensor& weight_pack5,
-    const torch::Tensor& weight_scale,
-    const torch::Tensor& row_combine_ptrs,
-    const bool tail_reduce = false,
-    const int64_t ll_block_m = 32) {
-    check_cuda_contiguous(output_workspace, "output_workspace");
-    check_cuda_contiguous(act_fp8, "act_fp8");
-    check_cuda_contiguous(act_scale, "act_scale");
-    check_cuda_contiguous(m_indices, "m_indices");
-    check_cuda_contiguous(weight_pack5, "weight_pack5");
-    check_cuda_contiguous(weight_scale, "weight_scale");
-    check_cuda_contiguous(row_combine_ptrs, "row_combine_ptrs");
-    TORCH_CHECK(!tail_reduce,
-                "V3 K3 LL pack5 tail_reduce uses k3_v3_ll_combine_tail");
-    TORCH_CHECK(output_workspace.scalar_type() == torch::kBFloat16,
-                "output_workspace must be BF16");
-    TORCH_CHECK(act_fp8.scalar_type() == torch::kFloat8_e4m3fn,
-                "act_fp8 must be FP8 E4M3");
-    TORCH_CHECK(act_scale.scalar_type() == torch::kFloat32,
-                "act_scale must be FP32");
-    TORCH_CHECK(m_indices.scalar_type() == torch::kInt,
-                "m_indices must be int32");
-    TORCH_CHECK(weight_pack5.scalar_type() == torch::kFloat8_e4m3fn,
-                "weight_pack5 must be FP8 E4M3");
-    TORCH_CHECK(weight_scale.scalar_type() == torch::kFloat32,
-                "weight_scale must be FP32");
-    TORCH_CHECK(row_combine_ptrs.scalar_type() == torch::kInt64,
-                "row_combine_ptrs must be int64");
-    TORCH_CHECK(output_workspace.dim() == 2,
-                "output_workspace must be [rows, hidden]");
-    TORCH_CHECK(act_fp8.dim() == 2, "act_fp8 must be [rows, intermediate]");
-    TORCH_CHECK(output_workspace.size(0) == act_fp8.size(0),
-                "output_workspace and act_fp8 row counts must match");
-    const int total_rows = static_cast<int>(act_fp8.size(0));
-    const int intermediate = static_cast<int>(act_fp8.size(1));
-    const int hidden = static_cast<int>(output_workspace.size(1));
-    TORCH_CHECK(total_rows > 0 && total_rows % 64 == 0,
-                "V3 K3 LL pack5 expects rows padded to 64");
-    TORCH_CHECK(hidden == 4096 && intermediate == 2048,
-                "V3 K3 LL pack5 is specialized for hidden=4096, intermediate=2048");
-    TORCH_CHECK(ll_block_m == 32 || ll_block_m == 48 || ll_block_m == 64,
-                "V3 K3 LL pack5 expects ll_block_m in {32, 48, 64}");
-    TORCH_CHECK(weight_scale.dim() == 2 && weight_scale.size(1) == hidden,
-                "weight_scale must be [local_experts, hidden]");
-    TORCH_CHECK(act_scale.numel() >= total_rows,
-                "act_scale must have at least one scale per row");
-    TORCH_CHECK(m_indices.numel() >= weight_scale.size(0),
-                "m_indices must carry one actual row count per local expert");
-    TORCH_CHECK(row_combine_ptrs.numel() >= total_rows,
-                "row_combine_ptrs length must cover total rows");
-    TORCH_CHECK(weight_pack5.dim() >= 1 &&
-                    weight_pack5.numel() >=
-                        weight_scale.size(0) * static_cast<int64_t>(hidden) *
-                            static_cast<int64_t>(intermediate),
-                "weight_pack5 must contain flattened [local_experts, hidden, intermediate]");
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    dcu_megamoe_v3_launch_k3_ll_combine_pack5(
-        reinterpret_cast<hip_bfloat16*>(output_workspace.data_ptr()),
-        reinterpret_cast<const uint8_t*>(act_fp8.data_ptr()),
-        act_scale.data_ptr<float>(),
-        m_indices.data_ptr<int32_t>(),
-        reinterpret_cast<const uint8_t*>(weight_pack5.data_ptr()),
-        weight_scale.data_ptr<float>(),
-        row_combine_ptrs.data_ptr<int64_t>(),
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        total_rows,
-        0,
-        static_cast<int>(weight_scale.size(0)),
-        0,
-        0,
-        nullptr,
-        0,
-        hidden,
-        0,
-        static_cast<int>(ll_block_m),
-        nullptr,
-        stream);
-    const hipError_t post_launch_status = hipGetLastError();
-    TORCH_CHECK(post_launch_status == hipSuccess,
-                "hipGetLastError after V3 K3 LL pack5 launch failed: ",
-                hipGetErrorString(post_launch_status));
 }
 
 void k3_v3_ll_combine_tail(
@@ -383,7 +277,6 @@ void k3_v3_ll_combine_tail(
         runtime_num_tokens_ptr,
         static_cast<int>(num_topk),
         hidden,
-        1,
         static_cast<int>(ll_block_m),
         signal_generation_ptr,
         stream);
@@ -396,17 +289,6 @@ void k3_v3_ll_combine_tail(
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("k3_v3_ll_combine",
-          &k3_v3_ll_combine,
-          pybind11::arg("output_workspace"),
-          pybind11::arg("act_fp8"),
-          pybind11::arg("act_scale"),
-          pybind11::arg("m_indices"),
-          pybind11::arg("weight_pack5"),
-          pybind11::arg("weight_scale"),
-          pybind11::arg("row_combine_ptrs"),
-          pybind11::arg("tail_reduce") = false,
-          pybind11::arg("ll_block_m") = 32);
     m.def("k3_v3_ll_combine_tail",
           &k3_v3_ll_combine_tail,
           pybind11::arg("output_workspace"),

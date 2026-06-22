@@ -223,9 +223,9 @@ class SymmBuffer:
         buffer_ptrs[group.rank()] = buffer_ptr
 
         # Slots [0, 17] are used by the legacy rank/local barriers and K3
-        # tail-reduce signals. The staged K1/K2/K3 path uses 18 and 19 for its
-        # ticket/release rank barrier.
-        signal_num_bytes = _align(max(group.size(), 27) * 4, 128)
+        # tail-reduce signals. The staged K1/K2/K3 path uses 18..21 for rank
+        # barriers.
+        signal_num_bytes = _align(max(group.size(), 22) * 4, 128)
         signal_ptr, signal_handle = _C.allocate_hip_ipc_signal_buffer(signal_num_bytes)
         signal_handles = [None] * group.size()
         dist.all_gather_object(signal_handles, signal_handle, group)

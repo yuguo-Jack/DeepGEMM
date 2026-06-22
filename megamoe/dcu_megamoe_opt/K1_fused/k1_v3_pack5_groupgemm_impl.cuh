@@ -17,6 +17,10 @@ using float32x2_t = float __attribute__((ext_vector_type(2)));
 using float32x4_t = float __attribute__((ext_vector_type(4)));
 using bf16x4_t = uint16_t __attribute__((ext_vector_type(4)));
 
+static constexpr int kV3K1TailDoneCounterRingSlots = 16;
+static constexpr int kV3K1TailPeerReadyOffset =
+    2 * kV3K1TailDoneCounterRingSlots;
+
 __device__ int32x2_t llvm_amdgcn_raw_buffer_load_i32x2(
     int32x4_t resource,
     int voffset,
@@ -513,8 +517,6 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
     int num_ranks) {
     constexpr int kTailSignalSlotBase = 8;
     constexpr int kBarrierSignalSlotBase = 18;
-    constexpr int kTailDoneCounterRingSlots = 16;
-    constexpr int kTailPeerReadyOffset = 2 * kTailDoneCounterRingSlots;
     const int thread_id = static_cast<int>(threadIdx.x);
     __shared__ int barrier_generation;
     __shared__ int barrier_ticket;
@@ -531,7 +533,7 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
     if (thread_id == 0 && tail_done_counter != nullptr) {
         tail_done_counter[0] = 0;
         tail_done_counter[1] = 0;
-        tail_done_counter[kTailPeerReadyOffset] = 0;
+        tail_done_counter[kV3K1TailPeerReadyOffset] = 0;
     }
     if (thread_id == 0 && graph_runtime_num_tokens != nullptr &&
         graph_runtime_num_tokens_out != nullptr) {
@@ -549,7 +551,6 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
         __hip_atomic_store(my_signals + kTailSignalSlotBase + thread_id, 0,
                            __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
-
     __threadfence_system();
     __syncthreads();
 
@@ -592,10 +593,10 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
             graph_tail_signal_generation_out[0] = barrier_generation;
             if (tail_done_counter != nullptr) {
                 const int slot =
-                    barrier_generation & (kTailDoneCounterRingSlots - 1);
+                    barrier_generation & (kV3K1TailDoneCounterRingSlots - 1);
                 tail_done_counter[2 * slot] = 0;
                 tail_done_counter[2 * slot + 1] = 0;
-                tail_done_counter[kTailPeerReadyOffset + slot] = 0;
+                tail_done_counter[kV3K1TailPeerReadyOffset + slot] = 0;
             }
         }
 
@@ -735,7 +736,6 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
                                : num_max_tokens_per_rank;
     const int route_scan_routes_per_rank = route_token_stride * num_topk;
     const int total_scan_routes = num_ranks * route_scan_routes_per_rank;
-
     if (local_topk_mask != nullptr || tail_tokens != nullptr) {
         for (int token_idx = global_tid; token_idx < num_max_tokens_per_rank;
              token_idx += grid_threads) {

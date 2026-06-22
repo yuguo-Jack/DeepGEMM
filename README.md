@@ -181,12 +181,13 @@ during initialization by creating tensor views into the same `route_scratch`
 storage; no extra device kernels, D2H synchronization, or duplicate activation
 buffers are introduced for the first timed call.
 
-By default K3 uses the integrated ASM tail-reduce path for both eager and graph
+By default K3 uses the integrated tail-reduce path for both eager and graph
 staged execution, so it avoids the separate `rank_barrier + reduce` tail that
-can show large latency swings.  Set `K3_USE_ASM_TAIL_REDUCE=0` only when
-debugging the older barrier/reduce path.  For `num_max_tokens_per_rank <= 2048`,
-the tail reducer defaults to 64 reducer workgroups; larger max-token buffers
-keep the previous 128-workgroup default.
+can show large latency swings.  The LL backend always uses the fused tail path;
+`K3_USE_ASM_TAIL_REDUCE=0` is ignored for LL and only selects the older
+normal-backend barrier/reduce path.  For
+`num_max_tokens_per_rank <= 2048`, the tail reducer defaults to 64 reducer
+workgroups; larger max-token buffers keep the previous 128-workgroup default.
 
 The staged path keeps the tail-reduce signal state in `route_scratch`; this
 state is prepared during buffer initialization rather than the timed execution
