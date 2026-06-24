@@ -37,6 +37,7 @@ def test_v3_backend_auto_policy(monkeypatch):
     config = load_module("dcu_megamoe_v3_config", V3_CONFIG_PATH)
     monkeypatch.delenv("MEGAMOE_DCU_BACKEND", raising=False)
     monkeypatch.delenv("MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD", raising=False)
+
     assert config.BACKEND_ENV == "MEGAMOE_DCU_BACKEND"
     assert config.NORMAL_LL_TOKEN_THRESHOLD_ENV == "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
     assert config.DEFAULT_NORMAL_LL_TOKEN_THRESHOLD == 256
@@ -200,8 +201,9 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "tail_chunk_expected" not in k1_py
     assert "publish_tail_chunk_expected" not in k1_ext
     assert "v3_k1_publish_tail_chunk_expected_device" not in k1_header
-    assert "kV3K1TailChunkSignalSlotBase" not in k1_header
-    assert "counter.numel() >= 48" in k1_asm_ext
+    assert "kV3K1TailChunkSignalSlotBase" in k1_header
+    assert "kV3K1TailCopyExpertDoneOffset" in k1_header
+    assert "counter.numel() >= 80" in k1_asm_ext
     assert "V3_K1_Fused_DeepGemm" not in k1_header
     assert "v3_k1_build_fixed_route_tile_device" not in k1_header
     assert "V3_K1_Pure" not in k1_header
@@ -223,13 +225,13 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "ensure_k3_combine_tail_reduce_asm_code_object" not in k3_py
     assert "ext.k3_v3_ll_combine(" not in k3_py
     assert "ext.k3_v3_ll_combine_tail" in k3_py
-    assert "ext.k3_v3_ll_combine_tail_split" not in k3_py
+    assert "ext.k3_v3_ll_combine_tail_split" in k3_py
     assert "void k3_v3_ll_combine(" not in k3_ext
     assert 'm.def("k3_v3_ll_combine",' not in k3_ext
-    assert "k3_v3_ll_combine_tail_split" not in k3_ext
-    assert "MEGAMOE_DCU_LL_K3_SPLIT_TAIL" not in opt_py
-    assert "ll_split_tail" not in opt_py
-    assert "ll_split_tail" not in k3_py
+    assert "k3_v3_ll_combine_tail_split" in k3_ext
+    assert "MEGAMOE_DCU_LL_K3_SPLIT_TAIL" in opt_py
+    assert "ll_k3_split_tail_enabled" in opt_py
+    assert "ll_split_tail: bool = False" in k3_py
     assert "def _tail_reduce_enabled_for_backend" in opt_py
     assert "if v3_backend == V3_BACKEND_LL:\n        return True" in opt_py
     assert "LL no-tail / tail-reduce-0 path has been retired" not in opt_py
@@ -244,24 +246,34 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
         1,
     )[0]
     assert "graph_runtime_num_tokens: torch.Tensor | None = None" in v3_k3_signature
+    assert "ll_split_tail: bool = False" in v3_k3_signature
+    assert "ll_split_copy_shrink" not in v3_k3_signature
     assert "runtime_num_tokens_tensor" in k3_ext
     assert "runtime_num_tokens_ptr" in k3_ext
-    assert "num_tokens, runtime_num_tokens, num_topk" in k3_ext
+    assert "split_copy_shrink" not in k3_ext
+    assert "split_copy_shrink" not in k3_py
+    assert "split_copy_shrink" not in opt_py
+    assert "num_tokens,\n            runtime_num_tokens,\n            num_topk" in k3_ext
+    assert "max_copy_rows_ptr" in k3_ext
     assert "effective_num_tokens" in k3_header
     assert "static_cast<int64_t>(effective_num_tokens) * vecs_per_token" in k3_header
-    assert "V3_K3_LowLatencyCombineReduceKernel" not in k3_header
-    assert "v3_k3_tail_reduce_chunk_worker_device" not in k3_header
+    assert "V3_K3_LowLatencyCombineReduceKernel" in k3_header
+    assert "v3_k3_split_reduce_chunk_tile_device" in k3_header
     assert "v3_k3_tail_wait_gemm_expert_ready_device" not in k3_header
     assert "kV3K3TailGemmExpertDoneOffset" not in k3_header
-    assert "kV3K3TailCopyExpertDoneOffset" not in k3_header
+    assert "kV3K3TailCopyExpertDoneOffset" in k3_header
     assert "publish_gemm_expert_done" not in k3_header
-    assert "const int expected_count = (token_end - token_start) * num_topk" not in k3_header
+    assert "const int expected_count = (token_end - token_start) * num_topk" in k3_header
+    assert "max_copy_rows <= kCopyRows" in k3_header
+    assert "graph_ll_split_copy_shrink_out" not in k1_header
+    assert "graph_ll_split_copy_shrink" not in opt_py
     assert "expected=%d seen=%d all_done=%d" not in k3_header
     assert "at::cuda::getStreamFromPool" not in k3_ext
     assert "hipEventRecord" not in k3_ext
     assert "hipStreamWaitEvent" not in k3_ext
     assert "3 * kTailDoneCounterRingSlots + 2 * 32" not in k3_ext
     assert "constexpr int64_t kTailDoneCounterInts = 3 * kTailDoneCounterRingSlots" in k3_ext
+    assert "kSplitTailDoneCounterInts" in k3_ext
     assert "k3_v3_ll_reference" not in k3_ext
     assert "V3_K3_LowLatencyMaskedGroupGemmKernel" in k3_header
     assert "V3_K3_Fused_DeepGemm" not in k3_header

@@ -221,8 +221,8 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
 
     constexpr int64_t kProbStorageBytes = 256;
     constexpr int64_t kTailDoneCounterRingSlots = 16;
-    constexpr int64_t kTailDoneCounterInts = 48;
-    static_assert(kTailDoneCounterInts == 3 * kTailDoneCounterRingSlots,
+    constexpr int64_t kTailDoneCounterInts = 80;
+    static_assert(kTailDoneCounterInts == 3 * kTailDoneCounterRingSlots + 32,
                   "tail done counter scratch layout changed");
     constexpr int64_t kTailSignalAddrs = 16;
     const int64_t route_base =

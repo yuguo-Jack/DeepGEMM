@@ -510,6 +510,10 @@ __device__ static inline int load_signal_system_acquire(const volatile int* ptr)
 }
 
 constexpr int kDefaultStagedBarrierSignalSlotBase = 18;
+constexpr int kSplitTailChunkSignalSlotBase = 22;
+constexpr int kSplitTailChunkSignalSlots = 4;
+constexpr int kSplitTailCopyExpertDoneOffset = 48;
+constexpr int kSplitTailCopyExpertDoneCount = 32;
 
 __global__ void rank_barrier_kernel(
     uint8_t* local_sym_buffer,
@@ -542,6 +546,16 @@ __global__ void rank_barrier_kernel(
         constexpr int kTailPeerReadyOffset = 2 * kTailDoneCounterRingSlots;
         asm_done_counter[kTailPeerReadyOffset] = 0;
     }
+    if (asm_done_counter != nullptr &&
+        thread_id < kSplitTailChunkSignalSlots) {
+        constexpr int kTailDoneCounterRingSlots = 16;
+        constexpr int kTailPeerReadyOffset = 2 * kTailDoneCounterRingSlots;
+        asm_done_counter[kTailPeerReadyOffset + thread_id] = 0;
+    }
+    if (asm_done_counter != nullptr &&
+        thread_id < kSplitTailCopyExpertDoneCount) {
+        asm_done_counter[kSplitTailCopyExpertDoneOffset + thread_id] = 0;
+    }
     if (thread_id == 0 && graph_runtime_num_tokens != nullptr &&
         graph_runtime_num_tokens_out != nullptr) {
         int runtime_tokens = graph_runtime_num_tokens[0];
@@ -555,6 +569,12 @@ __global__ void rank_barrier_kernel(
     if (reset_tail_signal_slots && thread_id < num_ranks) {
         __hip_atomic_store(my_signals + 8 + thread_id, 0, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    if (reset_tail_signal_slots &&
+        thread_id < kSplitTailChunkSignalSlots) {
+        __hip_atomic_store(
+            my_signals + kSplitTailChunkSignalSlotBase + thread_id, 0,
+            __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
     if (route_scratch != nullptr) {
         if (k1_flags_numel > 0) {
@@ -621,6 +641,10 @@ __global__ void rank_barrier_kernel(
                 asm_done_counter[2 * slot] = 0;
                 asm_done_counter[2 * slot + 1] = 0;
                 asm_done_counter[kTailPeerReadyOffset + slot] = 0;
+                for (int expert = 0;
+                     expert < kSplitTailCopyExpertDoneCount; ++expert) {
+                    asm_done_counter[kSplitTailCopyExpertDoneOffset + expert] = 0;
+                }
             }
             __threadfence_system();
         }

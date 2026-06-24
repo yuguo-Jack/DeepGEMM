@@ -40,16 +40,17 @@ void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
     int32_t* graph_tail_signal_generation_out,
     int graph_max_tokens,
     hipStream_t stream) {
+    (void)problem_size;
     const bool mask_tiny_store = valid_rows_per_expert <= 16;
 #define DCU_MEGAMOE_V3_LAUNCH_K1_LL(                                            \
     BLOCK_M, CUS, MASK_TINY_STORE, PARALLEL_STAGE_COPY)                         \
     V3_K1_LowLatencyMaskedGroupGemmKernel<                                      \
-        32, 4096, 4096, BLOCK_M, 256, 64, 4, CUS, MASK_TINY_STORE, true,        \
+        32, 4096, 4096, BLOCK_M, 256, 64, 4, CUS, MASK_TINY_STORE,              \
         PARALLEL_STAGE_COPY>                                                     \
         <<<dim3(CUS), dim3(256), 0, stream>>>(                                  \
             out, staged_x, weight_pack5, staged_x_scale, weight_scale,           \
-            problem_size, rows_aligned_per_expert, sym_buffer,                  \
-            route_scratch_i32, grid_barrier, barrier_epoch, rank_idx,           \
+            rows_aligned_per_expert, sym_buffer, route_scratch_i32,              \
+            grid_barrier, barrier_epoch, rank_idx,                               \
             num_ranks, num_global_experts, num_max_tokens_per_rank, num_topk,    \
             runtime_num_tokens, route_weights, m_indices, output_index,          \
             row_combine_ptrs, local_topk_mask, tail_tokens, local_expert_stats,  \

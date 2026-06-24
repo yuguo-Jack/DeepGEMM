@@ -32,9 +32,10 @@ K_K1_ASM_LAUNCH_ARGS_BYTES = 256
 K_K2_GRAPH_ROW_BLOCKS = 8192
 K_PROB_STORAGE_BYTES = 256
 K_TAIL_DONE_COUNTER_RING_SLOTS = 16
-K_TAIL_DONE_COUNTER_INTS = 48
+K_TAIL_DONE_COUNTER_INTS = 80
 K_POST_K3_BARRIER_SIGNAL_SLOT_BASE = 20
 V3_LL_BLOCK_M = 32
+K_LL_SPLIT_TAIL_MAX_TOKENS = 256
 K_DTYPE_SIZES = {
     torch.bfloat16: 2,
     torch.float32: 4,
@@ -75,6 +76,19 @@ def _tail_reduce_enabled_for_backend(v3_backend: str) -> bool:
     if v3_backend == V3_BACKEND_LL:
         return True
     return k3_tail_reduce_enabled()
+
+
+def ll_k3_split_tail_enabled() -> bool:
+    value = os.getenv("MEGAMOE_DCU_LL_K3_SPLIT_TAIL", "0").strip().lower()
+    return value in {"1", "true", "yes", "on", "split"}
+
+
+def _ll_k3_split_tail_enabled_for_tokens(v3_backend: str, num_tokens: int) -> bool:
+    return (
+        v3_backend == V3_BACKEND_LL
+        and ll_k3_split_tail_enabled()
+        and int(num_tokens) <= K_LL_SPLIT_TAIL_MAX_TOKENS
+    )
 
 
 def k2_skip_inactive_rows_enabled(num_tokens: int) -> bool:
@@ -470,6 +484,7 @@ def fp8_mega_moe_opt_3stage(
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
     use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend)
+    use_ll_split_tail = _ll_k3_split_tail_enabled_for_tokens(v3_backend, num_tokens)
     state = _state(
         sym_buffer,
         rank_idx=rank_idx,
@@ -567,6 +582,7 @@ def fp8_mega_moe_opt_3stage(
             asm_signal_generation=asm_signal_generation,
             asm_reduce_y=y,
             sym_buffer=sym_buffer,
+            rank_idx=rank_idx,
             num_ranks=num_ranks,
             num_experts=num_experts,
             num_tokens=num_tokens,
@@ -574,6 +590,7 @@ def fp8_mega_moe_opt_3stage(
             hidden=hidden,
             output_workspace=l1_out,
             prob_storage=state.scratch.k3_prob_storage,
+            ll_split_tail=use_ll_split_tail,
             use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
@@ -675,6 +692,9 @@ def _run_opt_3stage_graph(
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
     use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend)
+    use_ll_split_tail = _ll_k3_split_tail_enabled_for_tokens(
+        v3_backend, graph_max_tokens
+    )
     state = _state(
         sym_buffer,
         rank_idx=rank_idx,
@@ -807,6 +827,7 @@ def _run_opt_3stage_graph(
             asm_signal_generation_tensor=state.scratch.graph_tail_signal_generation,
             asm_reduce_y=y[:graph_max_tokens],
             sym_buffer=sym_buffer,
+            rank_idx=rank_idx,
             num_ranks=num_ranks,
             num_experts=num_experts,
             num_tokens=graph_max_tokens,
@@ -816,6 +837,7 @@ def _run_opt_3stage_graph(
             prob_storage=state.scratch.k3_prob_storage,
             active_tiles=state.scratch.k1_active_tiles,
             graph_runtime_offset_from_active_tiles=graph_runtime_offset,
+            ll_split_tail=use_ll_split_tail,
             use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )

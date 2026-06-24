@@ -24,6 +24,25 @@ using bf16x4_t = uint16_t __attribute__((ext_vector_type(4)));
 static constexpr int kV3K3TailDoneCounterRingSlots = 16;
 static constexpr int kV3K3TailPeerReadyOffset =
     2 * kV3K3TailDoneCounterRingSlots;
+static constexpr int kV3K3TailChunkSignalSlotBase = 22;
+static constexpr int kV3K3TailChunkSignalSlots = 4;
+static constexpr int kV3K3TailChunkM = 64;
+static constexpr int kV3K3TailCopyDoneSignalSlotBase = 8;
+static constexpr int kV3K3TailCopyExpertDoneOffset =
+    3 * kV3K3TailDoneCounterRingSlots;
+static constexpr int kV3K3TailCopyExpertDoneCount = 32;
+
+__device__ static inline void block_barrier_device();
+__device__ static inline void invalidate_l1_device();
+__device__ static inline int load_signal_system_acquire_device(
+    const volatile int* ptr);
+__device__ static inline int64_t global_load_i64_glc_device(
+    const int64_t* ptr);
+__device__ static inline uint4 global_load_uint4_device(const uint4* ptr);
+__device__ static inline void wait_vmem_lds_store_device();
+__device__ static inline int v3_k3_tail_effective_tokens_device(
+    int num_tokens,
+    const int32_t* runtime_num_tokens);
 
 __device__ int32x2_t llvm_amdgcn_raw_buffer_load_i32x2(
     int32x4_t resource,
@@ -141,6 +160,538 @@ __device__ static inline void buffer_load_lds_16b_device(
     __builtin_amdgcn_raw_buffer_load_lds(
         resource, lds_ptr, 16, global_byte_offset, 0, 0, 0);
     return;
+}
+
+__device__ static inline int v3_k3_split_clamp_tokens_device(
+    int value,
+    int max_tokens) {
+    if (value < 0)
+        return 0;
+    if (value > max_tokens)
+        return max_tokens;
+    return value;
+}
+
+__device__ static inline int v3_k3_split_peer_runtime_tokens_device(
+    uint8_t* local_sym_buffer,
+    int peer_rank,
+    int num_ranks,
+    int num_max_tokens_per_rank) {
+    auto** sym_buffers = deep_gemm::mega::dcu_peer_sym_buffer_ptrs(
+        local_sym_buffer);
+    auto* peer_runtime = deep_gemm::mega::dcu_runtime_num_tokens_ptr(
+        sym_buffers[peer_rank], num_ranks);
+    return v3_k3_split_clamp_tokens_device(peer_runtime[0],
+                                           num_max_tokens_per_rank);
+}
+
+__device__ static inline int v3_k3_split_max_peer_runtime_tokens_device(
+    uint8_t* local_sym_buffer,
+    int num_ranks,
+    int num_max_tokens_per_rank) {
+    int max_runtime_tokens = 0;
+    for (int rank = 0; rank < num_ranks; ++rank) {
+        const int runtime_tokens = v3_k3_split_peer_runtime_tokens_device(
+            local_sym_buffer, rank, num_ranks, num_max_tokens_per_rank);
+        if (runtime_tokens > max_runtime_tokens)
+            max_runtime_tokens = runtime_tokens;
+    }
+    return max_runtime_tokens;
+}
+
+__device__ static inline void v3_k3_split_publish_row_chunk_device(
+    int64_t row_addr,
+    uint8_t* local_sym_buffer,
+    int num_ranks,
+    int num_experts,
+    int num_max_tokens_per_rank,
+    int num_topk,
+    int hidden) {
+    if (row_addr <= 0)
+        return;
+    auto** sym_buffers =
+        deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
+    auto** signal_buffers =
+        deep_gemm::mega::dcu_peer_signal_ptrs(local_sym_buffer, num_ranks);
+    const uint64_t addr = static_cast<uint64_t>(row_addr);
+    const int64_t combine_rows =
+        static_cast<int64_t>(num_topk) * num_max_tokens_per_rank;
+    const uint64_t combine_bytes =
+        static_cast<uint64_t>(combine_rows) * hidden * sizeof(uint16_t);
+    for (int dest_rank = 0; dest_rank < num_ranks; ++dest_rank) {
+        uint16_t* combine_base = deep_gemm::mega::get_sections(
+            sym_buffers[dest_rank], num_ranks, num_experts,
+            num_max_tokens_per_rank, num_topk, hidden).combine;
+        const uint64_t base = reinterpret_cast<uint64_t>(combine_base);
+        if (addr < base || addr >= base + combine_bytes)
+            continue;
+        const uint64_t elem_offset = (addr - base) / sizeof(uint16_t);
+        const int64_t partial_row =
+            static_cast<int64_t>(elem_offset / static_cast<uint64_t>(hidden));
+        const int token_idx =
+            static_cast<int>(partial_row % num_max_tokens_per_rank);
+        if (token_idx < 0 || token_idx >= num_max_tokens_per_rank)
+            return;
+        const int chunk = token_idx / kV3K3TailChunkM;
+        if (chunk < 0 || chunk >= kV3K3TailChunkSignalSlots)
+            return;
+        atomicAdd_system(signal_buffers[dest_rank] +
+                             kV3K3TailChunkSignalSlotBase + chunk,
+                         1);
+        return;
+    }
+}
+
+__device__ static inline void v3_k3_split_signal_copy_done_device(
+    uint8_t* sym_buffer,
+    int rank_idx,
+    int num_ranks) {
+    if (threadIdx.x != 0)
+        return;
+    auto** signal_buffers =
+        deep_gemm::mega::dcu_peer_signal_ptrs(sym_buffer, num_ranks);
+    for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
+        __hip_atomic_store(
+            signal_buffers[peer_rank] + kV3K3TailCopyDoneSignalSlotBase +
+                rank_idx,
+            1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+__device__ static inline void v3_k3_split_finish_copy_block_device(
+    int32_t* done_counter,
+    int active_copy_blocks,
+    uint8_t* sym_buffer,
+    int rank_idx,
+    int num_ranks) {
+    if (done_counter == nullptr || active_copy_blocks <= 0)
+        return;
+    if (threadIdx.x == 0) {
+        const int old = atomicAdd_system(done_counter, 1);
+        if (old + 1 == active_copy_blocks) {
+            __threadfence_system();
+            v3_k3_split_signal_copy_done_device(sym_buffer, rank_idx,
+                                                num_ranks);
+        }
+    }
+}
+
+__device__ static inline bool v3_k3_split_all_copy_done_device(
+    int* my_signal_buffer,
+    int num_ranks) {
+    for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
+        auto* done = reinterpret_cast<volatile int*>(
+            my_signal_buffer + kV3K3TailCopyDoneSignalSlotBase + peer_rank);
+        if (load_signal_system_acquire_device(done) < 1)
+            return false;
+    }
+    return true;
+}
+
+__device__ static inline void v3_k3_split_reduce_chunk_tile_device(
+    uint16_t* reduce_y,
+    uint8_t* local_sym_buffer,
+    int hidden_tile,
+    int token_start,
+    int token_end,
+    int num_ranks,
+    int num_experts,
+    int num_max_tokens_per_rank,
+    int num_topk,
+    int hidden) {
+    constexpr int kBf16PerVec = 8;
+    constexpr int kHiddenTile = 256;
+    constexpr int kVecsPerHiddenTile = kHiddenTile / kBf16PerVec;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int tokens = token_end - token_start;
+    if (tokens <= 0)
+        return;
+    const int64_t total_vecs =
+        static_cast<int64_t>(tokens) * kVecsPerHiddenTile;
+    const uint16_t* combine_base = deep_gemm::mega::get_sections(
+        local_sym_buffer, num_ranks, num_experts, num_max_tokens_per_rank,
+        num_topk, hidden).combine;
+    auto* y_vec = reinterpret_cast<uint4*>(reduce_y);
+    const int global_vec_base = hidden_tile * kVecsPerHiddenTile;
+    const int vecs_per_token = hidden / kBf16PerVec;
+    for (int64_t task = tid; task < total_vecs;
+         task += static_cast<int64_t>(blockDim.x)) {
+        const int token_offset =
+            static_cast<int>(task / kVecsPerHiddenTile);
+        const int vec_in_tile =
+            static_cast<int>(task -
+                             static_cast<int64_t>(token_offset) *
+                                 kVecsPerHiddenTile);
+        const int token_idx = token_start + token_offset;
+        const int vec_idx = global_vec_base + vec_in_tile;
+        float sum_x_lo = 0.0f;
+        float sum_x_hi = 0.0f;
+        float sum_y_lo = 0.0f;
+        float sum_y_hi = 0.0f;
+        float sum_z_lo = 0.0f;
+        float sum_z_hi = 0.0f;
+        float sum_w_lo = 0.0f;
+        float sum_w_hi = 0.0f;
+        for (int topk_slot = 0; topk_slot < num_topk; ++topk_slot) {
+            const int64_t partial_row =
+                static_cast<int64_t>(topk_slot) * num_max_tokens_per_rank +
+                token_idx;
+            const auto packed = global_load_uint4_device(
+                reinterpret_cast<const uint4*>(
+                    combine_base + partial_row * hidden) +
+                vec_idx);
+#define V3_K3_SPLIT_REDUCE_ACCUM(FIELD, SUM_LO, SUM_HI)                       \
+            do {                                                               \
+                const uint32_t word = packed.FIELD;                            \
+                SUM_LO += deep_gemm::mega::bf16_bits_to_float(                 \
+                    static_cast<uint16_t>(word));                              \
+                SUM_HI += deep_gemm::mega::bf16_bits_to_float(                 \
+                    static_cast<uint16_t>(word >> 16));                        \
+            } while (0)
+            V3_K3_SPLIT_REDUCE_ACCUM(x, sum_x_lo, sum_x_hi);
+            V3_K3_SPLIT_REDUCE_ACCUM(y, sum_y_lo, sum_y_hi);
+            V3_K3_SPLIT_REDUCE_ACCUM(z, sum_z_lo, sum_z_hi);
+            V3_K3_SPLIT_REDUCE_ACCUM(w, sum_w_lo, sum_w_hi);
+#undef V3_K3_SPLIT_REDUCE_ACCUM
+        }
+        uint4 out;
+        out.x = deep_gemm::mega::pack2_f32_to_bf16_bits(sum_x_lo, sum_x_hi);
+        out.y = deep_gemm::mega::pack2_f32_to_bf16_bits(sum_y_lo, sum_y_hi);
+        out.z = deep_gemm::mega::pack2_f32_to_bf16_bits(sum_z_lo, sum_z_hi);
+        out.w = deep_gemm::mega::pack2_f32_to_bf16_bits(sum_w_lo, sum_w_hi);
+        y_vec[static_cast<int64_t>(token_idx) * vecs_per_token + vec_idx] = out;
+    }
+}
+
+template <int kHidden = 4096,
+          int kCopyRows = 16,
+          int kCopyHidden = 256>
+__global__ __launch_bounds__(256, 1) void
+V3_K3_LowLatencyCombineReduceKernel(
+    const hip_bfloat16* local_out,
+    const int32_t* actual_m,
+    const int32_t* max_copy_rows_ptr,
+    int m_per_expert,
+    const int64_t* row_combine_ptrs,
+    uint8_t* sym_buffer,
+    int32_t* done_counter,
+    uint16_t* reduce_y,
+    int rank_idx,
+    int num_ranks,
+    int num_experts,
+    int num_max_tokens_per_rank,
+    int num_tokens,
+    const int32_t* runtime_num_tokens,
+    int num_topk) {
+    constexpr int kBf16PerVec = 8;
+    constexpr int kVecsPerCopyTile = kCopyHidden / kBf16PerVec;
+    constexpr int kHiddenTiles = kHidden / kCopyHidden;
+    const int local_experts = num_experts / num_ranks;
+    const int row_blocks_per_expert =
+        (m_per_expert + kCopyRows - 1) / kCopyRows;
+    const int copy_blocks =
+        local_experts * row_blocks_per_expert * kHiddenTiles;
+    constexpr int kReduceBlocks =
+        kV3K3TailChunkSignalSlots * kHiddenTiles;
+    const int tid = static_cast<int>(threadIdx.x);
+    int copy_row_blocks_per_expert = row_blocks_per_expert;
+    if (runtime_num_tokens != nullptr && max_copy_rows_ptr != nullptr) {
+        int max_copy_rows = *max_copy_rows_ptr;
+        if (max_copy_rows < 0)
+            max_copy_rows = 0;
+        if (max_copy_rows > m_per_expert)
+            max_copy_rows = m_per_expert;
+        if (max_copy_rows <= kCopyRows)
+            copy_row_blocks_per_expert =
+                (max_copy_rows + kCopyRows - 1) / kCopyRows;
+    }
+    const int active_copy_blocks =
+        local_experts * copy_row_blocks_per_expert * kHiddenTiles;
+
+    if (blockIdx.x == 0 && tid == 0) {
+        const int max_peer_runtime_tokens =
+            v3_k3_split_max_peer_runtime_tokens_device(
+                sym_buffer, num_ranks, num_max_tokens_per_rank);
+        if (max_peer_runtime_tokens >
+            kV3K3TailChunkSignalSlots * kV3K3TailChunkM) {
+            printf("MegaMoE HIP K3 LL split-tail supports runtime tokens <= %d, "
+                   "got peer max=%d\n",
+                   kV3K3TailChunkSignalSlots * kV3K3TailChunkM,
+                   max_peer_runtime_tokens);
+            abort();
+        }
+    }
+
+    if (static_cast<int>(blockIdx.x) < active_copy_blocks) {
+        const int copy_idx = static_cast<int>(blockIdx.x);
+        const int hidden_tile = copy_idx % kHiddenTiles;
+        const int row_block =
+            (copy_idx / kHiddenTiles) % copy_row_blocks_per_expert;
+        const int expert =
+            copy_idx / (kHiddenTiles * copy_row_blocks_per_expert);
+        int cur_tokens = actual_m[expert];
+        if (cur_tokens < 0)
+            cur_tokens = 0;
+        if (cur_tokens > m_per_expert)
+            cur_tokens = m_per_expert;
+        const int row_start = row_block * kCopyRows;
+        if (cur_tokens <= 0 || row_start >= cur_tokens) {
+            v3_k3_split_finish_copy_block_device(
+                done_counter, active_copy_blocks, sym_buffer, rank_idx,
+                num_ranks);
+            return;
+        }
+        int row_end = row_start + kCopyRows;
+        if (row_end > cur_tokens)
+            row_end = cur_tokens;
+        const int rows_in_block = row_end - row_start;
+
+        const int64_t total_vecs =
+            static_cast<int64_t>(rows_in_block) * kVecsPerCopyTile;
+        const int hidden_vec_base = hidden_tile * kVecsPerCopyTile;
+        const int64_t expert_row_base =
+            static_cast<int64_t>(expert) * m_per_expert;
+        const auto* src_vec =
+            reinterpret_cast<const uint4*>(local_out + expert_row_base * kHidden);
+        __shared__ int64_t row_addr_tile[kCopyRows];
+        if (tid < rows_in_block) {
+            row_addr_tile[tid] = global_load_i64_glc_device(
+                row_combine_ptrs + expert_row_base + row_start + tid);
+        }
+        block_barrier_device();
+        for (int64_t task = tid; task < total_vecs;
+             task += static_cast<int64_t>(blockDim.x)) {
+            const int row_offset =
+                static_cast<int>(task / kVecsPerCopyTile);
+            const int vec_in_tile =
+                static_cast<int>(task -
+                                     static_cast<int64_t>(row_offset) *
+                                         kVecsPerCopyTile);
+            const int row_in_expert = row_start + row_offset;
+            const int64_t row_addr = row_addr_tile[row_offset];
+            if (__builtin_expect(row_addr <= 0, 0))
+                continue;
+            const int vec_idx = hidden_vec_base + vec_in_tile;
+            const uint4 packed =
+                global_load_uint4_device(src_vec +
+                                         static_cast<int64_t>(row_in_expert) *
+                                             (kHidden / kBf16PerVec) +
+                                         vec_idx);
+            auto* dst_vec = reinterpret_cast<uint4*>(
+                reinterpret_cast<uint16_t*>(row_addr));
+            dst_vec[vec_idx] = packed;
+        }
+        wait_vmem_lds_store_device();
+        block_barrier_device();
+        __threadfence_system();
+
+        constexpr int kMaxSignalRanks = 8;
+        constexpr int kPublishSlots =
+            kMaxSignalRanks * kV3K3TailChunkSignalSlots;
+        __shared__ int publish_expert;
+        __shared__ int publish_counts[kPublishSlots];
+        __shared__ uint64_t publish_combine_base[kMaxSignalRanks];
+        __shared__ uint64_t publish_combine_end[kMaxSignalRanks];
+        if (tid == 0) {
+            const int active_row_blocks =
+                (cur_tokens + kCopyRows - 1) / kCopyRows;
+            const int old = atomicAdd_system(
+                done_counter + kV3K3TailCopyExpertDoneOffset + expert, 1);
+            publish_expert =
+                (old + 1 == active_row_blocks * kHiddenTiles) ? 1 : 0;
+        }
+        block_barrier_device();
+        if (publish_expert) {
+            if (num_ranks <= kMaxSignalRanks) {
+                auto** sym_buffers =
+                    deep_gemm::mega::dcu_peer_sym_buffer_ptrs(sym_buffer);
+                auto** signal_buffers =
+                    deep_gemm::mega::dcu_peer_signal_ptrs(sym_buffer,
+                                                          num_ranks);
+                for (int slot = tid; slot < kPublishSlots;
+                     slot += blockDim.x) {
+                    publish_counts[slot] = 0;
+                }
+                for (int peer_rank = tid; peer_rank < num_ranks;
+                     peer_rank += blockDim.x) {
+                    uint16_t* combine_base = deep_gemm::mega::get_sections(
+                        sym_buffers[peer_rank], num_ranks, num_experts,
+                        num_max_tokens_per_rank, num_topk, kHidden).combine;
+                    const int64_t combine_rows =
+                        static_cast<int64_t>(num_topk) *
+                        num_max_tokens_per_rank;
+                    const uint64_t combine_bytes =
+                        static_cast<uint64_t>(combine_rows) * kHidden *
+                        sizeof(uint16_t);
+                    const uint64_t base =
+                        reinterpret_cast<uint64_t>(combine_base);
+                    publish_combine_base[peer_rank] = base;
+                    publish_combine_end[peer_rank] = base + combine_bytes;
+                }
+                block_barrier_device();
+                for (int row = tid; row < cur_tokens; row += blockDim.x) {
+                    const int logical_row =
+                        static_cast<int>(expert_row_base) + row;
+                    const int64_t row_addr = global_load_i64_glc_device(
+                        row_combine_ptrs + logical_row);
+                    if (__builtin_expect(row_addr <= 0, 0))
+                        continue;
+                    const uint64_t addr = static_cast<uint64_t>(row_addr);
+                    for (int peer_rank = 0; peer_rank < kMaxSignalRanks;
+                         ++peer_rank) {
+                        if (peer_rank >= num_ranks)
+                            break;
+                        const uint64_t base =
+                            publish_combine_base[peer_rank];
+                        if (addr < base ||
+                            addr >= publish_combine_end[peer_rank])
+                            continue;
+                        const uint64_t elem_offset =
+                            (addr - base) / sizeof(uint16_t);
+                        const int64_t partial_row =
+                            static_cast<int64_t>(
+                                elem_offset /
+                                static_cast<uint64_t>(kHidden));
+                        const int token_idx = static_cast<int>(
+                            partial_row % num_max_tokens_per_rank);
+                        if (token_idx < 0 ||
+                            token_idx >= num_max_tokens_per_rank)
+                            break;
+                        const int chunk = token_idx / kV3K3TailChunkM;
+                        if (chunk >= 0 &&
+                            chunk < kV3K3TailChunkSignalSlots) {
+                            atomicAdd(
+                                publish_counts +
+                                    peer_rank *
+                                        kV3K3TailChunkSignalSlots +
+                                    chunk,
+                                    1);
+                        }
+                        break;
+                    }
+                }
+                block_barrier_device();
+                const int active_slots =
+                    num_ranks * kV3K3TailChunkSignalSlots;
+                for (int slot = tid; slot < active_slots;
+                     slot += blockDim.x) {
+                    const int count = publish_counts[slot];
+                    if (count <= 0)
+                        continue;
+                    const int peer_rank =
+                        slot / kV3K3TailChunkSignalSlots;
+                    const int chunk =
+                        slot -
+                        peer_rank * kV3K3TailChunkSignalSlots;
+                    atomicAdd_system(signal_buffers[peer_rank] +
+                                         kV3K3TailChunkSignalSlotBase +
+                                         chunk,
+                                     count);
+                }
+            } else {
+                for (int row = tid; row < cur_tokens; row += blockDim.x) {
+                    const int logical_row =
+                        static_cast<int>(expert_row_base) + row;
+                    const int64_t row_addr = global_load_i64_glc_device(
+                        row_combine_ptrs + logical_row);
+                    v3_k3_split_publish_row_chunk_device(
+                        row_addr, sym_buffer, num_ranks, num_experts,
+                        num_max_tokens_per_rank, num_topk, kHidden);
+                }
+            }
+        }
+        block_barrier_device();
+        __threadfence_system();
+        v3_k3_split_finish_copy_block_device(
+            done_counter, active_copy_blocks, sym_buffer, rank_idx, num_ranks);
+        return;
+    }
+
+    const int reduce_idx = static_cast<int>(blockIdx.x) - copy_blocks;
+    if (reduce_idx < 0 || reduce_idx >= kReduceBlocks)
+        return;
+
+    if (active_copy_blocks <= 0)
+        v3_k3_split_signal_copy_done_device(sym_buffer, rank_idx, num_ranks);
+
+    const int hidden_tile = reduce_idx % kHiddenTiles;
+    const int chunk = reduce_idx / kHiddenTiles;
+    if (chunk < 0 || chunk >= kV3K3TailChunkSignalSlots)
+        return;
+
+    const int effective_num_tokens = v3_k3_tail_effective_tokens_device(
+        num_tokens, runtime_num_tokens);
+    if (effective_num_tokens >
+        kV3K3TailChunkSignalSlots * kV3K3TailChunkM) {
+        if (tid == 0) {
+            printf("MegaMoE HIP K3 LL split-tail reduce supports runtime "
+                   "tokens <= %d, got local=%d\n",
+                   kV3K3TailChunkSignalSlots * kV3K3TailChunkM,
+                   effective_num_tokens);
+            abort();
+        }
+        return;
+    }
+    const int token_start = chunk * kV3K3TailChunkM;
+    int token_end = token_start + kV3K3TailChunkM;
+    if (token_end > effective_num_tokens)
+        token_end = effective_num_tokens;
+    if (token_start >= token_end)
+        return;
+    const int expected_count = (token_end - token_start) * num_topk;
+    auto** signal_buffers =
+        deep_gemm::mega::dcu_peer_signal_ptrs(sym_buffer, num_ranks);
+    int* my_signal_buffer = signal_buffers[rank_idx];
+    auto* signal = reinterpret_cast<volatile int*>(
+        my_signal_buffer + kV3K3TailChunkSignalSlotBase + chunk);
+    int* chunk_ready_counter =
+        done_counter == nullptr
+            ? nullptr
+            : done_counter + kV3K3TailPeerReadyOffset + chunk;
+    if (tid == 0) {
+        if (chunk_ready_counter != nullptr && hidden_tile != 0) {
+            auto* ready = reinterpret_cast<volatile int*>(chunk_ready_counter);
+            const auto start_time = clock64();
+            while (load_signal_system_acquire_device(ready) < expected_count) {
+                invalidate_l1_device();
+                if (clock64() - start_time >
+                    deep_gemm::mega::kBarrierTimeoutCycles) {
+                    const int seen = load_signal_system_acquire_device(ready);
+                    printf("MegaMoE HIP K3 LL chunk-local-ready timeout: chunk=%d "
+                           "hidden_tile=%d expected=%d seen=%d\n",
+                           chunk, hidden_tile, expected_count, seen);
+                    abort();
+                }
+            }
+        } else {
+            const auto start_time = clock64();
+            while (load_signal_system_acquire_device(signal) < expected_count) {
+                if (v3_k3_split_all_copy_done_device(my_signal_buffer,
+                                                     num_ranks))
+                    break;
+                invalidate_l1_device();
+                if (clock64() - start_time >
+                    deep_gemm::mega::kBarrierTimeoutCycles) {
+                    const int seen = load_signal_system_acquire_device(signal);
+                    printf("MegaMoE HIP K3 LL chunk-ready timeout: chunk=%d "
+                           "expected=%d seen=%d\n",
+                           chunk, expected_count, seen);
+                    abort();
+                }
+            }
+            if (chunk_ready_counter != nullptr) {
+                __hip_atomic_store(chunk_ready_counter, expected_count,
+                                   __ATOMIC_RELEASE,
+                                   __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+        }
+        invalidate_l1_device();
+    }
+    block_barrier_device();
+    invalidate_l1_device();
+    v3_k3_split_reduce_chunk_tile_device(
+        reduce_y, sym_buffer, hidden_tile, token_start, token_end, num_ranks,
+        num_experts, num_max_tokens_per_rank, num_topk, kHidden);
 }
 
 __device__ static inline void buffer_load_lds_4b_device(
@@ -925,8 +1476,6 @@ template <int kExperts,
           int kBlockK,
           int kNumWarps,
           int kCUs,
-          bool kMaskTinyStore = false,
-          bool kUseFixedRows = false,
           bool kTailReduce = false>
 __global__ __launch_bounds__(256, 1) void
 V3_K3_LowLatencyMaskedGroupGemmKernel(
@@ -1029,13 +1578,10 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
                               ld_col * kLdRows * kLdElementsPerThread;
     const int shfl_src_lane = (lane % 16) * 4 + (lane / 16);
 
-    int local_tokens = m_per_expert;
-    if constexpr (!kUseFixedRows) {
-        local_tokens = 0;
-        if (lane < kExperts) {
-            const int count = actual_m[lane];
-            local_tokens = count > m_per_expert ? m_per_expert : count;
-        }
+    int local_tokens = 0;
+    if (lane < kExperts) {
+        const int count = actual_m[lane];
+        local_tokens = count > m_per_expert ? m_per_expert : count;
     }
 
     int last_expert_end = 0;
@@ -1071,10 +1617,8 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
                 for (int mr = 0; mr < kMRepeats; ++mr) {
                     const int row_in_expert =
                         tile_m * kBlockM + mr * 16 + ld_row;
-                    if constexpr (kMaskTinyStore) {
-                        if (row_in_expert >= cur_tokens)
-                            continue;
-                    }
+                    if (row_in_expert >= cur_tokens)
+                        continue;
                     const int logical_row =
                         expert * m_per_expert + row_in_expert;
                     row_addr_prefetch[mr] = global_load_i64_glc_device(
@@ -1189,10 +1733,8 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
             for (int mr = 0; mr < kMRepeats; ++mr) {
                 const int row_in_expert =
                     tile_m * kBlockM + mr * 16 + ld_row;
-                if constexpr (kMaskTinyStore) {
-                    if (row_in_expert >= cur_tokens)
-                        continue;
-                }
+                if (row_in_expert >= cur_tokens)
+                    continue;
                 int64_t row_addr = 0;
                 if (row_combine_ptrs != nullptr) {
                     row_addr = row_addr_prefetch[mr];

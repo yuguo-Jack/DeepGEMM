@@ -5777,3 +5777,468 @@
   - graph capture256 replay `32/128/256` 对两组 uneven 全部 correct，replay median 分别为 `mix129 0.605/0.695/0.701 ms`、`edge256 0.609/0.744/0.932 ms`。
 - 中途看到的 `edge256` graph VMFault 是在 `sglang.launch_server + bench_serving` 已占用 87% VRAM 和高 HCU util 的污染环境下发生；清理该 framework run 并确认 HCU 全 idle 后未复现。
 - 后续结论口径：graph uneven 是否正常必须先确认所有 HCU idle；若有 SGLang/server/bench 常驻占卡，VMFault 或 timing outlier 不应直接归因到 LL kernel。
+## 2026-06-23 LL K3 split-tail restart finding
+
+- The useful restart point is the historical v3 split + chunk-ready path, not LL_V2 and not the retired split baseline.
+- Keep the first K3 kernel pure/local so GEMM does not perform peer combine stores. Move communication and reduce to a second combine/reduce kernel.
+- Preserve the low-latency contract from the successful run: chunk_m=64, destination-token chunk `comp_signal`, copy/publish gating by peer runtime tokens for uneven, reduce gating by local runtime tokens, and no hot-path host-side reset.
+- Re-introduce behind a single opt-in switch first. Only consider defaulting after full eager/graph + uneven tests beat current fused-tail LL and framework small-token behavior is acceptable.
+- K1 rank-barrier work should optimize the existing inline LL start contract rather than split K1 into extra kernels. The contract still must publish/reset runtime tokens, tail signals, chunk signals, and generation state in graph-safe order; the optimization target is fewer global waits/clears and less uneven amplification, not removal of required visibility semantics.
+
+## 2026-06-23 LL K3 split-tail restored bottleneck finding
+
+- The restored split-tail path is functionally correct but slower than the historical chunk-ready result.
+- Restoring the copy grid to row-block granularity fixed the accidental one-CTA-per-expert copy shape, but performance stayed near `0.574/0.674/0.781/0.881/1.189 ms` for uniform eager `8/32/64/128/256`.
+- A shared row-address prefetch inside the copy CTA did not materially improve the split combine/reduce kernel.
+- HIP profiler evidence points to the second split kernel, not the pure local GEMM, as the limiting factor:
+  - split local K3 at 64 tokens is around `~170 us`;
+  - split combine/reduce at 64 tokens is around `~220-350 us`;
+  - fused-tail K3 at 64 tokens is around `~300-414 us`.
+- The likely missing optimization is lowering the second kernel's readiness-publish overhead. The current restored code scans rows and performs a system atomic per valid row. The next experiment aggregates counts per destination rank and token chunk in LDS, then publishes one system atomic per non-empty peer chunk.
+
+## 2026-06-23 LL K3 split-tail current optimization finding
+
+- The restored split-tail path is functionally sound but the second combine/reduce kernel remains the bottleneck. Local K3 GEMM is not the first target.
+- Aggregated publish is effective because it converts row-level remote system atomics into per-destination-chunk system atomics. Keep this as the current champion.
+- Active-copy CTA pooling is not effective in the current task encoding. Even when it reduces grid size, each CTA scans multiple empty or inactive copy tasks with a grid-stride loop; for small-token and uneven cases that extra control work outweighs any scheduler savings. Do not retry the same 1024-pool shape.
+- Rowptr wave-broadcast is not a default win. It reduces LDS row-address traffic but produces mixed timing and loses against the shared row-address version on several uniform/graph points.
+- `kCopyRows=32` is also not a default win. It improves a few small-token points but regresses important 64/128 cases, likely from larger copy CTA work granularity and delayed publish.
+- Continue optimizing the second kernel only through low-latency-safe changes:
+  - no additional hot-path launch unless used as a diagnostic;
+  - no host-side reset/copy;
+  - preserve graph replay semantics;
+  - keep uneven copy-side runtime gating by destination/peer tokens and reduce-side gating by local runtime tokens.
+
+## 2026-06-23 LL K3 split-tail wait-sharing finding
+
+- Explicit vector store asm on the peer-combine copy path is not a broad default win. It can improve selected tiny or uneven cases, but it regresses enough uniform/graph points that source-level assignment should remain the default until ISA evidence shows a different bottleneck.
+- Explicit vector store asm on the final reduce-y path is also not a broad default win. It improved a few points, including 256-token eager, but worsened others and did not address the main split-reduce waiting/scheduling cost.
+- Chunk wait-sharing is the current best low-risk improvement:
+  - only one reducer block per chunk waits the remote chunk signal;
+  - sibling hidden-tile reducer blocks wait a local `done_counter[32 + chunk]` ready value;
+  - no extra kernel launch and no host-side clearing are introduced;
+  - K1 inline reset and the standalone rank barrier reset must clear `done_counter[32..35]` to avoid graph replay stale-ready state.
+- Wait-sharing improves broad points versus aggregated publish alone, especially uniform 32/64/128, graph 64/128, uneven eager, and uneven graph 128. It still does not beat fused-tail on all small-token and uneven graph cases, so it remains opt-in.
+- Next likely lever is block-count granularity in the second split kernel. Copy still wants `kCopyHidden=256` for row-block stores, but reduce may be able to use a wider hidden tile such as 512 to halve reducer CTA count and local-ready waiters. This should be implemented as a separable reduce hidden tile, not by changing copy granularity.
+
+## 2026-06-23 LL K3 split-tail reduce-tile finding
+
+- `kReduceHidden=512` is rejected. It halves the number of reducer CTAs, but the larger per-CTA serial work and lower scheduling granularity are worse for this low-latency path.
+- The result indicates that split reduce is not dominated purely by CTA launch/scheduler count. At 128/256 and uneven cases, keeping 256-hidden reducer tiles gives more useful parallelism and earlier completion despite more blocks.
+- Future block-count work should not retry the same wider-hidden shape. More promising options are reducing per-block polling/publish work, avoiding repeated row-address rescans, or improving copy-side publish locality without delaying per-chunk readiness.
+
+## 2026-06-23 LL K3 split-tail copy-granularity finding
+
+- Expert-hidden copy CTA coarsening is rejected as a default. It reduces the copy grid from row-block granularity to one CTA per expert/hidden tile and improves a few tiny-token graph points, but it delays row-block completion and regresses the main 32/64/128 and uneven eager cases.
+- The current row-block copy grid is still the best broad shape because it preserves enough parallelism for the peer combine copy and lets publish readiness arrive earlier for populated row blocks.
+- Do not retry the same coarsening shape. If copy-grid overhead is revisited, it should preserve row-block-level parallelism or use a compact active row-block list without adding a hot-path host pass or a large reset surface.
+
+## 2026-06-24 K1 LL start barrier reset finding
+
+- The current K1 LL start barrier must still keep the cross-rank visibility semantics. Removing the barrier outright is unsafe for graph replay and uneven input visibility.
+- A small safe trim exists inside the reset surface: split-tail expert-done counters `tail_done_counter[48..79]` are cleared by 32 threads before `__threadfence_system()` and the rank barrier, so the later graph-path thread0 serial loop clearing the same range is redundant.
+- The graph-path generation ring clears are not redundant and should stay:
+  - `tail_done_counter[2 * slot]` and `[2 * slot + 1]` are fused-tail owner/done ring slots;
+  - `tail_done_counter[32 + slot]` covers the fused-tail peer-ready ring, including slots beyond split chunk-ready counters `[32..35]`.
+- Expected impact is modest but directionally useful for graph/small-token LL: fewer serial global stores on the K1 hot launch without changing ABI, envs, K3 split-tail behavior, or signal-slot contracts.
+- Measured impact is mixed rather than decisive. The trim passes the full split-tail correctness matrix, but the timing movement is at noise/small-overhead scale: some graph and 256-token points improve while uneven eager regresses in the same run.
+- This confirms K1 reset cleanup is not the main missing lever for split-tail. The larger unresolved issue is that the current restored split-tail remains much slower than the historical chunk-ready best, especially around 32/64/128 tokens.
+
+## 2026-06-24 LL K3 split-tail active-row-block copy-grid finding
+
+- The active-row-block copy-grid experiment is rejected as a default.
+- The idea was to reduce empty capacity copy CTAs without adding a host pass:
+  - host launch bounded copy blocks by `min(num_max_tokens_per_rank, 256) * topk` plus per-expert fragmentation;
+  - device copy CTAs scanned `actual_m[0..local_experts)` in `tid==0` to map active row-block id to `(expert, row_block)`.
+- Full split-only matrix passed correctness, but timing stayed near the previous wait-sharing champion and did not recover the historical chunk-ready best:
+  - uniform eager `8/32/64/128/256`: `0.575/0.660/0.749/0.827/1.159 ms`;
+  - uniform graph capture256 replay: `0.529/0.658/0.740/0.815/1.169 ms`;
+  - uneven eager `mix129/edge256`: `0.781/0.841 ms`;
+  - uneven graph `mix129`: `0.643/0.800/0.770 ms`;
+  - uneven graph `edge256`: `0.645/0.799/0.824 ms`.
+- Compared with the retained wait-sharing/capacity-grid shape, this only moves noise-level points and regresses important `64/128` and uneven graph replay. The per-CTA `actual_m` scan likely replaces empty-CTA cost with serialized control overhead.
+- Action: revert the active-row-block mapping and keep the current broad best shape: capacity row-block copy grid, shared row-address prefetch, aggregated destination-chunk publish, and chunk wait-sharing.
+
+## 2026-06-24 LL K3 split-tail row-block-major copy ordering finding
+
+- Row-block-major copy ordering is rejected as a default.
+- This experiment kept the same capacity-grid block count but changed copy CTA order from expert-major `(expert, row_block, hidden_tile)` to row-block-major `(row_block, expert, hidden_tile)`.
+- Full split-only matrix passed correctness, but timing was mixed/regressive:
+  - uniform eager `8/32/64/128/256`: `0.571/0.662/0.754/0.838/1.172 ms`;
+  - uniform graph capture256 replay: `0.526/0.660/0.746/0.818/1.174 ms`;
+  - uneven eager `mix129/edge256`: `0.782/0.846 ms`;
+  - uneven graph `mix129`: `0.642/0.776/0.775 ms`;
+  - uneven graph `edge256`: `0.643/0.782/0.827 ms`.
+- Compared with the retained expert-major capacity mapping, this does not improve the important `32/64/128/256` uniform path and only moves isolated uneven graph points. The likely benefit from earlier inter-expert row-block issue is not enough to offset worse locality/scheduling order.
+- Action: revert to expert-major capacity mapping while keeping shared row-address prefetch, aggregated destination-chunk publish, chunk wait-sharing, and the small K1 reset trim.
+- Lightweight `hipprof --hip-trace --stats --follow-fork` on the retained split path at 64 tokens remains useful context but not a direct benchmark oracle because the correctness script also launches baseline/DeepEP kernels:
+  - `V3_K3_LowLatencyMaskedGroupGemmKernel<...>`: 152 calls, avg about `171 us`;
+  - `V3_K3_LowLatencyCombineReduceKernel<4096,16,256>`: 152 calls, avg about `166 us`;
+  - the second kernel is still large enough that further K3 split-tail work should target copy/publish/reduce scheduling, not local K3 GEMM first.
+
+## 2026-06-24 LL K3 split-tail dynamic max-copy boundary finding
+
+- Dynamic max-copy boundary is rejected as a default.
+- This experiment read the extra K1 `actual_m[local_experts]` max-row slot inside `V3_K3_LowLatencyCombineReduceKernel`, shortened the copy branch to active row blocks, and scheduled reduce blocks immediately after `effective_copy_blocks`.
+- Full split-only matrix passed correctness, but timing was only a tiny-token win and not a broad improvement:
+  - uniform eager `8/32/64/128/256`: `0.565/0.662/0.752/0.832/1.169 ms`;
+  - uniform graph capture256 replay: `0.520/0.661/0.748/0.818/1.177 ms`;
+  - uneven eager `mix129/edge256`: `0.785/0.854 ms`;
+  - uneven graph `mix129`: `0.641/0.775/0.781 ms`;
+  - uneven graph `edge256`: `0.642/0.806/0.829 ms`.
+- Compared with the retained expert-major capacity-grid shape, this helps `8` tokens but does not improve the important `32/64/128/256` path and regresses several uneven graph points.
+- It also unnecessarily exposes a different split-tail pybind/source contract by requiring `m_indices` to carry an extra max-row count. The lower-risk default is to keep the capacity-grid mapping and let inactive row blocks return early.
+- Action: revert dynamic max-copy boundary and restore the prior contract: `m_indices` only needs one actual row count per local expert.
+
+## 2026-06-24 LL K3 split-tail peer-runtime max-scan removal finding
+
+- Removing the device-side peer runtime max scan is rejected as a default.
+- The scan is a small block0 safety check in `V3_K3_LowLatencyCombineReduceKernel`: it reads peer runtime tokens and aborts if any peer runtime exceeds the four chunk slots. The A/B removed it and relied on the caller to keep runtime tokens within 256.
+- Full split-only matrix passed correctness after fixing the important distinction between runtime tokens and capacity tokens (`tokens=8/384` is valid because runtime is 8 even though capacity is 384).
+- Results:
+  - uniform eager `8/32/64/128/256`: `0.573/0.656/0.749/0.830/1.169 ms`;
+  - uniform graph capture256 replay: `0.536/0.657/0.740/0.815/1.173 ms`;
+  - uneven eager `mix129/edge256`: `0.781/0.848 ms`;
+  - uneven graph `mix129`: `0.649/0.777/0.800 ms`;
+  - uneven graph `edge256`: `0.645/0.790/0.830 ms`.
+- The movement is mixed: it helps a few small-token/eager points, but it regresses 256-token and uneven graph points compared with the retained shape. Since it also removes a useful runtime guard, it is not worth keeping.
+- Action: revert the device-side peer max-runtime scan removal and keep the guard in the split combine/reduce kernel.
+
+## 2026-06-24 LL K3 split-tail reduce-load finding
+
+- The split reduce kernel had an avoidable memory-traffic multiplier: for each output `uint4`, it iterated over topk separately for x/y/z/w and reloaded the same combine `uint4` four times.
+- Loading each topk `uint4` once and accumulating all x/y/z/w BF16 pairs together is a clear retained optimization:
+  - no ABI change;
+  - no extra launch;
+  - no host-side reset or copy;
+  - no graph replay semantic change;
+  - no uneven runtime-token contract change.
+- The full split-only matrix passed correctness and improved the broad path:
+  - uniform eager `8/32/64/128/256`: `0.563/0.622/0.675/0.753/1.083 ms`;
+  - uniform graph capture256 replay: `0.529/0.624/0.668/0.740/1.096 ms`;
+  - uneven eager `mix129/edge256`: `0.735/0.764 ms`;
+  - uneven graph `mix129`: `0.614/0.704/0.699 ms`;
+  - uneven graph `edge256`: `0.614/0.730/0.754 ms`.
+- This explains a large part of why the restored split-tail lagged the historical chunk-ready result: the second kernel was doing redundant global loads during reduce. Keep the single-load reducer as the current champion.
+- Remaining target is not local K3 GEMM; it is the last small graph/uneven gap versus fused-tail, likely in readiness timing and launch/scheduling overhead rather than arithmetic bandwidth.
+
+## 2026-06-24 LL K3 split-tail dynamic max-copy retest on single-load finding
+
+- Re-tested the dynamic max-copy boundary after the single-load reducer improvement because the previous dynamic variant specifically helped tiny graph/eager points.
+- The variant again passed full correctness, but the performance tradeoff was mixed:
+  - uniform eager `8/32/64/128/256`: `0.560/0.628/0.676/0.752/1.082 ms`;
+  - uniform graph capture256 replay: `0.512/0.622/0.674/0.739/1.095 ms`;
+  - uneven eager `mix129/edge256`: `0.710/0.766 ms`;
+  - uneven graph `mix129`: `0.605/0.712/0.710 ms`;
+  - uneven graph `edge256`: `0.604/0.727/0.742 ms`.
+- Compared with the retained single-load capacity-grid shape, dynamic max-copy helps uniform graph `8/32`, uneven eager `mix129`, and uneven graph `32`, but regresses uniform eager `32`, uniform graph `64`, mix graph `128/256`, and does not fix edge graph `128`.
+- It also requires the split pybind to assume `m_indices[local_experts]` carries a max-row count, which is a wider contract for a non-broad win.
+- Action: reject and revert dynamic max-copy again. Keep the current champion as capacity row-block copy grid + shared row-address prefetch + aggregated publish + chunk wait-sharing + single-load reduce.
+
+## 2026-06-24 LL K3 split-tail graph uneven shrink-gating finding
+
+- Simple tiny max-copy shrink is useful but needs a graph uneven gate:
+  - it improves uniform graph tiny and edge128 when low-token ranks can skip empty copy row blocks;
+  - it regresses mix129 graph128/256 because those same low-token ranks shrink too aggressively inside a larger uneven replay bucket.
+- Per-CTA peer-aware gating is rejected. Scanning peer runtime tokens inside every split combine/reduce CTA causes large graph regressions and repeats work that the K1 start barrier already performs once.
+- K1-computed graph shrink was the right place to test the idea, but the measured variants are rejected:
+  - full peer scan in K1 still lost on mix129 graph128/256;
+  - parallel peer scan remained worse on mix129 graph128/256;
+  - sentinel-rank heuristic was worse than both.
+- Retained conclusion:
+  - do not keep `graph_ll_split_copy_shrink` scratch or K3 `split_copy_shrink` ABI;
+  - keep the simple optional max-row tiny shrink only because it is already available from K1's `m_indices` extra slot and does not add a new scratch/host contract;
+  - further work should target K3 split combine/reduce scheduling or reduce/copy memory work, not another K1-side graph bucket heuristic unless profiler evidence shows the K1 barrier dominates.
+
+## 2026-06-24 LL K3 split-tail current post-clean baseline
+
+- After removing the rejected K1-computed shrink ABI, the retained split-tail shape is:
+  - two K3 kernels under `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1`;
+  - local pure K3 groupgemm writes `output_workspace`;
+  - `V3_K3_LowLatencyCombineReduceKernel<4096,16,256>` performs copy/publish/reduce;
+  - row-block capacity copy grid, shared row-address prefetch, aggregated destination chunk publish, chunk wait-sharing, optional tiny max-row shrink, peer-runtime guard, and single-load reduce.
+- Same-environment split vs fused recheck shows the split path now beats fused-tail on nearly all standalone points:
+  - uniform eager: split wins `8/32/64/128/256`;
+  - uniform graph capture256 replay: split wins `8/32/64/128/256`;
+  - uneven eager: split wins `mix129` and `edge256`;
+  - uneven graph `edge256`: split wins replay `32/128/256`;
+  - uneven graph `mix129`: split wins replay32, is noise-level tied at replay256, and loses replay128 by about `19 us`.
+- The remaining problem is narrow and graph/uneven specific. It is not explained by local K3 GEMM cost, and the rejected K1 shrink experiments indicate that trying to globally shorten copy blocks from K1 metadata is the wrong lever.
+- Next useful work should target the second K3 split kernel with changes that can help `mix129 graph128` without hurting uniform graph:
+  - reduce/publish readiness timing;
+  - copy/reduce CTA scheduling order that preserves row-block parallelism;
+  - avoid per-CTA peer scans and avoid widening host/graph ABI.
+
+## 2026-06-24 LL K3 split-tail tiny-threshold finding
+
+- Tightening optional tiny max-copy shrink to `<=8` rows is rejected.
+- It is directionally useful for the narrow `mix129 graph128` gap (`0.717 -> 0.704 ms`) but remains slower than fused-tail (`0.698 ms`) and is not broad enough:
+  - edge graph128 regresses (`0.703 -> 0.727 ms`);
+  - edge graph256 regresses (`0.757 -> 0.766 ms`);
+  - uneven eager regresses on both tracked patterns.
+- The result suggests the remaining gap is not a simple row-shrink threshold problem. Further work should focus on reduce/copy block scheduling and readiness timing inside `V3_K3_LowLatencyCombineReduceKernel`, without introducing another K1-side shrink ABI or per-CTA peer scan.
+
+## 2026-06-24 LL K3 split-tail reduce-order finding
+
+- Chunk-first reduce block ordering is rejected.
+- Scheduling the wait-leader blocks for every chunk before sibling hidden tiles looks appealing for multi-chunk uneven graph replay, but measured results are worse:
+  - mix129 graph128 regresses to `0.722 ms`;
+  - edge graph128 regresses to `0.726 ms`;
+  - uniform graph32 also loses a little.
+- Interpretation: in this single combine/reduce kernel, reducers that wait too early consume scheduler/CU residency before copy CTAs have finished publishing chunk readiness. The original mapping keeps more copy progress ahead of reducer spin and is the safer default.
+
+## 2026-06-24 LL K3 split-tail row-block publish finding
+
+- Row-block-level chunk publish is rejected.
+- The experiment made every copy CTA publish its own row-block chunk counts and changed reducer expected count to include `kHiddenTiles`.
+- It is correct but much slower. The extra system atomics dominate:
+  - uniform graph32 regresses to `0.900 ms`;
+  - uniform graph128 regresses to `1.486 ms`;
+  - mix129 graph128 regresses to `1.191 ms`.
+- Keep expert-final aggregated publish as the current best shape. It performs one remote system atomic per populated destination chunk after all hidden tiles for an expert have copied, which is slower to become ready but much cheaper than per-row-block/per-hidden publishing.
+
+## 2026-06-24 LL K3 split-tail reduce micro-A/B findings
+
+- Explicit topk=6 unroll is rejected. It slightly improves several uniform points, but uneven graph128 regresses:
+  - output dir: `hygon_tmp/debug/v3_split_tail_reduce_unroll6_20260624`;
+  - mix129 capture256/replay128: `0.717 -> 0.720 ms`;
+  - edge256 capture256/replay128: `0.703 -> 0.725 ms`.
+- Vec-address-only reduce cleanup is also rejected:
+  - output dir: `hygon_tmp/debug/v3_split_tail_reduce_vecaddr_20260624`;
+  - mix129 capture256/replay128 improves to `0.702 ms`, but mix129 replay256 regresses to `0.729 ms` and edge256 replay128/256 regress to `0.722/0.767 ms`.
+- Retained conclusion: the current split reduce path is sensitive to code size/register pressure and scheduler timing. Keep the original reduce addressing and single-load accumulation; do not chase isolated arithmetic cleanup unless profiler/ISA evidence shows it is a bottleneck.
+
+## 2026-06-24 K1 uniform peer-scan parallelization finding
+
+- Parallelizing the K1 start-barrier uniform-runtime-token scan is rejected.
+- Output dir: `hygon_tmp/debug/v3_split_tail_k1_uniform_parallel_20260624`.
+- The variant improves uniform points:
+  - eager `8/32/64/128/256`: `0.561/0.616/0.669/0.747/1.085 ms`;
+  - graph capture256 replay: `0.505/0.615/0.657/0.732/1.084 ms`.
+- It is not safe as a default because uneven graph buckets regress:
+  - mix129 capture256/replay256: retained `0.707 ms`, variant `0.734 ms`;
+  - edge256 capture256/replay128: retained `0.703 ms`, variant `0.729 ms`;
+  - edge256 capture256/replay256: retained `0.757 ms`, variant `0.787 ms`.
+- Interpretation: replacing an 8-peer serial scan with cooperative threads adds shared state, atomics, and extra barriers to every K1 launch. That helps fully uniform timing but hurts uneven graph scheduling. Future K1 rank-barrier work should remove the global scan/barrier through a generation or readiness contract, not parallelize this tiny scan in-place.
+
+## 2026-06-24 K1 uniform peer-scan retention update
+
+- User chose to keep the K1 parallel scan as the current branch despite the mixed uneven result.
+- Updated interpretation:
+  - the K1 change is a useful uniform-path optimization and improves `mix129` capture256/replay128;
+  - its uneven graph regressions are real but should be treated as follow-up scheduling debt rather than an immediate revert reason.
+- Current retained risk list:
+  - `mix129` capture256/replay256 regresses by about `27 us`;
+  - `edge256` capture256/replay128 regresses by about `26 us`;
+  - `edge256` capture256/replay256 regresses by about `30 us`.
+- Follow-up should keep the K1 parallel scan enabled while testing K3 split combine/reduce scheduling and uneven readiness changes.
+
+## 2026-06-24 Env and LL template cleanup finding
+
+- Current code diff adds only one new runtime env switch: `MEGAMOE_DCU_LL_K3_SPLIT_TAIL`.
+- The split-tail path did not reintroduce the retired secondary switches:
+  - no `MEGAMOE_DCU_LL_K3_SPLIT_TAIL_CHUNK_READY`;
+  - no `MEGAMOE_DCU_LL_V2`;
+  - no `MEGAMOE_DCU_TEST_ZERO_TOPK_WEIGHT_STRIDE`.
+- K1 LL kernel template cleanup:
+  - `kUseSymmStage` had no false instantiation in the current code, so it was removed;
+  - the kernel now always builds the fused symm stage through `v3_k1_build_ll_stage_device`;
+  - the old kernel-side `actual_m` parameter was removed, while the outer launcher signature keeps `problem_size` for ABI stability and marks it unused.
+- K3 LL kernel template cleanup:
+  - `kUseFixedRows` had no true instantiation and was removed;
+  - row counts are always read from `actual_m`, matching current local/fused/split use;
+  - the K3 store-mask template toggle had only one value in current instantiations, so the invalid-row guard is fixed in the kernel body.
+- Validation after cleanup:
+  - local diff whitespace check passed;
+  - remote build passed;
+  - remote source guard passed with `9 passed in 6.93s`.
+
+## 2026-06-24 K1-5 no-atomic peer-match finding
+
+- The K1 parallel uniform-runtime scan should use per-peer shared match slots plus a thread0 reduction, not a shared `atomicAnd`.
+- Output dir: `hygon_tmp/debug/v3_split_tail_k1_match_noatomic_20260624`.
+- Compared with the retained atomic parallel scan:
+  - uniform eager/graph is effectively flat;
+  - `mix129` eager improves `0.730 -> 0.706 ms`;
+  - `mix129` graph256 improves `0.734 -> 0.712 ms`;
+  - `edge256` graph128/256 improves `0.729/0.787 -> 0.720/0.762 ms`.
+- Interpretation: the cooperative peer load itself is useful, but the shared atomic was extra synchronization pressure in the K1 start barrier. A small fixed shared array avoids the atomic while preserving the existing visibility contract and graph replay semantics.
+- Retained state: keep the no-atomic K1 peer-match version. This adds no new environment variable, no extra launch, and no host-side reset.
+
+## 2026-06-24 K1 dispatch-ready barrier-shrink finding
+
+- A direct K1 dispatch-ready replacement for the release-slot rank barrier is rejected.
+- Output dir: `hygon_tmp/debug/v3_split_tail_k1_dispatch_ready_20260624`.
+- The ablation was the closest current-code test of the DeepEP-LL-style idea:
+  - publish a per-rank ready generation after reset/runtime-token writes;
+  - let K1 route scan wait source ranks one by one;
+  - read each source rank's runtime token count and scan only its effective routes;
+  - remove the old all-rank release wait.
+- Correctness passed in the standalone matrix, but performance is not a broad win:
+  - uniform eager regressed from retained `0.562/0.616/0.669/0.747/1.080 ms` to `0.603/0.659/0.711/0.793/1.120 ms`;
+  - uniform graph regressed from retained `0.507/0.614/0.658/0.731/1.083 ms` to `0.550/0.658/0.703/0.777/1.123 ms`;
+  - uneven eager regressed from retained `0.706/0.767 ms` to `0.718/0.809 ms`;
+  - uneven graph replay128/256 improved (`mix129 0.702/0.712 -> 0.696/0.695 ms`, `edge256 0.720/0.762 -> 0.694/0.743 ms`), but replay32 regressed.
+- Interpretation:
+  - the useful piece is per-source effective-token scanning in uneven graph replay buckets;
+  - the harmful pieces are per-source ready waits in every K1 launch and disabling the uniform fast path;
+  - true DeepEP-style readiness likely needs a redesigned input layout with double buffer or consumer acknowledgements, otherwise a fast rank can publish a newer generation into the same single sym-buffer slot before a slow peer has safely consumed the previous generation.
+- Retained state:
+  - restore and keep the no-atomic release-barrier version as the current champion;
+  - do not retry the same dispatch-ready replacement without solving the single-buffer generation/reuse contract;
+  - if revisiting K1 uneven graph, test safer derivatives such as per-source effective scanning behind the existing visibility barrier, or a real double-buffer/epoch protocol, rather than just hard-replacing the release slot.
+
+## 2026-06-24 K3 split-tail publish should not filter by destination runtime tokens
+
+- Finding:
+  - split-tail publish should count valid `row_combine_ptr` rows by target combine-buffer address and chunk only;
+  - it should not also read the destination rank's runtime token count and filter by it.
+- Reason:
+  - K1 already creates `row_combine_ptr` only for valid routed rows;
+  - reduce-side expected counts are based on the local destination rank's runtime token count;
+  - adding a second publish-side destination-runtime read creates a redundant dependency that can become stale or inconsistent in framework graph/cross-layer reuse, causing `seen < expected` chunk-ready timeouts.
+- Framework symptom this explains:
+  - `chunk=0 expected=384 seen=107` means valid rows were under-published rather than reduce being slow;
+  - `chunk-local-ready ... expected=384 seen=0` on other hidden tiles is a secondary wait on the same missing chunk-ready publication.
+- Validation after removing the filter:
+  - source guard passed;
+  - cap4096 framework-like edge256 graph with external graph-token fill passed;
+  - four back-to-back graph calls sharing the same sym buffer passed;
+  - split-only uniform/uneven eager/graph matrix stayed correct and performance-neutral.
+
+## 2026-06-24 K3 split-tail reduce CTA offset must use the static copy grid boundary
+
+- Finding:
+  - `V3_K3_LowLatencyCombineReduceKernel` is launched with `copy_blocks + reduce_blocks`, where `copy_blocks` is computed from static `rows_per_expert`;
+  - inside the kernel, dynamic tiny-copy shrink can make `active_copy_blocks < copy_blocks`;
+  - reduce CTA mapping must still subtract `copy_blocks`, not `active_copy_blocks`.
+- Why:
+  - using `active_copy_blocks` turns inactive static-copy block IDs into reduce block IDs;
+  - the last `copy_blocks - active_copy_blocks` real reduce CTAs then map past `kReduceBlocks` and return;
+  - this can drop the `hidden_tile=0` leader for a chunk, so sibling hidden tiles wait forever on local-ready with `seen=0`.
+- Framework symptom:
+  - `chunk-local-ready timeout ... expected=384 seen=0` is the signature of this missing local chunk leader or a reset-before-leader-publish issue;
+  - in this case, the static/dynamic copy-boundary mismatch is a direct code-level explanation.
+- Fix:
+  - set `reduce_idx = blockIdx.x - copy_blocks`.
+- Validation:
+  - source guard passed;
+  - tiny-token split-tail smoke passed;
+  - edge256 graph replay passed;
+  - framework-like cap4096 tokens=64 graph passed;
+  - full split-only matrix stayed correct with timings close to the current best.
+
+## 2026-06-24 Current-best framework-trial snapshot
+
+- Output dir: `hygon_tmp/debug/v3_split_tail_current_best_20260624`.
+- Current retained implementation for framework trial:
+  - K1 no-atomic peer-match scan;
+  - K3 split-tail opt-in with `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1`;
+  - `K3_USE_ASM_TAIL_REDUCE=1` remains the benchmark setting.
+- Fresh timing snapshot:
+  - uniform eager `8/32/64/128/256`: `0.559/0.620/0.669/0.747/1.081 ms`;
+  - uniform graph capture256 replay: `0.506/0.616/0.660/0.733/1.087 ms`;
+  - uneven eager `mix129/edge256`: `0.721/0.771 ms`;
+  - uneven graph `mix129`: `0.607/0.733/0.711 ms`;
+  - uneven graph `edge256`: `0.602/0.725/0.761 ms`.
+- Interpretation:
+  - this is the version to try in the framework first;
+  - do not treat the fresh `mix129` graph128 regression versus the earlier no-atomic run as a new algorithmic finding until framework traces confirm it;
+  - framework validation should compare the actual decode trace, because standalone graph replay buckets still show small run-to-run jitter.
+
+## 2026-06-24 Split-tail graph capture needs EP-rank host alignment
+
+- Finding:
+  - K3 split-tail is graph-replay safe in the standalone MegaMoE tests, but SGLang graph capture/warmup can still abort if EP ranks do not enter the same MoE split-tail kernel together.
+- Evidence:
+  - package-level graph tests pass for uniform and uneven cases;
+  - framework capture logs show mixed `chunk-ready seen=0/149` and `chunk-local-ready seen=0` failures across different ranks/chunks;
+  - SGLang capture warmup aligns `tp_group`, while split-tail waits on the MegaMoE EP peer signal contract.
+- Fix direction:
+  - align EP ranks in the framework before entering the MegaMoE LL split-tail call during graph capture/warmup;
+  - use SGLang `GroupCoordinator.barrier()`, which uses the CPU group and does not enqueue NCCL/device work;
+  - keep this barrier scoped to `get_is_capture_mode() and LL backend and MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1`, so graph replay and eager performance are unchanged.
+- Limitation:
+  - this addresses capture-time host entry skew, not a kernel algorithm speed issue;
+  - if a future failure still reports `expected=384 seen=0`, inspect whether the captured graph uses a stale `cuda_graph_num_tokens` value for that layer.
+
+## 2026-06-24 Split-tail capture warmup must set graph runtime tokens without recording a fill
+
+- Finding:
+  - SGLang graph replay correctly calls `set_mega_moe_cuda_graph_num_tokens(raw_num_token)` before graph replay;
+  - graph capture/warmup did not do the equivalent by default because `SGLANG_MEGAMOE_SKIP_GRAPH_TOKEN_FILL=1`;
+  - MegaMoE's sym buffer initializes `cuda_graph_num_tokens` to the graph bucket capacity, which is not necessarily the current warmup/capture token count.
+- Why this matters for split-tail:
+  - split-tail K3 executes during warmup and uses the K1-clamped runtime-token scalar to decide copy/reduce bounds;
+  - stale bucket values can make K1/K3 process padded rows whose topk data was not prepared for the current capture call;
+  - those padded rows can generate invalid peer row pointers, causing VMFault in `V3_K3_LowLatencyCombineReduceKernel`.
+- Correct rule:
+  - fill `buf.cuda_graph_num_tokens` during graph warmup/pre-capture execution after the sym buffer exists;
+  - do not fill while `torch.cuda.is_current_stream_capturing()` is true, otherwise the fill would be recorded into the graph and override dynamic replay tokens.
+- Patch:
+  - SGLang `mega_moe.py` now detects LL split-tail capture mode and fills `graph_num_tokens` only when not actively stream-capturing.
+- Performance impact:
+  - no graph replay or eager hot-path work is added;
+  - the extra fill happens only during graph capture/warmup.
+
+## 2026-06-24 Split-tail is not memory-equivalent to fused-tail
+
+- Finding:
+  - K3 fused-tail and K3 split-tail share the same high-level LL intent, but they do not have the same failure surface.
+- Why:
+  - fused-tail keeps K3 GEMM, peer combine stores, readiness signaling, and reduce inside one kernel;
+  - split-tail separates local K3 GEMM from the peer combine/reduce step;
+  - the second split-tail kernel directly consumes `row_combine_ptrs` and can store through them before any publish-side address decoding rejects invalid values.
+- Consequence:
+  - a stale, padded, or capture-bucket-mismatched nonzero `row_combine_ptr` can VMFault split-tail while fused-tail appears stable;
+  - timeout logs such as `chunk-ready seen < expected` and VMFault logs in `V3_K3_LowLatencyCombineReduceKernel` should be debugged as split-tail state/lifetime bugs, not as proof that the fused-tail GEMM math is wrong.
+- Guard attempt:
+  - a split-copy `row_addr` range validation guard was tested to turn invalid row pointers into skipped rows instead of direct stores;
+  - package/unit and framework-like repros passed, but the real framework still VMFaulted;
+  - because the guard did not solve the observed failure and adds extra hot-path work, it was reverted to preserve the prior unit-test-stable/current-best split-tail implementation.
+- Current conclusion:
+  - keep investigating the framework call path with actual failing dumps of layer id, runtime token scalar, topk rows, and row-combine pointers;
+  - do not carry the rowptr guard as production code unless a real failing dump proves invalid nonzero row pointers are the root cause.
+
+## 2026-06-24 Real SGLang repro confirms split-tail K3 combine/reduce VMFault
+
+- Repro command:
+  - full 8-rank SGLang launch-server under `sglang_megamoe`;
+  - split-tail enabled and graph token fill skipped;
+  - `num_max_tokens_per_rank=4096`, graph max tokens per rank `256`.
+- Evidence:
+  - log path: `/workspace/DeepGEMM/hygon_tmp/sglang_debug/repro_splittail_vmfault_20260624_183758/server.log`;
+  - VMFault queue dump directly matched `V3_K3_LowLatencyCombineReduceKernel<4096,16,256>`;
+  - this is the split-tail second-stage combine/reduce kernel, not the local pure K3 GEMM.
+- Important distinction:
+  - package graph tests and synthetic framework-like tests are insufficient for this bug;
+  - the real SGLang launch creates enough concurrent graph/capture/runtime state to trigger the fault.
+- Current hypothesis:
+  - the split-tail combine/reduce kernel is consuming capture-time state that is valid in the package harness but invalid or stale in SGLang, likely around runtime token scalar, padded topk rows, `row_combine_ptrs`, or signal generation/counter lifetime;
+  - because the failure is in the second split-tail kernel, the next useful instrumentation should log/dump the exact K1 output state for the failing framework call before K3 split-tail launches.
+
+## 2026-06-24 Split-tail chunk-ready waits need copy-done fallback
+
+- Root cause refined from the real SGLang repro:
+  - graph capture enters the LL backend with `num_tokens=64`, `topk=6`, so split-tail reduce expects `64 * 6 = 384` published rows for chunk 0;
+  - capture-time/dummy routed rows can contain fewer actually published rows than this full theoretical count;
+  - the previous split-tail protocol waited only for the exact per-chunk row count, so hidden-tile reducers could spin forever and eventually hit `chunk-ready` / `chunk-local-ready` timeout or VMFault in `V3_K3_LowLatencyCombineReduceKernel`.
+- Why fused-tail did not fail:
+  - fused-tail keeps GEMM copy, peer combine writes, readiness, and reduce in one kernel and does not require the separated reduce kernel to observe an exact external chunk count;
+  - split-tail has a stricter inter-kernel readiness contract, so it needs an end-of-copy fallback for sparse/padded capture inputs.
+- Fix:
+  - add a per-rank system-scope copy-done signal in existing tail signal slots 8..15;
+  - every active split-copy CTA increments `done_counter[0]` after its copy and publish work are complete;
+  - the last local copy CTA publishes copy-done to every peer signal buffer after `__threadfence_system()`;
+  - reduce hidden-tile 0 still takes the fast path when the chunk counter reaches `expected_count`, but it now also breaks once all peer ranks report copy-done;
+  - sibling hidden tiles continue to wait on the local chunk-ready counter, so normal full-count cases retain the existing hot path.
+- Validation:
+  - remote build passed: `DG_FORCE_BUILD=1 MAX_JOBS=8 python3 setup.py build_ext --inplace`;
+  - source/contract guard passed: `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1 PYTHONPATH=/workspace/DeepGEMM python3 -m pytest megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py -q` -> `9 passed`;
+  - real SGLang repro with `MEGAMOE_DCU_SKIP_GRAPH_TOKEN_FILL=1` no longer VMFaulted: graph capture completed for all 8 ranks, server became ready, and the run ended only because the 600s repro timeout shut it down;
+  - repro log: `/workspace/DeepGEMM/hygon_tmp/sglang_debug/repro_splittail_vmfault_20260624_191047/server.log`;
+  - no `KERNEL VMFault`, `chunk-ready timeout`, `chunk-local-ready timeout`, or `Fatal Python error` remained in that log.
+- Performance check:
+  - current split-only matrix: `/workspace/DeepGEMM/hygon_tmp/debug/v3_split_tail_copydone_fix_20260624`;
+  - previous split champion: `/workspace/DeepGEMM/hygon_tmp/debug/v3_split_tail_k1_uniform_parallel_20260624`;
+  - performance is neutral to slightly better on most eager/graph points, with graph256 uniform within noise and uneven graph generally improved versus the previous split champion.

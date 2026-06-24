@@ -207,6 +207,7 @@ def k3_l2_fused_v3_to_combine(
     asm_signal_generation_tensor: torch.Tensor | None = None,
     asm_reduce_y: torch.Tensor | None = None,
     sym_buffer=None,
+    rank_idx: int = 0,
     num_ranks: int = 0,
     num_experts: int = 0,
     num_tokens: int = 0,
@@ -217,6 +218,7 @@ def k3_l2_fused_v3_to_combine(
     active_tiles: torch.Tensor | None = None,
     graph_runtime_offset_from_active_tiles: int = 0,
     graph_runtime_num_tokens: torch.Tensor | None = None,
+    ll_split_tail: bool = False,
     ll_block_m: int = 32,
     use_unified_weight_layout: bool = False,
     verbose_build: bool = False,
@@ -334,10 +336,34 @@ def k3_l2_fused_v3_to_combine(
             int(num_topk),
             int(ll_block_m),
         )
-        ext.k3_v3_ll_combine_tail(
-            *common_args,
-            signal_generation_arg,
-            runtime_tokens_arg,
-        )
+        if ll_split_tail:
+            ext.k3_v3_ll_combine_tail_split(
+                output_workspace,
+                act_fp8.contiguous(),
+                act_scale.contiguous(),
+                m_indices.contiguous(),
+                l2_weight.contiguous(),
+                l2_scale.contiguous(),
+                row_combine_ptrs.contiguous(),
+                sym_buffer.buffer,
+                asm_done_counter.contiguous(),
+                asm_signal_addrs.contiguous(),
+                asm_reduce_y.contiguous(),
+                int(rank_idx),
+                int(num_ranks),
+                int(num_experts),
+                int(sym_buffer.num_max_tokens_per_rank),
+                int(num_tokens),
+                int(num_topk),
+                int(ll_block_m),
+                signal_generation_arg,
+                runtime_tokens_arg,
+            )
+        else:
+            ext.k3_v3_ll_combine_tail(
+                *common_args,
+                signal_generation_arg,
+                runtime_tokens_arg,
+            )
         return None
     raise NotImplementedError(f"unsupported V3 K3 backend: {backend}")

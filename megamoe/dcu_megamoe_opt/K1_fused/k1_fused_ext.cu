@@ -1186,9 +1186,9 @@ k1_symm_fused_l1_v3_pack5(
         const auto& counter = tail_done_counter.value();
         TORCH_CHECK(counter.is_cuda() && counter.is_contiguous() &&
                         counter.scalar_type() == torch::kInt &&
-                        counter.numel() >= 48,
+                        counter.numel() >= 80,
                     "tail_done_counter must be a contiguous CUDA int32 tensor "
-                    "with at least 48 elements");
+                    "with at least 80 elements");
         tail_done_counter_tensor = &counter;
     }
     const torch::Tensor* graph_runtime_num_tokens_out_tensor = nullptr;

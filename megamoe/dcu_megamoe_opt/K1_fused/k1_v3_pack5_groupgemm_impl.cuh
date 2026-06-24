@@ -20,6 +20,12 @@ using bf16x4_t = uint16_t __attribute__((ext_vector_type(4)));
 static constexpr int kV3K1TailDoneCounterRingSlots = 16;
 static constexpr int kV3K1TailPeerReadyOffset =
     2 * kV3K1TailDoneCounterRingSlots;
+static constexpr int kV3K1TailChunkSignalSlotBase = 22;
+static constexpr int kV3K1TailChunkSignalSlots = 4;
+static constexpr int kV3K1TailCopyExpertDoneOffset =
+    3 * kV3K1TailDoneCounterRingSlots;
+static constexpr int kV3K1TailCopyExpertDoneCount = 32;
+static constexpr int kV3K1StartSignalSlotBase = 18;
 
 __device__ int32x2_t llvm_amdgcn_raw_buffer_load_i32x2(
     int32x4_t resource,
@@ -516,10 +522,10 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
     int rank_idx,
     int num_ranks) {
     constexpr int kTailSignalSlotBase = 8;
-    constexpr int kBarrierSignalSlotBase = 18;
     const int thread_id = static_cast<int>(threadIdx.x);
     __shared__ int barrier_generation;
     __shared__ int barrier_ticket;
+    __shared__ int uniform_peer_match[kV3K1TailDoneCounterRingSlots];
 
     if (blockIdx.x != 0)
         return;
@@ -533,7 +539,14 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
     if (thread_id == 0 && tail_done_counter != nullptr) {
         tail_done_counter[0] = 0;
         tail_done_counter[1] = 0;
-        tail_done_counter[kV3K1TailPeerReadyOffset] = 0;
+    }
+    if (tail_done_counter != nullptr &&
+        thread_id < kV3K1TailCopyExpertDoneCount) {
+        tail_done_counter[kV3K1TailCopyExpertDoneOffset + thread_id] = 0;
+    }
+    if (tail_done_counter != nullptr &&
+        thread_id < kV3K1TailChunkSignalSlots) {
+        tail_done_counter[kV3K1TailPeerReadyOffset + thread_id] = 0;
     }
     if (thread_id == 0 && graph_runtime_num_tokens != nullptr &&
         graph_runtime_num_tokens_out != nullptr) {
@@ -551,12 +564,16 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
         __hip_atomic_store(my_signals + kTailSignalSlotBase + thread_id, 0,
                            __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
+    if (thread_id < kV3K1TailChunkSignalSlots) {
+        __hip_atomic_store(my_signals + kV3K1TailChunkSignalSlotBase + thread_id,
+                           0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
     __threadfence_system();
     __syncthreads();
 
     auto* barrier_signals = signal_buffers[0];
-    const int barrier_arrival_slot = kBarrierSignalSlotBase;
-    const int barrier_release_slot = kBarrierSignalSlotBase + 1;
+    const int barrier_arrival_slot = kV3K1StartSignalSlotBase;
+    const int barrier_release_slot = kV3K1StartSignalSlotBase + 1;
     if (thread_id == 0) {
         barrier_ticket = atomicAdd_system(barrier_signals + barrier_arrival_slot, 1);
         barrier_generation = barrier_ticket / num_ranks + 1;
@@ -599,20 +616,23 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
                 tail_done_counter[kV3K1TailPeerReadyOffset + slot] = 0;
             }
         }
+    }
 
-        auto* sym_buffers =
-            deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
-        int local_tokens = runtime_num_tokens[0];
+    auto* sym_buffers =
+        deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
+    const int local_tokens = runtime_num_tokens[0];
+    if (thread_id < num_ranks) {
+        auto* peer_runtime_num_tokens =
+            deep_gemm::mega::dcu_runtime_num_tokens_ptr(
+                sym_buffers[thread_id], num_ranks);
+        uniform_peer_match[thread_id] =
+            peer_runtime_num_tokens[0] == local_tokens ? 1 : 0;
+    }
+    __syncthreads();
+    if (thread_id == 0) {
         int uniform = 1;
-        for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
-            auto* peer_runtime_num_tokens =
-                deep_gemm::mega::dcu_runtime_num_tokens_ptr(
-                    sym_buffers[peer_rank], num_ranks);
-            if (peer_runtime_num_tokens[0] != local_tokens) {
-                uniform = 0;
-                break;
-            }
-        }
+        for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank)
+            uniform &= uniform_peer_match[peer_rank];
         *deep_gemm::mega::dcu_uniform_num_tokens_ptr(local_sym_buffer,
                                                      num_ranks) = uniform;
         __threadfence_system();
@@ -761,7 +781,8 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
         v3_k1_ll_grid_barrier_device(grid_barrier, static_cast<int>(gridDim.x));
     }
 
-    for (int route_scan_linear = global_tid; route_scan_linear < total_scan_routes;
+    for (int route_scan_linear = global_tid;
+         route_scan_linear < total_scan_routes;
          route_scan_linear += grid_threads) {
             const int source_rank =
                 route_scan_linear / route_scan_routes_per_rank;
@@ -819,7 +840,7 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
                     static_cast<int64_t>(reinterpret_cast<uintptr_t>(
                         sections.combine + partial_row * kK));
             }
-        }
+    }
     v3_k1_ll_grid_barrier_device(grid_barrier, static_cast<int>(gridDim.x));
 
     if (global_tid == 0) {
@@ -974,7 +995,6 @@ template <int kExperts,
           int kNumWarps,
           int kCUs,
           bool kMaskTinyStore = false,
-          bool kUseSymmStage = false,
           bool kParallelStageCopy = false>
 __global__ __launch_bounds__(256, 1) void
 V3_K1_LowLatencyMaskedGroupGemmKernel(
@@ -983,7 +1003,6 @@ V3_K1_LowLatencyMaskedGroupGemmKernel(
     const uint8_t* weight_packed,
     const float* x_scale,
     const float* w_scale,
-    const int32_t* actual_m,
     int m_per_expert,
     uint8_t* local_sym_buffer = nullptr,
     int32_t* route_scratch_i32 = nullptr,
@@ -1044,21 +1063,17 @@ V3_K1_LowLatencyMaskedGroupGemmKernel(
                               ld_col * kLdRows * kLdElementsPerThread;
     const int shfl_src_lane = (lane % 16) * 4 + (lane / 16);
 
-    const int32_t* gemm_m = actual_m;
-    if constexpr (kUseSymmStage) {
-        gemm_m =
-            v3_k1_build_ll_stage_device<
-                kExperts, kK, kBlockM, kParallelStageCopy>(
+    const int32_t* gemm_m =
+        v3_k1_build_ll_stage_device<kExperts, kK, kBlockM, kParallelStageCopy>(
             x, x_scale, local_sym_buffer, route_scratch_i32, grid_barrier,
             barrier_epoch, rank_idx, num_ranks, num_global_experts,
-            num_max_tokens_per_rank, num_topk, runtime_num_tokens,
-            m_per_expert, route_weights_out, row_expert_out, output_index,
+            num_max_tokens_per_rank, num_topk, runtime_num_tokens, m_per_expert,
+            route_weights_out, row_expert_out, output_index,
             row_combine_ptrs_out, local_topk_mask, tail_tokens,
             cumulative_local_expert_recv_stats, enable_start_rank_barrier,
             tail_done_counter, graph_runtime_num_tokens_for_barrier,
             graph_runtime_num_tokens_out, graph_tail_signal_generation_out,
             graph_max_tokens);
-    }
 
     int local_tokens = 0;
     if (lane < kExperts) {
