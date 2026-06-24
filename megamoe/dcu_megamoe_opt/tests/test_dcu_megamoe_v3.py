@@ -37,11 +37,8 @@ def test_v3_backend_auto_policy(monkeypatch):
     config = load_module("dcu_megamoe_v3_config", V3_CONFIG_PATH)
     monkeypatch.delenv("MEGAMOE_DCU_BACKEND", raising=False)
     monkeypatch.delenv("MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD", raising=False)
-    monkeypatch.delenv("MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT", raising=False)
-
     assert config.BACKEND_ENV == "MEGAMOE_DCU_BACKEND"
     assert config.NORMAL_LL_TOKEN_THRESHOLD_ENV == "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
-    assert config.UNIFIED_WEIGHT_LAYOUT_ENV == "MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT"
     assert config.DEFAULT_NORMAL_LL_TOKEN_THRESHOLD == 256
     for tokens in (0, 1, 8, 32, 128, 256):
         assert config.select_v3_backend(tokens) == "ll"
@@ -64,10 +61,6 @@ def test_v3_backend_auto_policy(monkeypatch):
         config.normal_ll_token_threshold("-1")
     with pytest.raises(ValueError, match="MEGAMOE_DCU_BACKEND"):
         config.select_v3_backend(8, "bogus")
-    assert config.unified_weight_layout_enabled() is False
-    assert config.unified_weight_layout_enabled("1") is True
-    monkeypatch.setenv("MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT", "true")
-    assert config.unified_weight_layout_enabled() is True
 
 
 def reference_pack5_weight(weight: torch.Tensor) -> torch.Tensor:

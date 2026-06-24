@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from ..v3_config import normalize_v3_backend, unified_weight_layout_enabled
+from ..v3_config import normalize_v3_backend
 from . import k1_fused_ext as _ext
 
 
@@ -53,10 +53,12 @@ def _check_fused_l1_shape(
         raise ValueError(K1_SHAPE_CONTRACT)
 
 
-def ensure_fused_l1_asm_pack5_code_object() -> Path:
+def ensure_fused_l1_asm_pack5_code_object(
+    use_unified_weight_layout: bool = False,
+) -> Path:
     co = (
         FUSED_L1_ASM_UNIFIED_PACK5_CO
-        if unified_weight_layout_enabled()
+        if use_unified_weight_layout
         else FUSED_L1_ASM_PACK5_CO
     )
     if not co.exists():
@@ -167,6 +169,7 @@ def k1_symm_fused_l1_v3_asm_pack5(
     cumulative_local_expert_recv_stats: torch.Tensor | None = None,
     force_compact_prebuild: bool = False,
     capacity_num_tokens: int | None = None,
+    use_unified_weight_layout: bool = False,
     verbose_build: bool = False,
 ):
     _check_fused_l1_shape(
@@ -180,7 +183,9 @@ def k1_symm_fused_l1_v3_asm_pack5(
     )
     l1_weight_pack5, l1_scale = l1_weights
     ext = load_extension(verbose=verbose_build)
-    code_object = ensure_fused_l1_asm_pack5_code_object()
+    code_object = ensure_fused_l1_asm_pack5_code_object(
+        use_unified_weight_layout=use_unified_weight_layout
+    )
     symm_base_addr, symm_x_span = _cached_symm_x_addr_range(
         sym_buffer, num_ranks, hidden
     )
@@ -227,6 +232,7 @@ def k1_symm_fused_l1_v3_asm_pack5_graph(
     runtime_num_tokens: torch.Tensor,
     alignment: int = 256,
     l1_out_workspace: torch.Tensor | None = None,
+    use_unified_weight_layout: bool = False,
     verbose_build: bool = False,
 ):
     _check_fused_l1_shape(
@@ -240,7 +246,9 @@ def k1_symm_fused_l1_v3_asm_pack5_graph(
     )
     l1_weight_pack5, l1_scale = l1_weights
     ext = load_extension(verbose=verbose_build)
-    code_object = ensure_fused_l1_asm_pack5_code_object()
+    code_object = ensure_fused_l1_asm_pack5_code_object(
+        use_unified_weight_layout=use_unified_weight_layout
+    )
     symm_base_addr, symm_x_span = _cached_symm_x_addr_range(
         sym_buffer, num_ranks, hidden
     )
@@ -289,6 +297,7 @@ def k1_symm_fused_l1_v3(
     cumulative_local_expert_recv_stats: torch.Tensor | None = None,
     force_compact_prebuild: bool = False,
     capacity_num_tokens: int | None = None,
+    use_unified_weight_layout: bool = False,
     ll_block_m: int = 32,
     ll_asm_compatible_layout: bool = False,
     enable_start_rank_barrier: bool = False,
@@ -323,6 +332,7 @@ def k1_symm_fused_l1_v3(
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
             force_compact_prebuild=force_compact_prebuild,
             capacity_num_tokens=capacity_num_tokens,
+            use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
     l1_weight_pack5, l1_scale = l1_weights
@@ -368,6 +378,7 @@ def k1_symm_fused_l1_v3_graph(
     backend: str,
     alignment: int = 256,
     l1_out_workspace: torch.Tensor | None = None,
+    use_unified_weight_layout: bool = False,
     ll_block_m: int = 32,
     ll_asm_compatible_layout: bool = False,
     enable_start_rank_barrier: bool = False,
@@ -400,6 +411,7 @@ def k1_symm_fused_l1_v3_graph(
             runtime_num_tokens=runtime_num_tokens,
             alignment=alignment,
             l1_out_workspace=l1_out_workspace,
+            use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
     l1_weight_pack5, l1_scale = l1_weights

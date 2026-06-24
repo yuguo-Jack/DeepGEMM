@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from ..v3_config import normalize_v3_backend, unified_weight_layout_enabled
+from ..v3_config import normalize_v3_backend
 from . import k3_fused_ext as _ext
 
 
@@ -28,19 +28,23 @@ def _ensure_prebuilt_code_object(co: Path, label: str) -> Path:
     return co
 
 
-def ensure_k3_combine_pack5_asm_code_object() -> Path:
+def ensure_k3_combine_pack5_asm_code_object(
+    use_unified_weight_layout: bool = False,
+) -> Path:
     co = (
         K3_COMBINE_UNIFIED_PACK5_ASM_CO
-        if unified_weight_layout_enabled()
+        if use_unified_weight_layout
         else K3_COMBINE_PACK5_ASM_CO
     )
     return _ensure_prebuilt_code_object(co, "K3 V3 pack5 combine")
 
 
-def ensure_k3_combine_tail_reduce_pack5_asm_code_object() -> Path:
+def ensure_k3_combine_tail_reduce_pack5_asm_code_object(
+    use_unified_weight_layout: bool = False,
+) -> Path:
     co = (
         K3_COMBINE_TAIL_REDUCE_UNIFIED_PACK5_ASM_CO
-        if unified_weight_layout_enabled()
+        if use_unified_weight_layout
         else K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO
     )
     return _ensure_prebuilt_code_object(
@@ -214,6 +218,7 @@ def k3_l2_fused_v3_to_combine(
     graph_runtime_offset_from_active_tiles: int = 0,
     graph_runtime_num_tokens: torch.Tensor | None = None,
     ll_block_m: int = 32,
+    use_unified_weight_layout: bool = False,
     verbose_build: bool = False,
 ) -> torch.Tensor | None:
     """V3 K3 dispatch point for staged opt.
@@ -237,7 +242,9 @@ def k3_l2_fused_v3_to_combine(
     if backend == "normal":
         ext = load_extension(verbose=verbose_build)
         if asm_reduce_y is None:
-            code_object = ensure_k3_combine_pack5_asm_code_object()
+            code_object = ensure_k3_combine_pack5_asm_code_object(
+                use_unified_weight_layout=use_unified_weight_layout
+            )
             ext.k3_l2_combine_asm_pack5_out(
                 output_workspace,
                 act_fp8.contiguous(),
@@ -256,7 +263,9 @@ def k3_l2_fused_v3_to_combine(
             raise ValueError("V3 K3 ASM-pack5 tail path requires sym_buffer, done counter, and signal addrs")
         if not num_ranks or not num_experts or num_tokens < 0 or not num_topk or not hidden:
             raise ValueError("V3 K3 ASM-pack5 tail path requires shape metadata")
-        code_object = ensure_k3_combine_tail_reduce_pack5_asm_code_object()
+        code_object = ensure_k3_combine_tail_reduce_pack5_asm_code_object(
+            use_unified_weight_layout=use_unified_weight_layout
+        )
         ext.k3_l2_combine_asm_tail_reduce_pack5_out(
             act_fp8.contiguous(),
             act_scale.contiguous(),

@@ -9,7 +9,6 @@ from . import _C
 from .dcu_megamoe_opt.v3_config import (
     V3_BACKEND_NORMAL,
     normalize_v3_backend,
-    unified_weight_layout_enabled,
 )
 
 
@@ -364,14 +363,14 @@ def transform_fp8_weights_for_mega_moe(
 
 def _select_v3_weight_layout(weights: Any, backend: str):
     if isinstance(weights, dict):
-        key = "unified" if unified_weight_layout_enabled() else backend
+        key = "unified" if "unified" in weights else backend
         if key not in weights:
             raise KeyError(
                 f"missing V3 weight layout {key!r}; provide keys 'll'/'normal' "
-                "or 'unified' when MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1"
+                "or a single 'unified' layout"
             )
-        return weights[key]
-    return weights
+        return weights[key], key
+    return weights, backend
 
 
 def deepep_deepgemm_preprocess_channelwise(
@@ -426,8 +425,13 @@ def fp8_mega_moe(
 ):
     call_y = y
     v3_backend = normalize_v3_backend(megamoe_backend)
-    l1_weights = _select_v3_weight_layout(l1_weights, v3_backend)
-    l2_weights = _select_v3_weight_layout(l2_weights, v3_backend)
+    l1_weights, l1_layout = _select_v3_weight_layout(l1_weights, v3_backend)
+    l2_weights, l2_layout = _select_v3_weight_layout(l2_weights, v3_backend)
+    if l1_layout != l2_layout:
+        raise ValueError(
+            f"V3 L1/L2 weight layouts must match, got {l1_layout!r} and {l2_layout!r}"
+        )
+    use_unified_weight_layout = l1_layout == "unified"
     if recipe != (1, 1, 32):
         raise ValueError("DCU W8A8 MegaMoE expects recipe=(1, 1, 32)")
     if activation != "swiglu":
@@ -477,6 +481,7 @@ def fp8_mega_moe(
             activation_clamp=activation_clamp,
             fast_math=fast_math,
             v3_backend=v3_backend,
+            use_unified_weight_layout=use_unified_weight_layout,
         )
         return
     else:
@@ -502,6 +507,7 @@ def fp8_mega_moe(
             fast_math=fast_math,
             v3_backend=v3_backend,
             capacity_num_tokens=capacity_num_tokens,
+            use_unified_weight_layout=use_unified_weight_layout,
         )
         return
 

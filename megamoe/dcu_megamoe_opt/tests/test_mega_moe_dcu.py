@@ -34,10 +34,16 @@ from megamoe.dcu_megamoe_opt.v3_config import (
     NORMAL_LL_TOKEN_THRESHOLD_ENV,
     V3_BACKEND_AUTO,
     select_v3_backend,
-    unified_weight_layout_enabled,
     v3_backend_mode,
 )
 from megamoe.dcu_megamoe_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
+
+
+UNIFIED_WEIGHT_LAYOUT_ENV = "MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT"
+
+
+def env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def print_once(rank: int, msg: str = ""):
@@ -447,6 +453,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     backend_mode = v3_backend_mode(args.megamoe_backend)
     v3_backend = select_v3_backend(backend_selector_tokens, backend_mode)
+    weight_layout = (
+        "unified"
+        if env_flag_enabled(UNIFIED_WEIGHT_LAYOUT_ENV)
+        else ("normal" if v3_backend == "normal" else "unified")
+    )
     fused_execution = f"v3_{v3_backend}_graph" if args.cuda_graph else "v3_staged"
     print_once(rank, "DCU MegaMoE channelwise W8A8 test:")
     print_once(rank, f" > megamoe: {getattr(megamoe, '__file__', None)}")
@@ -500,28 +511,26 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l1_bf16,
         l2_bf16,
     )
-    fused_l1_weights = baseline_l1_weights
-    fused_l2_weights = baseline_l2_weights
     from megamoe.dcu_megamoe_opt import v3_layout
 
     l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
     l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
-    ll_l1_weights = (v3_layout.flatten_pack5_weight(l1_fp8), l1_scale)
-    ll_l2_weights = (v3_layout.flatten_pack5_weight(l2_fp8), l2_scale)
-    if unified_weight_layout_enabled():
-        fused_l1_weights = {"unified": ll_l1_weights}
-        fused_l2_weights = {"unified": ll_l2_weights}
-        layout_desc = "single transposed pack5"
-    else:
+    if weight_layout == "normal":
         fused_l1_weights = {
-            "ll": ll_l1_weights,
             "normal": (v3_layout.flatten_pack5_weight_asm_normal(l1_fp8), l1_scale),
         }
         fused_l2_weights = {
-            "ll": ll_l2_weights,
             "normal": (v3_layout.flatten_pack5_weight_asm_normal(l2_fp8), l2_scale),
         }
-        layout_desc = "dual pack5 (LL transposed, normal ASM plain)"
+        layout_desc = "single normal ASM plain pack5"
+    else:
+        fused_l1_weights = {
+            "unified": (v3_layout.flatten_pack5_weight(l1_fp8), l1_scale),
+        }
+        fused_l2_weights = {
+            "unified": (v3_layout.flatten_pack5_weight(l2_fp8), l2_scale),
+        }
+        layout_desc = "single unified transposed pack5"
     print_once(rank, f" > V3 staged layout: {layout_desc}")
     stats_initial = torch.randint(0, 100, (num_experts_per_rank,), dtype=torch.int32, device="cuda")
     stats_fused = stats_initial.clone()
@@ -833,6 +842,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "backend_selector_tokens": backend_selector_tokens,
                 "megamoe_backend": v3_backend,
                 "megamoe_backend_mode": backend_mode,
+                "weight_layout": weight_layout,
                 "hidden": hidden,
                 "intermediate_hidden": intermediate_hidden,
                 "num_experts": num_experts,
@@ -935,6 +945,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "backend_selector_tokens": backend_selector_tokens,
             "megamoe_backend": v3_backend,
             "megamoe_backend_mode": backend_mode,
+            "weight_layout": weight_layout,
             "hidden": hidden,
             "intermediate_hidden": intermediate_hidden,
             "num_experts": num_experts,

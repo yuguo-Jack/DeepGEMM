@@ -2,9 +2,8 @@
 
 These helpers are intentionally not used by the opt runtime path. V3
 execution expects callers/tests to provide weights that are already in this
-pack5 layout.  The default performance path may provide separate LL and
-normal-ASM pack5 tensors; set MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1 only when
-the caller intentionally uses the shared transposed LL layout for both.
+pack5 layout. Callers select the runtime layout by passing either a single
+"unified" weight dict entry or a backend-specific entry such as "normal".
 """
 
 from __future__ import annotations

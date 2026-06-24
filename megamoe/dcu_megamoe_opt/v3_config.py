@@ -10,7 +10,6 @@ V3_BACKEND_AUTO = "auto"
 
 BACKEND_ENV = "MEGAMOE_DCU_BACKEND"
 NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
-UNIFIED_WEIGHT_LAYOUT_ENV = "MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT"
 DEFAULT_NORMAL_LL_TOKEN_THRESHOLD = 256
 
 _VALID_V3_BACKENDS = {V3_BACKEND_LL, V3_BACKEND_NORMAL}
@@ -64,8 +63,3 @@ def select_v3_backend(selector_tokens: int, backend_mode: str | None = None) -> 
         return normalize_v3_backend(mode)
     threshold = normal_ll_token_threshold()
     return V3_BACKEND_LL if tokens <= threshold else V3_BACKEND_NORMAL
-
-
-def unified_weight_layout_enabled(value: str | None = None) -> bool:
-    raw = os.getenv(UNIFIED_WEIGHT_LAYOUT_ENV, "0") if value is None else value
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}

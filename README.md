@@ -157,11 +157,13 @@ l2_weights = {
 
 The LL layout uses `v3_layout.flatten_pack5_weight(...)`; the normal ASM layout
 uses `v3_layout.flatten_pack5_weight_asm_normal(...)`.  This dual-layout mode
-is the default performance path.  If a deployment must keep a single transformed
-weight layout, set `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` and provide a
-`{"unified": (weight, scale)}` dictionary, or the legacy tuple.  The unified
-mode loads `_UNIFIED_PACK5` ASM code objects and is intended as a compatibility
-path, not the default best-performance path.
+is the default performance path.  In the repository test script,
+`MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` forces even the normal backend fixture to
+construct a single `{"unified": (weight, scale)}` layout.  Production callers
+should select this compatibility path explicitly by passing a `{"unified": ...}`
+layout dictionary, or the legacy tuple.  The unified mode loads `_UNIFIED_PACK5`
+ASM code objects and is intended as a compatibility path, not the default
+best-performance path.
 
 For eager uneven-rank requests, pass the same EP-group maximum local token count
 as the optional host scalar `capacity_num_tokens`.  This value is not a backend

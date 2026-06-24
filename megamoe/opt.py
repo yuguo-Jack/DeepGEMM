@@ -434,6 +434,7 @@ def fp8_mega_moe_opt_3stage(
     fast_math: bool,
     v3_backend: str,
     capacity_num_tokens: Optional[int] = None,
+    use_unified_weight_layout: bool = False,
 ) -> None:
     if not fast_math:
         raise RuntimeError("opt DCU MegaMoE path requires fast_math")
@@ -516,6 +517,7 @@ def fp8_mega_moe_opt_3stage(
         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
         force_compact_prebuild=force_safe_compact,
         capacity_num_tokens=route_capacity_num_tokens,
+        use_unified_weight_layout=use_unified_weight_layout,
         verbose_build=verbose_build,
     )
     k1_kwargs["backend"] = v3_backend
@@ -572,6 +574,7 @@ def fp8_mega_moe_opt_3stage(
             hidden=hidden,
             output_workspace=l1_out,
             prob_storage=state.scratch.k3_prob_storage,
+            use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
         k3_kwargs["backend"] = v3_backend
@@ -590,6 +593,7 @@ def fp8_mega_moe_opt_3stage(
         k3_kwargs = dict(
             output_workspace=l1_out,
             prob_storage=state.scratch.k3_prob_storage,
+            use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
         k3_kwargs["backend"] = v3_backend
@@ -637,6 +641,7 @@ def _run_opt_3stage_graph(
     fast_math: bool,
     graph_max_tokens: Optional[int] = None,
     v3_backend: str,
+    use_unified_weight_layout: bool = False,
 ) -> None:
     if not fast_math:
         raise RuntimeError("opt DCU MegaMoE graph path requires fast_math")
@@ -736,6 +741,7 @@ def _run_opt_3stage_graph(
         runtime_num_tokens=runtime_num_tokens,
         alignment=alignment,
         l1_out_workspace=state.scratch.l1_out,
+        use_unified_weight_layout=use_unified_weight_layout,
         verbose_build=verbose_build,
     )
     k1_kwargs["backend"] = v3_backend
@@ -810,6 +816,7 @@ def _run_opt_3stage_graph(
             prob_storage=state.scratch.k3_prob_storage,
             active_tiles=state.scratch.k1_active_tiles,
             graph_runtime_offset_from_active_tiles=graph_runtime_offset,
+            use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
         k3_kwargs["backend"] = v3_backend
@@ -835,6 +842,7 @@ def _run_opt_3stage_graph(
             prob_storage=state.scratch.k3_prob_storage,
             active_tiles=state.scratch.k1_active_tiles,
             graph_runtime_offset_from_active_tiles=graph_runtime_offset,
+            use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
         k3_kwargs["backend"] = v3_backend
