@@ -155,9 +155,11 @@ l2_weights = {
 }
 ```
 
-The LL layout uses `v3_layout.flatten_pack5_weight(...)`; the normal ASM layout
-uses `v3_layout.flatten_pack5_weight_asm_normal(...)`.  This dual-layout mode
-is the default performance path.  In the repository test script,
+The LL layout uses `megamoe.flatten_pack5_weight(...)`; the normal ASM layout
+uses `megamoe.flatten_pack5_weight_asm_normal(...)`.  These helpers are exported
+from the top-level `megamoe` package so framework code does not need to import
+`megamoe.dcu_megamoe_opt.v3_layout` directly.  This dual-layout mode is the
+default performance path.  In the repository test script,
 `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` forces even the normal backend fixture to
 construct a single `{"unified": (weight, scale)}` layout.  Production callers
 should select this compatibility path explicitly by passing a `{"unified": ...}`

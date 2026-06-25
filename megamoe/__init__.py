@@ -10,6 +10,10 @@ from .dcu_megamoe_opt.v3_config import (
     V3_BACKEND_NORMAL,
     normalize_v3_backend,
 )
+from .dcu_megamoe_opt.v3_layout import (
+    flatten_pack5_weight,
+    flatten_pack5_weight_asm_normal,
+)
 
 
 def _align(value: int, alignment: int) -> int:
@@ -529,6 +533,8 @@ __all__ = [
     "get_mega_moe_hip_build_config",
     "get_symm_buffer_for_mega_moe",
     "transform_fp8_weights_for_mega_moe",
+    "flatten_pack5_weight",
+    "flatten_pack5_weight_asm_normal",
     "deepep_deepgemm_preprocess_channelwise",
     "deepep_deepgemm_postprocess_channelwise",
     "fp8_mega_moe",

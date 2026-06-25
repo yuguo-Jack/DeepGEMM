@@ -511,24 +511,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l1_bf16,
         l2_bf16,
     )
-    from megamoe.dcu_megamoe_opt import v3_layout
-
     l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
     l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
     if weight_layout == "normal":
         fused_l1_weights = {
-            "normal": (v3_layout.flatten_pack5_weight_asm_normal(l1_fp8), l1_scale),
+            "normal": (megamoe.flatten_pack5_weight_asm_normal(l1_fp8), l1_scale),
         }
         fused_l2_weights = {
-            "normal": (v3_layout.flatten_pack5_weight_asm_normal(l2_fp8), l2_scale),
+            "normal": (megamoe.flatten_pack5_weight_asm_normal(l2_fp8), l2_scale),
         }
         layout_desc = "single normal ASM plain pack5"
     else:
         fused_l1_weights = {
-            "unified": (v3_layout.flatten_pack5_weight(l1_fp8), l1_scale),
+            "unified": (megamoe.flatten_pack5_weight(l1_fp8), l1_scale),
         }
         fused_l2_weights = {
-            "unified": (v3_layout.flatten_pack5_weight(l2_fp8), l2_scale),
+            "unified": (megamoe.flatten_pack5_weight(l2_fp8), l2_scale),
         }
         layout_desc = "single unified transposed pack5"
     print_once(rank, f" > V3 staged layout: {layout_desc}")

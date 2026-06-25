@@ -361,6 +361,12 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "megamoe_backend: str = V3_BACKEND_NORMAL" in api_source
     assert "graph: bool = False" in api_source
     assert "capacity_num_tokens: Optional[int] = None" in api_source
+    assert "from .dcu_megamoe_opt.v3_layout import" in api_source
+    assert "flatten_pack5_weight" in api_source
+    assert "flatten_pack5_weight_asm_normal" in api_source
+    assert "from megamoe.dcu_megamoe_opt import v3_layout" not in test_source
+    assert "megamoe.flatten_pack5_weight_asm_normal" in test_source
+    assert "megamoe.flatten_pack5_weight(l" in test_source
     assert "dispatch_num_tokens: Optional[int] = None" not in api_source
     assert "ll_cuda_graph" not in api_source
     assert "normal_cuda_graph" not in api_source

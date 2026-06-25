@@ -9517,3 +9517,35 @@
   - remote source guard passed: `9 passed in 6.75s`;
   - remote LL `fast_math=0` correctness-only smoke passed for 8 tokens;
   - remote normal `fast_math=0` correctness-only smoke passed for 512 tokens.
+
+## 2026-06-25 - Expose pack5 layout helpers at megamoe top level
+
+- User requested framework access to `flatten_pack5_weight` and
+  `flatten_pack5_weight_asm_normal` without importing deep implementation paths.
+- Code changes:
+  - re-exported both helpers from `megamoe/__init__.py`;
+  - added both names to `megamoe.__all__`;
+  - updated README DCU layout guidance to use `megamoe.flatten_pack5_weight(...)`
+    and `megamoe.flatten_pack5_weight_asm_normal(...)`.
+- Validation:
+  - local `py_compile` passed for `megamoe/__init__.py` and the source guard;
+  - local direct import cannot run without the HIP `_C` extension in the Windows Python environment;
+  - remote source guard passed: `9 passed in 6.73s`;
+  - remote import check confirmed both top-level attributes are present.
+
+## 2026-06-25 - Pack5 helper export follow-up check
+
+- Follow-up fix:
+  - changed `megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` to use
+    `megamoe.flatten_pack5_weight(...)` and
+    `megamoe.flatten_pack5_weight_asm_normal(...)` instead of importing
+    `megamoe.dcu_megamoe_opt.v3_layout`;
+  - moved the source guard into the test that already reads `test_source`.
+- Comprehensive checks:
+  - local `py_compile` passed for both MegaMoE test files;
+  - local `git diff --check` passed;
+  - remote source guard passed: `9 passed in 6.90s`;
+  - remote LL correctness-only smoke passed and printed
+    `V3 staged layout: single unified transposed pack5`;
+  - remote normal correctness-only smoke passed and printed
+    `V3 staged layout: single normal ASM plain pack5`.
