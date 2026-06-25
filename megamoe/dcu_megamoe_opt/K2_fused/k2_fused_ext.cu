@@ -174,7 +174,16 @@ __device__ __forceinline__ int actual_m_max_or_scan(
     return max_m;
 }
 
-template <int Threads>
+template <bool kFastMath>
+__device__ __forceinline__ float swiglu_gate(const float gate) {
+    if constexpr (kFastMath) {
+        return gate * (1.0f / (1.0f + __expf(-gate)));
+    } else {
+        return gate / (1.0f + expf(-gate));
+    }
+}
+
+template <int Threads, bool kFastMath>
 __global__ __launch_bounds__(Threads)
 void swiglu_quant_channelwise_kernel(
     const uint16_t* __restrict__ x,
@@ -263,8 +272,7 @@ void swiglu_quant_channelwise_kernel(
                 up = fminf(clamp_value, fmaxf(-clamp_value, up));
                 gate = fminf(clamp_value, gate);
             }
-            const float sig = 1.0f / (1.0f + __expf(-gate));
-            const float y = gate * sig * up * route_weight;
+            const float y = swiglu_gate<kFastMath>(gate) * up * route_weight;
             y_smem[col + i] = y;
             local_amax = fmaxf(local_amax, fabsf(y));
         }
@@ -307,7 +315,7 @@ void swiglu_quant_channelwise_kernel(
     }
 }
 
-template <int Threads, int VecGroups>
+template <int Threads, int VecGroups, bool kFastMath>
 __global__ __launch_bounds__(Threads)
 void swiglu_quant_channelwise_reg_kernel(
     const uint16_t* __restrict__ x,
@@ -414,10 +422,10 @@ void swiglu_quant_channelwise_reg_kernel(
                 gate2 = fminf(clamp_value, gate2);
                 gate3 = fminf(clamp_value, gate3);
             }
-            y0[g] = gate0 * (1.0f / (1.0f + __expf(-gate0))) * up0 * route_weight;
-            y1[g] = gate1 * (1.0f / (1.0f + __expf(-gate1))) * up1 * route_weight;
-            y2[g] = gate2 * (1.0f / (1.0f + __expf(-gate2))) * up2 * route_weight;
-            y3[g] = gate3 * (1.0f / (1.0f + __expf(-gate3))) * up3 * route_weight;
+            y0[g] = swiglu_gate<kFastMath>(gate0) * up0 * route_weight;
+            y1[g] = swiglu_gate<kFastMath>(gate1) * up1 * route_weight;
+            y2[g] = swiglu_gate<kFastMath>(gate2) * up2 * route_weight;
+            y3[g] = swiglu_gate<kFastMath>(gate3) * up3 * route_weight;
             local_amax = fmaxf(local_amax, fabsf(y0[g]));
             local_amax = fmaxf(local_amax, fabsf(y1[g]));
             local_amax = fmaxf(local_amax, fabsf(y2[g]));
@@ -474,7 +482,7 @@ void swiglu_quant_channelwise_reg_kernel(
     }
 }
 
-template <int Threads>
+template <int Threads, bool kFastMath>
 void launch_swiglu_quant_channelwise(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
@@ -507,7 +515,7 @@ void launch_swiglu_quant_channelwise(
     if (hidden == 2048) {
         constexpr int vec_groups = 2048 / (Threads * 4);
         hipLaunchKernelGGL(
-            (swiglu_quant_channelwise_reg_kernel<Threads, vec_groups>),
+            (swiglu_quant_channelwise_reg_kernel<Threads, vec_groups, kFastMath>),
             dim3(launch_blocks),
             dim3(Threads),
             shared_bytes_for_reg,
@@ -532,7 +540,7 @@ void launch_swiglu_quant_channelwise(
     } else if (hidden == 4096) {
         constexpr int vec_groups = 4096 / (Threads * 4);
         hipLaunchKernelGGL(
-            (swiglu_quant_channelwise_reg_kernel<Threads, vec_groups>),
+            (swiglu_quant_channelwise_reg_kernel<Threads, vec_groups, kFastMath>),
             dim3(launch_blocks),
             dim3(Threads),
             shared_bytes_for_reg,
@@ -558,7 +566,7 @@ void launch_swiglu_quant_channelwise(
         const size_t shared_bytes =
             static_cast<size_t>(hidden + Threads) * sizeof(float);
         hipLaunchKernelGGL(
-            (swiglu_quant_channelwise_kernel<Threads>),
+            (swiglu_quant_channelwise_kernel<Threads, kFastMath>),
             dim3(rows),
             dim3(Threads),
             shared_bytes,
@@ -585,6 +593,7 @@ void launch_swiglu_quant_channelwise(
     K2_HIP_CHECK(hipGetLastError());
 }
 
+template <bool kFastMath>
 void launch_swiglu_quant_channelwise_auto(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
@@ -604,28 +613,28 @@ void launch_swiglu_quant_channelwise_auto(
     const int64_t active_tile_m) {
     const int hidden = static_cast<int>(x.size(1) / 2);
     if (hidden <= 2048 && !output_bf16) {
-        launch_swiglu_quant_channelwise<64>(
+        launch_swiglu_quant_channelwise<64, kFastMath>(
             x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
             active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
     } else if (hidden <= 2048) {
-        launch_swiglu_quant_channelwise<128>(
+        launch_swiglu_quant_channelwise<128, kFastMath>(
             x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
             active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
     } else if (hidden == 4096) {
-        launch_swiglu_quant_channelwise<128>(
+        launch_swiglu_quant_channelwise<128, kFastMath>(
             x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
             active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
     } else {
-        launch_swiglu_quant_channelwise<256>(
+        launch_swiglu_quant_channelwise<256, kFastMath>(
             x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
             active_tiles,
             out_fp8, out_scale, out_bf16,
@@ -655,7 +664,8 @@ void swiglu_quant_channelwise_out(
     const std::optional<torch::Tensor>& actual_m,
     const int64_t m_per_expert,
     const std::optional<torch::Tensor>& active_tiles,
-    const int64_t active_tile_m) {
+    const int64_t active_tile_m,
+    const bool fast_math) {
     check_cuda_contiguous(x, "x");
     check_cuda_contiguous(out_fp8, "out_fp8");
     check_cuda_contiguous(out_scale, "out_scale");
@@ -736,13 +746,23 @@ void swiglu_quant_channelwise_out(
     auto out_fp8_view = out_fp8;
     auto out_scale_view = out_scale.view({-1});
     auto out_bf16_view = out_bf16;
-    launch_swiglu_quant_channelwise_auto(
-        x, topk_weights, row_combine_ptrs_data, actual_m_data,
-        actual_m_max_data,
-        active_tiles_data,
-        out_fp8_view, out_scale_view, out_bf16_view,
-        output_bf16, has_clamp_value, clamp_value, max_row_blocks,
-        m_per_expert, local_experts, active_tile_m);
+    if (fast_math) {
+        launch_swiglu_quant_channelwise_auto<true>(
+            x, topk_weights, row_combine_ptrs_data, actual_m_data,
+            actual_m_max_data,
+            active_tiles_data,
+            out_fp8_view, out_scale_view, out_bf16_view,
+            output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+            m_per_expert, local_experts, active_tile_m);
+    } else {
+        launch_swiglu_quant_channelwise_auto<false>(
+            x, topk_weights, row_combine_ptrs_data, actual_m_data,
+            actual_m_max_data,
+            active_tiles_data,
+            out_fp8_view, out_scale_view, out_bf16_view,
+            output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+            m_per_expert, local_experts, active_tile_m);
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -760,5 +780,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("actual_m") = std::nullopt,
           pybind11::arg("m_per_expert") = 0,
           pybind11::arg("active_tiles") = std::nullopt,
-          pybind11::arg("active_tile_m") = 0);
+          pybind11::arg("active_tile_m") = 0,
+          pybind11::arg("fast_math") = true);
 }

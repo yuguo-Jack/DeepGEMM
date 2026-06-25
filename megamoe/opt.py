@@ -79,7 +79,7 @@ def _tail_reduce_enabled_for_backend(v3_backend: str) -> bool:
 
 
 def ll_k3_split_tail_enabled() -> bool:
-    value = os.getenv("MEGAMOE_DCU_LL_K3_SPLIT_TAIL", "0").strip().lower()
+    value = os.getenv("MEGAMOE_DCU_LL_K3_SPLIT_TAIL", "1").strip().lower()
     return value in {"1", "true", "yes", "on", "split"}
 
 
@@ -450,9 +450,6 @@ def fp8_mega_moe_opt_3stage(
     capacity_num_tokens: Optional[int] = None,
     use_unified_weight_layout: bool = False,
 ) -> None:
-    if not fast_math:
-        raise RuntimeError("opt DCU MegaMoE path requires fast_math")
-
     l1_weight, l1_scale = l1_weights
     l2_weight, l2_scale = l2_weights
     num_tokens = int(y.size(0))
@@ -568,6 +565,7 @@ def fp8_mega_moe_opt_3stage(
         ),
         actual_m=k2_actual_m,
         m_per_expert=k2_m_per_expert,
+        fast_math=fast_math,
         verbose_build=verbose_build,
     )
 
@@ -660,8 +658,6 @@ def _run_opt_3stage_graph(
     v3_backend: str,
     use_unified_weight_layout: bool = False,
 ) -> None:
-    if not fast_math:
-        raise RuntimeError("opt DCU MegaMoE graph path requires fast_math")
     if cumulative_local_expert_recv_stats is not None:
         raise ValueError("opt DCU MegaMoE graph path does not support stats")
     l1_weight, l1_scale = l1_weights
@@ -808,6 +804,7 @@ def _run_opt_3stage_graph(
         m_per_expert=k2_m_per_expert,
         active_tiles=k2_active_tiles,
         active_tile_m=K_K1_ROUTE_TILE_M if k2_active_tiles is not None else 0,
+        fast_math=fast_math,
         verbose_build=verbose_build,
     )
 

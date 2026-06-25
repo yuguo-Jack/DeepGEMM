@@ -9341,6 +9341,42 @@
 - Cleanup:
   - ran the remote HCU cleanup script after the repro;
   - HCU usage returned to 0%.
+
+## 2026-06-24 - Post-commit planning checkpoint
+
+- Current local commit: `5e390d1 Optimize DCU MegaMoE LL split tail`.
+- Working tree was clean before this planning update.
+- Updated current-memory state:
+  - K3 split-tail remains opt-in through `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1`;
+  - copy-done fallback is the retained fix for real SGLang graph-capture VMFault/chunk-timeout failures;
+  - K1 retained change is the no-atomic peer-match / parallel uniform scan implementation;
+  - K1 dispatch-ready rank-barrier shrink is rejected for now because broad uniform regressions outweighed isolated uneven graph wins.
+- Validation artifacts to keep using:
+  - latest split matrix: `/workspace/DeepGEMM/hygon_tmp/debug/v3_split_tail_copydone_fix_20260624`;
+  - real SGLang repro pass log: `/workspace/DeepGEMM/hygon_tmp/sglang_debug/repro_splittail_vmfault_20260624_191047/server.log`;
+  - source guard result: split-tail pytest guard passed `9 passed`.
+- Next action boundary:
+  - framework can trial commit `5e390d1` as the stable split-tail checkpoint;
+  - further optimization must be backed by timing/profiler evidence and must not add hot-path launch, host reset/copy, graph-recorded static token fill, or high-latency global synchronization.
+
+## 2026-06-24 - Clean task-plan status markers
+
+- Updated `.planning/dcu_megamoe_v3/task_plan.md` status markers after current checkpoint review.
+- Converted completed historical `🧭` route_scratch / compatibility directions to `✅`.
+- Converted no-longer-active DeepEP full baseline item to `🚫`.
+- Downgraded non-current layout mining and split-tail default-enable/perf tuning items to `🧭 optional backlog`.
+- Cleared remaining real `[ ]` task entries from `task_plan.md`; only explanatory legend text still mentions `[ ]`.
+
+## 2026-06-24 - Phase 19 profiling request added
+
+- User requested two evidence-first optimization tracks:
+  - fine-grained profiling/ablation of the K1 pre-GEMM rank barrier and related reset/wait/scan costs;
+  - fine-grained profiling/ablation of K3 split-tail second kernel, separating split copy, peer writes, signal wait/local-ready, and reduce cost.
+- Added Phase 19 to `task_plan.md`.
+- Working rule for this phase:
+  - profile first, then optimize;
+  - no speculative deletion of synchronization semantics;
+  - any retained code change must pass uniform/uneven eager and graph replay validation and compare against fused tail plus current split-tail checkpoint.
 - Next:
   - use this real framework log as the anchor repro instead of the package-level framework-like repro;
   - inspect the failing K3 kernel args and upstream K1 graph-token/topk/row-combine state for the exact capture call.
@@ -9370,3 +9406,114 @@
   - compared with previous split champion `v3_split_tail_k1_uniform_parallel_20260624`, the fix is neutral/slightly better on most points; graph uniform remains within noise.
 - Cleanup:
   - HCU cleanup script run after validation; HCU compute/VRAM returned to 0%.
+
+## 2026-06-24 - Phase 19 first profiler pass
+
+- Synced the current local source snapshot to the remote node and rebuilt under `/workspace/DeepGEMM`.
+- Remote source guard passed with split-tail enabled: `9 passed in 6.48s`.
+- Ran first `hipprof --hip-trace --hsa-trace --stats` pass for LL split-tail `num_tokens=128`.
+- Output directory:
+  - `/workspace/DeepGEMM/hygon_tmp/debug/phase19_profile_20260624_202223`.
+- Parsed target kernel timing from `split128_profile.hipkernel.csv`:
+  - K1 `V3_K1_LowLatencyMaskedGroupGemmKernel`: `152` calls, average about `1371 us/call` under profiler overhead;
+  - K3 local groupgemm: `152` calls, average about `183 us/call`;
+  - K3 split combine/reduce: `152` calls, average about `217 us/call`;
+  - K2 swiglu: `304` calls, average about `37.9 us/call`.
+- Decision:
+  - proceed with temporary compile-time profiling/ablation hooks;
+  - K1 needs phase timing inside the existing start barrier;
+  - K3 needs second-kernel copy/store/publish/wait/reduce ablation before choosing the next optimization.
+
+## 2026-06-24 - Phase 19 K1/K3 ablations
+
+- Added temporary compile-time K1 `clock64` phase timing and K3 split-kernel ablation hooks, then removed them after data collection.
+- K1 uniform phase output:
+  - `/workspace/DeepGEMM/hygon_tmp/debug/phase19_k1_phase_20260624_203314`;
+  - local reset/peer scan were small, but release barrier had occasional skew spikes.
+- K1 uneven phase output:
+  - `/workspace/DeepGEMM/hygon_tmp/debug/phase19_k1_phase_uneven_20260624_203452`;
+  - rank0 first generation waited about `34M cycles` in the release barrier with `ticket=0`, confirming cross-rank arrival skew dominates the worst case.
+- K3 ablation output:
+  - `/workspace/DeepGEMM/hygon_tmp/debug/phase19_k3_ablate_20260624_203631`;
+  - current split kernel: about `245.2 us/call`;
+  - copy/publish-only: about `88.6 us/call`;
+  - skip vector copy body: about `163.6 us/call`;
+  - reduce-only/minimal copydone: about `165.0 us/call`;
+  - copy+wait without reduce body: about `157.4 us/call`.
+- Rejected follow-up variants:
+  - direct hidden-tile system wait: `/workspace/DeepGEMM/hygon_tmp/debug/phase19_k3_direct_ready_20260624_204818`, correct but not faster;
+  - split combine/reduce blockDim 128: `/workspace/DeepGEMM/hygon_tmp/debug/phase19_k3_block128_20260624_205207`, correct but slower.
+- Restored production code on the remote node after ablations:
+  - local K1/K3 source has no debug/ablation code diff;
+  - remote K3 launch was restored to blockDim 256;
+  - remote rebuild passed;
+  - split-tail source guard passed: `9 passed in 6.80s`.
+
+## 2026-06-24 - Phase 19 K3 combine/reduce split experiment start
+
+- User requested splitting the current K3 split-tail second kernel again:
+  - current retained path has local K3 groupgemm as kernel 1;
+  - current second kernel mixes peer combine communication and local reduce work;
+  - new experiment will launch peer combine communication and local reduce as separate kernels.
+- Plan update:
+  - added the K3 combine/reduce split experiment to `task_plan.md`;
+  - no new runtime environment switch is planned for this first A/B;
+  - the copy-done fallback, chunk-ready semantics, graph safety, and uneven runtime-token gating must remain intact.
+
+## 2026-06-24 - Phase 19 K3 combine/reduce split experiment rejected
+
+- Implemented and tested a temporary three-kernel split-tail shape:
+  - local K3 groupgemm;
+  - `V3_K3_LowLatencyCombineCopyKernel`;
+  - `V3_K3_LowLatencyLocalReduceKernel`.
+- Correctness/compile:
+  - remote rebuild passed;
+  - source guard passed: `9 passed in 7.04s`;
+  - uniform128 and edge256 graph smoke both passed correctness.
+- Performance:
+  - uniform128 eager median regressed to about `0.771-0.774 ms`;
+  - edge256 graph smoke was about `0.762 ms`;
+  - current retained combined split-tail anchor is better: uniform128 about `0.743 ms`, edge256 graph about `0.737 ms`.
+- Hipprof:
+  - copy kernel typically about `80-95 us/call`;
+  - reduce kernel roughly `35-195 us/call`;
+  - the extra launch and same-stream serialization erased any benefit from separating the work.
+- Decision:
+  - reverted local code back to the stable combined `V3_K3_LowLatencyCombineReduceKernel`;
+  - synced the restored code to the remote node;
+  - remote rebuild passed and source guard again passed: `9 passed in 7.00s`.
+
+## 2026-06-25 - Phase 20 LL strong-sync investigation started
+
+- User asked whether the LL flow has K1/K3 rank-barrier-like strong sync that can be reduced, and whether DeepEP has similar synchronization.
+- Read current K1/K3 code and refreshed DeepEP LL knowledge through `dcu-rag-kb`.
+- Current map:
+  - K1 has the coarse EP-rank arrival/release barrier in `v3_k1_ll_start_rank_barrier_device`;
+  - K3 fused tail has a reducer-leader wait on peer tail generation signals;
+  - K3 split-tail uses per-chunk ready counters plus copy-done fallback, so it is already more fine-grained than fused-tail's whole-tail peer wait.
+- DeepEP comparison:
+  - DeepEP LL also synchronizes, but it scopes waits through low-latency buffer layout, phase/epoch-style ownership, data-ready counters, and completion signals;
+  - this suggests the next MegaMoE optimization should narrow readiness scope rather than hard-remove barriers.
+- Updated `task_plan.md` Phase 20 and appended the strong-sync finding summary.
+- No kernel code was changed in this step.
+
+## 2026-06-25 - Phase 21 split-tail default and fast_math parity
+
+- Planning cleanup:
+  - marked the already-rejected K1 dispatch-ready, K3 direct-ready, and K3 three-kernel split follow-ups as not active;
+  - added and completed Phase 21 in `task_plan.md`.
+- Code changes:
+  - changed `MEGAMOE_DCU_LL_K3_SPLIT_TAIL` default from off to on for LL token buckets `<=256`;
+  - kept `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` as the forced fused-tail fallback;
+  - removed the DCU opt-path RuntimeError for `fast_math=False`;
+  - threaded `fast_math` into K2 and added fast/precise SwiGLU template specializations.
+- README:
+  - updated the DCU MegaMoE section for split-tail default usage, fallback knobs, graph behavior, and the `fast_math` switch.
+- Validation:
+  - local `py_compile` passed for modified Python files;
+  - local pytest could not run because the Windows Python environment lacks `pytest`;
+  - remote HCU cleanup showed all 8 cards at 0% HCU/VRAM before validation;
+  - remote rebuild passed: `DG_FORCE_BUILD=1 MAX_JOBS=8 python3 setup.py build_ext --inplace`;
+  - remote source guard passed: `9 passed in 6.75s`;
+  - remote LL `fast_math=0` correctness-only smoke passed for 8 tokens;
+  - remote normal `fast_math=0` correctness-only smoke passed for 512 tokens.

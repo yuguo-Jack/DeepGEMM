@@ -167,6 +167,8 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     k1_header = (K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh").read_text(
         encoding="utf-8"
     )
+    k2_py = (K2_FUSED_DIR / "k2_fused.py").read_text(encoding="utf-8")
+    k2_ext = (K2_FUSED_DIR / "k2_fused_ext.cu").read_text(encoding="utf-8")
     k3_py = (K3_FUSED_DIR / "k3_fused.py").read_text(encoding="utf-8")
     k3_asm_ext = (K3_FUSED_DIR / "k3_fused_ext.cu").read_text(encoding="utf-8")
     k3_ext = (K3_FUSED_DIR / "k3_v3_fused_ext.cu").read_text(encoding="utf-8")
@@ -230,6 +232,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert 'm.def("k3_v3_ll_combine",' not in k3_ext
     assert "k3_v3_ll_combine_tail_split" in k3_ext
     assert "MEGAMOE_DCU_LL_K3_SPLIT_TAIL" in opt_py
+    assert 'os.getenv("MEGAMOE_DCU_LL_K3_SPLIT_TAIL", "1")' in opt_py
     assert "ll_k3_split_tail_enabled" in opt_py
     assert "ll_split_tail: bool = False" in k3_py
     assert "def _tail_reduce_enabled_for_backend" in opt_py
@@ -263,6 +266,14 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "kV3K3TailGemmExpertDoneOffset" not in k3_header
     assert "kV3K3TailCopyExpertDoneOffset" in k3_header
     assert "publish_gemm_expert_done" not in k3_header
+    assert "requires fast_math" not in opt_py
+    assert "fast_math: bool = True" in k2_py
+    assert "bool(fast_math)" in k2_py
+    assert "template <bool kFastMath>" in k2_ext
+    assert "swiglu_gate<kFastMath>" in k2_ext
+    assert "launch_swiglu_quant_channelwise_auto<true>" in k2_ext
+    assert "launch_swiglu_quant_channelwise_auto<false>" in k2_ext
+    assert 'pybind11::arg("fast_math") = true' in k2_ext
     assert "const int expected_count = (token_end - token_start) * num_topk" in k3_header
     assert "max_copy_rows <= kCopyRows" in k3_header
     assert "graph_ll_split_copy_shrink_out" not in k1_header

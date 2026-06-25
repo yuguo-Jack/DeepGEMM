@@ -28,6 +28,7 @@ def swiglu_quant_channelwise_out(
     m_per_expert: int = 0,
     active_tiles: torch.Tensor | None = None,
     active_tile_m: int = 0,
+    fast_math: bool = True,
     verbose_build: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
@@ -61,6 +62,7 @@ def swiglu_quant_channelwise_out(
         int(m_per_expert),
         active_tiles.contiguous() if active_tiles is not None else None,
         int(active_tile_m),
+        bool(fast_math),
     )
     out_scale_view = out_scale.view(1, x.shape[0])
     if output_bf16:
