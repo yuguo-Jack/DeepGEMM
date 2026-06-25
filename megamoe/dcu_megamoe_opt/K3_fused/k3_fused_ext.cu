@@ -511,7 +511,7 @@ __device__ static inline int load_signal_system_acquire(const volatile int* ptr)
 
 constexpr int kDefaultStagedBarrierSignalSlotBase = 18;
 constexpr int kSplitTailChunkSignalSlotBase = 22;
-constexpr int kSplitTailChunkSignalSlots = 4;
+constexpr int kSplitTailChunkSignalSlots = 8;
 constexpr int kSplitTailCopyExpertDoneOffset = 48;
 constexpr int kSplitTailCopyExpertDoneCount = 32;
 

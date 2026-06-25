@@ -457,7 +457,7 @@ This section supersedes the abandoned `dcu_megamoe_ll_v2` plan for current work.
 - [x] Restore and validate functional support for uniform eager, uniform graph capture256 replay, uneven eager, and uneven graph capture256 replay.
 - [x] Add source guards for the split-tail pybind, wrapper, signal slots, and single env switch.
 - [x] Confirm the current split-tail diff introduces only one new env switch, `MEGAMOE_DCU_LL_K3_SPLIT_TAIL`; no LL_V2/chunk-ready/zero-topk diagnostic env was reintroduced.
-- [x] Default enable gate: split-tail is promoted to the default LL K3 path for token buckets `<=256`; `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` remains the fallback to force fused tail.
+- [x] Default enable gate: split-tail is promoted to the default LL K3 path for token buckets `<=512`; `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` remains the fallback to force fused tail.
 
 ### Phase 17: Optimize Split Combine/Reduce Kernel
 
@@ -512,7 +512,7 @@ This section supersedes the abandoned `dcu_megamoe_ll_v2` plan for current work.
 - Working policy:
   - continue from `.planning/dcu_megamoe_v3`;
   - keep `.planning/dcu_megamoe_ll_v2` archived only;
-  - keep split-tail default-on for LL token buckets `<=256`; set `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` only for fallback/debug;
+  - keep split-tail default-on for LL token buckets `<=512`; set `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` only for fallback/debug;
   - do not add new diagnostic environment switches unless the user explicitly asks.
 - Retained K1 state:
   - keep the no-atomic peer-match / parallel uniform scan implementation;

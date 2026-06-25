@@ -110,6 +110,8 @@ static inline void launch_v3_k3_ll_split_combine_reduce(
     constexpr int kCopyRows = 16;
     constexpr int kCopyHidden = 256;
     constexpr int kChunkSlots = kV3K3TailChunkSignalSlots;
+    static_assert(kChunkSlots * kV3K3TailChunkM == 512,
+                  "LL split-tail chunk signal capacity must cover 512 tokens");
     const int local_experts =
         num_ranks > 0 ? (num_experts / num_ranks) : num_experts;
     const int hidden_tiles = hidden / kCopyHidden;
@@ -547,7 +549,7 @@ void k3_v3_ll_combine_tail_split(
     } else {
         TORCH_CHECK(num_tokens <=
                         kV3K3TailChunkSignalSlots * kV3K3TailChunkM,
-                    "V3 K3 LL split-tail eager path supports num_tokens <= 256");
+                    "V3 K3 LL split-tail eager path supports num_tokens <= 512");
     }
     const int local_experts = num_ranks > 0 ? (num_experts / num_ranks) : 0;
     TORCH_CHECK(m_indices.numel() >= local_experts,

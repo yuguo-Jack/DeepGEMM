@@ -21,7 +21,7 @@ static constexpr int kV3K1TailDoneCounterRingSlots = 16;
 static constexpr int kV3K1TailPeerReadyOffset =
     2 * kV3K1TailDoneCounterRingSlots;
 static constexpr int kV3K1TailChunkSignalSlotBase = 22;
-static constexpr int kV3K1TailChunkSignalSlots = 4;
+static constexpr int kV3K1TailChunkSignalSlots = 8;
 static constexpr int kV3K1TailCopyExpertDoneOffset =
     3 * kV3K1TailDoneCounterRingSlots;
 static constexpr int kV3K1TailCopyExpertDoneCount = 32;

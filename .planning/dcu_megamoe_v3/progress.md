@@ -9549,3 +9549,76 @@
     `V3 staged layout: single unified transposed pack5`;
   - remote normal correctness-only smoke passed and printed
     `V3 staged layout: single normal ASM plain pack5`.
+
+## 2026-06-25 - LL graph vs normal eager threshold sweep 256..512
+
+- User asked to re-check the framework LL/normal threshold around 256 because a
+  fixed threshold may be imprecise.
+- Before the run, all 8 HCUs were checked clean: 0% VRAM and 0% HCU.
+- Sweep output:
+  `/workspace/DeepGEMM/hygon_tmp/debug/threshold_ll_graph_normal_eager_20260625_134518`.
+- Method:
+  - LL graph: capture256 replay256 for the 256 boundary bucket, and capture512
+    replay `256,272,...,512` for the 256-512 region;
+  - normal eager: capacity512 with runtime tokens `256,272,...,512`;
+  - shape: EP8, experts=256, topk=6, hidden=4096, intermediate=2048,
+    warmup=5, repeat=10.
+- Result:
+  - LL graph wins through 352 tokens;
+  - 368 is essentially the crossover: LL graph `1.695239 ms`, normal eager
+    `1.691820 ms`;
+  - from 384 upward, normal eager is clearly faster, reaching about 22.6%
+    faster at 512.
+- Current threshold recommendation from this sweep:
+  - use LL graph for `<=352` if the framework can select at this granularity;
+  - use normal eager for `>=368`;
+  - if the selector must remain coarse and conservative, 352 is a better
+    boundary than 256 for this measured shape.
+- Correctness follow-up:
+  - LL graph sweep used baseline comparison for all graph replay token points;
+    max_abs was `0.000244141` for capture256 replay256 and `0.000488281`
+    for every capture512 replay point;
+  - normal eager performance sweep used `correctness_iters=0`, so spot
+    correctness-only checks were added for 352, 368, and 512 tokens;
+  - all three normal spot checks passed with max_abs `0.000488281`.
+- After the run, all 8 HCUs were again checked clean: 0% VRAM and 0% HCU.
+
+## 2026-06-25 - Extend LL K3 split-tail gate from 256 to 512
+
+- Motivation:
+  - the previous 256->272 graph timing jump came from 256 using split-tail while
+    capture512 replay used fused-tail because split-tail was gated to `<=256`;
+  - historical split-tail data already suggested 512-token LL has room versus
+    fused-tail.
+- Code changes:
+  - raised `K_LL_SPLIT_TAIL_MAX_TOKENS` from 256 to 512;
+  - expanded K1/K3 split-tail chunk-ready signal slots from 4 to 8 while keeping
+    `chunk_m=64`, so runtime capacity becomes `8 * 64 = 512`;
+  - updated K1 start-path signal reset, K3 split combine/reduce waits/publishes,
+    and the standalone rank-barrier reset helper to clear all 8 chunk slots;
+  - added source guards for the 512 gate and 8-slot contract.
+- Validation:
+  - remote HCU check before testing: 8 cards at 0% VRAM / 0% HCU;
+  - rebuild passed with `DG_FORCE_BUILD=1 MAX_JOBS=8 python3 setup.py build_ext --inplace`;
+  - source guard passed: `9 passed in 6.77s`;
+  - LL split-tail eager correctness passed for 272 and 512 tokens:
+    max_abs `0.000244141` / `0.000488281`;
+  - LL split-tail graph capture512 correctness passed for replay
+    256,272,352,512 with max_abs `0.000488281`.
+- Performance:
+  - new split-tail graph cap512 output:
+    `hygon_tmp/debug/splittail512_ll_graph_cap512_bench.json`;
+  - comparison CSV:
+    `hygon_tmp/debug/splittail512_ll_graph_cap512_compare.csv`;
+  - versus old LL fused graph cap512, split-tail is faster at every
+    256..512 step by about 17.4% to 28.6%;
+  - versus the prior normal eager sweep, split-tail graph wins through 496
+    tokens; at 512, normal eager is only about 1.4% faster in this run
+    (`1.760519 ms` split graph vs `1.735479 ms` normal eager).
+- Current routing recommendation from this run:
+  - the kernel split-tail support can safely cover LL buckets up to 512;
+  - if framework threshold can be arbitrary, `<=496` is the strict measured
+    LL-graph win point versus normal eager;
+  - if using a coarse bucket threshold, `512` is defensible for graph/decode
+    because it removes the 256->272 fused-tail jump and is much faster than LL
+    fused-tail, but exact 512 should be watched in framework-level traces.

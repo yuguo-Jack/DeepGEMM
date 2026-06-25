@@ -187,13 +187,13 @@ buffers are introduced for the first timed call.
 
 By default K3 uses an integrated tail-reduce path for staged execution, so it
 avoids the separate `rank_barrier + reduce` tail that can show large latency
-swings.  For LL token buckets `<=256`, the default K3 path is split-tail:
+swings.  For LL token buckets `<=512`, the default K3 path is split-tail:
 the first kernel runs local K3 group GEMM without peer communication, and the
 second kernel performs peer combine plus local reduce with chunk-ready signals
 and a copy-done fallback for graph-capture sparse/padded rows.  Set
 `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` to force the older LL fused-tail branch for
-fallback/debug.  The split-tail gate is LL-only and still refuses larger token
-buckets, so 4096-token prefill-style normal work should continue to use the
+fallback/debug.  The split-tail gate is LL-only and still refuses token buckets
+larger than 512, so 4096-token prefill-style normal work should continue to use the
 normal backend selected by the framework.
 
 `K3_USE_ASM_TAIL_REDUCE=1` remains the default for the normal backend and uses
@@ -309,7 +309,7 @@ python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
 ```
 
 The staged graph bucket supports the same K3 modes as eager execution.  LL graph
-buckets `<=256` use split-tail by default unless
+buckets `<=512` use split-tail by default unless
 `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0`; larger LL graph buckets and normal graph
 buckets use their fused/integrated K3 tail path.  The captured K3 path consumes
 K1's device-side active-tile count plus the graph runtime token scalar where
@@ -321,7 +321,7 @@ per-expert statistics across variable-token requests.
 Host-side tuning knobs for the staged path do not add device kernels:
 
 - `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0|1` controls only the LL K3 tail branch for
-  token buckets `<=256`.  The default is `1`.
+  token buckets `<=512`.  The default is `1`.
 - `K2_SKIP_INACTIVE_ROWS_MIN_TOKENS` controls when eager K2 consumes K1's
   `row_combine_ptrs` validity metadata. The default is 1536, so larger token
   counts skip inactive-row activation work while smaller token counts keep the

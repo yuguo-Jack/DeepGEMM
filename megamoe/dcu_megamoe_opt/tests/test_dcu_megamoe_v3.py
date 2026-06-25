@@ -234,6 +234,11 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "MEGAMOE_DCU_LL_K3_SPLIT_TAIL" in opt_py
     assert 'os.getenv("MEGAMOE_DCU_LL_K3_SPLIT_TAIL", "1")' in opt_py
     assert "ll_k3_split_tail_enabled" in opt_py
+    assert "K_LL_SPLIT_TAIL_MAX_TOKENS = 512" in opt_py
+    assert "kV3K1TailChunkSignalSlots = 8" in k1_header
+    assert "kV3K3TailChunkSignalSlots = 8" in k3_header
+    assert "kSplitTailChunkSignalSlots = 8" in k3_asm_ext
+    assert "LL split-tail chunk signal capacity must cover 512 tokens" in k3_ext
     assert "ll_split_tail: bool = False" in k3_py
     assert "def _tail_reduce_enabled_for_backend" in opt_py
     assert "if v3_backend == V3_BACKEND_LL:\n        return True" in opt_py
