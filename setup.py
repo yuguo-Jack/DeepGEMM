@@ -79,7 +79,7 @@ else:
     ]
     build_libraries = ['cudart', 'nvrtc']
     build_library_dirs = [f'{CUDA_HOME}/lib64']
-third_party_include_dirs = [
+third_party_include_dirs = [] if IS_HIP_EXTENSION else [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
 ]
