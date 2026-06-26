@@ -328,6 +328,115 @@ Host-side tuning knobs for the staged path do not add device kernels:
   leaner K2 launch path. Graph replay always passes row metadata so inactive
   capture rows can early-return under variable runtime token counts.
 
+#### DeepEP LL masked baseline test environment
+
+`megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` supports two baseline
+flows plus an auto selector:
+
+- `--baseline-kind auto` is the default.  It selects `ll-masked` when
+  `--megamoe-backend` resolves to LL, and `normal-contiguous` when the backend
+  resolves to normal.
+- `--baseline-kind normal-contiguous` is the DeepEP normal dispatch plus
+  contiguous DeepGEMM baseline.
+- `--baseline-kind ll-masked` uses DeepEP low-latency dispatch plus DeepGEMM
+  masked grouped GEMM.  This baseline always captures and replays its own CUDA
+  graph, independent of whether the MegaMoE side passes `--cuda-graph`.
+
+When the resolved MegaMoE backend is LL, the test includes BF16 input
+channelwise FP8 quantization in the MegaMoE timed path for a fair comparison
+with DeepEP LL dispatch.  This uses `megamoe.cast_to_fp8_channelwise_out(...)`,
+which calls `lightop.op.per_token_quant_fp8` and writes directly into
+`sym_buffer.x` and `sym_buffer.x_sf`; no extra FP8/scale copy is needed after
+the cast.  The normal backend keeps the historical pre-quantized test timing
+path, so normal-vs-normal regression numbers stay comparable with earlier
+reports.
+
+The `ll-masked` baseline requires the same ROCSHMEM/DUSHMEM low-latency
+environment as DeepEP LL.  The exact HCA names and topology file are
+node-specific; the topology file should describe the HCA PCI devices, not GPU
+PCI devices.  Reuse the topology file from a known-good DeepEP LL framework run
+if one exists.  Otherwise, choose the active HCA list first and generate a
+topology file from `/sys/class/infiniband/<dev>/device`, for example:
+
+```bash
+export ROCSHMEM_ALLOWED_IBV_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3
+mkdir -p /workspace/DeepGEMM/hygon_tmp/deepep_topo
+TOPO=/workspace/DeepGEMM/hygon_tmp/deepep_topo/topo.config
+: > "${TOPO}"
+for dev in mlx5_0 mlx5_1 mlx5_2 mlx5_3; do
+  bdf=$(basename "$(readlink -f "/sys/class/infiniband/${dev}/device")")
+  idx=${dev#mlx5_}
+  echo "${bdf} ${dev} ${idx}" >> "${TOPO}"
+done
+export ROCSHMEM_TOPO_FILE_FORCE="${TOPO}"
+```
+
+With `ROCSHMEM_ALLOWED_IBV_DEVICES` and `ROCSHMEM_TOPO_FILE_FORCE` set by the
+node topology step above, the remaining minimal environment for the
+`ll-masked` baseline is:
+
+```bash
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTHONPATH=/workspace/DeepGEMM:${PYTHONPATH:-}
+
+# DeepEP LL / ROCSHMEM baseline.  Heap size must be larger than
+# deep_ep.Buffer.get_low_latency_rdma_size_hint(...); 10 GiB covers the 512
+# graph-capacity validation bucket.
+export DEEPEP_ENABLE_LL_DISPATCH_OPT=1
+export ROCSHMEM_DISABLE_HDP_FLUSH=1
+export ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX=288
+export ROCSHMEM_MAX_NUM_CONTEXTS=48
+export ROCSHMEM_HEAP_SIZE=10737418240
+export DUSHMEM_HEAP_SIZE=10737418240
+```
+
+The LL fair-timing path also requires the `lightop` package used by the
+framework path to provide `lightop.op.per_token_quant_fp8`.
+
+Avoid setting `DEEP_EP_DEVICE_TO_HCA_MAPPING` or `DUSHMEM_IB_GID_INDEX` unless
+the node requires them and the values have been verified; wrong HCA or GID
+settings can make DeepEP LL fail during QP setup.  The `ll-masked` baseline
+uses DeepEP LL dispatch with FP8 E4M3 and per-token/row scale
+(`quant_type=2`, `quant_group_size=0`, `fp8_round_scale=False`), matching the
+MegaMoE W8A8 test fixture's channelwise input scale granularity.  Its masked
+DeepGEMM weights use the masked Marlin layout exported as
+`megamoe.weight8bit_nt_kpack2_marlin_masked(...)`; this layout is not
+interchangeable with the normal/contiguous
+`megamoe.weight8bit_nt_kpack2_marlin(...)` layout.
+
+The masked Marlin layout is sensitive to the installed DCU `deepgemm` package.
+The `ll-masked` baseline was validated on the following package fingerprint
+inside the `sglang_megamoe` container:
+
+- `deepgemm` metadata version: `2.1.0+das.dtk2604.cb50a46`
+- `deepgemm/version.py`: `version='2.1.0'`, `git_hash='cb50a46'`,
+  `git_branch='develop'`, `dtk='2604'`, `torch_version='2.9'`
+- `/usr/local/lib/python3.10/dist-packages/deepgemm/m_group_gemm_nt_masked.py`
+  sha256: `de6c1b2a3688b38ad3cc42cba05698f7dcecb6382f74c5aee54a73c646de5345`
+- `/usr/local/lib/python3.10/dist-packages/deepgemm/op.cpython-310-x86_64-linux-gnu.so`
+  sha256: `0e8ea450cc99919bdcde619db02d63a926111b50125085e928097c53c39ecfef`
+
+If any of these change, rerun the standalone masked layout probe before trusting
+`--baseline-kind ll-masked`, because DCU DeepGEMM masked weight layouts have
+changed across internal builds.
+
+Example `ll-masked` baseline graph run:
+
+```bash
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
+  --num-processes 8 \
+  --num-max-tokens-per-rank 512 \
+  --num-tokens 128 \
+  --hidden 4096 \
+  --intermediate-hidden 2048 \
+  --num-experts 256 \
+  --num-topk 6 \
+  --megamoe-backend ll \
+  --cuda-graph \
+  --cuda-graph-test-tokens 128 \
+  --cuda-graph-bench
+```
+
 ### Validate
 
 Run the DSV4-Flash correctness and performance check:

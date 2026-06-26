@@ -9622,3 +9622,171 @@
   - if using a coarse bucket threshold, `512` is defensible for graph/decode
     because it removes the 256->272 fused-tail jump and is much faster than LL
     fused-tail, but exact 512 should be watched in framework-level traces.
+
+## 2026-06-26 - Add DeepEP LL masked DeepGEMM comparison baseline
+
+- User asked for a second baseline in `test_mega_moe_dcu.py` based on the
+  SGLang DeepEP LL flow plus DeepGEMM masked groupgemm.
+- Reference points checked:
+  - SGLang `DeepEPDispatcher` low-latency path calls
+    `low_latency_dispatch(..., quant_type=2)` and returns masked-layout FP8
+    hidden states, scales, `masked_m`, and `expected_m`;
+  - SGLang DeepGEMM runner consumes that masked layout with
+    `grouped_gemm_nt_f8f8bf16_masked`;
+  - local DCU masked DeepGEMM tests use the Marlin/kpack weight layout and
+    `[E, M, 1]` / `[E, N, 1]` scale tensors.
+- Code update:
+  - added `--baseline-kind normal-contiguous/ll-masked`;
+  - default `normal-contiguous` baseline remains the existing DeepEP normal +
+    contiguous DeepGEMM flow;
+  - `ll-masked` creates an independent DeepEP low-latency buffer and always
+    uses a captured/replayed baseline CUDA graph, independent of whether
+    MegaMoE itself is run eagerly or with `--cuda-graph`;
+  - the `ll-masked` graph capacity reuses
+    `sym_buffer.cuda_graph_max_tokens_per_rank`, matching the MegaMoE graph
+    capacity contract;
+  - graph correctness compares output `y` only; cumulative local expert stats
+    are checked separately in the eager correctness loop with a test-side
+    all-gather/topk routing oracle, so stats validation does not add graph
+    outputs or graph-side synchronization;
+  - inside that baseline graph it runs
+    `DeepEP LL dispatch -> DeepGEMM masked L1 -> K2 SwiGLU FP8 quant ->
+    DeepGEMM masked L2 -> DeepEP LL combine`;
+  - MegaMoE backend selection is not restricted by the baseline kind, so the
+    user can compare LL or normal MegaMoE against the same LL masked baseline;
+  - CUDA graph bucket checking now captures a separate baseline graph for
+    `ll-masked` and reports baseline graph replay timing alongside MegaMoE
+    graph replay timing.
+- Local verification:
+  - `python -m py_compile megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py`
+    passed;
+  - `git diff --check -- megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py`
+    passed.
+- Remote validation on `sglang_megamoe`:
+  - initial failures were environment/setup issues, not masked GEMM:
+    the DeepEP LL buffer needed `ROCSHMEM_HEAP_SIZE` larger than the
+    requested RDMA allocation, and the generic README `mlx5_2..9` topology
+    did not match this node;
+  - the working DeepEP LL environment reuses the old framework topology file
+    `/workspace/DeepGEMM/hygon_tmp/sglang_debug/deepep_topo/topo_11_4hca.config`
+    with `ROCSHMEM_ALLOWED_IBV_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3`,
+    `ROCSHMEM_DISABLE_HDP_FLUSH=1`, `ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX=288`,
+    `ROCSHMEM_MAX_NUM_CONTEXTS=48`, and enough heap for the selected graph cap;
+  - graph/eager normal-contiguous regression checks still pass:
+    LL 128-token correctness max_abs `0.000244141`, normal 512-token
+    correctness max_abs `0.000488281`, and source guard `9 passed`;
+  - `ll-masked` now runs end-to-end with the old 4-HCA topo.
+- Masked weight-layout fix:
+  - `ll-masked` must use the SGLang/DeepEP decode masked Marlin layout
+    (`weight8bit_nt_kpack2_marlin1` style), now exported as
+    `megamoe.weight8bit_nt_kpack2_marlin_masked`;
+  - the normal/contiguous `weight8bit_nt_kpack2_marlin` layout and the
+    historical `hygon_tmp/dcu_deepgemm_test` `marlin2` layout are not
+    interchangeable for `deepgemm.m_grouped_fp8_gemm_nt_masked`;
+  - after switching the baseline weights to the masked layout, strict default
+    `--atol=0.0035` passes again.
+- Remote LL masked baseline performance, EP8 shape
+  experts=256/topk=6/hidden=4096/intermediate=2048, unified weights:
+  - cap128 token128 graph: MegaMoE replay `0.7398 ms`,
+    baseline replay `0.8606 ms`, MegaMoE `1.16x`;
+  - cap512 token128 graph: MegaMoE replay `0.7380 ms`,
+    baseline replay `1.2384 ms`, MegaMoE `1.69x`;
+  - cap512 token256 graph: MegaMoE replay `1.0743 ms`,
+    baseline replay `1.4049 ms`, MegaMoE `1.31x`;
+  - cap512 token512 graph: MegaMoE replay `1.7540 ms`,
+    baseline replay `2.0927 ms`, MegaMoE `1.19x`;
+  - eager MegaMoE versus graph baseline at cap128/token128:
+    MegaMoE `0.7468 ms`, baseline `0.8626 ms`, MegaMoE `1.16x`.
+- Result directories:
+  - `hygon_tmp/debug/ll_masked_baseline_20260626_120944` for graph cap128;
+  - `hygon_tmp/debug/ll_masked_baseline_20260626_121054` for graph cap512
+    token128;
+  - `hygon_tmp/debug/ll_masked_baseline_matrix_20260626_121209` for graph
+    token256/token512.
+  - `hygon_tmp/debug/ll_masked_marlin1_fix_20260626_143126` for the strict
+    correctness fix validation;
+  - `hygon_tmp/debug/ll_masked_marlin1_regress_20260626_143243` for normal
+    baseline regression plus fixed ll-masked graph128 timing.
+
+## 2026-06-26 - LL masked baseline precision investigation update
+
+- The earlier caveat that attributed `ll-masked` mismatch mainly to DeepEP LL
+  dispatch-side FP8 quantization is superseded by deeper probes and the final
+  masked weight-layout fix.
+- Evidence gathered:
+  - DeepEP LL dispatch quantization versus MegaMoE external channelwise
+    quantization has matching scales and small dequant differences
+    (`ll_dispatch_quant_probe.py`: scale diff `0`, dequant max about `0.0084`);
+  - forcing BF16 LL dispatch then quantizing packed rows outside DeepEP still
+    leaves the full `ll-masked` mismatch, so DeepEP LL quantization is not the
+    primary source;
+  - DeepEP LL combine semantics match a direct route-weight oracle within about
+    `0.0011`, so combine/handle ordering is not the large-error source;
+  - the error appears already at the first masked L1 GEMM:
+    `masked_gemm_l1_accuracy_probe.py` measured max_abs about `1.29` and
+    mean_abs about `0.184` versus a local PyTorch matmul reference;
+  - replacing MegaMoE Marlin pack with the historical DCU masked-test
+    `weight8bit_nt_kpack2_marlin2` did not improve L1 accuracy;
+  - using runtime-derived `expected_m` versus capacity-derived `expected_m`
+    also did not improve L1 accuracy.
+- Root-cause conclusion:
+  - the installed DCU `deepgemm.m_grouped_fp8_gemm_nt_masked` kernel is correct
+    for this flow when paired with the masked Marlin layout used by SGLang
+    decode (`marlin1` style);
+  - the failing standalone probes were using the wrong weight layout:
+    `megamoe.weight8bit_nt_kpack2_marlin` and the historical
+    `weight8bit_nt_kpack2_marlin2` both produce max_abs around `1.17..1.29`,
+    while `weight8bit_nt_kpack2_marlin_masked` produces standalone L1 max_abs
+    about `0.00195`;
+  - the lower wrapper `m_grouped_fp8_gemm_nt_masked_impl` is still stale
+    against the op signature, so tests should call the public
+    `m_grouped_fp8_gemm_nt_masked` wrapper.
+- Validation after fix:
+  - ll-masked strict correctness token64/cap512 passed with max_abs
+    `0.00204468`, mean_abs `4.12e-05`, and graph bucket max_abs
+    `0.000244141`;
+  - normal-contiguous regression token64 still passed with max_abs
+    `0.000244141`;
+  - ll-masked graph128/cap512 passed strict correctness with max_abs
+    `0.00204468`; MegaMoE graph replay averaged `0.7405 ms`, fixed
+    ll-masked baseline graph replay averaged `1.2387 ms`.
+
+## 2026-06-26 - Auto baseline and LL fair input quantization
+
+- User requested the comparison baseline to follow the tested MegaMoE backend:
+  - LL backend should default to the DeepEP LL + masked DeepGEMM baseline;
+  - normal backend should default to the existing normal dispatch +
+    contiguous DeepGEMM baseline.
+- Code changes:
+  - added `--baseline-kind auto` as the default in
+    `test_mega_moe_dcu.py`;
+  - `auto` resolves to `ll-masked` for LL MegaMoE and
+    `normal-contiguous` for normal MegaMoE;
+  - added `megamoe.cast_to_fp8_channelwise_out(...)`, an out-form input
+    quantization helper that calls `lightop.op.per_token_quant_fp8`;
+  - when the resolved MegaMoE backend is LL, the test now quantizes BF16 input
+    directly into `sym_buffer.x` and `sym_buffer.x_sf` inside the fused timed
+    path, matching the framework style and avoiding an extra FP8/scale copy;
+  - normal backend timing keeps the historical pre-quantized test path for
+    comparability.
+- Validation:
+  - local `py_compile` passed for `megamoe/__init__.py` and both DCU test
+    files;
+  - local `git diff --check` passed for the modified source files;
+  - remote HCU checks before and after GPU tests showed no KFD PIDs;
+  - remote source guard passed: `9 passed`;
+  - LL auto correctness, graph cap512 replay128:
+    `baseline_kind_resolved=ll-masked`,
+    `fused_input_quant_in_timed_path=True`, eager max_abs `0.000488281`,
+    graph max_abs `0.000259399`;
+  - normal auto correctness token512:
+    `baseline_kind_resolved=normal-contiguous`,
+    `fused_input_quant_in_timed_path=False`, max_abs `0.000488281`.
+- Performance with LL input quant included in graph replay:
+  - output: `hygon_tmp/debug/ll_auto_baseline_quant_20260626/ll_cap512_graph_bench.json`;
+  - cap512 replay128: MegaMoE graph `0.7495 ms`, ll-masked baseline graph
+    `1.2382 ms`;
+  - cap512 replay512: MegaMoE graph `1.7527 ms`, ll-masked baseline graph
+    `2.0997 ms`;
+  - eager token128 benchmark in the same run: MegaMoE `0.7388 ms`, baseline
+    `1.2419 ms`, `1.68x` speedup.

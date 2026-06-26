@@ -40,6 +40,9 @@ from megamoe.dcu_megamoe_opt.K2_fused.k2_fused import swiglu_quant_channelwise_o
 
 
 UNIFIED_WEIGHT_LAYOUT_ENV = "MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT"
+BASELINE_AUTO = "auto"
+BASELINE_NORMAL_CONTIGUOUS = "normal-contiguous"
+BASELINE_LL_MASKED = "ll-masked"
 
 
 def env_flag_enabled(name: str) -> bool:
@@ -49,6 +52,15 @@ def env_flag_enabled(name: str) -> bool:
 def print_once(rank: int, msg: str = ""):
     if rank == 0:
         print(msg, flush=True)
+
+
+def baseline_kind_description(kind: str, prepost_backend: str) -> str:
+    if kind == BASELINE_LL_MASKED:
+        return "deepep_ll_dispatch_deepgemm_masked_k2_swiglu_quant_deepep_ll_combine_channelwise"
+    return (
+        f"deepep_dispatch_{prepost_backend}_scatter_deepgemm_k2_swiglu_quant_"
+        f"{prepost_backend}_gather_deepep_combine_channelwise"
+    )
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -93,6 +105,16 @@ def unpack_recv_x_fp8_channelwise(recv_x):
     else:
         recv_x_fp8, recv_x_scale = megamoe.cast_to_fp8_channelwise(recv_x)
     return recv_x_fp8.contiguous(), recv_x_scale.contiguous()
+
+
+def cast_input_for_test_baseline(x: torch.Tensor):
+    fp8 = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    scale = torch.empty((x.size(0),), dtype=torch.float32, device=x.device)
+    try:
+        megamoe.cast_to_fp8_channelwise_out(x, fp8, scale)
+    except RuntimeError:
+        return megamoe.cast_to_fp8_channelwise(x)
+    return fp8, scale
 
 
 def counts_to_gpu_and_total(recv_counts, recv_counts_cuda, device, recv_topk_idx):
@@ -142,6 +164,103 @@ def dispatch_deepep_normal(
         except TypeError:
             dispatch_deepep_normal.supports_alignment = False
     return ep_buffer.dispatch(payload, **kwargs)
+
+
+def create_deepep_low_latency_buffer(
+    group,
+    num_max_tokens_per_rank: int,
+    hidden: int,
+    num_ranks: int,
+    num_experts: int,
+    num_experts_per_rank: int,
+):
+    rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
+        num_max_tokens_per_rank,
+        hidden,
+        num_ranks,
+        num_experts,
+    )
+    try:
+        buffer = deep_ep.Buffer(
+            group,
+            num_rdma_bytes=rdma_bytes,
+            low_latency_mode=True,
+            num_qps_per_rank=num_experts_per_rank,
+            allow_mnnvl=True,
+            explicitly_destroy=True,
+        )
+    except TypeError:
+        buffer = deep_ep.Buffer(
+            group,
+            num_rdma_bytes=rdma_bytes,
+            low_latency_mode=True,
+            num_qps_per_rank=num_experts_per_rank,
+            explicitly_destroy=True,
+        )
+    if hasattr(buffer, "clean_low_latency_buffer"):
+        buffer.clean_low_latency_buffer(
+            num_max_tokens_per_rank,
+            hidden,
+            num_experts,
+        )
+    return buffer
+
+
+def wait_deepep_event(event, hook=None):
+    if hook is not None:
+        hook()
+    elif hasattr(event, "current_stream_wait") and getattr(event, "event", None) is not None:
+        event.current_stream_wait()
+
+
+def as_masked_deepgemm_scale(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dim() == 2:
+        return scale.unsqueeze(-1).contiguous()
+    return scale.contiguous()
+
+
+def as_masked_deepgemm_weights(weights: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    weight, scale = weights
+    return weight, as_masked_deepgemm_scale(scale)
+
+
+def deepgemm_masked_fp8_gemm(
+    a: tuple[torch.Tensor, torch.Tensor],
+    weights: tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+    if getattr(deepgemm_masked_fp8_gemm, "needs_overlap_arg", False):
+        deepgemm.m_grouped_fp8_gemm_nt_masked(
+            a,
+            weights,
+            out,
+            masked_m,
+            expected_m,
+            False,
+            signal=None,
+        )
+        return
+    try:
+        deepgemm.m_grouped_fp8_gemm_nt_masked(
+            a,
+            weights,
+            out,
+            masked_m,
+            expected_m,
+        )
+    except TypeError:
+        deepgemm_masked_fp8_gemm.needs_overlap_arg = True
+        deepgemm.m_grouped_fp8_gemm_nt_masked(
+            a,
+            weights,
+            out,
+            masked_m,
+            expected_m,
+            False,
+            signal=None,
+        )
 
 
 def deepep_deepgemm_preprocess_channelwise(
@@ -337,6 +456,158 @@ def run_deepgemm_megamoe_baseline(
     }
 
 
+def run_deepep_ll_deepgemm_masked_baseline(
+    ep_buffer,
+    x_bf16,
+    x_fp8,
+    x_scale,
+    topk_idx,
+    topk_weights,
+    l1_weights,
+    l2_weights,
+    num_max_tokens_per_rank: int,
+    _expected_tokens_per_rank: int,
+    num_ranks: int,
+    num_experts: int,
+    num_experts_per_rank: int,
+    num_topk: int,
+    intermediate_hidden: int,
+    hidden: int,
+    activation_clamp: float | None,
+    fast_math: bool,
+    out: torch.Tensor | None = None,
+    return_stats: bool = False,
+):
+    topk_idx_i64 = topk_idx.to(torch.int64).contiguous()
+    topk_weights = topk_weights.contiguous()
+    dispatch_quantization = "inside_deepep_ll"
+    if hasattr(ep_buffer, "low_latency_dispatch_fp8"):
+        packed_recv_hidden, masked_m, handle, event, hook = ep_buffer.low_latency_dispatch_fp8(
+            x_fp8.contiguous(),
+            x_scale.view(-1, 1).contiguous(),
+            topk_idx_i64,
+            num_max_tokens_per_rank,
+            num_experts,
+            async_finish=False,
+            return_recv_hook=False,
+        )
+        dispatch_quantization = "prequantized_fp8"
+    else:
+        # Current DeepEP LL only accepts BF16 input and performs FP8 casting in
+        # low_latency_dispatch. The normal DeepEP dispatch path supports
+        # prequantized tuples, but LL does not expose that API in current builds.
+        packed_recv_hidden, masked_m, handle, event, hook = ep_buffer.low_latency_dispatch(
+            x_bf16.contiguous(),
+            topk_idx_i64,
+            num_max_tokens_per_rank,
+            num_experts,
+            quant_type=2,
+            quant_group_size=0,
+            fp8_round_scale=False,
+            async_finish=False,
+            return_recv_hook=False,
+        )
+    wait_deepep_event(event)
+    if not isinstance(packed_recv_hidden, tuple):
+        raise RuntimeError("DeepEP LL baseline expects FP8 low_latency_dispatch output")
+
+    recv_x_fp8, recv_x_scale = packed_recv_hidden
+    recv_x_fp8 = recv_x_fp8.contiguous()
+    recv_x_scale = as_masked_deepgemm_scale(recv_x_scale)
+    masked_m = masked_m.to(device=x_bf16.device, dtype=torch.int32, non_blocking=True).contiguous()
+
+    num_groups, m_per_expert, _ = recv_x_fp8.shape
+    runtime_tokens_for_expected = int(x_bf16.shape[0])
+    expected_m = max(
+        1,
+        (runtime_tokens_for_expected * int(num_ranks) * int(num_topk) + int(num_experts))
+        // int(num_experts),
+    )
+
+    l1_out = torch.empty(
+        (num_groups, m_per_expert, intermediate_hidden * 2),
+        device=x_bf16.device,
+        dtype=torch.bfloat16,
+    )
+    deepgemm_masked_fp8_gemm(
+        (recv_x_fp8, recv_x_scale),
+        as_masked_deepgemm_weights(l1_weights),
+        l1_out,
+        masked_m,
+        expected_m,
+    )
+
+    flat_l1 = l1_out.view(num_groups * m_per_expert, intermediate_hidden * 2)
+    flat_l2_fp8 = torch.empty(
+        (num_groups * m_per_expert, intermediate_hidden),
+        device=x_bf16.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    flat_l2_scale = torch.empty(
+        (num_groups * m_per_expert,),
+        device=x_bf16.device,
+        dtype=torch.float32,
+    )
+    dummy_l2_bf16 = torch.empty(
+        (num_groups * m_per_expert, intermediate_hidden),
+        device=x_bf16.device,
+        dtype=torch.bfloat16,
+    )
+    swiglu_quant_channelwise_out(
+        flat_l1,
+        None,
+        flat_l2_fp8,
+        flat_l2_scale,
+        dummy_l2_bf16,
+        num_per_channels=intermediate_hidden,
+        output_bf16=False,
+        clamp_value=activation_clamp,
+        row_combine_ptrs=None,
+        actual_m=masked_m,
+        m_per_expert=m_per_expert,
+        fast_math=fast_math,
+    )
+
+    l2_out = torch.empty(
+        (num_groups, m_per_expert, hidden),
+        device=x_bf16.device,
+        dtype=torch.bfloat16,
+    )
+    deepgemm_masked_fp8_gemm(
+        (
+            flat_l2_fp8.view(num_groups, m_per_expert, intermediate_hidden),
+            flat_l2_scale.view(num_groups, m_per_expert, 1).contiguous(),
+        ),
+        as_masked_deepgemm_weights(l2_weights),
+        l2_out,
+        masked_m,
+        expected_m,
+    )
+
+    combine_kwargs = dict(
+        x=l2_out,
+        topk_idx=topk_idx_i64,
+        topk_weights=topk_weights,
+        handle=handle,
+        zero_copy=False,
+        async_finish=False,
+        return_recv_hook=False,
+    )
+    if out is not None:
+        combine_kwargs["out"] = out
+    y_baseline, event, hook = ep_buffer.low_latency_combine(**combine_kwargs)
+    wait_deepep_event(event)
+
+    stats = masked_m[:num_experts_per_rank].contiguous() if return_stats else None
+    return y_baseline, stats, {
+        "valid_m": int(topk_idx.numel()),
+        "recv_rows": int(num_groups * m_per_expert),
+        "grouped_rows": int(num_groups * m_per_expert),
+        "expected_m": expected_m,
+        "dispatch_quantization": dispatch_quantization,
+    }
+
+
 def bench_tilelang_ms(fn, warmup: int, repeat: int, backend: str = TILELANG_BENCH_BACKEND) -> dict[str, float]:
     median_ms = tilelang_bench(
         fn,
@@ -453,6 +724,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     backend_mode = v3_backend_mode(args.megamoe_backend)
     v3_backend = select_v3_backend(backend_selector_tokens, backend_mode)
+    baseline_kind = (
+        BASELINE_LL_MASKED
+        if args.baseline_kind == BASELINE_AUTO and v3_backend == "ll"
+        else (
+            BASELINE_NORMAL_CONTIGUOUS
+            if args.baseline_kind == BASELINE_AUTO
+            else args.baseline_kind
+        )
+    )
     weight_layout = (
         "unified"
         if env_flag_enabled(UNIFIED_WEIGHT_LAYOUT_ENV)
@@ -474,24 +754,45 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         hidden,
         intermediate_hidden,
     )
-    needs_deepep_baseline = (
-        args.correctness_iters > 0
-        or not args.skip_bench
-        or (
-            args.cuda_graph
-            and not args.cuda_graph_skip_baseline
+    ll_masked_baseline = baseline_kind == BASELINE_LL_MASKED
+    fused_quantizes_input = v3_backend == "ll"
+    ll_baseline_capacity_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
+    if ll_masked_baseline and num_tokens > ll_baseline_capacity_tokens:
+        raise ValueError(
+            "--baseline-kind ll-masked uses the MegaMoE graph capacity; "
+            f"num_tokens={num_tokens} exceeds capacity={ll_baseline_capacity_tokens}"
         )
-    )
+    if ll_masked_baseline:
+        needs_deepep_baseline = True
+    else:
+        needs_deepep_baseline = (
+            args.correctness_iters > 0
+            or not args.skip_bench
+            or (
+                args.cuda_graph
+                and not args.cuda_graph_skip_baseline
+            )
+        )
     ep_buffer = None
     ep_config = None
     if needs_deepep_baseline:
-        ep_buffer = deep_ep.Buffer(
-            group,
-            DEEPEP_BUFFER_BYTES,
-            0,
-            explicitly_destroy=True,
-        )
-        ep_config = deep_ep.Config(*DEEPEP_CONFIG)
+        if ll_masked_baseline:
+            ep_buffer = create_deepep_low_latency_buffer(
+                group,
+                ll_baseline_capacity_tokens,
+                hidden,
+                num_ranks,
+                num_experts,
+                num_experts_per_rank,
+            )
+        else:
+            ep_buffer = deep_ep.Buffer(
+                group,
+                DEEPEP_BUFFER_BYTES,
+                0,
+                explicitly_destroy=True,
+            )
+            ep_config = deep_ep.Config(*DEEPEP_CONFIG)
 
     x_bf16 = (torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * args.input_scale)
     l1_bf16 = (
@@ -506,13 +807,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
     topk_weights = torch.softmax(topk_weights.float(), dim=-1)
 
-    x_fp8, x_scale = megamoe.cast_to_fp8_channelwise(x_bf16)
-    baseline_l1_weights, baseline_l2_weights = megamoe.transform_fp8_weights_for_mega_moe(
-        l1_bf16,
-        l2_bf16,
-    )
+    x_fp8, x_scale = cast_input_for_test_baseline(x_bf16)
     l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
     l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
+    if ll_masked_baseline:
+        baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l1_fp8), l1_scale)
+        baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l2_fp8), l2_scale)
+    else:
+        baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin(l1_fp8), l1_scale)
+        baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin(l2_fp8), l2_scale)
     if weight_layout == "normal":
         fused_l1_weights = {
             "normal": (megamoe.flatten_pack5_weight_asm_normal(l1_fp8), l1_scale),
@@ -536,8 +839,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     baseline_layout_cache = None
 
     def copy_inputs_to_sym_buffer():
-        sym_buffer.x[:num_tokens].copy_(x_fp8)
-        sym_buffer.x_sf[:num_tokens].copy_(x_scale)
+        if fused_quantizes_input:
+            megamoe.cast_to_fp8_channelwise_out(
+                x_bf16,
+                sym_buffer.x[:num_tokens],
+                sym_buffer.x_sf[:num_tokens],
+            )
+        else:
+            sym_buffer.x[:num_tokens].copy_(x_fp8)
+            sym_buffer.x_sf[:num_tokens].copy_(x_scale)
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
         sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
@@ -560,6 +870,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     def get_baseline_layout_cache():
         nonlocal baseline_layout_cache
+        if baseline_kind != BASELINE_NORMAL_CONTIGUOUS:
+            return None
         if baseline_layout_cache is None:
             layout_result = ep_buffer.get_dispatch_layout(topk_idx, num_experts)
             if len(layout_result) != 5:
@@ -570,15 +882,49 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             baseline_layout_cache = (num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank)
         return baseline_layout_cache
 
-    def run_baseline(return_stats: bool):
-        layout_cache = get_baseline_layout_cache()
-        baseline_y, baseline_counts, meta = run_deepgemm_megamoe_baseline(
+    def run_selected_baseline(
+        x_bf16_arg,
+        x_fp8_arg,
+        x_scale_arg,
+        topk_idx_arg,
+        topk_weights_arg,
+        expected_tokens_per_rank: int,
+        return_stats: bool,
+        out: torch.Tensor | None = None,
+        use_layout_cache: bool = True,
+    ):
+        if baseline_kind == BASELINE_LL_MASKED:
+            return run_deepep_ll_deepgemm_masked_baseline(
+                ep_buffer,
+                x_bf16_arg,
+                x_fp8_arg,
+                x_scale_arg,
+                topk_idx_arg,
+                topk_weights_arg,
+                baseline_l1_weights,
+                baseline_l2_weights,
+                ll_baseline_capacity_tokens,
+                expected_tokens_per_rank,
+                num_ranks,
+                num_experts,
+                num_experts_per_rank,
+                num_topk,
+                intermediate_hidden,
+                hidden,
+                args.activation_clamp,
+                bool(args.fast_math),
+                out=out,
+                return_stats=return_stats,
+            )
+
+        layout_cache = get_baseline_layout_cache() if use_layout_cache else None
+        return run_deepgemm_megamoe_baseline(
             ep_buffer,
             ep_config,
-            x_fp8,
-            x_scale,
-            topk_idx,
-            topk_weights,
+            x_fp8_arg,
+            x_scale_arg,
+            topk_idx_arg,
+            topk_weights_arg,
             baseline_l1_weights,
             baseline_l2_weights,
             num_experts,
@@ -590,6 +936,113 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             args.prepost_backend,
             layout_cache=layout_cache,
             return_stats=return_stats,
+        )
+
+    expected_local_counts_cache = None
+
+    def get_expected_local_counts_eager():
+        nonlocal expected_local_counts_cache
+        if expected_local_counts_cache is not None:
+            return expected_local_counts_cache
+        gathered_topk = uneven_all_gather_topk_idx(topk_idx, group=group)
+        local_begin = rank * num_experts_per_rank
+        local_end = local_begin + num_experts_per_rank
+        local_mask = (gathered_topk >= local_begin) & (gathered_topk < local_end)
+        local_ids = (gathered_topk[local_mask] - local_begin).to(torch.int64)
+        counts = torch.bincount(local_ids, minlength=num_experts_per_rank).to(torch.int32)
+        expected_local_counts_cache = counts.contiguous()
+        return expected_local_counts_cache
+
+    ll_baseline_graph_cache = {}
+
+    def clean_ll_baseline_buffer():
+        if ll_masked_baseline and hasattr(ep_buffer, "clean_low_latency_buffer"):
+            ep_buffer.clean_low_latency_buffer(
+                ll_baseline_capacity_tokens,
+                hidden,
+                num_experts,
+            )
+
+    def get_ll_masked_baseline_graph(
+        cache_name: str,
+        token_count: int,
+        local_token_count: int,
+        baseline_x_bf16,
+        baseline_x_fp8,
+        baseline_x_scale,
+        baseline_topk_idx,
+        baseline_topk_weights,
+    ):
+        key = (cache_name, int(token_count), int(local_token_count))
+        cached = ll_baseline_graph_cache.get(key)
+        if cached is not None:
+            return cached
+
+        baseline_graph_y = torch.empty(
+            (local_token_count, hidden),
+            device=baseline_x_bf16.device,
+            dtype=torch.bfloat16,
+        )
+
+        def run_baseline_graph_once():
+            run_selected_baseline(
+                baseline_x_bf16[:local_token_count],
+                baseline_x_fp8[:local_token_count],
+                baseline_x_scale[:local_token_count],
+                baseline_topk_idx[:local_token_count],
+                baseline_topk_weights[:local_token_count],
+                token_count,
+                return_stats=False,
+                out=baseline_graph_y,
+            )
+
+        clean_ll_baseline_buffer()
+        torch.cuda.synchronize()
+        for _ in range(args.cuda_graph_warmup):
+            run_baseline_graph_once()
+        torch.cuda.synchronize()
+
+        clean_ll_baseline_buffer()
+        torch.cuda.synchronize()
+        baseline_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(baseline_graph):
+            run_baseline_graph_once()
+        cached = (baseline_graph, baseline_graph_y)
+        ll_baseline_graph_cache[key] = cached
+        return cached
+
+    def run_baseline(return_stats: bool):
+        if ll_masked_baseline:
+            baseline_graph, baseline_y = get_ll_masked_baseline_graph(
+                "main",
+                backend_selector_tokens,
+                num_tokens,
+                x_bf16,
+                x_fp8,
+                x_scale,
+                topk_idx,
+                topk_weights,
+            )
+            baseline_graph.replay()
+            baseline_stats = (
+                stats_initial + get_expected_local_counts_eager()
+                if return_stats
+                else None
+            )
+            return baseline_y, baseline_stats, {
+                "valid_m": int(topk_idx.numel()),
+                "recv_rows": int(num_tokens),
+                "grouped_rows": int(num_tokens),
+                "baseline_graph": True,
+            }
+        baseline_y, baseline_counts, meta = run_selected_baseline(
+            x_bf16,
+            x_fp8,
+            x_scale,
+            topk_idx,
+            topk_weights,
+            backend_selector_tokens,
+            return_stats,
         )
         baseline_stats = stats_initial + baseline_counts if baseline_counts is not None else None
         return baseline_y, baseline_stats, meta
@@ -615,7 +1068,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             graph_scores, num_topk, dim=-1, largest=True, sorted=False
         )
         graph_topk_weights = torch.softmax(graph_topk_weights.float(), dim=-1)
-        graph_x_fp8, graph_x_scale = megamoe.cast_to_fp8_channelwise(graph_x_bf16)
+        graph_x_fp8, graph_x_scale = cast_input_for_test_baseline(graph_x_bf16)
         y_graph = torch.empty((capture_tokens, hidden), dtype=torch.bfloat16, device="cuda")
 
         def local_graph_token_count(token_count: int) -> int:
@@ -631,13 +1084,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         def fill_graph_inputs(token_count: int) -> int:
             local_token_count = local_graph_token_count(token_count)
             sym_buffer.cuda_graph_num_tokens.fill_(local_token_count)
-            sym_buffer.x[:local_token_count].copy_(graph_x_fp8[:local_token_count])
-            sym_buffer.x_sf[:local_token_count].copy_(graph_x_scale[:local_token_count])
+            if not fused_quantizes_input:
+                sym_buffer.x[:local_token_count].copy_(graph_x_fp8[:local_token_count])
+                sym_buffer.x_sf[:local_token_count].copy_(graph_x_scale[:local_token_count])
             sym_buffer.topk_idx[:local_token_count].copy_(graph_topk_idx[:local_token_count])
             sym_buffer.topk_weights[:local_token_count].copy_(graph_topk_weights[:local_token_count])
             return local_token_count
 
         def run_graph_bucket_once():
+            if fused_quantizes_input:
+                megamoe.cast_to_fp8_channelwise_out(
+                    graph_x_bf16,
+                    sym_buffer.x[:capture_tokens],
+                    sym_buffer.x_sf[:capture_tokens],
+                )
             megamoe.fp8_w8a8_mega_moe(
                 y_graph,
                 fused_l1_weights,
@@ -677,25 +1137,31 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     f"replays={args.cuda_graph_replays}, baseline_skipped=True",
                 )
                 continue
-            baseline_y, _, _ = run_deepgemm_megamoe_baseline(
-                ep_buffer,
-                ep_config,
-                graph_x_fp8[:local_token],
-                graph_x_scale[:local_token],
-                graph_topk_idx[:local_token],
-                graph_topk_weights[:local_token],
-                baseline_l1_weights,
-                baseline_l2_weights,
-                num_experts,
-                num_experts_per_rank,
-                intermediate_hidden,
-                hidden,
-                args.activation_clamp,
-                DEEPEP_EXPERT_ALIGNMENT,
-                args.prepost_backend,
-                layout_cache=None,
-                return_stats=False,
-            )
+            if baseline_kind == BASELINE_LL_MASKED:
+                baseline_graph, baseline_y = get_ll_masked_baseline_graph(
+                    "graph_bucket",
+                    token,
+                    local_token,
+                    graph_x_bf16,
+                    graph_x_fp8,
+                    graph_x_scale,
+                    graph_topk_idx,
+                    graph_topk_weights,
+                )
+                for _ in range(args.cuda_graph_replays):
+                    baseline_graph.replay()
+                torch.cuda.synchronize()
+            else:
+                baseline_y, _, _ = run_selected_baseline(
+                    graph_x_bf16[:local_token],
+                    graph_x_fp8[:local_token],
+                    graph_x_scale[:local_token],
+                    graph_topk_idx[:local_token],
+                    graph_topk_weights[:local_token],
+                    token,
+                    return_stats=False,
+                    use_layout_cache=False,
+                )
             graph_nonfinite = nonfinite_count(y_graph[:local_token])
             baseline_nonfinite = nonfinite_count(baseline_y)
             diff = (y_graph[:local_token].float() - baseline_y.float()).abs()
@@ -762,6 +1228,32 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     y_graph.device,
                     group,
                 )
+                baseline_rank_graph_metrics = None
+                baseline_graph_timing = None
+                if baseline_kind == BASELINE_LL_MASKED and not args.cuda_graph_skip_baseline:
+                    baseline_graph, _ = get_ll_masked_baseline_graph(
+                        "graph_bucket",
+                        token,
+                        local_token,
+                        graph_x_bf16,
+                        graph_x_fp8,
+                        graph_x_scale,
+                        graph_topk_idx,
+                        graph_topk_weights,
+                    )
+                    baseline_graph_timing = bench_tilelang_ms(
+                        lambda: baseline_graph.replay(),
+                        args.warmup,
+                        args.repeat,
+                    )
+                    baseline_rank_graph_metrics = gather_rank_metrics(
+                        [
+                            baseline_graph_timing["median_ms"] / 1e3,
+                            baseline_graph_timing["min_ms"] / 1e3,
+                        ],
+                        y_graph.device,
+                        group,
+                    )
                 if rank == 0:
                     graph_avg_s, graph_min_s = rank_graph_metrics.mean(dim=0).cpu().tolist()
                     graph_timing_rows.append(
@@ -773,8 +1265,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             "graph_replay_min_ms_avg_per_rank": graph_min_s * 1e3,
                             "bench_backend": f"tilelang_{graph_timing['backend']}",
                             "includes_input_update": False,
+                            "includes_input_quantization": bool(fused_quantizes_input),
                         }
                     )
+                    if baseline_rank_graph_metrics is not None:
+                        baseline_graph_avg_s, baseline_graph_min_s = (
+                            baseline_rank_graph_metrics.mean(dim=0).cpu().tolist()
+                        )
+                        graph_timing_rows[-1].update(
+                            {
+                                "baseline_graph_replay_median_ms_avg_per_rank": baseline_graph_avg_s * 1e3,
+                                "baseline_graph_replay_min_ms_avg_per_rank": baseline_graph_min_s * 1e3,
+                                "baseline_graph_kind": BASELINE_LL_MASKED,
+                                "baseline_graph_bench_backend": f"tilelang_{baseline_graph_timing['backend']}",
+                            }
+                        )
                     print_once(
                         rank,
                         f"CUDA graph bucket bench token={token}/{capture_tokens}: "
@@ -790,10 +1295,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     print_once(rank, f" > hidden={hidden}, intermediate={intermediate_hidden}")
     print_once(rank, f" > experts={num_experts}, topk={num_topk}, local_experts={num_experts_per_rank}")
     print_once(rank, f" > scale modes=input/weight/l2_act channelwise fp32")
-    print_once(rank, f" > baseline preprocess={args.prepost_backend} SGLang DeepEP normal ep_scatter/ep_gather style")
+    baseline_desc = baseline_kind_description(baseline_kind, args.prepost_backend)
+    print_once(rank, f" > baseline={baseline_desc} (kind={baseline_kind}, requested={args.baseline_kind})")
+    print_once(rank, f" > fused_input_quant_in_timed_path={fused_quantizes_input}")
     print_once(rank, " > router weights=CUDA MegaMoE compatible SwiGLU-pre-L2-quant")
     print_once(rank, f" > sym_buffer={sym_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
     print_once(rank, f" > route_scratch={sym_buffer.route_scratch.nbytes / 2 ** 30:.3f} GiB")
+
+    if ll_masked_baseline and (args.correctness_iters > 0 or not args.skip_bench):
+        get_ll_masked_baseline_graph(
+            "main",
+            backend_selector_tokens,
+            num_tokens,
+            x_bf16,
+            x_fp8,
+            x_scale,
+            topk_idx,
+            topk_weights,
+        )
 
     for i in range(args.correctness_iters):
         fused_y, fused_stats = run_fused(reset_stats=True)
@@ -807,6 +1326,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         diff_nonfinite = nonfinite_count(diff)
         max_abs = diff.max().item() if diff.numel() else 0.0
         mean_abs = diff.mean().item() if diff.numel() else 0.0
+        if baseline_stats is None:
+            raise AssertionError("baseline stats missing in correctness check")
         stats_ok = torch.equal(fused_stats, baseline_stats)
         if fused_nonfinite or baseline_nonfinite or diff_nonfinite:
             raise AssertionError(
@@ -846,7 +1367,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "num_experts": num_experts,
                 "num_topk": num_topk,
                 "prepost_backend": args.prepost_backend,
+                "baseline_kind": baseline_desc,
+                "baseline_kind_resolved": baseline_kind,
+                "baseline_kind_requested": args.baseline_kind,
                 "fused_execution": fused_execution,
+                "fused_input_quant_in_timed_path": bool(fused_quantizes_input),
                 "correctness_iters": args.correctness_iters,
                 "atol": args.atol,
                 "cuda_graph_timings": cuda_graph_timing_rows,
@@ -954,8 +1479,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "fused_min_ms_avg_per_rank": avg_fused_min_s * 1e3,
             "baseline_median_ms_avg_per_rank": avg_baseline_s * 1e3,
             "baseline_min_ms_avg_per_rank": avg_baseline_min_s * 1e3,
-            "baseline_kind": f"deepep_dispatch_{args.prepost_backend}_scatter_deepgemm_k2_swiglu_quant_{args.prepost_backend}_gather_deepep_combine_channelwise",
+            "baseline_kind": baseline_desc,
+            "baseline_kind_resolved": baseline_kind,
+            "baseline_kind_requested": args.baseline_kind,
             "fused_execution": fused_execution,
+            "fused_input_quant_in_timed_path": bool(fused_quantizes_input),
             "bench_backend": f"tilelang_{fused_timing['backend']}",
             "router_weight_stage": "swiglu_pre_l2_quant",
             "cuda_graph_timings": cuda_graph_timing_rows,
@@ -1025,6 +1553,16 @@ def parse_args():
     parser.add_argument("--input-scale", type=float, default=0.05)
     parser.add_argument("--weight-scale", type=float, default=0.05)
     parser.add_argument("--prepost-backend", choices=("hip", "triton"), default="hip")
+    parser.add_argument(
+        "--baseline-kind",
+        choices=(BASELINE_AUTO, BASELINE_NORMAL_CONTIGUOUS, BASELINE_LL_MASKED),
+        default=BASELINE_AUTO,
+        help=(
+            "baseline flow: auto selects ll-masked for LL MegaMoE and "
+            "normal-contiguous for normal MegaMoE; explicit values keep the "
+            "previous comparison modes"
+        ),
+    )
     parser.add_argument("--correctness-iters", type=int, default=1)
     parser.add_argument("--atol", type=float, default=0.0035)
     parser.add_argument("--warmup", type=int, default=5)

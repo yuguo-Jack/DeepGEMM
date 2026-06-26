@@ -84,12 +84,77 @@ def _is_current_stream_capturing() -> bool:
     return bool(checker()) if checker is not None else False
 
 
+_LIGHTOP_PER_TOKEN_QUANT_FP8: Optional[Any] = None
+
+
+def _get_lightop_per_token_quant_fp8():
+    global _LIGHTOP_PER_TOKEN_QUANT_FP8
+    if _LIGHTOP_PER_TOKEN_QUANT_FP8 is not None:
+        return _LIGHTOP_PER_TOKEN_QUANT_FP8
+    try:
+        from lightop import op as lightop_op
+    except Exception as exc:
+        raise RuntimeError(
+            "DCU W8A8 MegaMoE requires lightop.op.per_token_quant_fp8 "
+            "for fused channelwise input quantization"
+        ) from exc
+    quant = getattr(lightop_op, "per_token_quant_fp8", None)
+    if quant is None:
+        raise RuntimeError(
+            "DCU W8A8 MegaMoE requires lightop.op.per_token_quant_fp8 "
+            "for fused channelwise input quantization"
+        )
+    _LIGHTOP_PER_TOKEN_QUANT_FP8 = quant
+    return _LIGHTOP_PER_TOKEN_QUANT_FP8
+
+
 def cast_to_fp8_channelwise(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError("channelwise FP8 cast expects a 2D tensor")
     scale = x.abs().float().amax(dim=1).clamp(min=1.0e-4) / 448.0
     fp8 = (x.float() / scale.view(-1, 1)).to(torch.float8_e4m3fn)
     return fp8.contiguous(), scale.float().contiguous()
+
+
+def cast_to_fp8_channelwise_out(
+    x: torch.Tensor,
+    out_fp8: torch.Tensor,
+    out_scale: torch.Tensor,
+    *,
+    allow_torch_fallback: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize BF16 activations directly into preallocated output buffers."""
+    if x.dim() != 2:
+        raise ValueError("channelwise FP8 cast expects a 2D tensor")
+    if out_fp8.dim() != 2:
+        raise ValueError("out_fp8 must be a 2D tensor")
+    rows, hidden = x.shape
+    if out_fp8.size(0) < rows or out_fp8.size(1) != hidden:
+        raise ValueError("out_fp8 must have shape [>=rows, hidden]")
+    if out_scale.numel() < rows:
+        raise ValueError("out_scale must have at least one scale per row")
+
+    out_fp8_view = out_fp8[:rows, :hidden]
+    if not out_fp8_view.is_contiguous():
+        raise ValueError("out_fp8 slice must be contiguous")
+    if not out_scale.is_contiguous():
+        raise ValueError("out_scale must be contiguous")
+    out_scale_view = out_scale.view(-1)[:rows]
+    if rows == 0:
+        return out_fp8_view, out_scale_view
+    try:
+        quant = _get_lightop_per_token_quant_fp8()
+    except RuntimeError:
+        if not allow_torch_fallback:
+            raise
+        fp8, scale = cast_to_fp8_channelwise(x)
+        out_fp8_view.copy_(fp8)
+        out_scale_view.copy_(scale)
+        return out_fp8_view, out_scale_view
+
+    quant_input = x if x.is_contiguous() else x.contiguous()
+    quant(out_fp8_view, quant_input, out_scale_view)
+    return out_fp8_view, out_scale_view
 
 
 def cast_grouped_weight_to_fp8_channelwise(
@@ -131,6 +196,55 @@ def weight8bit_nt_kpack2_marlin(
         .permute(0, 1, 3, 2, 4)
         .contiguous()
         .reshape(num_groups, rows // n_tile, k * n_tile)
+    )
+
+
+def weight8bit_nt_kpack2_marlin_masked(
+    weight: torch.Tensor,
+    k_tile: int = 16,
+    k_tile_group: int = 4,
+    n_tile: int = 16,
+    n_tile_group: int = 16,
+) -> torch.Tensor:
+    if weight.dim() not in (2, 3):
+        raise ValueError("masked Marlin weight layout expects a 2D or 3D weight tensor")
+    if k_tile != 16 or k_tile_group != 4 or n_tile != 16 or n_tile_group != 16:
+        raise ValueError("DCU masked DeepGEMM currently supports only 16x4 by 16x16 kpack2 tiles")
+
+    if weight.dim() == 2:
+        rows, k = weight.shape
+        if rows % (n_tile * n_tile_group) != 0 or k % (k_tile * k_tile_group) != 0:
+            raise ValueError("masked Marlin weights require rows divisible by 256 and K divisible by 64")
+        return (
+            weight.reshape(
+                rows // (n_tile * n_tile_group),
+                n_tile_group,
+                n_tile,
+                k // (k_tile * k_tile_group),
+                k_tile_group,
+                k_tile,
+            )
+            .permute(0, 3, 1, 4, 2, 5)
+            .contiguous()
+            .reshape(rows // k_tile, k * k_tile)
+        )
+
+    num_groups, rows, k = weight.shape
+    if rows % (n_tile * n_tile_group) != 0 or k % (k_tile * k_tile_group) != 0:
+        raise ValueError("masked Marlin weights require rows divisible by 256 and K divisible by 64")
+    return (
+        weight.reshape(
+            num_groups,
+            rows // (n_tile * n_tile_group),
+            n_tile_group,
+            n_tile,
+            k // (k_tile * k_tile_group),
+            k_tile_group,
+            k_tile,
+        )
+        .permute(0, 1, 4, 2, 5, 3, 6)
+        .contiguous()
+        .reshape(num_groups, rows // k_tile, k * k_tile)
     )
 
 
@@ -365,6 +479,18 @@ def transform_fp8_weights_for_mega_moe(
     )
 
 
+def transform_fp8_weights_for_masked_deepgemm(
+    l1_weights: torch.Tensor,
+    l2_weights: torch.Tensor,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    l1_fp8, l1_scale = cast_grouped_weight_to_fp8_channelwise(l1_weights)
+    l2_fp8, l2_scale = cast_grouped_weight_to_fp8_channelwise(l2_weights)
+    return (
+        (weight8bit_nt_kpack2_marlin_masked(l1_fp8), l1_scale),
+        (weight8bit_nt_kpack2_marlin_masked(l2_fp8), l2_scale),
+    )
+
+
 def _select_v3_weight_layout(weights: Any, backend: str):
     if isinstance(weights, dict):
         key = "unified" if "unified" in weights else backend
@@ -528,11 +654,14 @@ except Exception:
 __all__ = [
     "SymmBuffer",
     "cast_to_fp8_channelwise",
+    "cast_to_fp8_channelwise_out",
     "cast_grouped_weight_to_fp8_channelwise",
     "weight8bit_nt_kpack2_marlin",
+    "weight8bit_nt_kpack2_marlin_masked",
     "get_mega_moe_hip_build_config",
     "get_symm_buffer_for_mega_moe",
     "transform_fp8_weights_for_mega_moe",
+    "transform_fp8_weights_for_masked_deepgemm",
     "flatten_pack5_weight",
     "flatten_pack5_weight_asm_normal",
     "deepep_deepgemm_preprocess_channelwise",

@@ -369,9 +369,17 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "from .dcu_megamoe_opt.v3_layout import" in api_source
     assert "flatten_pack5_weight" in api_source
     assert "flatten_pack5_weight_asm_normal" in api_source
+    assert "cast_to_fp8_channelwise_out" in api_source
+    assert "lightop.op.per_token_quant_fp8" in api_source
+    assert "weight8bit_nt_kpack2_marlin_masked" in api_source
     assert "from megamoe.dcu_megamoe_opt import v3_layout" not in test_source
     assert "megamoe.flatten_pack5_weight_asm_normal" in test_source
     assert "megamoe.flatten_pack5_weight(l" in test_source
+    assert "megamoe.weight8bit_nt_kpack2_marlin_masked" in test_source
+    assert 'BASELINE_AUTO = "auto"' in test_source
+    assert 'default=BASELINE_AUTO' in test_source
+    assert "fused_input_quant_in_timed_path" in test_source
+    assert "megamoe.cast_to_fp8_channelwise_out(" in test_source
     assert "dispatch_num_tokens: Optional[int] = None" not in api_source
     assert "ll_cuda_graph" not in api_source
     assert "normal_cuda_graph" not in api_source
