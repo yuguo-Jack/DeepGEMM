@@ -14,6 +14,9 @@ V3_LAYOUT_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "v3_layout.py"
 OPT_PATH = ROOT / "megamoe" / "opt.py"
 SETUP_PATH = ROOT / "setup.py"
 MEGA_DCU_API_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "csrc" / "apis" / "mega_dcu.hpp"
+MEGA_DCU_KERNEL_PATH = (
+    ROOT / "megamoe" / "dcu_megamoe_opt" / "csrc" / "kernels" / "mega_moe_baseline_hip.cu"
+)
 K1_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_opt" / "K1_fused"
 K2_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_opt" / "K2_fused"
 K3_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_opt" / "K3_fused"
@@ -40,10 +43,10 @@ def test_v3_backend_auto_policy(monkeypatch):
 
     assert config.BACKEND_ENV == "MEGAMOE_DCU_BACKEND"
     assert config.NORMAL_LL_TOKEN_THRESHOLD_ENV == "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
-    assert config.DEFAULT_NORMAL_LL_TOKEN_THRESHOLD == 256
-    for tokens in (0, 1, 8, 32, 128, 256):
+    assert config.DEFAULT_NORMAL_LL_TOKEN_THRESHOLD == 512
+    for tokens in (0, 1, 8, 32, 128, 256, 512):
         assert config.select_v3_backend(tokens) == "ll"
-    for tokens in (257, 512, 1024, 4096, 8192):
+    for tokens in (513, 1024, 4096, 8192):
         assert config.select_v3_backend(tokens) == "normal"
     assert config.v3_backend_mode("auto") == "auto"
     assert config.v3_backend_mode("ll") == "ll"
@@ -358,6 +361,7 @@ def test_v3_normal_graph_runtime_work_is_limited_without_d2h():
 def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     api_source = (ROOT / "megamoe" / "__init__.py").read_text(encoding="utf-8")
     c_api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
+    c_kernel_source = MEGA_DCU_KERNEL_PATH.read_text(encoding="utf-8")
     test_source = (
         ROOT / "megamoe" / "dcu_megamoe_opt" / "tests" / "test_mega_moe_dcu.py"
     ).read_text(encoding="utf-8")
@@ -369,8 +373,16 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "from .dcu_megamoe_opt.v3_layout import" in api_source
     assert "flatten_pack5_weight" in api_source
     assert "flatten_pack5_weight_asm_normal" in api_source
-    assert "cast_to_fp8_channelwise_out" in api_source
-    assert "lightop.op.per_token_quant_fp8" in api_source
+    assert "pre_dispatch_fp8_channelwise_out" in api_source
+    assert "pre_dispatch_fp8_channelwise_out" in c_api_source
+    assert "mega_moe_pre_dispatch_fp8_channelwise_kernel" in c_kernel_source
+    assert "stage_topk_route<TopkIdxI64, TopkWeightsBf16>" in c_kernel_source
+    assert "mega_moe_pre_dispatch_fp8_channelwise_vec16_4096_kernel" in c_kernel_source
+    assert "mega_moe_pre_dispatch_fp8_channelwise_wave4_4096_kernel" in c_kernel_source
+    assert "dim3((rows + 3) / 4)" in c_kernel_source
+    assert "__builtin_hcu_cvt_pk_fp8_f32" in c_kernel_source
+    assert "__builtin_hcu_cvt_f32_bf16" in c_kernel_source
+    assert "lightop" not in api_source
     assert "weight8bit_nt_kpack2_marlin_masked" in api_source
     assert "from megamoe.dcu_megamoe_opt import v3_layout" not in test_source
     assert "megamoe.flatten_pack5_weight_asm_normal" in test_source
@@ -378,8 +390,27 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "megamoe.weight8bit_nt_kpack2_marlin_masked" in test_source
     assert 'BASELINE_AUTO = "auto"' in test_source
     assert 'default=BASELINE_AUTO' in test_source
-    assert "fused_input_quant_in_timed_path" in test_source
-    assert "megamoe.cast_to_fp8_channelwise_out(" in test_source
+    assert "fused_quantizes_input" not in test_source
+    assert "fused_input_quant_in_timed_path" not in test_source
+    assert "includes_input_quantization" not in test_source
+    assert "megamoe.pre_dispatch_fp8_channelwise_out(" in test_source
+    assert "normal_baseline_predispatch_buffers = {}" in test_source
+    assert "\n    baseline_predispatch_buffers = {}" not in test_source
+    assert "cast_input_for_test_baseline" not in test_source
+    assert 'hasattr(ep_buffer, "low_latency_dispatch_fp8")' not in test_source
+    assert "dispatch_quantization" not in test_source
+    assert "low_latency_dispatch_fp8" not in test_source
+    assert "ep_buffer.low_latency_dispatch(" in test_source
+    assert "quant_type=2" in test_source
+    assert "quant_group_size=0" in test_source
+    assert "fp8_round_scale=False" in test_source
+    assert "normal_baseline_graph_cache" not in test_source
+    assert "def get_ll_masked_baseline_graph(" in test_source
+    assert "if baseline_kind == BASELINE_LL_MASKED and not args.cuda_graph_skip_baseline" in test_source
+    assert '"baseline_graph_kind": BASELINE_LL_MASKED' in test_source
+    assert '"baseline_graph_kind": BASELINE_NORMAL_CONTIGUOUS' not in test_source
+    assert "run_selected_baseline(\n                    graph_x_bf16[:local_token]" in test_source
+    assert "use_layout_cache=False" in test_source
     assert "dispatch_num_tokens: Optional[int] = None" not in api_source
     assert "ll_cuda_graph" not in api_source
     assert "normal_cuda_graph" not in api_source
@@ -402,6 +433,7 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
 
     assert "--megamoe-backend" in test_source
     assert "--cuda-graph" in test_source
+    assert "--opt-3stage" not in test_source
     assert "--ll-cuda-graph" not in test_source
     assert "--normal-cuda-graph" not in test_source
     assert "--big-fused-cuda-graph" not in test_source

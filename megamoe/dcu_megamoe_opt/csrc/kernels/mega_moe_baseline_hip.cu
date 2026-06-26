@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -32,6 +33,357 @@ __device__ static inline float bf16_bits_to_float(const uint16_t x) {
 #else
     return __uint_as_float(static_cast<uint32_t>(x) << 16);
 #endif
+}
+
+__device__ static inline float wave_shuffle_down_float(const float value, const int lane_delta) {
+    const int32_t remote = __builtin_amdgcn_ds_bpermute(
+        (__lane_id() + lane_delta) << 2,
+        __builtin_bit_cast(int32_t, value));
+    return __builtin_bit_cast(float, remote);
+}
+
+__device__ static inline float wave_broadcast_lane0_float(const float value) {
+    const int32_t lane0 = __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int32_t, value));
+    return __builtin_bit_cast(float, lane0);
+}
+
+__device__ static inline float wave_reduce_max_64(float value) {
+#pragma unroll
+    for (int offset = 32; offset > 0; offset >>= 1)
+        value = fmaxf(value, wave_shuffle_down_float(value, offset));
+    return wave_broadcast_lane0_float(value);
+}
+
+__device__ static inline float clip_fp8_e4m3fn(const float x) {
+    return fminf(448.0f, fmaxf(-448.0f, x));
+}
+
+__device__ static inline uint32_t pack2_fp8_e4m3fn(const float x0, const float x1) {
+#if defined(__gfx938__) || defined(__gfx94__) || defined(__gfx12__)
+    uint32_t packed = 0;
+    packed = __builtin_hcu_cvt_pk_fp8_f32(
+        clip_fp8_e4m3fn(x0), clip_fp8_e4m3fn(x1), packed, false);
+    return packed & 0xffffu;
+#else
+    return 0u;
+#endif
+}
+
+__device__ static inline uint32_t pack4_fp8_e4m3fn(
+    const float x0,
+    const float x1,
+    const float x2,
+    const float x3) {
+#if defined(__gfx938__) || defined(__gfx94__) || defined(__gfx12__)
+    uint32_t packed = 0;
+    packed = __builtin_hcu_cvt_pk_fp8_f32(
+        clip_fp8_e4m3fn(x0), clip_fp8_e4m3fn(x1), packed, false);
+    packed = __builtin_hcu_cvt_pk_fp8_f32(
+        clip_fp8_e4m3fn(x2), clip_fp8_e4m3fn(x3), packed, true);
+    return packed;
+#else
+    const uint32_t lo = pack2_fp8_e4m3fn(x0, x1);
+    const uint32_t hi = pack2_fp8_e4m3fn(x2, x3);
+    return lo | (hi << 16);
+#endif
+}
+
+template <bool TopkIdxI64, bool TopkWeightsBf16>
+__device__ static inline void stage_topk_route(const void* __restrict__ topk_idx,
+                                               const void* __restrict__ topk_weights,
+                                               int64_t* __restrict__ out_topk_idx,
+                                               float* __restrict__ out_topk_weights,
+                                               const int64_t route_offset) {
+    if constexpr (TopkIdxI64) {
+        out_topk_idx[route_offset] = static_cast<const int64_t*>(topk_idx)[route_offset];
+    } else {
+        out_topk_idx[route_offset] =
+            static_cast<int64_t>(static_cast<const int*>(topk_idx)[route_offset]);
+    }
+
+    if constexpr (TopkWeightsBf16) {
+        out_topk_weights[route_offset] =
+            bf16_bits_to_float(static_cast<const uint16_t*>(topk_weights)[route_offset]);
+    } else {
+        out_topk_weights[route_offset] = static_cast<const float*>(topk_weights)[route_offset];
+    }
+}
+
+template <int Threads, bool TopkIdxI64, bool TopkWeightsBf16>
+__global__ __launch_bounds__(Threads)
+void mega_moe_pre_dispatch_fp8_channelwise_kernel(const uint16_t* __restrict__ x_bf16,
+                                                  const void* __restrict__ topk_idx,
+                                                  const void* __restrict__ topk_weights,
+                                                  uint8_t* __restrict__ out_fp8,
+                                                  float* __restrict__ out_scale,
+                                                  int64_t* __restrict__ out_topk_idx,
+                                                  float* __restrict__ out_topk_weights,
+                                                  const int rows,
+                                                  const int hidden,
+                                                  const int topk) {
+    __shared__ float wave_maxes[Threads / 64];
+    __shared__ float row_scale;
+
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows)
+        return;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int64_t x_row_offset = static_cast<int64_t>(row) * hidden;
+    const int64_t topk_row_offset = static_cast<int64_t>(row) * topk;
+
+    if (tid < topk) {
+        const int64_t route_offset = topk_row_offset + tid;
+        stage_topk_route<TopkIdxI64, TopkWeightsBf16>(
+            topk_idx, topk_weights, out_topk_idx, out_topk_weights, route_offset);
+    }
+
+    float local_max = 0.0f;
+    for (int col = tid * 8; col < hidden; col += Threads * 8) {
+        const uint64_t packed =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col);
+        const uint64_t packed_hi =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 4);
+        const float x0 = fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed)));
+        const float x1 = fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed >> 16)));
+        const float x2 = fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed >> 32)));
+        const float x3 = fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed >> 48)));
+        const float x4 = fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed_hi)));
+        const float x5 = fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed_hi >> 16)));
+        const float x6 = fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed_hi >> 32)));
+        const float x7 = fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed_hi >> 48)));
+        local_max = fmaxf(local_max,
+                          fmaxf(fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)),
+                                fmaxf(fmaxf(x4, x5), fmaxf(x6, x7))));
+    }
+
+    const float wave_max = wave_reduce_max_64(local_max);
+    if ((tid & 63) == 0)
+        wave_maxes[tid >> 6] = wave_max;
+    __syncthreads();
+
+    float block_max = tid < (Threads / 64) ? wave_maxes[tid] : 0.0f;
+    if (tid < 64)
+        block_max = wave_reduce_max_64(block_max);
+    if (tid == 0) {
+        row_scale = fmaxf(block_max, 1.0e-4f) / 448.0f;
+        out_scale[row] = row_scale;
+    }
+    __syncthreads();
+
+    const float inv_scale = 1.0f / row_scale;
+    for (int col = tid * 8; col < hidden; col += Threads * 8) {
+        const uint64_t packed =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col);
+        const uint64_t packed_hi =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 4);
+        const float x0 = bf16_bits_to_float(static_cast<uint16_t>(packed)) * inv_scale;
+        const float x1 = bf16_bits_to_float(static_cast<uint16_t>(packed >> 16)) * inv_scale;
+        const float x2 = bf16_bits_to_float(static_cast<uint16_t>(packed >> 32)) * inv_scale;
+        const float x3 = bf16_bits_to_float(static_cast<uint16_t>(packed >> 48)) * inv_scale;
+        const float x4 = bf16_bits_to_float(static_cast<uint16_t>(packed_hi)) * inv_scale;
+        const float x5 = bf16_bits_to_float(static_cast<uint16_t>(packed_hi >> 16)) * inv_scale;
+        const float x6 = bf16_bits_to_float(static_cast<uint16_t>(packed_hi >> 32)) * inv_scale;
+        const float x7 = bf16_bits_to_float(static_cast<uint16_t>(packed_hi >> 48)) * inv_scale;
+        uint32_t* out_vec = reinterpret_cast<uint32_t*>(out_fp8 + x_row_offset + col);
+        out_vec[0] = pack4_fp8_e4m3fn(x0, x1, x2, x3);
+        out_vec[1] = pack4_fp8_e4m3fn(x4, x5, x6, x7);
+    }
+}
+
+template <bool TopkIdxI64, bool TopkWeightsBf16>
+__global__ __launch_bounds__(256)
+void mega_moe_pre_dispatch_fp8_channelwise_vec16_4096_kernel(
+    const uint16_t* __restrict__ x_bf16,
+    const void* __restrict__ topk_idx,
+    const void* __restrict__ topk_weights,
+    uint8_t* __restrict__ out_fp8,
+    float* __restrict__ out_scale,
+    int64_t* __restrict__ out_topk_idx,
+    float* __restrict__ out_topk_weights,
+    const int rows,
+    const int topk) {
+    constexpr int Threads = 256;
+    constexpr int Hidden = 4096;
+    constexpr int Vec = 16;
+    __shared__ float wave_maxes[Threads / 64];
+    __shared__ float row_scale;
+
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows)
+        return;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int64_t x_row_offset = static_cast<int64_t>(row) * Hidden;
+    const int64_t topk_row_offset = static_cast<int64_t>(row) * topk;
+
+    if (tid < topk) {
+        const int64_t route_offset = topk_row_offset + tid;
+        stage_topk_route<TopkIdxI64, TopkWeightsBf16>(
+            topk_idx, topk_weights, out_topk_idx, out_topk_weights, route_offset);
+    }
+
+    const int col = tid * Vec;
+    const uint64_t packed0 =
+        *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col);
+    const uint64_t packed1 =
+        *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 4);
+    const uint64_t packed2 =
+        *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 8);
+    const uint64_t packed3 =
+        *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 12);
+
+    float values[Vec];
+    values[0] = bf16_bits_to_float(static_cast<uint16_t>(packed0));
+    values[1] = bf16_bits_to_float(static_cast<uint16_t>(packed0 >> 16));
+    values[2] = bf16_bits_to_float(static_cast<uint16_t>(packed0 >> 32));
+    values[3] = bf16_bits_to_float(static_cast<uint16_t>(packed0 >> 48));
+    values[4] = bf16_bits_to_float(static_cast<uint16_t>(packed1));
+    values[5] = bf16_bits_to_float(static_cast<uint16_t>(packed1 >> 16));
+    values[6] = bf16_bits_to_float(static_cast<uint16_t>(packed1 >> 32));
+    values[7] = bf16_bits_to_float(static_cast<uint16_t>(packed1 >> 48));
+    values[8] = bf16_bits_to_float(static_cast<uint16_t>(packed2));
+    values[9] = bf16_bits_to_float(static_cast<uint16_t>(packed2 >> 16));
+    values[10] = bf16_bits_to_float(static_cast<uint16_t>(packed2 >> 32));
+    values[11] = bf16_bits_to_float(static_cast<uint16_t>(packed2 >> 48));
+    values[12] = bf16_bits_to_float(static_cast<uint16_t>(packed3));
+    values[13] = bf16_bits_to_float(static_cast<uint16_t>(packed3 >> 16));
+    values[14] = bf16_bits_to_float(static_cast<uint16_t>(packed3 >> 32));
+    values[15] = bf16_bits_to_float(static_cast<uint16_t>(packed3 >> 48));
+
+    float local_max = 0.0f;
+#pragma unroll
+    for (int i = 0; i < Vec; ++i)
+        local_max = fmaxf(local_max, fabsf(values[i]));
+
+    const float wave_max = wave_reduce_max_64(local_max);
+    if ((tid & 63) == 0)
+        wave_maxes[tid >> 6] = wave_max;
+    __syncthreads();
+
+    float block_max = tid < (Threads / 64) ? wave_maxes[tid] : 0.0f;
+    if (tid < 64)
+        block_max = wave_reduce_max_64(block_max);
+    if (tid == 0) {
+        row_scale = fmaxf(block_max, 1.0e-4f) / 448.0f;
+        out_scale[row] = row_scale;
+    }
+    __syncthreads();
+
+    const float inv_scale = 1.0f / row_scale;
+    uint32_t* out_vec = reinterpret_cast<uint32_t*>(out_fp8 + x_row_offset + col);
+    out_vec[0] = pack4_fp8_e4m3fn(
+        values[0] * inv_scale, values[1] * inv_scale,
+        values[2] * inv_scale, values[3] * inv_scale);
+    out_vec[1] = pack4_fp8_e4m3fn(
+        values[4] * inv_scale, values[5] * inv_scale,
+        values[6] * inv_scale, values[7] * inv_scale);
+    out_vec[2] = pack4_fp8_e4m3fn(
+        values[8] * inv_scale, values[9] * inv_scale,
+        values[10] * inv_scale, values[11] * inv_scale);
+    out_vec[3] = pack4_fp8_e4m3fn(
+        values[12] * inv_scale, values[13] * inv_scale,
+        values[14] * inv_scale, values[15] * inv_scale);
+}
+
+template <bool TopkIdxI64, bool TopkWeightsBf16>
+__global__ __launch_bounds__(256)
+void mega_moe_pre_dispatch_fp8_channelwise_wave4_4096_kernel(
+    const uint16_t* __restrict__ x_bf16,
+    const void* __restrict__ topk_idx,
+    const void* __restrict__ topk_weights,
+    uint8_t* __restrict__ out_fp8,
+    float* __restrict__ out_scale,
+    int64_t* __restrict__ out_topk_idx,
+    float* __restrict__ out_topk_weights,
+    const int rows,
+    const int topk) {
+    constexpr int Hidden = 4096;
+    constexpr int Vec = 16;
+    constexpr int Wave = 64;
+    constexpr int TokensPerCta = 4;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int wave_id = tid / Wave;
+    const int lane = tid & (Wave - 1);
+    const int row = static_cast<int>(blockIdx.x) * TokensPerCta + wave_id;
+    if (row >= rows)
+        return;
+
+    const int64_t x_row_offset = static_cast<int64_t>(row) * Hidden;
+    const int64_t topk_row_offset = static_cast<int64_t>(row) * topk;
+
+    if (lane < topk) {
+        const int64_t route_offset = topk_row_offset + lane;
+        stage_topk_route<TopkIdxI64, TopkWeightsBf16>(
+            topk_idx, topk_weights, out_topk_idx, out_topk_weights, route_offset);
+    }
+
+    float local_max = 0.0f;
+    for (int col = lane * Vec; col < Hidden; col += Wave * Vec) {
+        const uint64_t packed0 =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col);
+        const uint64_t packed1 =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 4);
+        const uint64_t packed2 =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 8);
+        const uint64_t packed3 =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 12);
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed0))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed0 >> 16))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed0 >> 32))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed0 >> 48))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed1))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed1 >> 16))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed1 >> 32))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed1 >> 48))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed2))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed2 >> 16))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed2 >> 32))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed2 >> 48))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed3))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed3 >> 16))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed3 >> 32))));
+        local_max = fmaxf(local_max, fabsf(bf16_bits_to_float(static_cast<uint16_t>(packed3 >> 48))));
+    }
+
+    const float row_max = wave_reduce_max_64(local_max);
+    const float row_scale = fmaxf(row_max, 1.0e-4f) / 448.0f;
+    if (lane == 0)
+        out_scale[row] = row_scale;
+    const float inv_scale = 1.0f / row_scale;
+
+    for (int col = lane * Vec; col < Hidden; col += Wave * Vec) {
+        const uint64_t packed0 =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col);
+        const uint64_t packed1 =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 4);
+        const uint64_t packed2 =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 8);
+        const uint64_t packed3 =
+            *reinterpret_cast<const uint64_t*>(x_bf16 + x_row_offset + col + 12);
+        uint32_t* out_vec = reinterpret_cast<uint32_t*>(out_fp8 + x_row_offset + col);
+        out_vec[0] = pack4_fp8_e4m3fn(
+            bf16_bits_to_float(static_cast<uint16_t>(packed0)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed0 >> 16)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed0 >> 32)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed0 >> 48)) * inv_scale);
+        out_vec[1] = pack4_fp8_e4m3fn(
+            bf16_bits_to_float(static_cast<uint16_t>(packed1)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed1 >> 16)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed1 >> 32)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed1 >> 48)) * inv_scale);
+        out_vec[2] = pack4_fp8_e4m3fn(
+            bf16_bits_to_float(static_cast<uint16_t>(packed2)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed2 >> 16)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed2 >> 32)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed2 >> 48)) * inv_scale);
+        out_vec[3] = pack4_fp8_e4m3fn(
+            bf16_bits_to_float(static_cast<uint16_t>(packed3)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed3 >> 16)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed3 >> 32)) * inv_scale,
+            bf16_bits_to_float(static_cast<uint16_t>(packed3 >> 48)) * inv_scale);
+    }
 }
 
 __global__ void deepep_scatter_prefix_kernel(const int* num_recv_tokens_per_expert,
@@ -186,6 +538,80 @@ void launch_mega_moe_deepep_scatter_channelwise_hip(
                            hidden,
                            num_experts);
     }
+    DG_HIP_CHECK(hipGetLastError());
+}
+
+void launch_mega_moe_pre_dispatch_fp8_channelwise_hip(
+    const void* x_bf16,
+    const void* topk_idx,
+    const void* topk_weights,
+    void* out_fp8,
+    float* out_scale,
+    int64_t* out_topk_idx,
+    float* out_topk_weights,
+    const int rows,
+    const int hidden,
+    const int topk,
+    const bool topk_idx_i64,
+    const bool topk_weights_bf16) {
+    constexpr int kThreads = 256;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const dim3 grid(std::max(1, rows));
+    const dim3 block(kThreads);
+#define LAUNCH_PREDISPATCH_KERNEL(TOPK_I64, TOPK_W_BF16)                                      \
+    do {                                                                                       \
+        if (hidden == 4096) {                                                                   \
+            hipLaunchKernelGGL(                                                                \
+                (mega_moe_pre_dispatch_fp8_channelwise_wave4_4096_kernel<                     \
+                    TOPK_I64, TOPK_W_BF16>),                                                   \
+                dim3((rows + 3) / 4),                                                          \
+                block,                                                                         \
+                0,                                                                             \
+                stream,                                                                        \
+                static_cast<const uint16_t*>(x_bf16),                                          \
+                topk_idx,                                                                      \
+                topk_weights,                                                                  \
+                static_cast<uint8_t*>(out_fp8),                                                \
+                out_scale,                                                                     \
+                out_topk_idx,                                                                  \
+                out_topk_weights,                                                              \
+                rows,                                                                          \
+                topk);                                                                         \
+        } else {                                                                               \
+            hipLaunchKernelGGL(                                                                \
+                (mega_moe_pre_dispatch_fp8_channelwise_kernel<                                 \
+                    kThreads, TOPK_I64, TOPK_W_BF16>),                                         \
+                grid,                                                                          \
+                block,                                                                         \
+                0,                                                                             \
+                stream,                                                                        \
+                static_cast<const uint16_t*>(x_bf16),                                          \
+                topk_idx,                                                                      \
+                topk_weights,                                                                  \
+                static_cast<uint8_t*>(out_fp8),                                                \
+                out_scale,                                                                     \
+                out_topk_idx,                                                                  \
+                out_topk_weights,                                                              \
+                rows,                                                                          \
+                hidden,                                                                        \
+                topk);                                                                         \
+        }                                                                                      \
+    } while (0)
+
+    if (topk_idx_i64) {
+        if (topk_weights_bf16) {
+            LAUNCH_PREDISPATCH_KERNEL(true, true);
+        } else {
+            LAUNCH_PREDISPATCH_KERNEL(true, false);
+        }
+    } else {
+        if (topk_weights_bf16) {
+            LAUNCH_PREDISPATCH_KERNEL(false, true);
+        } else {
+            LAUNCH_PREDISPATCH_KERNEL(false, false);
+        }
+    }
+#undef LAUNCH_PREDISPATCH_KERNEL
     DG_HIP_CHECK(hipGetLastError());
 }
 

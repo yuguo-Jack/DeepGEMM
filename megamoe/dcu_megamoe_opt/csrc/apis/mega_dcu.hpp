@@ -66,6 +66,96 @@ void launch_mega_moe_deepep_gather_channelwise_hip(
     bool topk_ids_i64,
     bool apply_topk_weights);
 
+void launch_mega_moe_pre_dispatch_fp8_channelwise_hip(
+    const void* x_bf16,
+    const void* topk_idx,
+    const void* topk_weights,
+    void* out_fp8,
+    float* out_scale,
+    int64_t* out_topk_idx,
+    float* out_topk_weights,
+    int rows,
+    int hidden,
+    int topk,
+    bool topk_idx_i64,
+    bool topk_weights_bf16);
+
+static void pre_dispatch_fp8_channelwise_out(
+    const torch::Tensor& x,
+    const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& out_fp8,
+    const torch::Tensor& out_scale,
+    const torch::Tensor& out_topk_idx,
+    const torch::Tensor& out_topk_weights) {
+    TORCH_CHECK(x.is_cuda() && topk_idx.is_cuda() && topk_weights.is_cuda() &&
+                out_fp8.is_cuda() && out_scale.is_cuda() && out_topk_idx.is_cuda() &&
+                out_topk_weights.is_cuda(),
+                "MegaMoE pre-dispatch tensors must be CUDA/HIP tensors");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16,
+                "MegaMoE pre-dispatch currently expects BF16 input activations");
+    TORCH_CHECK(out_fp8.scalar_type() == torch::kFloat8_e4m3fn,
+                "MegaMoE pre-dispatch out_fp8 must be FP8 E4M3");
+    TORCH_CHECK(out_scale.scalar_type() == torch::kFloat32,
+                "MegaMoE pre-dispatch out_scale must be FP32");
+    TORCH_CHECK(topk_idx.scalar_type() == torch::kLong ||
+                topk_idx.scalar_type() == torch::kInt,
+                "MegaMoE pre-dispatch topk_idx must be int64 or int32");
+    TORCH_CHECK(out_topk_idx.scalar_type() == torch::kLong,
+                "MegaMoE pre-dispatch out_topk_idx must be int64");
+    TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32 ||
+                topk_weights.scalar_type() == torch::kBFloat16,
+                "MegaMoE pre-dispatch topk_weights must be FP32 or BF16");
+    TORCH_CHECK(out_topk_weights.scalar_type() == torch::kFloat32,
+                "MegaMoE pre-dispatch out_topk_weights must be FP32");
+    TORCH_CHECK(x.is_contiguous() && topk_idx.is_contiguous() &&
+                topk_weights.is_contiguous() && out_fp8.is_contiguous() &&
+                out_scale.is_contiguous() && out_topk_idx.is_contiguous() &&
+                out_topk_weights.is_contiguous(),
+                "MegaMoE pre-dispatch tensors must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "MegaMoE pre-dispatch x must be [tokens, hidden]");
+    TORCH_CHECK(topk_idx.dim() == 2 && topk_weights.dim() == 2,
+                "MegaMoE pre-dispatch topk tensors must be [tokens, topk]");
+    TORCH_CHECK(out_fp8.dim() == 2 && out_topk_idx.dim() == 2 &&
+                out_topk_weights.dim() == 2,
+                "MegaMoE pre-dispatch output tensors must be 2D");
+    TORCH_CHECK(topk_idx.sizes() == topk_weights.sizes(),
+                "MegaMoE pre-dispatch topk_idx/topk_weights shape mismatch");
+
+    const int rows = static_cast<int>(x.size(0));
+    const int hidden = static_cast<int>(x.size(1));
+    const int topk = static_cast<int>(topk_idx.size(1));
+    TORCH_CHECK(topk_idx.size(0) == rows, "MegaMoE pre-dispatch topk rows mismatch");
+    TORCH_CHECK(out_fp8.size(0) >= rows && out_fp8.size(1) == hidden,
+                "MegaMoE pre-dispatch out_fp8 shape must be [>=tokens, hidden]");
+    TORCH_CHECK(out_scale.numel() >= rows,
+                "MegaMoE pre-dispatch out_scale needs at least one value per token");
+    TORCH_CHECK(out_topk_idx.size(0) >= rows && out_topk_idx.size(1) == topk &&
+                out_topk_weights.size(0) >= rows && out_topk_weights.size(1) == topk,
+                "MegaMoE pre-dispatch output topk tensors must be [>=tokens, topk]");
+    TORCH_CHECK(hidden % 8 == 0,
+                "MegaMoE pre-dispatch hidden size must be divisible by 8");
+    TORCH_CHECK(rows >= 0 && rows <= 1 << 20,
+                "MegaMoE pre-dispatch row count is out of supported range");
+    if (rows == 0) {
+        return;
+    }
+
+    launch_mega_moe_pre_dispatch_fp8_channelwise_hip(
+        x.data_ptr(),
+        topk_idx.data_ptr(),
+        topk_weights.data_ptr(),
+        out_fp8.data_ptr(),
+        out_scale.data_ptr<float>(),
+        out_topk_idx.data_ptr<int64_t>(),
+        out_topk_weights.data_ptr<float>(),
+        rows,
+        hidden,
+        topk,
+        topk_idx.scalar_type() == torch::kLong,
+        topk_weights.scalar_type() == torch::kBFloat16);
+}
+
 using MegaMoeSymmBufferSlices = std::tuple<
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -414,6 +504,14 @@ static void register_apis(pybind11::module_& m) {
           &get_mega_moe_route_scratch_size_for_mega_moe);
     m.def("get_mega_moe_hip_build_config", &get_mega_moe_hip_build_config);
     m.def("set_mega_moe_peer_ptrs", &set_mega_moe_peer_ptrs);
+    m.def("pre_dispatch_fp8_channelwise_out", &pre_dispatch_fp8_channelwise_out,
+          pybind11::arg("x"),
+          pybind11::arg("topk_idx"),
+          pybind11::arg("topk_weights"),
+          pybind11::arg("out_fp8"),
+          pybind11::arg("out_scale"),
+          pybind11::arg("out_topk_idx"),
+          pybind11::arg("out_topk_weights"));
     m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
           pybind11::arg("sf"), pybind11::arg("mn"), pybind11::arg("k"), pybind11::arg("recipe"),
           pybind11::arg("num_groups") = std::nullopt,

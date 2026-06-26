@@ -9790,3 +9790,264 @@
     `2.0997 ms`;
   - eager token128 benchmark in the same run: MegaMoE `0.7388 ms`, baseline
     `1.2419 ms`, `1.68x` speedup.
+
+## 2026-06-26 - Fused MegaMoE LL pre-dispatch kernel bring-up
+
+- User requested removing the remaining framework-style pre-dispatch overhead
+  from the LL MegaMoE path by fusing BF16 input quantization, top-k dtype
+  staging/cast, and sym-buffer copies into a single DCU MegaMoE kernel.
+- Design decision:
+  - MegaMoE no longer depends on `lightop` for LL fair-timing input
+    quantization;
+  - new public API is `megamoe.pre_dispatch_fp8_channelwise_out(...)`;
+  - missing `_C.pre_dispatch_fp8_channelwise_out` is treated as a rebuild
+    error rather than falling back to `lightop`;
+  - graph capture uses the same fused pre-dispatch call inside the captured
+    MegaMoE graph, while replay-time host code only updates the runtime token
+    scalar.
+- Code state before remote validation:
+  - Python wrapper and `__all__` added in `megamoe/__init__.py`;
+  - pybind wrapper and dtype/shape checks added in
+    `csrc/apis/mega_dcu.hpp`;
+  - device kernel and launcher added to the hipcc-compiled
+    `csrc/kernels/mega_moe_baseline_hip.cu`;
+  - conversion main path uses gfx938 built-ins:
+    `__builtin_hcu_cvt_f32_bf16` for BF16->FP32 and
+    `__builtin_hcu_cvt_pk_fp8_f32` for FP32->FP8 packing;
+  - `test_mega_moe_dcu.py` LL eager/graph paths now stage input and top-k
+    tensors through the new fused pre-dispatch API;
+  - SGLang local framework path in `hygon_tmp/sglang/.../mega_moe.py` now
+    requires `megamoe.pre_dispatch_fp8_channelwise_out` and no longer calls
+    `lightop.op.per_token_quant_fp8`.
+- Local checks:
+  - `python -m py_compile` passed for `megamoe/__init__.py`,
+    both DCU test files, and the local SGLang `mega_moe.py`;
+  - `git diff --check` passed for the changed files;
+  - local source guard could not run because the Windows Python environment
+    does not have `pytest`; remote source guard is next.
+- Remote validation:
+  - HCU state checked before GPU tests: no KFD PIDs;
+  - remote rebuild passed with
+    `DG_FORCE_BUILD=1 MAX_JOBS=8 python3 setup.py build_ext --inplace`;
+  - source guard passed: `9 passed`;
+  - LL auto baseline graph correctness passed at cap512/replay128:
+    eager max_abs `0.000488281`, graph max_abs `0.000259399`;
+  - normal auto baseline smoke passed at token512:
+    max_abs `0.000488281` and `fused_input_quant_in_timed_path=False`.
+- Performance:
+  - result directory:
+    `/workspace/DeepGEMM/hygon_tmp/debug/fused_predispatch_vec8_bench`;
+  - LL graph cap512 replay128: MegaMoE `0.7579 ms`,
+    ll-masked baseline `1.2387 ms`;
+  - LL graph cap512 replay512: MegaMoE `1.7545 ms`,
+    ll-masked baseline `2.0964 ms`;
+  - eager token128 in the same run: MegaMoE `0.7341 ms`,
+    baseline `1.2394 ms`, `1.69x` speedup.
+- Tuning note:
+  - the first one-row/CTA pack4 version compiled and passed correctness, but
+    graph replay128 was around `0.7562 ms` and replay512 around `1.7591 ms`;
+  - retained vec8 version processes 8 BF16 values per thread per iteration,
+    keeping gfx938 built-in BF16/FP8 conversion and improving eager/token512
+    while replay128 median remains within noise.
+
+## 2026-06-26 - Test coverage tightened for pre-dispatch baseline semantics
+
+- User clarified that `normal-contiguous` baseline did not support CUDA graph
+  before and does not need CUDA graph support now.
+- Test/guard updates:
+  - renamed the normal baseline temporary tensor cache to
+    `normal_baseline_predispatch_buffers` to make clear it is only reusable
+    eager buffer storage, not a CUDA graph cache;
+  - source guard now asserts that only `ll-masked` has a baseline graph cache
+    and `baseline_graph_kind`, while normal graph-bucket correctness still
+    compares against an eager normal baseline;
+  - source guard also locks the current fair-timing contract:
+    `fused_quantizes_input = True` and both MegaMoE plus normal-contiguous
+    baseline call `megamoe.pre_dispatch_fp8_channelwise_out(...)`.
+- Validation:
+  - local `py_compile` passed for both DCU test files;
+  - remote source guard passed: `9 passed`;
+  - remote normal smoke passed after setting single-node RCCL interface
+    `NCCL_SOCKET_IFNAME=lo`:
+    `--megamoe-backend normal --baseline-kind normal-contiguous`,
+    token32/cap512, max_abs `0.000244141`,
+    `fused_input_quant_in_timed_path=True`, `cuda_graph_timings=[]`;
+  - remote LL graph smoke passed:
+    `--megamoe-backend ll --baseline-kind ll-masked --cuda-graph`,
+    token128/cap512, eager max_abs `0.000488281`,
+    graph max_abs `0.000259399`.
+
+## 2026-06-26 - Removed stale fused input switch from test metadata
+
+- `fused_quantizes_input` is no longer a real branch after MegaMoE normal and
+  LL both use `megamoe.pre_dispatch_fp8_channelwise_out(...)` in the timed
+  path.
+- Cleaned `test_mega_moe_dcu.py` to remove the stale local variable and then
+  removed the redundant output metadata fields entirely:
+  - `fused_input_quant_in_timed_path`;
+  - `includes_input_quantization`.
+- Updated source guard to assert the stale variable and redundant metadata
+  fields stay absent.
+- Validation:
+  - local `py_compile` passed for both DCU test files;
+  - local `git diff --check` passed;
+  - remote source guard passed: `9 passed`.
+
+## 2026-06-26 - Corrected LL masked baseline dispatch cleanup
+
+- User clarified the intended cleanup:
+  - remove the stale `hasattr(ep_buffer, "low_latency_dispatch_fp8")`
+    compatibility branch;
+  - remove the external standalone input pre-quantization for the LL masked
+    baseline;
+  - keep DeepEP LL baseline on BF16
+    `ep_buffer.low_latency_dispatch(..., quant_type=2, quant_group_size=0,
+    fp8_round_scale=False)`, because current DeepEP LL does not expose the
+    FP8 dispatch API in this environment.
+- Code state:
+  - `run_deepep_ll_deepgemm_masked_baseline` now accepts BF16 input and uses
+    DeepEP LL internal FP8 dispatch quantization;
+  - normal-contiguous baseline still uses
+    `megamoe.pre_dispatch_fp8_channelwise_out(...)` into reusable normal
+    baseline buffers before DeepEP normal dispatch;
+  - source guard asserts `low_latency_dispatch_fp8`, external test input
+    pre-quant helper, and stale dispatch metadata stay absent.
+- Validation:
+  - local `py_compile` and `git diff --check` passed;
+  - remote source guard passed: `9 passed`;
+  - remote LL graph smoke passed:
+    `--megamoe-backend ll --baseline-kind ll-masked --cuda-graph`,
+    token128/cap512, eager max_abs `0.000488281`,
+    graph max_abs `0.000259399`.
+
+## 2026-06-26 - LL/normal eager/graph 256/512 uniform+uneven matrix
+
+- Remote run dir:
+  `hygon_tmp/debug/ll_normal_graph_eager_256_512_20260626_173419`.
+- Setup:
+  - synced current dirty working tree files to remote and rebuilt
+    `megamoe` with `build_dcu_megamoe.sh`;
+  - source guard passed after rebuild: `9 passed`;
+  - checked HCU state before and after the run: all 8 cards idle, no leftover
+    `test_mega_moe_dcu.py` process.
+- Matrix:
+  - backends: `ll`, `normal`;
+  - modes: eager, graph;
+  - capacities/runtime tokens: 256 and 512;
+  - uneven token lists:
+    `256,129,64,32,16,7,0,0` and `512,257,128,64,32,7,0,0`;
+  - baseline kind left as `auto`: LL uses `ll-masked`, normal uses
+    `normal-contiguous`.
+- Correctness:
+  - all 16 JSON outputs report `correct=true`;
+  - max abs in logs stayed within current tolerance, with representative graph
+    checks at `0.000244141` to `0.000488281`.
+- Key per-card median latencies, ms:
+
+| Backend | Mode | Tokens | Shape | MegaMoE | Graph replay | Baseline | Speedup |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: |
+| LL | eager | 256 | uniform | 1.0769 | - | 1.1314 | 1.05x |
+| LL | eager | 256 | uneven | 0.7617 | - | 1.0306 | 1.35x |
+| LL | eager | 512 | uniform | 1.7706 | - | 2.0957 | 1.18x |
+| LL | eager | 512 | uneven | 0.9197 | - | 1.4946 | 1.63x |
+| LL | graph | 256 | uniform | 1.0733 | 1.0850 | 1.1327 | 1.06x |
+| LL | graph | 256 | uneven | 0.7704 | 0.7883 | 1.0399 | 1.35x |
+| LL | graph | 512 | uniform | 1.7646 | 1.7763 | 2.0953 | 1.19x |
+| LL | graph | 512 | uneven | 0.9466 | 0.9302 | 1.5007 | 1.59x |
+| normal | eager | 256 | uniform | 1.6459 | - | 2.6987 | 1.64x |
+| normal | eager | 256 | uneven | 1.5778 | - | 2.5471 | 1.61x |
+| normal | eager | 512 | uniform | 1.7629 | - | 2.9562 | 1.68x |
+| normal | eager | 512 | uneven | 1.6112 | - | 2.8009 | 1.74x |
+| normal | graph | 256 | uniform | 1.6429 | 1.5825 | 2.6794 | 1.63x |
+| normal | graph | 256 | uneven | 1.5673 | 1.4853 | 2.5986 | 1.66x |
+| normal | graph | 512 | uniform | 1.7667 | 1.7228 | 2.9583 | 1.67x |
+| normal | graph | 512 | uneven | 1.6108 | 1.5296 | 2.7893 | 1.73x |
+
+- Readout:
+  - LL split-tail remains ahead of the ll-masked baseline for both 256 and
+    512, with uneven cases benefiting most;
+  - normal V3 is consistently ahead of the normal-contiguous baseline and graph
+    replay trims normal latency versus eager in this run;
+  - LL graph replay is roughly aligned with LL eager at these exact token
+    buckets, with small noise-level deltas.
+
+## 2026-06-26 - Fused pre-dispatch vec16/wave4 tuning and boundary sweep
+
+- User requested further optimization of `pre_dispatch_fp8_channelwise_out`:
+  - first try a low-risk hidden=4096 vec16 register-reuse fast path;
+  - then try a wave-local multi-token CTA variant for 128/256/512;
+  - template top-k dtype handling while touching this path.
+- Code changes:
+  - added templated `stage_topk_route<TopkIdxI64, TopkWeightsBf16>()`, so
+    int32/int64 top-k ids and fp32/bf16 top-k weights no longer branch inside
+    the device loop;
+  - added a hidden=4096 vec16 register-reuse kernel: one CTA per row, each
+    thread loads 16 BF16 values once, reduces max, then packs FP8 from
+    registers;
+  - added a hidden=4096 wave4 kernel: one 256-thread CTA handles four rows,
+    one wave64 per token; this reduces CTA count for small/medium token
+    buckets and now serves as the default hidden=4096 fast path;
+  - both paths use gfx938 built-ins for BF16->FP32 and packed FP8 conversion.
+- Validation:
+  - local `py_compile` and `git diff --check` passed before remote testing;
+  - remote HCU check before testing showed all 8 cards idle;
+  - remote rebuild with `build_dcu_megamoe.sh` passed;
+  - remote source guard passed: `9 passed`;
+  - all endpoint sweeps below reported `correct=true`.
+- Single-kernel microbench for current wave4 path:
+  - result file:
+    `hygon_tmp/debug/predispatch_wave4_boundary_20260626/micro.json`;
+  - rows 128/256/257/512/1024/1025 with top-k
+    int64+fp32 and int32+bf16 all passed scale/topk checks;
+  - median latency stayed flat around `0.0504..0.0518 ms`, with no 257,
+    1024, or 1025 boundary jump.
+- End-to-end auto-backend matrix:
+  - result dir:
+    `hygon_tmp/debug/predispatch_wave4_e2e_boundary_20260626`;
+  - tested sizes: 128, 256, 257, 512, 1024, 1025;
+  - modes: eager and graph;
+  - shapes: uniform plus uneven lists
+    `128,65,32,16,8,7,0,0`,
+    `256,129,64,32,16,7,0,0`,
+    `257,129,64,32,16,7,0,0`,
+    `512,257,128,64,32,7,0,0`,
+    `1024,513,256,128,64,7,0,0`,
+    `1025,513,257,128,64,7,0,0`;
+  - threshold behavior with default 512:
+    128/256/257/512 selected LL, 1024/1025 selected normal.
+
+| Backend | Mode | Tokens | Shape | MegaMoE ms | Graph replay ms | Baseline ms | Speedup |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: |
+| LL | eager | 128 | uniform | 0.7402 | - | 0.8633 | 1.17x |
+| LL | eager | 128 | uneven | 0.6778 | - | 0.8047 | 1.19x |
+| LL | eager | 256 | uniform | 1.0818 | - | 1.1345 | 1.05x |
+| LL | eager | 256 | uneven | 0.7705 | - | 1.0257 | 1.33x |
+| LL | eager | 257 | uniform | 1.0707 | - | 1.1510 | 1.08x |
+| LL | eager | 257 | uneven | 0.7701 | - | 1.0329 | 1.34x |
+| LL | eager | 512 | uniform | 1.7666 | - | 2.0954 | 1.19x |
+| LL | eager | 512 | uneven | 0.9302 | - | 1.4990 | 1.61x |
+| LL | graph | 128 | uniform | 0.7379 | 0.7488 | 0.8617 | 1.17x |
+| LL | graph | 128 | uneven | 0.6741 | 0.6762 | 0.8074 | 1.20x |
+| LL | graph | 256 | uniform | 1.0805 | 1.0832 | 1.1305 | 1.05x |
+| LL | graph | 256 | uneven | 0.7603 | 0.7533 | 1.0390 | 1.37x |
+| LL | graph | 257 | uniform | 1.0720 | 1.0892 | 1.1481 | 1.07x |
+| LL | graph | 257 | uneven | 0.7673 | 0.7856 | 1.0351 | 1.35x |
+| LL | graph | 512 | uniform | 1.7733 | 1.7739 | 2.0952 | 1.18x |
+| LL | graph | 512 | uneven | 0.9506 | 0.9224 | 1.4999 | 1.58x |
+| normal | eager | 1024 | uniform | 2.0397 | - | 3.4292 | 1.68x |
+| normal | eager | 1024 | uneven | 1.7252 | - | 3.1389 | 1.82x |
+| normal | eager | 1025 | uniform | 2.1879 | - | 3.4473 | 1.58x |
+| normal | eager | 1025 | uneven | 1.7573 | - | 3.0826 | 1.75x |
+| normal | graph | 1024 | uniform | 2.0748 | 2.0514 | 3.4751 | 1.67x |
+| normal | graph | 1024 | uneven | 1.7270 | 1.6174 | 3.1522 | 1.83x |
+| normal | graph | 1025 | uniform | 2.1726 | 2.0683 | 3.5070 | 1.61x |
+| normal | graph | 1025 | uneven | 1.7486 | 1.6160 | 3.1371 | 1.79x |
+
+- Readout:
+  - current wave4 hidden=4096 fast path is safe on the tested LL and normal
+    boundaries;
+  - 257 does not show the previous fused-tail cliff pattern and stays aligned
+    with 256;
+  - 1024/1025 normal boundary is correct in both eager and graph, with graph
+    replay especially helpful for uneven;
+  - no card residue after the run: all 8 HCUs returned to 0% HCU/VRAM.

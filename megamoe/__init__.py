@@ -84,30 +84,6 @@ def _is_current_stream_capturing() -> bool:
     return bool(checker()) if checker is not None else False
 
 
-_LIGHTOP_PER_TOKEN_QUANT_FP8: Optional[Any] = None
-
-
-def _get_lightop_per_token_quant_fp8():
-    global _LIGHTOP_PER_TOKEN_QUANT_FP8
-    if _LIGHTOP_PER_TOKEN_QUANT_FP8 is not None:
-        return _LIGHTOP_PER_TOKEN_QUANT_FP8
-    try:
-        from lightop import op as lightop_op
-    except Exception as exc:
-        raise RuntimeError(
-            "DCU W8A8 MegaMoE requires lightop.op.per_token_quant_fp8 "
-            "for fused channelwise input quantization"
-        ) from exc
-    quant = getattr(lightop_op, "per_token_quant_fp8", None)
-    if quant is None:
-        raise RuntimeError(
-            "DCU W8A8 MegaMoE requires lightop.op.per_token_quant_fp8 "
-            "for fused channelwise input quantization"
-        )
-    _LIGHTOP_PER_TOKEN_QUANT_FP8 = quant
-    return _LIGHTOP_PER_TOKEN_QUANT_FP8
-
-
 def cast_to_fp8_channelwise(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError("channelwise FP8 cast expects a 2D tensor")
@@ -116,45 +92,77 @@ def cast_to_fp8_channelwise(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     return fp8.contiguous(), scale.float().contiguous()
 
 
-def cast_to_fp8_channelwise_out(
+def pre_dispatch_fp8_channelwise_out(
     x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
     out_fp8: torch.Tensor,
     out_scale: torch.Tensor,
-    *,
-    allow_torch_fallback: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize BF16 activations directly into preallocated output buffers."""
+    out_topk_idx: torch.Tensor,
+    out_topk_weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse LL pre-dispatch input quantization and top-k buffer staging."""
     if x.dim() != 2:
-        raise ValueError("channelwise FP8 cast expects a 2D tensor")
-    if out_fp8.dim() != 2:
-        raise ValueError("out_fp8 must be a 2D tensor")
+        raise ValueError("pre-dispatch x must be a 2D tensor")
+    if topk_idx.dim() != 2 or topk_weights.dim() != 2:
+        raise ValueError("pre-dispatch topk tensors must be 2D")
+    if topk_idx.shape != topk_weights.shape:
+        raise ValueError("pre-dispatch topk_idx/topk_weights shape mismatch")
     rows, hidden = x.shape
-    if out_fp8.size(0) < rows or out_fp8.size(1) != hidden:
+    if topk_idx.size(0) != rows:
+        raise ValueError("pre-dispatch topk rows must match x rows")
+    topk = topk_idx.size(1)
+    if out_fp8.dim() != 2 or out_fp8.size(0) < rows or out_fp8.size(1) != hidden:
         raise ValueError("out_fp8 must have shape [>=rows, hidden]")
     if out_scale.numel() < rows:
         raise ValueError("out_scale must have at least one scale per row")
+    if (
+        out_topk_idx.dim() != 2
+        or out_topk_weights.dim() != 2
+        or out_topk_idx.size(0) < rows
+        or out_topk_weights.size(0) < rows
+        or out_topk_idx.size(1) != topk
+        or out_topk_weights.size(1) != topk
+    ):
+        raise ValueError("output topk tensors must have shape [>=rows, topk]")
 
     out_fp8_view = out_fp8[:rows, :hidden]
-    if not out_fp8_view.is_contiguous():
-        raise ValueError("out_fp8 slice must be contiguous")
-    if not out_scale.is_contiguous():
-        raise ValueError("out_scale must be contiguous")
     out_scale_view = out_scale.view(-1)[:rows]
+    out_topk_idx_view = out_topk_idx[:rows, :topk]
+    out_topk_weights_view = out_topk_weights[:rows, :topk]
     if rows == 0:
-        return out_fp8_view, out_scale_view
-    try:
-        quant = _get_lightop_per_token_quant_fp8()
-    except RuntimeError:
-        if not allow_torch_fallback:
-            raise
-        fp8, scale = cast_to_fp8_channelwise(x)
-        out_fp8_view.copy_(fp8)
-        out_scale_view.copy_(scale)
-        return out_fp8_view, out_scale_view
+        return out_fp8_view, out_scale_view, out_topk_idx_view, out_topk_weights_view
+    if not (
+        out_fp8_view.is_contiguous()
+        and out_scale_view.is_contiguous()
+        and out_topk_idx_view.is_contiguous()
+        and out_topk_weights_view.is_contiguous()
+    ):
+        raise ValueError("pre-dispatch output slices must be contiguous")
 
-    quant_input = x if x.is_contiguous() else x.contiguous()
-    quant(out_fp8_view, quant_input, out_scale_view)
-    return out_fp8_view, out_scale_view
+    x_arg = x if x.is_contiguous() else x.contiguous()
+    topk_idx_arg = topk_idx if topk_idx.is_contiguous() else topk_idx.contiguous()
+    topk_weights_arg = (
+        topk_weights if topk_weights.is_contiguous() else topk_weights.contiguous()
+    )
+    try:
+        pre_dispatch = _C.pre_dispatch_fp8_channelwise_out
+    except AttributeError:
+        raise RuntimeError(
+            "DCU W8A8 MegaMoE requires _C.pre_dispatch_fp8_channelwise_out; "
+            "rebuild the megamoe HIP extension"
+        ) from None
+
+    pre_dispatch(
+        x_arg,
+        topk_idx_arg,
+        topk_weights_arg,
+        out_fp8_view,
+        out_scale_view,
+        out_topk_idx_view,
+        out_topk_weights_view,
+    )
+    return out_fp8_view, out_scale_view, out_topk_idx_view, out_topk_weights_view
 
 
 def cast_grouped_weight_to_fp8_channelwise(
@@ -654,7 +662,7 @@ except Exception:
 __all__ = [
     "SymmBuffer",
     "cast_to_fp8_channelwise",
-    "cast_to_fp8_channelwise_out",
+    "pre_dispatch_fp8_channelwise_out",
     "cast_grouped_weight_to_fp8_channelwise",
     "weight8bit_nt_kpack2_marlin",
     "weight8bit_nt_kpack2_marlin_masked",

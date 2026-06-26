@@ -106,17 +106,6 @@ def unpack_recv_x_fp8_channelwise(recv_x):
         recv_x_fp8, recv_x_scale = megamoe.cast_to_fp8_channelwise(recv_x)
     return recv_x_fp8.contiguous(), recv_x_scale.contiguous()
 
-
-def cast_input_for_test_baseline(x: torch.Tensor):
-    fp8 = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
-    scale = torch.empty((x.size(0),), dtype=torch.float32, device=x.device)
-    try:
-        megamoe.cast_to_fp8_channelwise_out(x, fp8, scale)
-    except RuntimeError:
-        return megamoe.cast_to_fp8_channelwise(x)
-    return fp8, scale
-
-
 def counts_to_gpu_and_total(recv_counts, recv_counts_cuda, device, recv_topk_idx):
     if recv_counts_cuda is not None:
         counts_gpu = recv_counts_cuda.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
@@ -459,8 +448,6 @@ def run_deepgemm_megamoe_baseline(
 def run_deepep_ll_deepgemm_masked_baseline(
     ep_buffer,
     x_bf16,
-    x_fp8,
-    x_scale,
     topk_idx,
     topk_weights,
     l1_weights,
@@ -480,33 +467,17 @@ def run_deepep_ll_deepgemm_masked_baseline(
 ):
     topk_idx_i64 = topk_idx.to(torch.int64).contiguous()
     topk_weights = topk_weights.contiguous()
-    dispatch_quantization = "inside_deepep_ll"
-    if hasattr(ep_buffer, "low_latency_dispatch_fp8"):
-        packed_recv_hidden, masked_m, handle, event, hook = ep_buffer.low_latency_dispatch_fp8(
-            x_fp8.contiguous(),
-            x_scale.view(-1, 1).contiguous(),
-            topk_idx_i64,
-            num_max_tokens_per_rank,
-            num_experts,
-            async_finish=False,
-            return_recv_hook=False,
-        )
-        dispatch_quantization = "prequantized_fp8"
-    else:
-        # Current DeepEP LL only accepts BF16 input and performs FP8 casting in
-        # low_latency_dispatch. The normal DeepEP dispatch path supports
-        # prequantized tuples, but LL does not expose that API in current builds.
-        packed_recv_hidden, masked_m, handle, event, hook = ep_buffer.low_latency_dispatch(
-            x_bf16.contiguous(),
-            topk_idx_i64,
-            num_max_tokens_per_rank,
-            num_experts,
-            quant_type=2,
-            quant_group_size=0,
-            fp8_round_scale=False,
-            async_finish=False,
-            return_recv_hook=False,
-        )
+    packed_recv_hidden, masked_m, handle, event, hook = ep_buffer.low_latency_dispatch(
+        x_bf16.contiguous(),
+        topk_idx_i64,
+        num_max_tokens_per_rank,
+        num_experts,
+        quant_type=2,
+        quant_group_size=0,
+        fp8_round_scale=False,
+        async_finish=False,
+        return_recv_hook=False,
+    )
     wait_deepep_event(event)
     if not isinstance(packed_recv_hidden, tuple):
         raise RuntimeError("DeepEP LL baseline expects FP8 low_latency_dispatch output")
@@ -604,7 +575,6 @@ def run_deepep_ll_deepgemm_masked_baseline(
         "recv_rows": int(num_groups * m_per_expert),
         "grouped_rows": int(num_groups * m_per_expert),
         "expected_m": expected_m,
-        "dispatch_quantization": dispatch_quantization,
     }
 
 
@@ -755,7 +725,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         intermediate_hidden,
     )
     ll_masked_baseline = baseline_kind == BASELINE_LL_MASKED
-    fused_quantizes_input = v3_backend == "ll"
     ll_baseline_capacity_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
     if ll_masked_baseline and num_tokens > ll_baseline_capacity_tokens:
         raise ValueError(
@@ -807,7 +776,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
     topk_weights = torch.softmax(topk_weights.float(), dim=-1)
 
-    x_fp8, x_scale = cast_input_for_test_baseline(x_bf16)
     l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
     l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
     if ll_masked_baseline:
@@ -837,19 +805,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     stats_fused = stats_initial.clone()
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     baseline_layout_cache = None
+    normal_baseline_predispatch_buffers = {}
 
     def copy_inputs_to_sym_buffer():
-        if fused_quantizes_input:
-            megamoe.cast_to_fp8_channelwise_out(
-                x_bf16,
-                sym_buffer.x[:num_tokens],
-                sym_buffer.x_sf[:num_tokens],
-            )
-        else:
-            sym_buffer.x[:num_tokens].copy_(x_fp8)
-            sym_buffer.x_sf[:num_tokens].copy_(x_scale)
-        sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
-        sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        megamoe.pre_dispatch_fp8_channelwise_out(
+            x_bf16,
+            topk_idx,
+            topk_weights,
+            sym_buffer.x[:num_tokens],
+            sym_buffer.x_sf[:num_tokens],
+            sym_buffer.topk_idx[:num_tokens],
+            sym_buffer.topk_weights[:num_tokens],
+        )
 
     def run_fused(reset_stats: bool = False):
         if reset_stats:
@@ -884,8 +851,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     def run_selected_baseline(
         x_bf16_arg,
-        x_fp8_arg,
-        x_scale_arg,
         topk_idx_arg,
         topk_weights_arg,
         expected_tokens_per_rank: int,
@@ -897,8 +862,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             return run_deepep_ll_deepgemm_masked_baseline(
                 ep_buffer,
                 x_bf16_arg,
-                x_fp8_arg,
-                x_scale_arg,
                 topk_idx_arg,
                 topk_weights_arg,
                 baseline_l1_weights,
@@ -917,14 +880,39 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 return_stats=return_stats,
             )
 
+        rows = int(x_bf16_arg.size(0))
+        cache_key = (rows, int(x_bf16_arg.size(1)), int(topk_idx_arg.size(1)))
+        cached = normal_baseline_predispatch_buffers.get(cache_key)
+        if cached is None:
+            cached = (
+                torch.empty(
+                    (rows, int(x_bf16_arg.size(1))),
+                    device=x_bf16_arg.device,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                torch.empty((rows,), device=x_bf16_arg.device, dtype=torch.float32),
+                torch.empty((rows, topk_idx_arg.size(1)), device=x_bf16_arg.device, dtype=torch.int64),
+                torch.empty((rows, topk_idx_arg.size(1)), device=x_bf16_arg.device, dtype=torch.float32),
+            )
+            normal_baseline_predispatch_buffers[cache_key] = cached
+        baseline_x_fp8, baseline_x_scale, baseline_topk_idx, baseline_topk_weights = cached
+        megamoe.pre_dispatch_fp8_channelwise_out(
+            x_bf16_arg,
+            topk_idx_arg,
+            topk_weights_arg,
+            baseline_x_fp8,
+            baseline_x_scale,
+            baseline_topk_idx,
+            baseline_topk_weights,
+        )
         layout_cache = get_baseline_layout_cache() if use_layout_cache else None
         return run_deepgemm_megamoe_baseline(
             ep_buffer,
             ep_config,
-            x_fp8_arg,
-            x_scale_arg,
-            topk_idx_arg,
-            topk_weights_arg,
+            baseline_x_fp8,
+            baseline_x_scale,
+            baseline_topk_idx,
+            baseline_topk_weights,
             baseline_l1_weights,
             baseline_l2_weights,
             num_experts,
@@ -968,8 +956,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         token_count: int,
         local_token_count: int,
         baseline_x_bf16,
-        baseline_x_fp8,
-        baseline_x_scale,
         baseline_topk_idx,
         baseline_topk_weights,
     ):
@@ -987,8 +973,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         def run_baseline_graph_once():
             run_selected_baseline(
                 baseline_x_bf16[:local_token_count],
-                baseline_x_fp8[:local_token_count],
-                baseline_x_scale[:local_token_count],
                 baseline_topk_idx[:local_token_count],
                 baseline_topk_weights[:local_token_count],
                 token_count,
@@ -1018,8 +1002,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 backend_selector_tokens,
                 num_tokens,
                 x_bf16,
-                x_fp8,
-                x_scale,
                 topk_idx,
                 topk_weights,
             )
@@ -1037,8 +1019,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             }
         baseline_y, baseline_counts, meta = run_selected_baseline(
             x_bf16,
-            x_fp8,
-            x_scale,
             topk_idx,
             topk_weights,
             backend_selector_tokens,
@@ -1068,7 +1048,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             graph_scores, num_topk, dim=-1, largest=True, sorted=False
         )
         graph_topk_weights = torch.softmax(graph_topk_weights.float(), dim=-1)
-        graph_x_fp8, graph_x_scale = cast_input_for_test_baseline(graph_x_bf16)
         y_graph = torch.empty((capture_tokens, hidden), dtype=torch.bfloat16, device="cuda")
 
         def local_graph_token_count(token_count: int) -> int:
@@ -1084,20 +1063,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         def fill_graph_inputs(token_count: int) -> int:
             local_token_count = local_graph_token_count(token_count)
             sym_buffer.cuda_graph_num_tokens.fill_(local_token_count)
-            if not fused_quantizes_input:
-                sym_buffer.x[:local_token_count].copy_(graph_x_fp8[:local_token_count])
-                sym_buffer.x_sf[:local_token_count].copy_(graph_x_scale[:local_token_count])
-            sym_buffer.topk_idx[:local_token_count].copy_(graph_topk_idx[:local_token_count])
-            sym_buffer.topk_weights[:local_token_count].copy_(graph_topk_weights[:local_token_count])
             return local_token_count
 
         def run_graph_bucket_once():
-            if fused_quantizes_input:
-                megamoe.cast_to_fp8_channelwise_out(
-                    graph_x_bf16,
-                    sym_buffer.x[:capture_tokens],
-                    sym_buffer.x_sf[:capture_tokens],
-                )
+            megamoe.pre_dispatch_fp8_channelwise_out(
+                graph_x_bf16,
+                graph_topk_idx,
+                graph_topk_weights,
+                sym_buffer.x[:capture_tokens],
+                sym_buffer.x_sf[:capture_tokens],
+                sym_buffer.topk_idx[:capture_tokens],
+                sym_buffer.topk_weights[:capture_tokens],
+            )
             megamoe.fp8_w8a8_mega_moe(
                 y_graph,
                 fused_l1_weights,
@@ -1143,8 +1120,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     token,
                     local_token,
                     graph_x_bf16,
-                    graph_x_fp8,
-                    graph_x_scale,
                     graph_topk_idx,
                     graph_topk_weights,
                 )
@@ -1154,8 +1129,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             else:
                 baseline_y, _, _ = run_selected_baseline(
                     graph_x_bf16[:local_token],
-                    graph_x_fp8[:local_token],
-                    graph_x_scale[:local_token],
                     graph_topk_idx[:local_token],
                     graph_topk_weights[:local_token],
                     token,
@@ -1236,8 +1209,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         token,
                         local_token,
                         graph_x_bf16,
-                        graph_x_fp8,
-                        graph_x_scale,
                         graph_topk_idx,
                         graph_topk_weights,
                     )
@@ -1265,7 +1236,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             "graph_replay_min_ms_avg_per_rank": graph_min_s * 1e3,
                             "bench_backend": f"tilelang_{graph_timing['backend']}",
                             "includes_input_update": False,
-                            "includes_input_quantization": bool(fused_quantizes_input),
                         }
                     )
                     if baseline_rank_graph_metrics is not None:
@@ -1297,7 +1267,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     print_once(rank, f" > scale modes=input/weight/l2_act channelwise fp32")
     baseline_desc = baseline_kind_description(baseline_kind, args.prepost_backend)
     print_once(rank, f" > baseline={baseline_desc} (kind={baseline_kind}, requested={args.baseline_kind})")
-    print_once(rank, f" > fused_input_quant_in_timed_path={fused_quantizes_input}")
     print_once(rank, " > router weights=CUDA MegaMoE compatible SwiGLU-pre-L2-quant")
     print_once(rank, f" > sym_buffer={sym_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
     print_once(rank, f" > route_scratch={sym_buffer.route_scratch.nbytes / 2 ** 30:.3f} GiB")
@@ -1308,8 +1277,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             backend_selector_tokens,
             num_tokens,
             x_bf16,
-            x_fp8,
-            x_scale,
             topk_idx,
             topk_weights,
         )
@@ -1371,7 +1338,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "baseline_kind_resolved": baseline_kind,
                 "baseline_kind_requested": args.baseline_kind,
                 "fused_execution": fused_execution,
-                "fused_input_quant_in_timed_path": bool(fused_quantizes_input),
                 "correctness_iters": args.correctness_iters,
                 "atol": args.atol,
                 "cuda_graph_timings": cuda_graph_timing_rows,
@@ -1483,7 +1449,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "baseline_kind_resolved": baseline_kind,
             "baseline_kind_requested": args.baseline_kind,
             "fused_execution": fused_execution,
-            "fused_input_quant_in_timed_path": bool(fused_quantizes_input),
             "bench_backend": f"tilelang_{fused_timing['backend']}",
             "router_weight_stage": "swiglu_pre_l2_quant",
             "cuda_graph_timings": cuda_graph_timing_rows,
@@ -1568,8 +1533,6 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--skip-bench", action="store_true")
-    parser.add_argument("--opt-3stage", action="store_true",
-                        help="compatibility no-op; DCU DSV4 MegaMoE now uses the V3 staged path by default")
     parser.add_argument("--megamoe-backend", choices=("auto", "ll", "normal"),
                         default=os.getenv(BACKEND_ENV, V3_BACKEND_AUTO),
                         help=f"V3 backend selector used by this test; defaults to {BACKEND_ENV}=auto. "

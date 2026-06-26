@@ -135,7 +135,7 @@ should make that decision before calling the API, typically by comparing the
 EP-group maximum local token count for the current request with their threshold
 so every rank chooses the same backend.  In this repository's test script, that
 framework-side policy is modeled by `MEGAMOE_DCU_BACKEND=auto|ll|normal` and
-`MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD` with a default threshold of 256 tokens.
+`MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD` with a default threshold of 512 tokens.
 Those two environment variables only affect `megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py`; they
 are not consumed by the production library call, `opt.py`, or the C++
 workspace size API.
@@ -342,14 +342,15 @@ flows plus an auto selector:
   masked grouped GEMM.  This baseline always captures and replays its own CUDA
   graph, independent of whether the MegaMoE side passes `--cuda-graph`.
 
-When the resolved MegaMoE backend is LL, the test includes BF16 input
-channelwise FP8 quantization in the MegaMoE timed path for a fair comparison
-with DeepEP LL dispatch.  This uses `megamoe.cast_to_fp8_channelwise_out(...)`,
-which calls `lightop.op.per_token_quant_fp8` and writes directly into
-`sym_buffer.x` and `sym_buffer.x_sf`; no extra FP8/scale copy is needed after
-the cast.  The normal backend keeps the historical pre-quantized test timing
-path, so normal-vs-normal regression numbers stay comparable with earlier
-reports.
+The MegaMoE test includes BF16 input channelwise FP8 quantization in the
+MegaMoE timed path for both LL and normal backends.  This uses MegaMoE's own fused
+`megamoe.pre_dispatch_fp8_channelwise_out(...)` kernel to quantize BF16 input
+directly into `sym_buffer.x/x_sf` and stage `topk_idx/topk_weights` in the
+same launch; no `lightop` dependency or extra FP8/top-k copy is needed in the
+MegaMoE timed path.  When `--baseline-kind normal-contiguous` is used, the
+baseline also runs the same fused pre-dispatch kernel into temporary FP8/scale
+and top-k buffers before DeepEP normal dispatch, so normal-vs-normal timing
+uses the same pre-dispatch accounting on both sides.
 
 The `ll-masked` baseline requires the same ROCSHMEM/DUSHMEM low-latency
 environment as DeepEP LL.  The exact HCA names and topology file are
@@ -389,9 +390,6 @@ export ROCSHMEM_MAX_NUM_CONTEXTS=48
 export ROCSHMEM_HEAP_SIZE=10737418240
 export DUSHMEM_HEAP_SIZE=10737418240
 ```
-
-The LL fair-timing path also requires the `lightop` package used by the
-framework path to provide `lightop.op.per_token_quant_fp8`.
 
 Avoid setting `DEEP_EP_DEVICE_TO_HCA_MAPPING` or `DUSHMEM_IB_GID_INDEX` unless
 the node requires them and the values have been verified; wrong HCA or GID
