@@ -708,13 +708,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if env_flag_enabled(UNIFIED_WEIGHT_LAYOUT_ENV)
         else ("normal" if v3_backend == "normal" else "unified")
     )
-    fused_execution = f"v3_{v3_backend}_graph" if args.cuda_graph else "v3_staged"
+    fused_execution = f"v3_{v3_backend}_eager"
+    graph_execution = f"v3_{v3_backend}_cuda_graph_replay" if args.cuda_graph else "disabled"
     print_once(rank, "DCU MegaMoE channelwise W8A8 test:")
     print_once(rank, f" > megamoe: {getattr(megamoe, '__file__', None)}")
     print_once(rank, f" > deep_ep: {getattr(deep_ep, '__file__', None)}")
     print_once(rank, f" > deepgemm: {getattr(deepgemm, '__file__', None)}")
     print_once(rank, f" > build config: {megamoe.get_mega_moe_hip_build_config()}")
     print_once(rank, f" > fused execution={fused_execution}")
+    print_once(rank, f" > cuda graph execution={graph_execution}")
 
     sym_buffer = megamoe.get_symm_buffer_for_mega_moe(
         group,
@@ -725,6 +727,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         intermediate_hidden,
     )
     ll_masked_baseline = baseline_kind == BASELINE_LL_MASKED
+    baseline_execution = (
+        "ll_masked_cuda_graph_replay"
+        if ll_masked_baseline
+        else "normal_contiguous_eager"
+    )
     ll_baseline_capacity_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
     if ll_masked_baseline and num_tokens > ll_baseline_capacity_tokens:
         raise ValueError(
@@ -1235,7 +1242,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             "graph_replay_median_ms_avg_per_rank": graph_avg_s * 1e3,
                             "graph_replay_min_ms_avg_per_rank": graph_min_s * 1e3,
                             "bench_backend": f"tilelang_{graph_timing['backend']}",
+                            "graph_execution": graph_execution,
                             "includes_input_update": False,
+                            "includes_host_input_update": False,
                         }
                     )
                     if baseline_rank_graph_metrics is not None:
@@ -1337,7 +1346,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "baseline_kind": baseline_desc,
                 "baseline_kind_resolved": baseline_kind,
                 "baseline_kind_requested": args.baseline_kind,
+                "baseline_execution": baseline_execution,
                 "fused_execution": fused_execution,
+                "fused_timing_scope": "eager_main_call",
+                "baseline_timing_scope": baseline_execution,
+                "cuda_graph_requested": bool(args.cuda_graph),
+                "graph_execution": graph_execution,
                 "correctness_iters": args.correctness_iters,
                 "atol": args.atol,
                 "cuda_graph_timings": cuda_graph_timing_rows,
@@ -1448,7 +1462,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "baseline_kind": baseline_desc,
             "baseline_kind_resolved": baseline_kind,
             "baseline_kind_requested": args.baseline_kind,
+            "baseline_execution": baseline_execution,
             "fused_execution": fused_execution,
+            "fused_timing_scope": "eager_main_call",
+            "baseline_timing_scope": baseline_execution,
+            "cuda_graph_requested": bool(args.cuda_graph),
+            "graph_execution": graph_execution,
             "bench_backend": f"tilelang_{fused_timing['backend']}",
             "router_weight_stage": "swiglu_pre_l2_quant",
             "cuda_graph_timings": cuda_graph_timing_rows,

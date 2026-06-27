@@ -407,6 +407,13 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "normal_baseline_graph_cache" not in test_source
     assert "def get_ll_masked_baseline_graph(" in test_source
     assert "if baseline_kind == BASELINE_LL_MASKED and not args.cuda_graph_skip_baseline" in test_source
+    assert 'fused_execution = f"v3_{v3_backend}_eager"' in test_source
+    assert 'graph_execution = f"v3_{v3_backend}_cuda_graph_replay" if args.cuda_graph else "disabled"' in test_source
+    assert '"fused_timing_scope": "eager_main_call"' in test_source
+    assert '"baseline_timing_scope": baseline_execution' in test_source
+    assert '"cuda_graph_requested": bool(args.cuda_graph)' in test_source
+    assert '"graph_execution": graph_execution' in test_source
+    assert '"includes_host_input_update": False' in test_source
     assert '"baseline_graph_kind": BASELINE_LL_MASKED' in test_source
     assert '"baseline_graph_kind": BASELINE_NORMAL_CONTIGUOUS' not in test_source
     assert "run_selected_baseline(\n                    graph_x_bf16[:local_token]" in test_source

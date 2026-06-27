@@ -10051,3 +10051,47 @@
   - 1024/1025 normal boundary is correct in both eager and graph, with graph
     replay especially helpful for uneven;
   - no card residue after the run: all 8 HCUs returned to 0% HCU/VRAM.
+
+## 2026-06-27 - LL graph small-token correctness/perf sweep
+
+- User requested LL graph correctness and performance versus the `ll-masked`
+  DeepEP LL + masked DeepGEMM baseline for 8/32/64/128 tokens, plus one
+  uneven case per size.
+- Setup:
+  - checked HCU state before the run: all 8 cards at 0% HCU/VRAM and no
+    leftover `test_mega_moe_dcu.py` / server process;
+  - fixed `--megamoe-backend ll --baseline-kind ll-masked`;
+  - enabled CUDA graph bucket correctness and replay timing with
+    `--cuda-graph --cuda-graph-bench`;
+  - result dir:
+    `hygon_tmp/debug/ll_graph_small_8_128_20260627`.
+- Correctness:
+  - all 8 JSON outputs report `correct=true`;
+  - main correctness compares output and stats;
+  - graph bucket correctness compares replay output against the LL masked
+    baseline;
+  - observed graph replay max_abs stayed within tolerance:
+    `0.000244141` or `0.000488281`.
+- Graph replay timing, per-rank average median ms:
+
+| Tokens | Shape | MegaMoE Graph | LL Masked Baseline Graph | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 8 | uniform | 0.5473 | 0.6032 | 1.10x |
+| 8 | uneven | 0.3306 | 0.3864 | 1.17x |
+| 32 | uniform | 0.6089 | 0.6735 | 1.11x |
+| 32 | uneven | 0.5269 | 0.6256 | 1.19x |
+| 64 | uniform | 0.6600 | 0.7232 | 1.10x |
+| 64 | uneven | 0.6110 | 0.6954 | 1.14x |
+| 128 | uniform | 0.7483 | 0.8533 | 1.14x |
+| 128 | uneven | 0.6764 | 0.8131 | 1.20x |
+
+- Uneven token lists used:
+  - 8: `8,5,3,1,0,0,0,0`;
+  - 32: `32,17,8,4,2,1,0,0`;
+  - 64: `64,33,16,8,4,1,0,0`;
+  - 128: `128,65,32,16,8,7,0,0`.
+- Readout:
+  - LL graph is faster than the LL masked baseline for every small-token
+    bucket tested;
+  - uneven buckets show larger relative gains, matching the earlier LL trend;
+  - after the run, `hy-smi` again showed all 8 HCUs at 0% HCU/VRAM.
