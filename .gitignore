@@ -34,3 +34,5 @@ hygon_tmp/
 !.planning/dcu_megamoe_v2/**
 !.planning/dcu_megamoe_v3/
 !.planning/dcu_megamoe_v3/**
+!.planning/dcu_megamoe_supernode/
+!.planning/dcu_megamoe_supernode/**
