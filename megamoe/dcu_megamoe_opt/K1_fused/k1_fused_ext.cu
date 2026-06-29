@@ -69,7 +69,6 @@ namespace {
 
 static constexpr const char* kFusedL1AsmKernelName =
     "DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1";
-static constexpr int kK1SupportedRanks = 8;
 static constexpr int kK1SupportedExperts = 256;
 static constexpr int kK1SupportedTopk = 6;
 static constexpr int kK1SupportedHidden = 4096;
@@ -84,10 +83,18 @@ static constexpr double kK1AutoCompactMinLocalTileSaving = 8.0;
 static constexpr int64_t kK1AutoCompactHighTilesPerExpert = 7;
 static constexpr double kK1CompactTightMarginMinSaving = 0.45;
 static constexpr const char* kK1ShapeContract =
-    "K1_fused dispatch-pull L1 asm is currently specialized for ranks=8, "
-    "experts=256, local_experts=32, topk=6, hidden=4096, "
+    "K1_fused dispatch-pull L1 asm is currently specialized for DSV4 Flash "
+    "ranks in {8,16,32}, experts=256, local_experts<=32, topk=6, hidden=4096, "
     "L1 output features=4096 (intermediate=2048), route_tile_m=256, "
     "alignment=256, and 0<=num_tokens_per_rank<=num_max_tokens_per_rank";
+
+bool is_supported_dsv4_flash_rank_count(const int64_t num_ranks) {
+    return num_ranks == 8 || num_ranks == 16 || num_ranks == 32;
+}
+
+bool is_supported_dsv4_flash_local_experts(const int64_t local_experts) {
+    return local_experts == 8 || local_experts == 16 || local_experts == 32;
+}
 
 int64_t ceil_div_i64(const int64_t a, const int64_t b) {
     return (a + b - 1) / b;
@@ -580,7 +587,7 @@ void launch_l1_deepgemm_fused_asm(
     const int local_experts = static_cast<int>(l1_weight.size(0));
     TORCH_CHECK(hidden == kK1SupportedHidden && n == kK1SupportedL1Rows,
                 kK1ShapeContract);
-    TORCH_CHECK(num_ranks == kK1SupportedRanks &&
+    TORCH_CHECK(is_supported_dsv4_flash_rank_count(num_ranks) &&
                     num_experts == kK1SupportedExperts &&
                     num_topk == kK1SupportedTopk,
                 kK1ShapeContract);
@@ -588,7 +595,8 @@ void launch_l1_deepgemm_fused_asm(
                 kK1ShapeContract);
     TORCH_CHECK(total_rows > 0 && total_rows % kK1RouteTileM == 0,
                 "fused L1 asm expects total_rows padded to a 256-row tile");
-    TORCH_CHECK(local_experts > 0, "local_experts must be positive");
+    TORCH_CHECK(is_supported_dsv4_flash_local_experts(local_experts),
+                kK1ShapeContract);
     TORCH_CHECK(sym_buffer.is_cuda() && sym_buffer.scalar_type() == torch::kInt8 &&
                     sym_buffer.is_contiguous(),
                 "sym_buffer must be contiguous CUDA int8");
@@ -863,7 +871,7 @@ k1_symm_fused_l1_asm_impl(
                 "symm K1 tensors must be contiguous");
     TORCH_CHECK(!code_object_path.empty(),
                 "K1_fused requires the fused L1 asm code object");
-    TORCH_CHECK(num_ranks == kK1SupportedRanks &&
+    TORCH_CHECK(is_supported_dsv4_flash_rank_count(num_ranks) &&
                     num_experts == kK1SupportedExperts &&
                     num_topk == kK1SupportedTopk &&
                     hidden == kK1SupportedHidden,
@@ -1150,7 +1158,7 @@ k1_symm_fused_l1_v3_pack5(
     TORCH_CHECK(sym_buffer.is_contiguous() && route_scratch.is_contiguous() &&
                     l1_weight_pack5.is_contiguous() && l1_scale.is_contiguous(),
                 "V3 K1 tensors must be contiguous");
-    TORCH_CHECK(num_ranks == kK1SupportedRanks &&
+    TORCH_CHECK(is_supported_dsv4_flash_rank_count(num_ranks) &&
                     num_experts == kK1SupportedExperts &&
                     num_topk == kK1SupportedTopk &&
                     hidden == kK1SupportedHidden &&
@@ -1163,7 +1171,8 @@ k1_symm_fused_l1_v3_pack5(
                 "V3 K1 pack5 C entry is LL-only; normal uses ASM-pack5");
 
     const int64_t local_experts = num_experts / num_ranks;
-    TORCH_CHECK(local_experts == 32, kK1ShapeContract);
+    TORCH_CHECK(is_supported_dsv4_flash_local_experts(local_experts),
+                kK1ShapeContract);
     TORCH_CHECK(l1_scale.dim() == 2 &&
                     l1_scale.size(0) == local_experts &&
                     l1_scale.size(1) == kK1SupportedL1Rows,
@@ -1489,7 +1498,7 @@ k1_graph_flag_reset_layout(
     const int64_t hidden,
     const int64_t l1_rows,
     const int64_t alignment) {
-    TORCH_CHECK(num_ranks == kK1SupportedRanks &&
+    TORCH_CHECK(is_supported_dsv4_flash_rank_count(num_ranks) &&
                     num_experts == kK1SupportedExperts &&
                     num_topk == kK1SupportedTopk &&
                     hidden == kK1SupportedHidden &&

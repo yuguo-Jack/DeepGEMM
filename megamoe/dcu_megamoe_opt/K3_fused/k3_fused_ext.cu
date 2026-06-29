@@ -259,10 +259,10 @@ void launch_l2_deepgemm_original_asm(
             check_cuda_contiguous(*asm_signal_addrs, "asm_signal_addrs");
             TORCH_CHECK(asm_signal_addrs->scalar_type() == torch::kInt64,
                         "asm_signal_addrs must be int64");
-            TORCH_CHECK(asm_signal_addrs->numel() >= 16,
-                        "asm_signal_addrs must contain 8 local and 8 peer signal addresses");
-            TORCH_CHECK(asm_signal_num_ranks > 0 && asm_signal_num_ranks <= 8,
-                        "asm_signal_num_ranks must be in [1, 8]");
+            TORCH_CHECK(asm_signal_num_ranks > 0 && asm_signal_num_ranks <= 32,
+                        "asm_signal_num_ranks must be in [1, 32]");
+            TORCH_CHECK(asm_signal_addrs->numel() >= 2 * asm_signal_num_ranks,
+                        "asm_signal_addrs must contain local and peer signal addresses");
         }
     }
     if (asm_reduce_y != nullptr) {
@@ -510,7 +510,6 @@ __device__ static inline int load_signal_system_acquire(const volatile int* ptr)
 }
 
 constexpr int kDefaultStagedBarrierSignalSlotBase = 18;
-constexpr int kSplitTailChunkSignalSlotBase = 22;
 constexpr int kSplitTailChunkSignalSlots = 8;
 constexpr int kSplitTailCopyExpertDoneOffset = 48;
 constexpr int kSplitTailCopyExpertDoneCount = 32;
@@ -567,14 +566,18 @@ __global__ void rank_barrier_kernel(
         runtime_num_tokens[0] = graph_max_tokens;
     }
     if (reset_tail_signal_slots && thread_id < num_ranks) {
-        __hip_atomic_store(my_signals + 8 + thread_id, 0, __ATOMIC_RELEASE,
-                           __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(
+            my_signals + deep_gemm::mega::dcu_tail_signal_slot_base(num_ranks) +
+                thread_id,
+            0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
     if (reset_tail_signal_slots &&
         thread_id < kSplitTailChunkSignalSlots) {
         __hip_atomic_store(
-            my_signals + kSplitTailChunkSignalSlotBase + thread_id, 0,
-            __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            my_signals +
+                deep_gemm::mega::dcu_split_tail_chunk_signal_slot_base(num_ranks) +
+                thread_id,
+            0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
     if (route_scratch != nullptr) {
         if (k1_flags_numel > 0) {

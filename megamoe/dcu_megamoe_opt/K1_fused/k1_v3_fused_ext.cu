@@ -43,9 +43,9 @@ void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
     (void)problem_size;
     const bool mask_tiny_store = valid_rows_per_expert <= 16;
 #define DCU_MEGAMOE_V3_LAUNCH_K1_LL(                                            \
-    BLOCK_M, CUS, MASK_TINY_STORE, PARALLEL_STAGE_COPY)                         \
+    EXPERTS, BLOCK_M, CUS, MASK_TINY_STORE, PARALLEL_STAGE_COPY)                 \
     V3_K1_LowLatencyMaskedGroupGemmKernel<                                      \
-        32, 4096, 4096, BLOCK_M, 256, 64, 4, CUS, MASK_TINY_STORE,              \
+        EXPERTS, 4096, 4096, BLOCK_M, 256, 64, 4, CUS, MASK_TINY_STORE,          \
         PARALLEL_STAGE_COPY>                                                     \
         <<<dim3(CUS), dim3(256), 0, stream>>>(                                  \
             out, staged_x, weight_pack5, staged_x_scale, weight_scale,           \
@@ -58,20 +58,34 @@ void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
             graph_runtime_num_tokens_for_barrier, graph_runtime_num_tokens_out,  \
             graph_tail_signal_generation_out, graph_max_tokens)
 
-    if (ll_block_m == 32 && ll_cus == 64) {
-        if (mask_tiny_store) {
-            DCU_MEGAMOE_V3_LAUNCH_K1_LL(32, 64, true, true);
-        } else {
-            DCU_MEGAMOE_V3_LAUNCH_K1_LL(32, 64, false, true);
-        }
-    } else if (ll_block_m == 48 && ll_cus == 64) {
-        DCU_MEGAMOE_V3_LAUNCH_K1_LL(48, 64, false, false);
-    } else if (ll_block_m == 64 && ll_cus == 64) {
-        if (mask_tiny_store) {
-            DCU_MEGAMOE_V3_LAUNCH_K1_LL(64, 64, true, false);
-        } else {
-            DCU_MEGAMOE_V3_LAUNCH_K1_LL(64, 64, false, false);
-        }
+#define DCU_MEGAMOE_V3_LAUNCH_K1_LL_FOR_EXPERTS(EXPERTS)                        \
+    do {                                                                        \
+        if (ll_block_m == 32 && ll_cus == 64) {                                  \
+            if (mask_tiny_store) {                                               \
+                DCU_MEGAMOE_V3_LAUNCH_K1_LL(EXPERTS, 32, 64, true, true);        \
+            } else {                                                             \
+                DCU_MEGAMOE_V3_LAUNCH_K1_LL(EXPERTS, 32, 64, false, true);       \
+            }                                                                    \
+        } else if (ll_block_m == 48 && ll_cus == 64) {                           \
+            DCU_MEGAMOE_V3_LAUNCH_K1_LL(EXPERTS, 48, 64, false, false);          \
+        } else if (ll_block_m == 64 && ll_cus == 64) {                           \
+            if (mask_tiny_store) {                                               \
+                DCU_MEGAMOE_V3_LAUNCH_K1_LL(EXPERTS, 64, 64, true, false);       \
+            } else {                                                             \
+                DCU_MEGAMOE_V3_LAUNCH_K1_LL(EXPERTS, 64, 64, false, false);      \
+            }                                                                    \
+        }                                                                        \
+    } while (0)
+
+    const int local_experts =
+        num_ranks > 0 ? (num_global_experts / num_ranks) : num_global_experts;
+    if (local_experts == 8) {
+        DCU_MEGAMOE_V3_LAUNCH_K1_LL_FOR_EXPERTS(8);
+    } else if (local_experts == 16) {
+        DCU_MEGAMOE_V3_LAUNCH_K1_LL_FOR_EXPERTS(16);
+    } else if (local_experts == 32) {
+        DCU_MEGAMOE_V3_LAUNCH_K1_LL_FOR_EXPERTS(32);
     }
+#undef DCU_MEGAMOE_V3_LAUNCH_K1_LL_FOR_EXPERTS
 #undef DCU_MEGAMOE_V3_LAUNCH_K1_LL
 }

@@ -26,6 +26,7 @@ static constexpr int kV3K1TailCopyExpertDoneOffset =
     3 * kV3K1TailDoneCounterRingSlots;
 static constexpr int kV3K1TailCopyExpertDoneCount = 32;
 static constexpr int kV3K1StartSignalSlotBase = 18;
+static constexpr int kV3K1MaxSignalRanks = 32;
 
 __device__ int32x2_t llvm_amdgcn_raw_buffer_load_i32x2(
     int32x4_t resource,
@@ -521,11 +522,14 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
     int graph_max_tokens,
     int rank_idx,
     int num_ranks) {
-    constexpr int kTailSignalSlotBase = 8;
+    const int kTailSignalSlotBase =
+        deep_gemm::mega::dcu_tail_signal_slot_base(num_ranks);
+    const int kTailChunkSignalSlotBase =
+        deep_gemm::mega::dcu_split_tail_chunk_signal_slot_base(num_ranks);
     const int thread_id = static_cast<int>(threadIdx.x);
     __shared__ int barrier_generation;
     __shared__ int barrier_ticket;
-    __shared__ int uniform_peer_match[kV3K1TailDoneCounterRingSlots];
+    __shared__ int uniform_peer_match[kV3K1MaxSignalRanks];
 
     if (blockIdx.x != 0)
         return;
@@ -565,15 +569,16 @@ __device__ static inline void v3_k1_ll_start_rank_barrier_device(
                            __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
     if (thread_id < kV3K1TailChunkSignalSlots) {
-        __hip_atomic_store(my_signals + kV3K1TailChunkSignalSlotBase + thread_id,
+        __hip_atomic_store(my_signals + kTailChunkSignalSlotBase + thread_id,
                            0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
     __threadfence_system();
     __syncthreads();
 
     auto* barrier_signals = signal_buffers[0];
-    const int barrier_arrival_slot = kV3K1StartSignalSlotBase;
-    const int barrier_release_slot = kV3K1StartSignalSlotBase + 1;
+    const int barrier_arrival_slot =
+        deep_gemm::mega::dcu_start_barrier_signal_slot_base(num_ranks);
+    const int barrier_release_slot = barrier_arrival_slot + 1;
     if (thread_id == 0) {
         barrier_ticket = atomicAdd_system(barrier_signals + barrier_arrival_slot, 1);
         barrier_generation = barrier_ticket / num_ranks + 1;
@@ -1027,7 +1032,7 @@ V3_K1_LowLatencyMaskedGroupGemmKernel(
     int32_t* graph_runtime_num_tokens_out = nullptr,
     int32_t* graph_tail_signal_generation_out = nullptr,
     int graph_max_tokens = -1) {
-    static_assert(kExperts == 32, "readlane expert broadcast assumes <=32 experts");
+    static_assert(kExperts <= 32, "readlane expert broadcast assumes <=32 experts");
     static_assert(kBlockM == 16 || kBlockM == 32 || kBlockM == 48 ||
                       kBlockM == 64,
                   "this low-latency kernel uses M16/M32/M48/M64 tiles");

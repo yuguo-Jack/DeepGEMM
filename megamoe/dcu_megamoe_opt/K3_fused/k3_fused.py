@@ -67,6 +67,16 @@ def load_v3_ll_extension(verbose: bool = False):
     return _v3_ext
 
 
+def _tail_signal_slot_base(num_ranks: int) -> int:
+    return 8 if int(num_ranks) <= 8 else int(num_ranks)
+
+
+def _start_barrier_signal_slot_base(num_ranks: int) -> int:
+    if int(num_ranks) <= 8:
+        return 18
+    return _tail_signal_slot_base(num_ranks) + int(num_ranks)
+
+
 def build_asm_tail_signal_addrs(
     sym_buffer,
     *,
@@ -82,13 +92,17 @@ def build_asm_tail_signal_addrs(
     signal_ptrs = [int(ptr) for ptr in signal_ptrs[: int(num_ranks)]]
     if len(signal_ptrs) != int(num_ranks) or any(ptr == 0 for ptr in signal_ptrs):
         raise RuntimeError("failed to get DCU symm signal pointers")
-    addrs = [0] * 16
+    tail_signal_slot_base = _tail_signal_slot_base(num_ranks)
+    addrs = [0] * (2 * int(num_ranks))
     for peer_rank in range(int(num_ranks)):
-        # Slots [8, 15] are reserved for K3 ASM tail generation signals.
-        # The regular MegaMoE rank barrier uses [0, num_ranks), while the
-        # local-block barrier uses 16 and 17.
-        addrs[peer_rank] = signal_ptrs[peer_rank] + (8 + int(rank_idx)) * 4
-        addrs[8 + peer_rank] = signal_ptrs[int(rank_idx)] + (8 + peer_rank) * 4
+        # EP8 preserves the historical [8, 15] layout. EP16/EP32 move this
+        # window after the rank-barrier slots to avoid signal overlap.
+        addrs[peer_rank] = signal_ptrs[peer_rank] + (
+            tail_signal_slot_base + int(rank_idx)
+        ) * 4
+        addrs[int(num_ranks) + peer_rank] = signal_ptrs[int(rank_idx)] + (
+            tail_signal_slot_base + peer_rank
+        ) * 4
     if out is None:
         return torch.tensor(addrs, device=sym_buffer.buffer.device, dtype=torch.int64)
     ext = load_extension(verbose=verbose_build)
@@ -108,7 +122,7 @@ def rank_barrier(
     graph_runtime_num_tokens_out: torch.Tensor | None = None,
     graph_tail_signal_generation_out: torch.Tensor | None = None,
     graph_max_tokens: int = -1,
-    barrier_signal_slot_base: int = 18,
+    barrier_signal_slot_base: int | None = None,
     verbose_build: bool = False,
 ) -> None:
     ext = load_extension(verbose=verbose_build)
@@ -137,7 +151,11 @@ def rank_barrier(
         if graph_tail_signal_generation_out is not None
         else None,
         int(graph_max_tokens),
-        int(barrier_signal_slot_base),
+        int(
+            _start_barrier_signal_slot_base(num_ranks)
+            if barrier_signal_slot_base is None
+            else barrier_signal_slot_base
+        ),
     )
 
 

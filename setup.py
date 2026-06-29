@@ -64,7 +64,7 @@ if IS_HIP_EXTENSION:
         os.path.join(dcu_opt_root, 'csrc'),
         project_path('third-party', 'fmt', 'include'),
     ]
-    build_libraries = []
+    build_libraries = ['hsa-runtime64']
     build_library_dirs = [f'{accelerator_home}/lib', f'{accelerator_home}/lib64']
 else:
     package_name = 'deep_gemm'

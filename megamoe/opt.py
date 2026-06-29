@@ -34,6 +34,7 @@ K_PROB_STORAGE_BYTES = 256
 K_TAIL_DONE_COUNTER_RING_SLOTS = 16
 K_TAIL_DONE_COUNTER_INTS = 80
 K_POST_K3_BARRIER_SIGNAL_SLOT_BASE = 20
+K_DSV4_FLASH_SUPPORTED_EP_RANKS = (8, 16, 32)
 V3_LL_BLOCK_M = 32
 K_LL_SPLIT_TAIL_MAX_TOKENS = 512
 K_DTYPE_SIZES = {
@@ -102,6 +103,26 @@ def _align(value: int, alignment: int) -> int:
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _dcu_tail_signal_slot_base(num_ranks: int) -> int:
+    return 8 if int(num_ranks) <= 8 else int(num_ranks)
+
+
+def _dcu_start_barrier_signal_slot_base(num_ranks: int) -> int:
+    if int(num_ranks) <= 8:
+        return 18
+    return _dcu_tail_signal_slot_base(num_ranks) + int(num_ranks)
+
+
+def _dcu_post_k3_barrier_signal_slot_base(num_ranks: int) -> int:
+    if int(num_ranks) <= 8:
+        return K_POST_K3_BARRIER_SIGNAL_SLOT_BASE
+    return _dcu_start_barrier_signal_slot_base(num_ranks) + 2
+
+
+def _dcu_tail_signal_addrs_count(num_ranks: int) -> int:
+    return 2 * int(num_ranks)
 
 
 def _route_task_workspace_bytes(*, num_ranks: int, num_experts: int, num_max_tokens: int) -> int:
@@ -250,6 +271,7 @@ def _route_scratch_views(
     act_scale_capacity_bytes = act_chunk_amax_offset - act_scale_offset
     prob_offset = route_base + act_chunk_amax_offset
     tail_done_offset = _align(prob_offset + K_PROB_STORAGE_BYTES, K_DTYPE_SIZES[torch.int32])
+    tail_signal_addrs_count = _dcu_tail_signal_addrs_count(num_ranks)
     tail_signal_addrs_offset = _align(
         tail_done_offset + K_TAIL_DONE_COUNTER_INTS * K_DTYPE_SIZES[torch.int32],
         K_DTYPE_SIZES[torch.int64],
@@ -315,9 +337,9 @@ def _route_scratch_views(
         asm_tail_signal_addrs=_route_scratch_tensor(
             route_scratch,
             byte_offset=tail_signal_addrs_offset,
-            byte_capacity=16 * K_DTYPE_SIZES[torch.int64],
+            byte_capacity=tail_signal_addrs_count * K_DTYPE_SIZES[torch.int64],
             dtype=torch.int64,
-            shape=(16,),
+            shape=(tail_signal_addrs_count,),
         ),
     )
 
@@ -418,7 +440,7 @@ def _check_shape(
     num_max_tokens_per_rank: int,
 ) -> None:
     if (
-        num_ranks != 8
+        num_ranks not in K_DSV4_FLASH_SUPPORTED_EP_RANKS
         or num_experts != 256
         or num_topk != 6
         or hidden != 4096
@@ -428,7 +450,7 @@ def _check_shape(
     ):
         raise ValueError(
             "DCU MegaMoE V3 staged path supports only DeepSeek-V4-Flash "
-            "EP8 shape: experts=256, topk=6, hidden=4096, intermediate=2048, "
+            "EP8/EP16/EP32 shape: experts=256, topk=6, hidden=4096, intermediate=2048, "
             "and 0<=num_tokens_per_rank<=num_max_tokens_per_rank"
         )
 
@@ -512,6 +534,7 @@ def fp8_mega_moe_opt_3stage(
             ),
             reset_tail_signal_slots=use_tail_reduce,
             graph_max_tokens=num_tokens,
+            barrier_signal_slot_base=_dcu_start_barrier_signal_slot_base(num_ranks),
             verbose_build=verbose_build,
         )
 
@@ -626,7 +649,7 @@ def fp8_mega_moe_opt_3stage(
             sym_buffer,
             rank_idx=rank_idx,
             num_ranks=num_ranks,
-            barrier_signal_slot_base=K_POST_K3_BARRIER_SIGNAL_SLOT_BASE,
+            barrier_signal_slot_base=_dcu_post_k3_barrier_signal_slot_base(num_ranks),
             verbose_build=verbose_build,
         )
         reduce_local_combine(
@@ -742,6 +765,7 @@ def _run_opt_3stage_graph(
                 state.scratch.graph_tail_signal_generation if use_tail_reduce else None
             ),
             graph_max_tokens=graph_max_tokens,
+            barrier_signal_slot_base=_dcu_start_barrier_signal_slot_base(num_ranks),
             verbose_build=verbose_build,
         )
 
@@ -879,7 +903,7 @@ def _run_opt_3stage_graph(
             sym_buffer,
             rank_idx=rank_idx,
             num_ranks=num_ranks,
-            barrier_signal_slot_base=K_POST_K3_BARRIER_SIGNAL_SLOT_BASE,
+            barrier_signal_slot_base=_dcu_post_k3_barrier_signal_slot_base(num_ranks),
             verbose_build=verbose_build,
         )
         reduce_local_combine_graph(

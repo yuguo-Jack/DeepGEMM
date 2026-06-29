@@ -35,6 +35,26 @@ __host__ __device__ static inline int64_t dcu_uniform_num_tokens_offset(const in
     return dcu_runtime_num_tokens_offset(num_ranks) + sizeof(int32_t);
 }
 
+__host__ __device__ static inline int dcu_tail_signal_slot_base(const int num_ranks) {
+    return num_ranks <= 8 ? 8 : num_ranks;
+}
+
+__host__ __device__ static inline int dcu_start_barrier_signal_slot_base(const int num_ranks) {
+    return num_ranks <= 8 ? 18 : dcu_tail_signal_slot_base(num_ranks) + num_ranks;
+}
+
+__host__ __device__ static inline int dcu_post_k3_barrier_signal_slot_base(const int num_ranks) {
+    return num_ranks <= 8 ? 20 : dcu_start_barrier_signal_slot_base(num_ranks) + 2;
+}
+
+__host__ __device__ static inline int dcu_split_tail_chunk_signal_slot_base(const int num_ranks) {
+    return num_ranks <= 8 ? 22 : dcu_post_k3_barrier_signal_slot_base(num_ranks) + 2;
+}
+
+__host__ __device__ static inline int dcu_required_signal_slots(const int num_ranks) {
+    return dcu_split_tail_chunk_signal_slot_base(num_ranks) + 8;
+}
+
 __host__ __device__ static inline int64_t dcu_input_token_offset(const int num_ranks) {
     return align_i64(dcu_uniform_num_tokens_offset(num_ranks) + sizeof(int32_t), 16);
 }

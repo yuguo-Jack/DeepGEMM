@@ -19,14 +19,15 @@ FUSED_L1_ASM_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_PACK5_NAME}.co"
 FUSED_L1_ASM_UNIFIED_PACK5_NAME = f"{FUSED_L1_ASM_NAME}_UNIFIED_PACK5"
 FUSED_L1_ASM_UNIFIED_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_UNIFIED_PACK5_NAME}.co"
 
-K1_SUPPORTED_RANKS = 8
+K1_SUPPORTED_RANKS = (8, 16, 32)
 K1_SUPPORTED_EXPERTS = 256
 K1_SUPPORTED_TOPK = 6
 K1_SUPPORTED_HIDDEN = 4096
 K1_SUPPORTED_ALIGNMENT = 256
 K1_SHAPE_CONTRACT = (
-    "K1_fused dispatch-pull L1 asm currently supports only ranks=8, "
-    "experts=256, local_experts=32, topk=6, hidden=4096, alignment=256, "
+    "K1_fused dispatch-pull L1 asm currently supports DSV4 Flash ranks in "
+    "{8,16,32}, experts=256, local_experts<=32, topk=6, hidden=4096, "
+    "alignment=256, "
     "and 0<=num_tokens_per_rank<=num_max_tokens_per_rank"
 )
 
@@ -42,7 +43,7 @@ def _check_fused_l1_shape(
     alignment: int,
 ) -> None:
     if (
-        int(num_ranks) != K1_SUPPORTED_RANKS
+        int(num_ranks) not in K1_SUPPORTED_RANKS
         or int(num_experts) != K1_SUPPORTED_EXPERTS
         or int(num_topk) != K1_SUPPORTED_TOPK
         or int(hidden) != K1_SUPPORTED_HIDDEN

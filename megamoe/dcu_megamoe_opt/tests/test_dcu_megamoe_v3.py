@@ -468,7 +468,8 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     opt_source = OPT_PATH.read_text(encoding="utf-8")
 
     assert "staged_pack5_shape" in api_source
-    assert "num_ranks == 8 && num_experts == 256 && num_topk == 6" in api_source
+    assert "(num_ranks == 8 || num_ranks == 16 || num_ranks == 32)" in api_source
+    assert "num_experts == 256 && num_topk == 6" in api_source
     assert "hidden == 4096 && intermediate_hidden == 2048" in api_source
     assert "return legacy_route_scratch_bytes();" not in api_source
     assert "dcu_route_scratch_bytes(" not in api_source
@@ -516,3 +517,42 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
         assert mirrored_name in opt_source
     assert "capacity_rows * static_cast<int64_t>(hidden)" in api_source
     assert "capacity_rows * hidden" in opt_source
+
+
+def test_v3_supernode_source_support():
+    init_source = (ROOT / "megamoe" / "__init__.py").read_text(encoding="utf-8")
+    opt_source = OPT_PATH.read_text(encoding="utf-8")
+    setup_source = SETUP_PATH.read_text(encoding="utf-8")
+    python_api_source = (
+        ROOT / "megamoe" / "dcu_megamoe_opt" / "csrc" / "python_api_hip.cpp"
+    ).read_text(encoding="utf-8")
+    layout_source = (
+        ROOT / "megamoe" / "dcu_megamoe_opt" / "include" / "mega_moe_dcu" / "layout.cuh"
+    ).read_text(encoding="utf-8")
+    k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
+    k1_ext = (K1_FUSED_DIR / "k1_v3_fused_ext.cu").read_text(encoding="utf-8")
+    k1_header = (K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh").read_text(
+        encoding="utf-8"
+    )
+    k3_ext = (K3_FUSED_DIR / "k3_v3_fused_ext.cu").read_text(encoding="utf-8")
+    k3_header = (K3_FUSED_DIR / "k3_v3_pack5_groupgemm_impl.cuh").read_text(
+        encoding="utf-8"
+    )
+    k3_py = (K3_FUSED_DIR / "k3_fused.py").read_text(encoding="utf-8")
+
+    assert "_DSV4_FLASH_SUPPORTED_EP_RANKS = (8, 16, 32)" in init_source
+    assert "K_DSV4_FLASH_SUPPORTED_EP_RANKS = (8, 16, 32)" in opt_source
+    assert "K1_SUPPORTED_RANKS = (8, 16, 32)" in k1_py
+    assert "dcu_required_signal_slots" in layout_source
+    assert "dcu_split_tail_chunk_signal_slot_base(num_ranks)" in k1_header
+    assert "dcu_split_tail_chunk_signal_slot_base(num_ranks)" in k3_header
+    assert "signal_addrs[num_ranks + rank]" in k3_header
+    assert "V3_K1_LowLatencyMaskedGroupGemmKernel<" in k1_ext
+    assert "EXPERTS, 4096, 4096" in k1_ext
+    assert "V3_K3_LowLatencyMaskedGroupGemmKernel<" in k3_ext
+    assert "kExperts, 4096, 2048" in k3_ext
+    assert "open_hip_fabric_handles" in python_api_source
+    assert "hsa_ext_rpc_memory_attach" in python_api_source
+    assert "MEGAMOE_DCU_SUPERNODE" in init_source
+    assert "build_libraries = ['hsa-runtime64']" in setup_source
+    assert "addrs = [0] * (2 * int(num_ranks))" in k3_py

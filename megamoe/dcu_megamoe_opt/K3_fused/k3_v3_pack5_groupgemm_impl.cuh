@@ -236,7 +236,9 @@ __device__ static inline void v3_k3_split_publish_row_chunk_device(
         if (chunk < 0 || chunk >= kV3K3TailChunkSignalSlots)
             return;
         atomicAdd_system(signal_buffers[dest_rank] +
-                             kV3K3TailChunkSignalSlotBase + chunk,
+                             deep_gemm::mega::dcu_split_tail_chunk_signal_slot_base(
+                                 num_ranks) +
+                             chunk,
                          1);
         return;
     }
@@ -250,9 +252,11 @@ __device__ static inline void v3_k3_split_signal_copy_done_device(
         return;
     auto** signal_buffers =
         deep_gemm::mega::dcu_peer_signal_ptrs(sym_buffer, num_ranks);
+    const int copy_done_signal_slot_base =
+        deep_gemm::mega::dcu_tail_signal_slot_base(num_ranks);
     for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
         __hip_atomic_store(
-            signal_buffers[peer_rank] + kV3K3TailCopyDoneSignalSlotBase +
+            signal_buffers[peer_rank] + copy_done_signal_slot_base +
                 rank_idx,
             1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
@@ -280,8 +284,10 @@ __device__ static inline bool v3_k3_split_all_copy_done_device(
     int* my_signal_buffer,
     int num_ranks) {
     for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
+        const int copy_done_signal_slot_base =
+            deep_gemm::mega::dcu_tail_signal_slot_base(num_ranks);
         auto* done = reinterpret_cast<volatile int*>(
-            my_signal_buffer + kV3K3TailCopyDoneSignalSlotBase + peer_rank);
+            my_signal_buffer + copy_done_signal_slot_base + peer_rank);
         if (load_signal_system_acquire_device(done) < 1)
             return false;
     }
@@ -485,7 +491,7 @@ V3_K3_LowLatencyCombineReduceKernel(
         block_barrier_device();
         __threadfence_system();
 
-        constexpr int kMaxSignalRanks = 8;
+        constexpr int kMaxSignalRanks = 32;
         constexpr int kPublishSlots =
             kMaxSignalRanks * kV3K3TailChunkSignalSlots;
         __shared__ int publish_expert;
@@ -583,10 +589,12 @@ V3_K3_LowLatencyCombineReduceKernel(
                     const int chunk =
                         slot -
                         peer_rank * kV3K3TailChunkSignalSlots;
-                    atomicAdd_system(signal_buffers[peer_rank] +
-                                         kV3K3TailChunkSignalSlotBase +
-                                         chunk,
-                                     count);
+                    atomicAdd_system(
+                        signal_buffers[peer_rank] +
+                            deep_gemm::mega::dcu_split_tail_chunk_signal_slot_base(
+                                num_ranks) +
+                            chunk,
+                        count);
                 }
             } else {
                 for (int row = tid; row < cur_tokens; row += blockDim.x) {
@@ -643,7 +651,9 @@ V3_K3_LowLatencyCombineReduceKernel(
         deep_gemm::mega::dcu_peer_signal_ptrs(sym_buffer, num_ranks);
     int* my_signal_buffer = signal_buffers[rank_idx];
     auto* signal = reinterpret_cast<volatile int*>(
-        my_signal_buffer + kV3K3TailChunkSignalSlotBase + chunk);
+        my_signal_buffer +
+        deep_gemm::mega::dcu_split_tail_chunk_signal_slot_base(num_ranks) +
+        chunk);
     int* chunk_ready_counter =
         done_counter == nullptr
             ? nullptr
@@ -1295,7 +1305,8 @@ __device__ static inline void v3_k3_tail_wait_peer_signals_device(
     int signal_generation) {
     if (threadIdx.x == 0) {
         for (int rank = 0; rank < num_ranks; ++rank) {
-            const int64_t addr = signal_addrs == nullptr ? 0 : signal_addrs[8 + rank];
+            const int64_t addr =
+                signal_addrs == nullptr ? 0 : signal_addrs[num_ranks + rank];
             if (addr == 0)
                 continue;
             auto* signal = reinterpret_cast<volatile int*>(addr);
@@ -1501,7 +1512,7 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
     const int32_t* signal_generation_ptr = nullptr,
     int done_target = 0,
     int reduce_blocks = 0) {
-    static_assert(kExperts == 32, "readlane expert broadcast assumes <=32 experts");
+    static_assert(kExperts <= 32, "readlane expert broadcast assumes <=32 experts");
     static_assert(kBlockM == 16 || kBlockM == 32 || kBlockM == 48 ||
                       kBlockM == 64,
                   "this low-latency kernel uses M16/M32/M48/M64 tiles");

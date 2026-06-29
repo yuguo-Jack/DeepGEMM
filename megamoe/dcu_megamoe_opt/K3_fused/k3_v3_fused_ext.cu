@@ -8,7 +8,7 @@
 
 #include "k3_v3_pack5_groupgemm_impl.cuh"
 
-template <int kBlockM>
+template <int kExperts, int kBlockM>
 static inline void launch_v3_k3_ll_rowptr(
     hip_bfloat16* output_workspace,
     const uint8_t* act_fp8,
@@ -36,7 +36,7 @@ static inline void launch_v3_k3_ll_rowptr(
     constexpr int kDoneTarget = 64;
     const dim3 grid(kCUs + reduce_blocks);
     V3_K3_LowLatencyMaskedGroupGemmKernel<
-        32, 4096, 2048, kBlockM, 256, 64, 4, kCUs, true>
+        kExperts, 4096, 2048, kBlockM, 256, 64, 4, kCUs, true>
         <<<grid, block, 0, stream>>>(
             output_workspace,
             act_fp8,
@@ -62,7 +62,7 @@ static inline void launch_v3_k3_ll_rowptr(
             reduce_blocks);
 }
 
-template <int kBlockM>
+template <int kExperts, int kBlockM>
 static inline void launch_v3_k3_ll_local(
     hip_bfloat16* output_workspace,
     const uint8_t* act_fp8,
@@ -76,7 +76,7 @@ static inline void launch_v3_k3_ll_local(
     constexpr int kCUs = 64;
     const dim3 grid(kCUs);
     V3_K3_LowLatencyMaskedGroupGemmKernel<
-        32, 4096, 2048, kBlockM, 256, 64, 4, kCUs, false>
+        kExperts, 4096, 2048, kBlockM, 256, 64, 4, kCUs, false>
         <<<grid, block, 0, stream>>>(
             output_workspace,
             act_fp8,
@@ -181,21 +181,32 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5(
     if (rows_per_expert <= 0 || total_rows % local_experts != 0)
         return;
     const int reduce_blocks = num_max_tokens_per_rank <= 2048 ? 64 : 128;
-#define DCU_MEGAMOE_V3_LAUNCH_LL(BLOCK_M)                                      \
-    launch_v3_k3_ll_rowptr<(BLOCK_M)>(                                         \
+#define DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, BLOCK_M)                             \
+    launch_v3_k3_ll_rowptr<(EXPERTS), (BLOCK_M)>(                              \
         output_workspace, act_fp8, act_scale, row_expert, weight_pack5,         \
         weight_scale,                                                           \
         row_combine_ptrs, rows_per_expert, sym_buffer, done_counter,            \
         signal_addrs, reduce_y, num_ranks, num_experts,                        \
         num_max_tokens_per_rank, num_tokens, runtime_num_tokens, num_topk,      \
         reduce_blocks, signal_generation_ptr, stream)
-    if (ll_block_m == 64) {
-        DCU_MEGAMOE_V3_LAUNCH_LL(64);
-    } else if (ll_block_m == 48) {
-        DCU_MEGAMOE_V3_LAUNCH_LL(48);
-    } else {
-        DCU_MEGAMOE_V3_LAUNCH_LL(32);
+#define DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(EXPERTS)                          \
+    do {                                                                        \
+        if (ll_block_m == 64) {                                                  \
+            DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, 64);                              \
+        } else if (ll_block_m == 48) {                                           \
+            DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, 48);                              \
+        } else {                                                                 \
+            DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, 32);                              \
+        }                                                                        \
+    } while (0)
+    if (local_experts == 8) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(8);
+    } else if (local_experts == 16) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(16);
+    } else if (local_experts == 32) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(32);
     }
+#undef DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS
 #undef DCU_MEGAMOE_V3_LAUNCH_LL
     (void)sym_buffer;
     (void)done_counter;
@@ -255,17 +266,28 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5_split(
         local_experts > 0 ? (total_rows / local_experts) : 0;
     if (rows_per_expert <= 0 || total_rows % local_experts != 0)
         return;
-#define DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(BLOCK_M)                                \
-    launch_v3_k3_ll_local<(BLOCK_M)>(                                          \
+#define DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, BLOCK_M)                       \
+    launch_v3_k3_ll_local<(EXPERTS), (BLOCK_M)>(                               \
         output_workspace, act_fp8, act_scale, row_expert, weight_pack5,         \
         weight_scale, rows_per_expert, stream)
-    if (ll_block_m == 64) {
-        DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(64);
-    } else if (ll_block_m == 48) {
-        DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(48);
-    } else {
-        DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(32);
+#define DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(EXPERTS)                    \
+    do {                                                                        \
+        if (ll_block_m == 64) {                                                  \
+            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, 64);                        \
+        } else if (ll_block_m == 48) {                                           \
+            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, 48);                        \
+        } else {                                                                 \
+            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, 32);                        \
+        }                                                                        \
+    } while (0)
+    if (local_experts == 8) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(8);
+    } else if (local_experts == 16) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(16);
+    } else if (local_experts == 32) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(32);
     }
+#undef DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS
 #undef DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL
     launch_v3_k3_ll_split_combine_reduce(
         output_workspace,
@@ -367,8 +389,8 @@ void k3_v3_ll_combine_tail(
                 "V3 K3 LL pack5 is specialized for hidden=4096, intermediate=2048");
     TORCH_CHECK(ll_block_m == 32 || ll_block_m == 48 || ll_block_m == 64,
                 "V3 K3 LL pack5 expects ll_block_m in {32, 48, 64}");
-    TORCH_CHECK(num_ranks > 0 && num_ranks <= 8,
-                "num_ranks must be in [1, 8]");
+    TORCH_CHECK(num_ranks > 0 && num_ranks <= 32,
+                "num_ranks must be in [1, 32]");
     TORCH_CHECK(num_experts > 0 && num_experts % num_ranks == 0,
                 "num_experts must be divisible by num_ranks");
     TORCH_CHECK(num_topk > 0 && num_tokens >= 0,
@@ -379,8 +401,8 @@ void k3_v3_ll_combine_tail(
     constexpr int64_t kTailDoneCounterInts = 3 * kTailDoneCounterRingSlots;
     TORCH_CHECK(done_counter.numel() >= kTailDoneCounterInts,
                 "done_counter must cover LL tail done and peer-ready rings");
-    TORCH_CHECK(signal_addrs.numel() >= 16,
-                "signal_addrs must have 16 entries");
+    TORCH_CHECK(signal_addrs.numel() >= 2 * num_ranks,
+                "signal_addrs must contain local and peer signal entries");
     const int32_t* signal_generation_ptr = nullptr;
     if (signal_generation_tensor.has_value()) {
         const auto& generation = signal_generation_tensor.value();
@@ -400,6 +422,8 @@ void k3_v3_ll_combine_tail(
         runtime_num_tokens_ptr = runtime.data_ptr<int32_t>();
     }
     const int local_experts = num_ranks > 0 ? (num_experts / num_ranks) : 0;
+    TORCH_CHECK(local_experts == 8 || local_experts == 16 || local_experts == 32,
+                "V3 K3 LL pack5 supports local_experts in {8,16,32}");
     TORCH_CHECK(m_indices.numel() >= local_experts,
                 "m_indices must carry one actual row count per local expert");
     TORCH_CHECK(row_combine_ptrs.numel() >= total_rows,
@@ -515,8 +539,8 @@ void k3_v3_ll_combine_tail_split(
                 "V3 K3 LL pack5 is specialized for hidden=4096, intermediate=2048");
     TORCH_CHECK(ll_block_m == 32 || ll_block_m == 48 || ll_block_m == 64,
                 "V3 K3 LL pack5 expects ll_block_m in {32, 48, 64}");
-    TORCH_CHECK(num_ranks > 0 && num_ranks <= 8,
-                "num_ranks must be in [1, 8]");
+    TORCH_CHECK(num_ranks > 0 && num_ranks <= 32,
+                "num_ranks must be in [1, 32]");
     TORCH_CHECK(rank_idx >= 0 && rank_idx < num_ranks,
                 "rank_idx must be in [0, num_ranks)");
     TORCH_CHECK(num_experts > 0 && num_experts % num_ranks == 0,
@@ -529,8 +553,8 @@ void k3_v3_ll_combine_tail_split(
         3 * kV3K3TailDoneCounterRingSlots + kV3K3TailCopyExpertDoneCount;
     TORCH_CHECK(done_counter.numel() >= kSplitTailDoneCounterInts,
                 "done_counter must cover LL split-tail copy counters");
-    TORCH_CHECK(signal_addrs.numel() >= 16,
-                "signal_addrs must have 16 entries");
+    TORCH_CHECK(signal_addrs.numel() >= 2 * num_ranks,
+                "signal_addrs must contain local and peer signal entries");
     if (signal_generation_tensor.has_value()) {
         const auto& generation = signal_generation_tensor.value();
         check_cuda_contiguous(generation, "signal_generation_tensor");
@@ -552,6 +576,8 @@ void k3_v3_ll_combine_tail_split(
                     "V3 K3 LL split-tail eager path supports num_tokens <= 512");
     }
     const int local_experts = num_ranks > 0 ? (num_experts / num_ranks) : 0;
+    TORCH_CHECK(local_experts == 8 || local_experts == 16 || local_experts == 32,
+                "V3 K3 LL pack5 supports local_experts in {8,16,32}");
     TORCH_CHECK(m_indices.numel() >= local_experts,
                 "m_indices must carry one actual row count per local expert");
     TORCH_CHECK(row_combine_ptrs.numel() >= total_rows,

@@ -20,8 +20,46 @@ def _align(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _is_hip_backend() -> bool:
     return getattr(torch.version, "hip", None) is not None
+
+
+def _use_supernode_peer_memory(num_ranks: int) -> bool:
+    return int(num_ranks) > 8 or _env_flag("MEGAMOE_DCU_SUPERNODE")
+
+
+_DSV4_FLASH_SUPPORTED_EP_RANKS = (8, 16, 32)
+
+
+def _dcu_tail_signal_slot_base(num_ranks: int) -> int:
+    return 8 if int(num_ranks) <= 8 else int(num_ranks)
+
+
+def _dcu_start_barrier_signal_slot_base(num_ranks: int) -> int:
+    if int(num_ranks) <= 8:
+        return 18
+    return _dcu_tail_signal_slot_base(num_ranks) + int(num_ranks)
+
+
+def _dcu_post_k3_barrier_signal_slot_base(num_ranks: int) -> int:
+    if int(num_ranks) <= 8:
+        return 20
+    return _dcu_start_barrier_signal_slot_base(num_ranks) + 2
+
+
+def _dcu_split_tail_chunk_signal_slot_base(num_ranks: int) -> int:
+    if int(num_ranks) <= 8:
+        return 22
+    return _dcu_post_k3_barrier_signal_slot_base(num_ranks) + 2
+
+
+def _dcu_required_signal_slots(num_ranks: int) -> int:
+    return _dcu_split_tail_chunk_signal_slot_base(num_ranks) + 8
 
 
 def _staged_pack5_shape_supported(
@@ -32,12 +70,12 @@ def _staged_pack5_shape_supported(
     hidden: int,
     intermediate_hidden: int,
 ) -> bool:
-    return (num_ranks, num_experts, num_topk, hidden, intermediate_hidden) == (
-        8,
-        256,
-        6,
-        4096,
-        2048,
+    return (
+        int(num_ranks) in _DSV4_FLASH_SUPPORTED_EP_RANKS
+        and int(num_experts) == 256
+        and int(num_topk) == 6
+        and int(hidden) == 4096
+        and int(intermediate_hidden) == 2048
     )
 
 
@@ -58,7 +96,8 @@ def _check_staged_pack5_shape(
     ):
         raise ValueError(
             "DCU MegaMoE staged LL/normal path currently supports only "
-            "EP8 experts=256 topk=6 hidden=4096 intermediate=2048. "
+            "DSV4 Flash EP8/EP16/EP32 experts=256 topk=6 hidden=4096 "
+            "intermediate=2048. "
             "Add a shape-specific staged layout before enabling new model sizes."
         )
 
@@ -264,7 +303,7 @@ def get_mega_moe_hip_build_config():
         "auto selection belongs to the framework/test layer"
     )
     config["supported_staged_shape"] = (
-        "EP8 experts=256 topk=6 hidden=4096 intermediate=2048"
+        "DSV4 Flash EP8/EP16/EP32 experts=256 topk=6 hidden=4096 intermediate=2048"
     )
     config["cuda_graph_max_tokens_source"] = "requested num_max_tokens_per_rank"
     config["cuda_graph_execution"] = "graph=True captures the selected v3_staged backend"
@@ -336,7 +375,25 @@ class SymmBuffer:
             activation,
         )
 
-        self.buffer, buffer_ptr, local_handle = _C.allocate_hip_ipc_buffer(num_bytes)
+        use_supernode_peer_memory = _use_supernode_peer_memory(group.size())
+        alloc_buffer = (
+            _C.allocate_hip_fabric_buffer
+            if use_supernode_peer_memory
+            else _C.allocate_hip_ipc_buffer
+        )
+        alloc_signal_buffer = (
+            _C.allocate_hip_fabric_signal_buffer
+            if use_supernode_peer_memory
+            else _C.allocate_hip_ipc_signal_buffer
+        )
+        open_handles = (
+            _C.open_hip_fabric_handles
+            if use_supernode_peer_memory
+            else _C.open_hip_ipc_handles
+        )
+        peer_memory_mode = "fabric" if use_supernode_peer_memory else "ipc"
+
+        self.buffer, buffer_ptr, local_handle = alloc_buffer(num_bytes)
         self.route_scratch = torch.empty(
             (route_scratch_num_bytes,),
             dtype=torch.int8,
@@ -344,23 +401,23 @@ class SymmBuffer:
         )
         ipc_handles = [None] * group.size()
         dist.all_gather_object(ipc_handles, local_handle, group)
-        buffer_ptrs = _C.open_hip_ipc_handles(ipc_handles, group.rank())
+        buffer_ptrs = open_handles(ipc_handles, group.rank())
         buffer_ptrs[group.rank()] = buffer_ptr
 
-        # Slots [0, 17] are used by the legacy rank/local barriers and K3
-        # tail-reduce signals. The staged K1/K2/K3 path uses 18..21 for rank
-        # barriers.
-        signal_num_bytes = _align(max(group.size(), 22) * 4, 128)
-        signal_ptr, signal_handle = _C.allocate_hip_ipc_signal_buffer(signal_num_bytes)
+        # EP8 keeps the historical signal layout. EP16/EP32 use dynamic slots
+        # so tail/copy, barrier, and chunk-ready signals never overlap.
+        signal_num_bytes = _align(_dcu_required_signal_slots(group.size()) * 4, 128)
+        signal_ptr, signal_handle = alloc_signal_buffer(signal_num_bytes)
         signal_handles = [None] * group.size()
         dist.all_gather_object(signal_handles, signal_handle, group)
-        signal_ptrs = _C.open_hip_ipc_handles(signal_handles, group.rank())
+        signal_ptrs = open_handles(signal_handles, group.rank())
         signal_ptrs[group.rank()] = signal_ptr
         self.handle = SimpleNamespace(
             buffer_ptrs=buffer_ptrs,
             buffer_ptr=buffer_ptr,
             signal_ptrs=signal_ptrs,
             signal_buffer_ptr=signal_ptr,
+            peer_memory_mode=peer_memory_mode,
         )
 
         self.buffer.zero_()
@@ -401,8 +458,12 @@ class SymmBuffer:
                 ptr if rank != self.group.rank() else 0
                 for rank, ptr in enumerate(self.handle.signal_ptrs)
             ]
-            _C.close_hip_ipc_handles(remote_ptrs)
-            _C.close_hip_ipc_handles(remote_signal_ptrs)
+            if getattr(self.handle, "peer_memory_mode", "ipc") == "fabric":
+                _C.close_hip_fabric_handles(remote_ptrs)
+                _C.close_hip_fabric_handles(remote_signal_ptrs)
+            else:
+                _C.close_hip_ipc_handles(remote_ptrs)
+                _C.close_hip_ipc_handles(remote_signal_ptrs)
             _C.free_hip_ipc_signal_buffer(self.handle.signal_buffer_ptr)
             _C.free_hip_ipc_buffer(self.handle.buffer_ptr)
         self.handle = None

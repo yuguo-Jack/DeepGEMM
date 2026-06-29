@@ -234,12 +234,13 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     TORCH_CHECK(hidden > 0 && intermediate_hidden > 0, "hidden sizes must be positive");
 
     const bool staged_pack5_shape =
-        num_ranks == 8 && num_experts == 256 && num_topk == 6 &&
+        (num_ranks == 8 || num_ranks == 16 || num_ranks == 32) &&
+        num_experts == 256 && num_topk == 6 &&
         hidden == 4096 && intermediate_hidden == 2048;
     TORCH_CHECK(
         staged_pack5_shape,
         "DCU MegaMoE staged LL/normal route_scratch currently supports only "
-        "EP8 experts=256 topk=6 hidden=4096 intermediate=2048");
+        "DSV4 Flash EP8/EP16/EP32 experts=256 topk=6 hidden=4096 intermediate=2048");
 
     constexpr int64_t kK1RouteTileM = 256;
     constexpr int64_t kK1Alignment = 256;
@@ -314,7 +315,7 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     constexpr int64_t kTailDoneCounterInts = 80;
     static_assert(kTailDoneCounterInts == 3 * kTailDoneCounterRingSlots + 32,
                   "tail done counter scratch layout changed");
-    constexpr int64_t kTailSignalAddrs = 16;
+    const int64_t kTailSignalAddrs = 2 * static_cast<int64_t>(num_ranks);
     const int64_t route_base =
         route_task_workspace_bytes(num_ranks, num_experts, num_max_tokens_per_rank);
     const int64_t prob_offset = route_base + offset;
