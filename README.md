@@ -344,7 +344,7 @@ flows plus an auto selector:
 
 The MegaMoE test includes BF16 input channelwise FP8 quantization in the
 MegaMoE timed path for both LL and normal backends.  This uses MegaMoE's own fused
-`megamoe.pre_dispatch_fp8_channelwise_out(...)` kernel to quantize BF16 input
+`megamoe.mega_moe_pre_dispatch(...)` kernel to quantize BF16 input
 directly into `sym_buffer.x/x_sf` and stage `topk_idx/topk_weights` in the
 same launch; no `lightop` dependency or extra FP8/top-k copy is needed in the
 MegaMoE timed path.  When `--baseline-kind normal-contiguous` is used, the

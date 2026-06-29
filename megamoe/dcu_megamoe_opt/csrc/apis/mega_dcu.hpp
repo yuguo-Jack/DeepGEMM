@@ -80,7 +80,7 @@ void launch_mega_moe_pre_dispatch_fp8_channelwise_hip(
     bool topk_idx_i64,
     bool topk_weights_bf16);
 
-static void pre_dispatch_fp8_channelwise_out(
+static void mega_moe_pre_dispatch(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -505,7 +505,7 @@ static void register_apis(pybind11::module_& m) {
           &get_mega_moe_route_scratch_size_for_mega_moe);
     m.def("get_mega_moe_hip_build_config", &get_mega_moe_hip_build_config);
     m.def("set_mega_moe_peer_ptrs", &set_mega_moe_peer_ptrs);
-    m.def("pre_dispatch_fp8_channelwise_out", &pre_dispatch_fp8_channelwise_out,
+    m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch,
           pybind11::arg("x"),
           pybind11::arg("topk_idx"),
           pybind11::arg("topk_weights"),
