@@ -139,6 +139,7 @@ def mega_moe_pre_dispatch(
     out_scale: torch.Tensor,
     out_topk_idx: torch.Tensor,
     out_topk_weights: torch.Tensor,
+    num_tokens: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse LL pre-dispatch input quantization and top-k buffer staging."""
     if x.dim() != 2:
@@ -147,9 +148,12 @@ def mega_moe_pre_dispatch(
         raise ValueError("pre-dispatch topk tensors must be 2D")
     if topk_idx.shape != topk_weights.shape:
         raise ValueError("pre-dispatch topk_idx/topk_weights shape mismatch")
-    rows, hidden = x.shape
-    if topk_idx.size(0) != rows:
-        raise ValueError("pre-dispatch topk rows must match x rows")
+    input_rows, hidden = x.shape
+    rows = int(num_tokens)
+    if rows < 0 or rows > input_rows:
+        raise ValueError("pre-dispatch num_tokens must be within x rows")
+    if topk_idx.size(0) < rows:
+        raise ValueError("pre-dispatch topk rows must cover num_tokens")
     topk = topk_idx.size(1)
     if out_fp8.dim() != 2 or out_fp8.size(0) < rows or out_fp8.size(1) != hidden:
         raise ValueError("out_fp8 must have shape [>=rows, hidden]")
@@ -171,13 +175,14 @@ def mega_moe_pre_dispatch(
     out_topk_weights_view = out_topk_weights[:rows, :topk]
     if rows == 0:
         return out_fp8_view, out_scale_view, out_topk_idx_view, out_topk_weights_view
+    out_scale_flat = out_scale.view(-1)
     if not (
-        out_fp8_view.is_contiguous()
-        and out_scale_view.is_contiguous()
-        and out_topk_idx_view.is_contiguous()
-        and out_topk_weights_view.is_contiguous()
+        out_fp8.is_contiguous()
+        and out_scale_flat.is_contiguous()
+        and out_topk_idx.is_contiguous()
+        and out_topk_weights.is_contiguous()
     ):
-        raise ValueError("pre-dispatch output slices must be contiguous")
+        raise ValueError("pre-dispatch output buffers must be contiguous")
 
     x_arg = x if x.is_contiguous() else x.contiguous()
     topk_idx_arg = topk_idx if topk_idx.is_contiguous() else topk_idx.contiguous()
@@ -196,10 +201,11 @@ def mega_moe_pre_dispatch(
         x_arg,
         topk_idx_arg,
         topk_weights_arg,
-        out_fp8_view,
-        out_scale_view,
-        out_topk_idx_view,
-        out_topk_weights_view,
+        out_fp8,
+        out_scale_flat,
+        out_topk_idx,
+        out_topk_weights,
+        rows,
     )
     return out_fp8_view, out_scale_view, out_topk_idx_view, out_topk_weights_view
 

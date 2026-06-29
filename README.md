@@ -346,8 +346,10 @@ The MegaMoE test includes BF16 input channelwise FP8 quantization in the
 MegaMoE timed path for both LL and normal backends.  This uses MegaMoE's own fused
 `megamoe.mega_moe_pre_dispatch(...)` kernel to quantize BF16 input
 directly into `sym_buffer.x/x_sf` and stage `topk_idx/topk_weights` in the
-same launch; no `lightop` dependency or extra FP8/top-k copy is needed in the
-MegaMoE timed path.  When `--baseline-kind normal-contiguous` is used, the
+same launch.  It takes a required `num_tokens` argument so framework code can
+pass capacity-sized buffers and mark only the live prefix, matching the NV
+DeepGEMM pre-dispatch calling style; no `lightop` dependency or extra FP8/top-k
+copy is needed in the MegaMoE timed path.  When `--baseline-kind normal-contiguous` is used, the
 baseline also runs the same fused pre-dispatch kernel into temporary FP8/scale
 and top-k buffers before DeepEP normal dispatch, so normal-vs-normal timing
 uses the same pre-dispatch accounting on both sides.

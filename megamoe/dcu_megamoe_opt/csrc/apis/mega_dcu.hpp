@@ -87,7 +87,8 @@ static void mega_moe_pre_dispatch(
     const torch::Tensor& out_fp8,
     const torch::Tensor& out_scale,
     const torch::Tensor& out_topk_idx,
-    const torch::Tensor& out_topk_weights) {
+    const torch::Tensor& out_topk_weights,
+    int64_t num_tokens) {
     TORCH_CHECK(x.is_cuda() && topk_idx.is_cuda() && topk_weights.is_cuda() &&
                 out_fp8.is_cuda() && out_scale.is_cuda() && out_topk_idx.is_cuda() &&
                 out_topk_weights.is_cuda(),
@@ -122,10 +123,14 @@ static void mega_moe_pre_dispatch(
     TORCH_CHECK(topk_idx.sizes() == topk_weights.sizes(),
                 "MegaMoE pre-dispatch topk_idx/topk_weights shape mismatch");
 
-    const int rows = static_cast<int>(x.size(0));
+    const int64_t input_rows = x.size(0);
+    const int64_t requested_rows = num_tokens;
+    TORCH_CHECK(requested_rows >= 0 && requested_rows <= input_rows,
+                "MegaMoE pre-dispatch num_tokens must be within x rows");
+    const int rows = static_cast<int>(requested_rows);
     const int hidden = static_cast<int>(x.size(1));
     const int topk = static_cast<int>(topk_idx.size(1));
-    TORCH_CHECK(topk_idx.size(0) == rows, "MegaMoE pre-dispatch topk rows mismatch");
+    TORCH_CHECK(topk_idx.size(0) >= rows, "MegaMoE pre-dispatch topk rows must cover num_tokens");
     TORCH_CHECK(out_fp8.size(0) >= rows && out_fp8.size(1) == hidden,
                 "MegaMoE pre-dispatch out_fp8 shape must be [>=tokens, hidden]");
     TORCH_CHECK(out_scale.numel() >= rows,
@@ -512,7 +517,8 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("out_fp8"),
           pybind11::arg("out_scale"),
           pybind11::arg("out_topk_idx"),
-          pybind11::arg("out_topk_weights"));
+          pybind11::arg("out_topk_weights"),
+          pybind11::arg("num_tokens"));
     m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
           pybind11::arg("sf"), pybind11::arg("mn"), pybind11::arg("k"), pybind11::arg("recipe"),
           pybind11::arg("num_groups") = std::nullopt,
