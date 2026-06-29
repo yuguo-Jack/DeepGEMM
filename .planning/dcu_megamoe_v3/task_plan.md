@@ -1,5 +1,15 @@
 # DCU MegaMoE V3 迁移计划
 
+
+## 状态标记约定
+
+- ✅：已完成的实现、验证或文档项。
+- [ ]：未完成但仍必做的项。
+- 🚫：已反证、已回退或明确不再推进的项。
+- 🧭：可选 backlog，只在有新证据或用户重新点名时恢复。
+- 不使用 `[x]`；已完成的 checkbox 统一改写为 ✅。
+- 当前不保留无明确 owner 的悬挂进行中项。
+
 ## 目标
 DCU MegaMoE V3 已转为主路径；当前目标是把 DCU MegaMoE 生产代码、pybind/API、baseline preprocess/postprocess、测试、脚本和相关资源集中到 `megamoe/dcu_megamoe_opt/`，并把旧 `large_opt` 命名收敛为 `opt`。构建不再依赖 `csrc/` 或 `deep_gemm/include/` 下的 DCU MegaMoE 专属文件。
 
@@ -112,30 +122,30 @@ DCU MegaMoE V3 已转为主路径；当前目标是把 DCU MegaMoE 生产代码�
   - baseline 性能只记录作参考，不参与是否通过 Phase 6 的判断。
 
 ## 遗弃/退役范围
-- [🚫] V3 normal C/aicc raw K1/K3 不再作为生产路径、默认 fallback、性能优化目标或后续计划项；历史 Phase 2/3/6 中 normal C/aicc 相关 ✅ 项仅表示曾经完成过 bring-up、诊断或反证。
-- [🚫] `DG_BUILD_MEGAMOE_V3_NORMAL_AICC`、normal raw backend build、`MEGAMOE_DCU_V3_K1_ASM_PACK5`/`MEGAMOE_DCU_V3_K3_ASM_PACK5` opt-in/out、`MEGAMOE_DCU_V3_NO_TAIL_SIGNAL`/`NO_TAIL_SYNC`/`K2_SYSTEM_FENCE`/`REDUCE_ACQUIRE`/`BARRIER_ACQUIRE` 等诊断 env 已退役；当前代码不再消费这些 env。
-- [🚫] `DG_BUILD_MEGAMOE_V2_EXT` 与 `megamoe/dcu_megamoe_v2/` 整体进入退役范围；后续实现清理时应删除 V2 extension build、package data、导入/测试/脚本引用，只保留 planning 中的历史记录。
-- [✅] 当前保留的 C extension 范围是 V3 LL pack5，且默认编译；normal 的验证和性能回归以 ASM-pack5 eager/graph、no-tail/tail、uniform/uneven 为准。
+- 🚫 V3 normal C/aicc raw K1/K3 不再作为生产路径、默认 fallback、性能优化目标或后续计划项；历史 Phase 2/3/6 中 normal C/aicc 相关 ✅ 项仅表示曾经完成过 bring-up、诊断或反证。
+- 🚫 `DG_BUILD_MEGAMOE_V3_NORMAL_AICC`、normal raw backend build、`MEGAMOE_DCU_V3_K1_ASM_PACK5`/`MEGAMOE_DCU_V3_K3_ASM_PACK5` opt-in/out、`MEGAMOE_DCU_V3_NO_TAIL_SIGNAL`/`NO_TAIL_SYNC`/`K2_SYSTEM_FENCE`/`REDUCE_ACQUIRE`/`BARRIER_ACQUIRE` 等诊断 env 已退役；当前代码不再消费这些 env。
+- 🚫 `DG_BUILD_MEGAMOE_V2_EXT` 与 `megamoe/dcu_megamoe_v2/` 整体进入退役范围；后续实现清理时应删除 V2 extension build、package data、导入/测试/脚本引用，只保留 planning 中的历史记录。
+- ✅ 当前保留的 C extension 范围是 V3 LL pack5，且默认编译；normal 的验证和性能回归以 ASM-pack5 eager/graph、no-tail/tail、uniform/uneven 为准。
 
 ## 用户确认的后续清理边界
-- [✅] V2 整体已清：删除 `DG_BUILD_MEGAMOE_V2_EXT`、`megamoe/dcu_megamoe_v2/`、`csrc/kernels/dcu_megamoe_v2/`、setup/package/test/script 中的 V2 build/package 引用；历史结论只留在 planning。
-- [✅] V3 normal C/raw 残留已清：K1/K3 pack5 header 中不会再 launch 的 normal C kernel body、fixed-route bring-up helper，以及 raw/stub/availability 相关断言和脚本已删除或退役。
-- [✅] 诊断 pybind 已清：删除 `k3_v3_ll_reference` 及调用它的 debug scripts/source guard。
-- [✅] 调试 env 已清：删除 `MEGAMOE_DCU_K3_DEBUG_LAUNCH`、`MEGAMOE_DCU_V3_DEBUG_STAGE_SYNC*`、`MEGAMOE_DCU_V3_STAGE_TIMING`；`MEGAMOE_DCU_V3_LL_BLOCK_M` 已在固定 block M=32 后移除。
-- [✅] dormant API 参数已清：删除 K3 `invalidate_before_read`、K3 `acquire_after_wait`、K2 `system_fence_after_write`，它们不属于当前 V3 生产路径。
-- [✅] K1 V3 normal ASM 边界已重整到 Python wrapper + pybind entry 层：新增 `k1_symm_fused_l1_v3_asm_pack5()` / graph wrapper 和 C++ pybind `k1_symm_fused_l1_v3_asm_pack5(...)`，调用点不再通过原 K1 ASM pybind 或泛化 backend 名称表达 V3 normal；底层 ASM launch 机制通过内部 helper 复用以避免行为和性能漂移。
-- [✅] `setup.py` 已回到最小 delta：保留 V3 必需源文件、pack5 ASM code object、`*.cuh` package data；清掉历史 source-list 临时变量和 V2/raw gate。
-- [✅] `opt.py` 已清掉开发期 sync/timing，只保留清晰 V3 backend 分流：normal ASM-pack5，LL C pack5。
-- [✅] `megamoe/__init__.py` 已检查：`_v3_normal_symm_warmup_enabled` 属于受 shape/backend/env 严格限制的 warmup alloc 逻辑，不是调试路径；为避免 first-run/perf 回归暂时保留。
-- [✅] `megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 已缩成轻量合同测试：V3 gate/backend、pack5 layout helper、setup surface、关键 env/retired symbol 默认不误触发。
-- [✅] `hygon_tmp/debug` 已清理为当前生产路径脚本为主；normal C/raw、reference/pure、旧 A/B 方向脚本已删除或改到当前 pybind/env。
+- ✅ V2 整体已清：删除 `DG_BUILD_MEGAMOE_V2_EXT`、`megamoe/dcu_megamoe_v2/`、`csrc/kernels/dcu_megamoe_v2/`、setup/package/test/script 中的 V2 build/package 引用；历史结论只留在 planning。
+- ✅ V3 normal C/raw 残留已清：K1/K3 pack5 header 中不会再 launch 的 normal C kernel body、fixed-route bring-up helper，以及 raw/stub/availability 相关断言和脚本已删除或退役。
+- ✅ 诊断 pybind 已清：删除 `k3_v3_ll_reference` 及调用它的 debug scripts/source guard。
+- ✅ 调试 env 已清：删除 `MEGAMOE_DCU_K3_DEBUG_LAUNCH`、`MEGAMOE_DCU_V3_DEBUG_STAGE_SYNC*`、`MEGAMOE_DCU_V3_STAGE_TIMING`；`MEGAMOE_DCU_V3_LL_BLOCK_M` 已在固定 block M=32 后移除。
+- ✅ dormant API 参数已清：删除 K3 `invalidate_before_read`、K3 `acquire_after_wait`、K2 `system_fence_after_write`，它们不属于当前 V3 生产路径。
+- ✅ K1 V3 normal ASM 边界已重整到 Python wrapper + pybind entry 层：新增 `k1_symm_fused_l1_v3_asm_pack5()` / graph wrapper 和 C++ pybind `k1_symm_fused_l1_v3_asm_pack5(...)`，调用点不再通过原 K1 ASM pybind 或泛化 backend 名称表达 V3 normal；底层 ASM launch 机制通过内部 helper 复用以避免行为和性能漂移。
+- ✅ `setup.py` 已回到最小 delta：保留 V3 必需源文件、pack5 ASM code object、`*.cuh` package data；清掉历史 source-list 临时变量和 V2/raw gate。
+- ✅ `opt.py` 已清掉开发期 sync/timing，只保留清晰 V3 backend 分流：normal ASM-pack5，LL C pack5。
+- ✅ `megamoe/__init__.py` 已检查：`_v3_normal_symm_warmup_enabled` 属于受 shape/backend/env 严格限制的 warmup alloc 逻辑，不是调试路径；为避免 first-run/perf 回归暂时保留。
+- ✅ `megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 已缩成轻量合同测试：V3 gate/backend、pack5 layout helper、setup surface、关键 env/retired symbol 默认不误触发。
+- ✅ `hygon_tmp/debug` 已清理为当前生产路径脚本为主；normal C/raw、reference/pure、旧 A/B 方向脚本已删除或改到当前 pybind/env。
 
 ## 当前验收快照（2026-06-15）
-- [✅] 远端环境：`hg@10.17.176.11` / `sglang_megamoe` 可用，8 张 HCU 空闲；验证后无 KFD 进程残留，显存/计算均为 0%。
-- [✅] 同步：本地 `setup.py`、`megamoe`、`tests` 已同步到 `/workspace/DeepGEMM`；远端旧 V2、旧 V3 stub、旧非 pack5 header 残留已删除。
-- [✅] 构建：容器内 `python3 -m compileall setup.py megamoe megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 通过；`PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 6/6 通过；清理 build 后 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过。
-- [✅] 源码残留：生产源码和主测试中 `DG_BUILD_MEGAMOE_V2_EXT`、`dcu_megamoe_v2`、`k3_v3_ll_reference`、调试 env、旧 raw/stub/Pure/非 pack5 命名均无残留；剩余历史字符串仅在轻量 source-guard 负向断言中。
-- [✅] 8 卡功能/性能 smoke：结果保存在远端 `hygon_tmp/debug/full_validation_20260615_161234/`。
+- ✅ 远端环境：`hg@10.17.176.11` / `sglang_megamoe` 可用，8 张 HCU 空闲；验证后无 KFD 进程残留，显存/计算均为 0%。
+- ✅ 同步：本地 `setup.py`、`megamoe`、`tests` 已同步到 `/workspace/DeepGEMM`；远端旧 V2、旧 V3 stub、旧非 pack5 header 残留已删除。
+- ✅ 构建：容器内 `python3 -m compileall setup.py megamoe megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 通过；`PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 6/6 通过；清理 build 后 `MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过。
+- ✅ 源码残留：生产源码和主测试中 `DG_BUILD_MEGAMOE_V2_EXT`、`dcu_megamoe_v2`、`k3_v3_ll_reference`、调试 env、旧 raw/stub/Pure/非 pack5 命名均无残留；剩余历史字符串仅在轻量 source-guard 负向断言中。
+- ✅ 8 卡功能/性能 smoke：结果保存在远端 `hygon_tmp/debug/full_validation_20260615_161234/`。
   - V3 normal tail 32: correct, fused `1.526879 ms`, baseline `2.805279 ms`, speedup `1.8373x`。
   - V3 normal no-tail 32: correct, fused `1.504639 ms`, baseline `2.814119 ms`, speedup `1.8703x`。
   - V3 normal tail uneven `17,31,48,64,79,96,112,127`: correct, fused `1.541459 ms`, baseline `2.823078 ms`, speedup `1.8314x`。
@@ -147,7 +157,7 @@ DCU MegaMoE V3 已转为主路径；当前目标是把 DCU MegaMoE 生产代码�
   - V3 normal no-tail 4096: correct, fused `5.808258 ms`, baseline `9.460317 ms`, speedup `1.6288x`。
   - V3 normal tail 4096: correct, fused `5.838198 ms`, baseline `9.513697 ms`, speedup `1.6296x`。
   - 非 V3 legacy opt tail 32: correct, fused `1.931739 ms`, baseline `2.785199 ms`, speedup `1.4418x`。
-- [✅] 本轮结论：V3 production cleanup 没有伤及主要生产路径或 legacy opt smoke；normal/LL graph replay 相比 eager 无劣化；normal 4096 tail/no-tail 和 LL tail/no-tail 均正常。后续只保留性能余量类 backlog，不再把 V2/normal C/raw/stub/诊断 env 作为计划项推进。
+- ✅ 本轮结论：V3 production cleanup 没有伤及主要生产路径或 legacy opt smoke；normal/LL graph replay 相比 eager 无劣化；normal 4096 tail/no-tail 和 LL tail/no-tail 均正常。后续只保留性能余量类 backlog，不再把 V2/normal C/raw/stub/诊断 env 作为计划项推进。
 
 ## 计划收敛规则（2026-06-15）
 - `✅ complete for production gate` 表示当前保留生产路径已实现并完成本轮远端验证；历史更大矩阵或纯性能优化不再阻塞该阶段。
@@ -160,251 +170,251 @@ DCU MegaMoE V3 已转为主路径；当前目标是把 DCU MegaMoE 生产代码�
 ## 分阶段计划
 
 ### Phase 0: 代码梳理与接口对齐
-- [✅] 逐段梳理 `opt.py` 的 eager 与 graph staged flow：K1 输入输出、K2 依赖、K3 tail reduce 两种分支。
-- [✅] 梳理 K1 ASM wrapper/ext 的真实接口：route_scratch 切片、`row_combine_ptrs`、`route_weights`、`m_indices`、`output_index`、`staged_x`、stats。
-- [✅] 梳理 K3 ASM wrapper/ext 的真实接口：`row_combine_ptrs`、`output_workspace`、`prob_storage`、tail signal、tail reduce、active_tiles/graph 参数。
-- [✅] 梳理 V2 C pack5 LL/normal K1/K3 已有能力与缺口，形成接口对照表。
-- 状态：✅ complete
+- ✅ 逐段梳理 `opt.py` 的 eager 与 graph staged flow：K1 输入输出、K2 依赖、K3 tail reduce 两种分支。
+- ✅ 梳理 K1 ASM wrapper/ext 的真实接口：route_scratch 切片、`row_combine_ptrs`、`route_weights`、`m_indices`、`output_index`、`staged_x`、stats。
+- ✅ 梳理 K3 ASM wrapper/ext 的真实接口：`row_combine_ptrs`、`output_workspace`、`prob_storage`、tail signal、tail reduce、active_tiles/graph 参数。
+- ✅ 梳理 V2 C pack5 LL/normal K1/K3 已有能力与缺口，形成接口对照表。
+- 状态：✅ 已完成
 
 ### Phase 1: V3 开关与后端选择设计
-- [✅] 增加 `USE_MEGAMOE_V3` 解析函数，并确保只有 `MEGAMOE_DCU_USE_OPT_3STAGE=1` 时才允许进入 V3 分支。
-- [✅] 实现 `MEGAMOE_DCU_V3_BACKEND=ll|normal`；未设置时默认 `normal`，显式 `ll` 才走 LL。
-- [✅] 明确 V3 weight contract：runtime/bench 只接收已提前转换好的 V3 pack5 权重，V3 分支不做权重处理 kernel。
-- [✅] 单测 fixture/setup 侧提前准备 V3 layout 权重，防止默认路径误用 V3 pack5 layout。
-- [✅] 加 source-level 测试保证默认路径仍引用原 ASM wrapper，V3 开启才引用新实现。
-- 状态：✅ complete
+- ✅ 增加 `USE_MEGAMOE_V3` 解析函数，并确保只有 `MEGAMOE_DCU_USE_OPT_3STAGE=1` 时才允许进入 V3 分支。
+- ✅ 实现 `MEGAMOE_DCU_V3_BACKEND=ll|normal`；未设置时默认 `normal`，显式 `ll` 才走 LL。
+- ✅ 明确 V3 weight contract：runtime/bench 只接收已提前转换好的 V3 pack5 权重，V3 分支不做权重处理 kernel。
+- ✅ 单测 fixture/setup 侧提前准备 V3 layout 权重，防止默认路径误用 V3 pack5 layout。
+- ✅ 加 source-level 测试保证默认路径仍引用原 ASM wrapper，V3 开启才引用新实现。
+- 状态：✅ 已完成
 
 ### Phase 2: K1 V3 功能迁移
-- [✅] 纠偏并移除 V2-derived K1 V3 core 依赖：`K1_fused` 下 V3 compute core 不得包含 `V2_` kernel 或 include/copy `dcu_megamoe_v2` 实现。
-- [✅] 将 `hygon_tmp/K1_groupgemm_fp8/k1_gemm.cpp` 的原始 pure K1 normal/LL 5pack C kernel 迁入 `megamoe/dcu_megamoe_opt/K1_fused` 的 stage-owned 代码。
-- [🚫] 历史项：K1 V3 raw pure kernel 显式 build gate 与 backend-scoped probe 曾用于 bring-up；normal raw backend 现已遗弃，raw build 仅保留 LL。
-- [✅] 复核历史 session `019e6ecc-aaed-74e1-aa6e-78b8ee3133f3` 的 V2 编译超时处理，并将 V3 raw K1 显式编译路径对齐 V2 的 VGPR codegen flag。
-- [🚫] 历史项：V3 normal backend 的 aicc 编译策略已退役；normal C/aicc raw 不再编译，normal 生产路径使用 ASM-pack5。
-- [✅] 跑通 K1 V3 normal low-level aicc smoke：fake symmetric buffer dispatch-pull metadata 有效，all-ones 输入/权重输出 sample 为 4096。
-- [✅] 收敛 K1 V3 normal low-level 实现为单一 fused normal kernel：删除 `pure_ext` 命名、删除 `k1_v3_stage_rows_from_ptrs_kernel`，normal GEMM 直接从 `row_x_ptrs/row_x_scales` load。
-- [✅] 删除 K1 V3 normal low-level bring-up 的 `hipMemsetAsync(grid_barrier)`，normal fused kernel 不再依赖额外 grid-barrier 初始化 op。
-- [✅] low-level smoke 复用原始 K1 ASM 路径已有 compact prebuild route kernel 与 scratch header/capacity/route-grid 策略，V3 low-level 不再维护独立 route header 布局；该项不代表 production fused 通信已完成。
-- [✅] low-level smoke 让 K1 V3 normal GEMM 消费 compact prebuild 产出的 `m_indices/row_x_ptrs/row_x_scales`：weight expert 来自 `m_indices`，padding mask 来自 `row_x_ptrs`，不再假设固定 per-expert row stride；该 rowptr GEMM 路径不得作为 e2e correctness。
-- [✅] 撤回 raw rowptr K1 从 public staged/e2e wrapper 的接入：`USE_MEGAMOE_V3=1` 在 K1 真正融合通信语义前 fail-fast，不再跑无效 K1-only e2e。
-- [✅] 建立 K1 V3 normal single-kernel fixed-route fused 骨架：blockIdx.x==0 在同一 K1 main kernel 内写 `row_x_ptrs/row_x_scales/m_indices/route_weights/output_index/row_combine_ptrs/stats`，其他 GEMM CTA 等 per-tile flag 后进入 pure 5pack GEMM 主体；aicc 编译通过，low-level ones/expert_ramp smoke 通过。
-- [✅] LL 继续以 stage-owned C pack5 K1 groupgemm core 为主体，维护 dispatch-pull 通信输入、route metadata、row combine pointer 和 stats 语义；normal 对应合同由 ASM-pack5 覆盖。
-- [✅] LL K1 dispatch-pull 已保留在当前 C pack5 staged kernel 内；normal 不再推进 C/aicc 版本。
-- [✅] 当前保留路径未引入独立 K1 通信前处理；LL 的 pure-vs-fused delta 已在 Phase 6/6b 记录并收口，normal 由原 K1 ASM-pack5 合同覆盖。
-- [✅] 已参考原始 DeepGEMM ASM 与现有 K1 fused ASM 的 dispatch-pull 语义和 wait/signal 位置；当前 normal 生产实现直接复用 isolated ASM-pack5 边界。
-- [✅] 建立 K1 ASM 差异图：`hygon_tmp/K1_groupgemm_fp8/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16.s` vs 原 K1 fused dispatch-pull ASM，先定位通信插入点、metadata 访问和可见性语义，再映射到 V3 pure C normal/LL 主体。
-- [✅] 对齐现有 K1 ASM 输出合同：`l1_out`、`route_weights`、`m_indices`、`output_index`、`row_combine_ptrs`、可选 expert stats。
-- [✅] 对齐原 K1 的 shape contract：EP8、experts=256、local_experts=32、topk=6、hidden=4096、alignment=256。
-- [✅] K1 pure-vs-fused 劣化检查点已在 Phase 6/6b 建立；LL residual 已收口为性能余量，normal 生产路径切到 ASM-pack5。
-- [✅] K1 实际 staged 通信链路 vs 原始 C 5pack groupgemm/pure kernel 的分项耗时已记录；后续不再把 normal C/aicc raw 作为优化目标。
-- [✅] K1 fused 相对 pure 的主要额外成本已通过 A/B/PMC 归因；无当前阻塞项。
-- [🚫] K1 前 rank barrier remove A/B 已反证：LL no-tail skip barrier correctness 失败，当前保留 rank barrier，不再作为待办。
-- [✅] 跑通 K1 normal metadata/unit correctness：以原 K1 ASM compact metadata 作为 oracle，验证 V3 fixed-route 在容量内场景的 `row_combine_ptrs/m_indices/route_weights/stats` 语义。
-- [✅] 修复 K1 V3 normal rowptr A-load 数值问题：确认 metadata 对齐但输出不一致时，根因是 divergent row pointer 被错误包装成 raw-buffer resource；已改为普通 global vector load，并通过 ASM/V3 K1 output compare 验证 `max_abs=0`。
-- [✅] 将 K1 V3 normal fixed-capacity route 生成从“每 tile 全量重扫 route”收敛为更接近原 K1 fused ASM 的 scanner 结构：前 4 个 row tiles 按 source rank 分片扫描，同一 K1 kernel 内写 row-side metadata 并发布 tile ready flag。
-- [✅] 跑通显式 fixed-route staged bring-up 定位验证：`MEGAMOE_DCU_V3_ALLOW_FIXED_ROUTE_BRINGUP=1` 下，V3 K1 normal + 原 K2 + 原 K3 ASM 在 1024 tokens tail-reduce on/off 均完成 debug 链路定位；该结果只能说明容量内 fixed-route launch/metadata/K2/K3 链路没有直接故障，不算 V3 e2e correctness，也不解除默认 fail-fast。
-- [✅] 对齐 K1 V3 normal compact-capacity tile list：同一 K1 kernel 内完成 count/build/emit compact rows，4096 random compare 中 `asm_rows == v3_rows == 29696`、active/common=24446、K1 output `max_abs=0`；1024 random compare 仍保持 rows=8192、active/common=6091、`max_abs=0`。
-- [✅] 跑通显式 compact-capacity staged debug：`MEGAMOE_DCU_V3_ALLOW_FIXED_ROUTE_BRINGUP=1` 下，V3 K1 normal + 原 K2 + 原 K3 ASM 在 1024/4096 tokens、tail-reduce on/off 均完成 debug 链路定位；该结果只能说明 normal compact-capacity K1 进入后续 staged 链路没有直接故障，不算最终 V3 e2e correctness，也不解除默认 fail-fast。
-- [✅] 恢复 normal K1-only correctness gate：public eager `USE_MEGAMOE_V3=1 MEGAMOE_DCU_V3_BACKEND=normal` 不再依赖 `MEGAMOE_DCU_V3_ALLOW_FIXED_ROUTE_BRINGUP`，K3 保持原 ASM，1024/4096 tokens tail-reduce on/off 均通过 baseline correctness。
-- [✅] K1 LL low-level fused helper 已接入同一 K1 launch，并通过 fake symmetric-buffer raw smoke、K1/K2/K3 单卡逐级诊断和 8 卡 K1-only staged gate；当前 K1-only staged 使用 K3-ASM-compatible 256-row/expert stride，最终 V3 K3 LL 接入后再保留/恢复 64-row 真 LL layout 做性能路径。
-- [✅] uneven tokens 与 cuda graph 已通过当前 production gate 覆盖；overflow/zero-weight 专门边界改为后续可选 edge-case guard，不阻塞当前 V3 K1 功能闭环。
-- 状态：✅ complete for production gate（normal C/aicc K1 历史路线已遗弃；后续仅保留可选 edge-case/perf backlog）
+- ✅ 纠偏并移除 V2-derived K1 V3 core 依赖：`K1_fused` 下 V3 compute core 不得包含 `V2_` kernel 或 include/copy `dcu_megamoe_v2` 实现。
+- ✅ 将 `hygon_tmp/K1_groupgemm_fp8/k1_gemm.cpp` 的原始 pure K1 normal/LL 5pack C kernel 迁入 `megamoe/dcu_megamoe_opt/K1_fused` 的 stage-owned 代码。
+- 🚫 历史项：K1 V3 raw pure kernel 显式 build gate 与 backend-scoped probe 曾用于 bring-up；normal raw backend 现已遗弃，raw build 仅保留 LL。
+- ✅ 复核历史 session `019e6ecc-aaed-74e1-aa6e-78b8ee3133f3` 的 V2 编译超时处理，并将 V3 raw K1 显式编译路径对齐 V2 的 VGPR codegen flag。
+- 🚫 历史项：V3 normal backend 的 aicc 编译策略已退役；normal C/aicc raw 不再编译，normal 生产路径使用 ASM-pack5。
+- ✅ 跑通 K1 V3 normal low-level aicc smoke：fake symmetric buffer dispatch-pull metadata 有效，all-ones 输入/权重输出 sample 为 4096。
+- ✅ 收敛 K1 V3 normal low-level 实现为单一 fused normal kernel：删除 `pure_ext` 命名、删除 `k1_v3_stage_rows_from_ptrs_kernel`，normal GEMM 直接从 `row_x_ptrs/row_x_scales` load。
+- ✅ 删除 K1 V3 normal low-level bring-up 的 `hipMemsetAsync(grid_barrier)`，normal fused kernel 不再依赖额外 grid-barrier 初始化 op。
+- ✅ low-level smoke 复用原始 K1 ASM 路径已有 compact prebuild route kernel 与 scratch header/capacity/route-grid 策略，V3 low-level 不再维护独立 route header 布局；该项不代表 production fused 通信已完成。
+- ✅ low-level smoke 让 K1 V3 normal GEMM 消费 compact prebuild 产出的 `m_indices/row_x_ptrs/row_x_scales`：weight expert 来自 `m_indices`，padding mask 来自 `row_x_ptrs`，不再假设固定 per-expert row stride；该 rowptr GEMM 路径不得作为 e2e correctness。
+- ✅ 撤回 raw rowptr K1 从 public staged/e2e wrapper 的接入：`USE_MEGAMOE_V3=1` 在 K1 真正融合通信语义前 fail-fast，不再跑无效 K1-only e2e。
+- ✅ 建立 K1 V3 normal single-kernel fixed-route fused 骨架：blockIdx.x==0 在同一 K1 main kernel 内写 `row_x_ptrs/row_x_scales/m_indices/route_weights/output_index/row_combine_ptrs/stats`，其他 GEMM CTA 等 per-tile flag 后进入 pure 5pack GEMM 主体；aicc 编译通过，low-level ones/expert_ramp smoke 通过。
+- ✅ LL 继续以 stage-owned C pack5 K1 groupgemm core 为主体，维护 dispatch-pull 通信输入、route metadata、row combine pointer 和 stats 语义；normal 对应合同由 ASM-pack5 覆盖。
+- ✅ LL K1 dispatch-pull 已保留在当前 C pack5 staged kernel 内；normal 不再推进 C/aicc 版本。
+- ✅ 当前保留路径未引入独立 K1 通信前处理；LL 的 pure-vs-fused delta 已在 Phase 6/6b 记录并收口，normal 由原 K1 ASM-pack5 合同覆盖。
+- ✅ 已参考原始 DeepGEMM ASM 与现有 K1 fused ASM 的 dispatch-pull 语义和 wait/signal 位置；当前 normal 生产实现直接复用 isolated ASM-pack5 边界。
+- ✅ 建立 K1 ASM 差异图：`hygon_tmp/K1_groupgemm_fp8/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16.s` vs 原 K1 fused dispatch-pull ASM，先定位通信插入点、metadata 访问和可见性语义，再映射到 V3 pure C normal/LL 主体。
+- ✅ 对齐现有 K1 ASM 输出合同：`l1_out`、`route_weights`、`m_indices`、`output_index`、`row_combine_ptrs`、可选 expert stats。
+- ✅ 对齐原 K1 的 shape contract：EP8、experts=256、local_experts=32、topk=6、hidden=4096、alignment=256。
+- ✅ K1 pure-vs-fused 劣化检查点已在 Phase 6/6b 建立；LL residual 已收口为性能余量，normal 生产路径切到 ASM-pack5。
+- ✅ K1 实际 staged 通信链路 vs 原始 C 5pack groupgemm/pure kernel 的分项耗时已记录；后续不再把 normal C/aicc raw 作为优化目标。
+- ✅ K1 fused 相对 pure 的主要额外成本已通过 A/B/PMC 归因；无当前阻塞项。
+- 🚫 K1 前 rank barrier remove A/B 已反证：LL no-tail skip barrier correctness 失败，当前保留 rank barrier，不再作为待办。
+- ✅ 跑通 K1 normal metadata/unit correctness：以原 K1 ASM compact metadata 作为 oracle，验证 V3 fixed-route 在容量内场景的 `row_combine_ptrs/m_indices/route_weights/stats` 语义。
+- ✅ 修复 K1 V3 normal rowptr A-load 数值问题：确认 metadata 对齐但输出不一致时，根因是 divergent row pointer 被错误包装成 raw-buffer resource；已改为普通 global vector load，并通过 ASM/V3 K1 output compare 验证 `max_abs=0`。
+- ✅ 将 K1 V3 normal fixed-capacity route 生成从“每 tile 全量重扫 route”收敛为更接近原 K1 fused ASM 的 scanner 结构：前 4 个 row tiles 按 source rank 分片扫描，同一 K1 kernel 内写 row-side metadata 并发布 tile ready flag。
+- ✅ 跑通显式 fixed-route staged bring-up 定位验证：`MEGAMOE_DCU_V3_ALLOW_FIXED_ROUTE_BRINGUP=1` 下，V3 K1 normal + 原 K2 + 原 K3 ASM 在 1024 tokens tail-reduce on/off 均完成 debug 链路定位；该结果只能说明容量内 fixed-route launch/metadata/K2/K3 链路没有直接故障，不算 V3 e2e correctness，也不解除默认 fail-fast。
+- ✅ 对齐 K1 V3 normal compact-capacity tile list：同一 K1 kernel 内完成 count/build/emit compact rows，4096 random compare 中 `asm_rows == v3_rows == 29696`、active/common=24446、K1 output `max_abs=0`；1024 random compare 仍保持 rows=8192、active/common=6091、`max_abs=0`。
+- ✅ 跑通显式 compact-capacity staged debug：`MEGAMOE_DCU_V3_ALLOW_FIXED_ROUTE_BRINGUP=1` 下，V3 K1 normal + 原 K2 + 原 K3 ASM 在 1024/4096 tokens、tail-reduce on/off 均完成 debug 链路定位；该结果只能说明 normal compact-capacity K1 进入后续 staged 链路没有直接故障，不算最终 V3 e2e correctness，也不解除默认 fail-fast。
+- ✅ 恢复 normal K1-only correctness gate：public eager `USE_MEGAMOE_V3=1 MEGAMOE_DCU_V3_BACKEND=normal` 不再依赖 `MEGAMOE_DCU_V3_ALLOW_FIXED_ROUTE_BRINGUP`，K3 保持原 ASM，1024/4096 tokens tail-reduce on/off 均通过 baseline correctness。
+- ✅ K1 LL low-level fused helper 已接入同一 K1 launch，并通过 fake symmetric-buffer raw smoke、K1/K2/K3 单卡逐级诊断和 8 卡 K1-only staged gate；当前 K1-only staged 使用 K3-ASM-compatible 256-row/expert stride，最终 V3 K3 LL 接入后再保留/恢复 64-row 真 LL layout 做性能路径。
+- ✅ uneven tokens 与 cuda graph 已通过当前 production gate 覆盖；overflow/zero-weight 专门边界改为后续可选 edge-case guard，不阻塞当前 V3 K1 功能闭环。
+- 状态：✅ 已完成（production gate 通过）（normal C/aicc K1 历史路线已遗弃；后续仅保留可选 edge-case/perf backlog）
 
 ### Phase 3: K3 V3 功能迁移
-- [✅] 建立 K3 V3 stage-owned build/source 边界：V3 LL pack5 extension 默认编译，不再保留 stub/raw build gate；生产 V3 代码不得 include `dcu_megamoe_v2` 实现。
-- [✅] 建立 K3 ASM 差异图：`hygon_tmp/K1_groupgemm_fp8/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16.s` vs 原 K3 combine / tail-reduce fused ASM，先定位 combine/tail-reduce 插入点、signal/fence/wait 语义，再映射到 V3 pure C normal/LL 主体；V2 只作为接口/行为参考。
-- [✅] K3 当前生产边界已收敛：LL 以 C pack5 groupgemm core 补齐 combine/tail 语义；normal 以 isolated ASM-pack5 补齐 no-tail/tail 语义，normal C/aicc 不再推进。
-- [🚫] 历史项：K3 V3 normal raw aicc 编译边界已退役；normal raw extension 不再编译。
-- [✅] 跑通 K3 V3 normal no-tail raw low-level smoke：all-ones 和两 expert/tile-homogeneous pack5 pattern 均经 `row_combine_ptrs` scatter 写 combine buffer，sample max error=0。
-- [✅] 跑通 K3 V3 normal no-tail 与原 K3 ASM 的 8 卡同输入分布式对比：4096 requested tokens、actual capacity 4224、K2 传真实 `row_combine_ptrs` skip inactive rows 时，combine 与 reduce 后 `y` 均为 `max_abs=0`。
-- [🚫] 历史项：K3 V3 normal no-tail raw combine 曾接入 eager staged no-tail 分支；当前已被 normal ASM-pack5 替代，不再作为 production 或 fallback。
-- [✅] K2->K3 可见性诊断：`MEGAMOE_DCU_V3_K2_SYSTEM_FENCE=1` 已验证不能单独修复 official 4096 no-tail；K2 save-temps 显示 fence path 生成 `s_waitcnt vmcnt(0) lgkmcnt(0)` + `buffer_wbinvl1_vol`，排除“K2 fence 未等 store 完成”假设。
-- [✅] K3->reduce rowptr store 形式诊断：V3 K3 pack5 combine BF16 rowptr store 已改为显式 `global_store_short`，aicc save-temps 确认 `global_store_short=384`、`flat_store_short=0`，epilogue 有 `s_waitcnt vmcnt(0)` + `buffer_wbinvl1_vol`；official 4096 no-tail 仍失败，说明 store family 不是唯一缺口。
-- [✅] 撤回默认 host sync / print 通过路径：`MEGAMOE_DCU_V3_NO_TAIL_SYNC` 默认关闭，显式诊断打开时也不打印；print 让 4096 no-tail 通过只能作为时序证据，不能作为修复。
-- [✅] 对齐 K3 no-tail 后的非 final barrier/rowptr 可见性语义：参考 Hygon allreduce release/acquire 和原 K3 ASM diff 后，legacy peer barrier / reduce acquire / K2 fence / store-only rowptr glc 均被反证；V3 K3 active-row mask 与 epilogue store 的 `row_combine_ptrs` load 已改为 `global_load_dwordx2 ... glc`，K1 scanner CTAs 的 metadata publish 使用 `__threadfence_system()` 后 clean 1024/4096 no-tail 三轮稳定通过；跳过 baseline oracle sync 的残差由 clone/原 ASM A/B 归类为测试 oracle 异步窗口，不作为生产同步修复。
-- [✅] 当前保留 K3 路径没有新增 runtime 通信 launch：normal 使用原 K3 fused ASM-pack5 epilogue/store/reduce 合同，LL 使用 stage-owned C pack5 combine/tail kernel。
-- [✅] LL K3 的 pure-vs-fused delta 已在 Phase 6/6b 记录并收口；normal C/aicc pure 流水保护计划已被 ASM-pack5 生产路径替代。
-- [✅] 已参考原始 DeepGEMM ASM 与现有 K3 fused ASM 的 combine/tail-reduce 语义和 wait/signal 位置；normal 生产实现直接使用 isolated ASM-pack5。
-- [✅] 对齐 K3 normal no-tail-reduce：写 combine buffer，外部 `rank_barrier + reduce_local_combine` 仍可复用；1024/4096 clean 三轮通过。LL no-tail 后续按 LL backend 接入单独覆盖。
-- [✅] 对齐 K3 normal tail-reduce：V3 normal 使用 isolated `K3COMBINE_TAILREDUCE_PACK5` ASM code object；LL 使用 C pack5 tail-reduce kernel。
-- [✅] 跑通 K3 V3 normal tail raw single-rank smoke：topk=1 与 topk=6 均验证 combine scatter、done owner slot、self signal wait、local reduce。
-- [🚫] 历史项：normal C raw tail stage compare / worker-load / done-signal 定位链条已停止，生产 tail 迁移到 ASM-pack5。
-- [🚫] 历史项：normal C raw tail reduce worker 读取语义不再继续修；相关证据保留在 progress/findings，后续不作为计划项推进。
-- [✅] 反证 tail direct-signal A/B：把 signal 改成 `atomicAdd_system(done_counter, 1)` 判定出的最后 GEMM CTA thread0 直接发布 peer signal 后，8 卡 `v3_only` 第 1 轮即出现多 rank nonfinite，比旧 owner-slot 路径更差；该补丁已撤回，不作为修复方向。
-- [✅] 完成 tail signal slots/generation 诊断：旧 owner-slot 路径下 8 卡 `v3_only` / `asm_first` stage compare 看到 local signal slots reset 前为 0、V3 后 send/recv generation 均为 1，done counter 也到达目标；当前证据不支持“signal slot reset 或 generation 未到达”作为根因。
-- [🚫] 历史项：K3 normal C/raw tail combine/row mapping Python 诊断不再继续；生产 tail 已迁移到 ASM-pack5，旧诊断读法只作为历史证据保留。
-- [🚫] 历史项：V3 normal C/raw tail reducer/combine 可见性与 active-row 覆盖语义不再作为后续修复路线；当前生产 tail 由 ASM-pack5 覆盖。
-- [✅] 按用户要求暂缓 normal tail 深挖，转入 K1/K3 fused LL：已恢复 true LL 64-row layout 并完成 K3 LL no-tail/tail staged correctness。
-- [🚫] 历史项：normal C/raw tail-reduce 定位停止恢复；无需再修旧 device post-hoc reduce / stage compare `rank_stats` 链条。
-- [✅] 对齐 K3 V3 LL no-tail-reduce：使用 LL pure 5pack 主体和 V3 pack5 L2 layout，写 `row_combine_ptrs` combine buffer，外部 `rank_barrier + reduce_local_combine` 继续复用；固定验证 32/128 tokens。
-- [✅] 对齐 K3 V3 LL tail-reduce：在 LL kernel 内完成 combine 写入后的本地 reduce 和跨 rank signal；32/128 tokens 三轮 8 卡 correctness 通过。
-- [✅] K3 pure-vs-fused 劣化检查点已建立：LL 记录 pure/local/staged rowptr delta，normal ASM-pack5 记录 pure/direct/remote-store ceiling。
-- [✅] K3 实际 staged 通信链路 vs 原始 C 5pack groupgemm/pure kernel 的分项耗时对照已记录；normal C/aicc raw 对照只保留为历史。
-- [✅] K3 fused residual 已归因为 remote/scattered combine store 数据通路；低风险 store/wait/locality A/B 已反证或收口，剩余为 optional backlog。
-- [✅] 明确跨 rank store 完成语义，保持与现有 tail signal / barrier 语义等价或更保守。
-- 状态：✅ complete for production gate（normal C/raw K3 历史路线已遗弃；remote-store/contract 大改仅保留 optional backlog）
+- ✅ 建立 K3 V3 stage-owned build/source 边界：V3 LL pack5 extension 默认编译，不再保留 stub/raw build gate；生产 V3 代码不得 include `dcu_megamoe_v2` 实现。
+- ✅ 建立 K3 ASM 差异图：`hygon_tmp/K1_groupgemm_fp8/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16.s` vs 原 K3 combine / tail-reduce fused ASM，先定位 combine/tail-reduce 插入点、signal/fence/wait 语义，再映射到 V3 pure C normal/LL 主体；V2 只作为接口/行为参考。
+- ✅ K3 当前生产边界已收敛：LL 以 C pack5 groupgemm core 补齐 combine/tail 语义；normal 以 isolated ASM-pack5 补齐 no-tail/tail 语义，normal C/aicc 不再推进。
+- 🚫 历史项：K3 V3 normal raw aicc 编译边界已退役；normal raw extension 不再编译。
+- ✅ 跑通 K3 V3 normal no-tail raw low-level smoke：all-ones 和两 expert/tile-homogeneous pack5 pattern 均经 `row_combine_ptrs` scatter 写 combine buffer，sample max error=0。
+- ✅ 跑通 K3 V3 normal no-tail 与原 K3 ASM 的 8 卡同输入分布式对比：4096 requested tokens、actual capacity 4224、K2 传真实 `row_combine_ptrs` skip inactive rows 时，combine 与 reduce 后 `y` 均为 `max_abs=0`。
+- 🚫 历史项：K3 V3 normal no-tail raw combine 曾接入 eager staged no-tail 分支；当前已被 normal ASM-pack5 替代，不再作为 production 或 fallback。
+- ✅ K2->K3 可见性诊断：`MEGAMOE_DCU_V3_K2_SYSTEM_FENCE=1` 已验证不能单独修复 official 4096 no-tail；K2 save-temps 显示 fence path 生成 `s_waitcnt vmcnt(0) lgkmcnt(0)` + `buffer_wbinvl1_vol`，排除“K2 fence 未等 store 完成”假设。
+- ✅ K3->reduce rowptr store 形式诊断：V3 K3 pack5 combine BF16 rowptr store 已改为显式 `global_store_short`，aicc save-temps 确认 `global_store_short=384`、`flat_store_short=0`，epilogue 有 `s_waitcnt vmcnt(0)` + `buffer_wbinvl1_vol`；official 4096 no-tail 仍失败，说明 store family 不是唯一缺口。
+- ✅ 撤回默认 host sync / print 通过路径：`MEGAMOE_DCU_V3_NO_TAIL_SYNC` 默认关闭，显式诊断打开时也不打印；print 让 4096 no-tail 通过只能作为时序证据，不能作为修复。
+- ✅ 对齐 K3 no-tail 后的非 final barrier/rowptr 可见性语义：参考 Hygon allreduce release/acquire 和原 K3 ASM diff 后，legacy peer barrier / reduce acquire / K2 fence / store-only rowptr glc 均被反证；V3 K3 active-row mask 与 epilogue store 的 `row_combine_ptrs` load 已改为 `global_load_dwordx2 ... glc`，K1 scanner CTAs 的 metadata publish 使用 `__threadfence_system()` 后 clean 1024/4096 no-tail 三轮稳定通过；跳过 baseline oracle sync 的残差由 clone/原 ASM A/B 归类为测试 oracle 异步窗口，不作为生产同步修复。
+- ✅ 当前保留 K3 路径没有新增 runtime 通信 launch：normal 使用原 K3 fused ASM-pack5 epilogue/store/reduce 合同，LL 使用 stage-owned C pack5 combine/tail kernel。
+- ✅ LL K3 的 pure-vs-fused delta 已在 Phase 6/6b 记录并收口；normal C/aicc pure 流水保护计划已被 ASM-pack5 生产路径替代。
+- ✅ 已参考原始 DeepGEMM ASM 与现有 K3 fused ASM 的 combine/tail-reduce 语义和 wait/signal 位置；normal 生产实现直接使用 isolated ASM-pack5。
+- ✅ 对齐 K3 normal no-tail-reduce：写 combine buffer，外部 `rank_barrier + reduce_local_combine` 仍可复用；1024/4096 clean 三轮通过。LL no-tail 后续按 LL backend 接入单独覆盖。
+- ✅ 对齐 K3 normal tail-reduce：V3 normal 使用 isolated `K3COMBINE_TAILREDUCE_PACK5` ASM code object；LL 使用 C pack5 tail-reduce kernel。
+- ✅ 跑通 K3 V3 normal tail raw single-rank smoke：topk=1 与 topk=6 均验证 combine scatter、done owner slot、self signal wait、local reduce。
+- 🚫 历史项：normal C raw tail stage compare / worker-load / done-signal 定位链条已停止，生产 tail 迁移到 ASM-pack5。
+- 🚫 历史项：normal C raw tail reduce worker 读取语义不再继续修；相关证据保留在 progress/findings，后续不作为计划项推进。
+- ✅ 反证 tail direct-signal A/B：把 signal 改成 `atomicAdd_system(done_counter, 1)` 判定出的最后 GEMM CTA thread0 直接发布 peer signal 后，8 卡 `v3_only` 第 1 轮即出现多 rank nonfinite，比旧 owner-slot 路径更差；该补丁已撤回，不作为修复方向。
+- ✅ 完成 tail signal slots/generation 诊断：旧 owner-slot 路径下 8 卡 `v3_only` / `asm_first` stage compare 看到 local signal slots reset 前为 0、V3 后 send/recv generation 均为 1，done counter 也到达目标；当前证据不支持“signal slot reset 或 generation 未到达”作为根因。
+- 🚫 历史项：K3 normal C/raw tail combine/row mapping Python 诊断不再继续；生产 tail 已迁移到 ASM-pack5，旧诊断读法只作为历史证据保留。
+- 🚫 历史项：V3 normal C/raw tail reducer/combine 可见性与 active-row 覆盖语义不再作为后续修复路线；当前生产 tail 由 ASM-pack5 覆盖。
+- ✅ 按用户要求暂缓 normal tail 深挖，转入 K1/K3 fused LL：已恢复 true LL 64-row layout 并完成 K3 LL no-tail/tail staged correctness。
+- 🚫 历史项：normal C/raw tail-reduce 定位停止恢复；无需再修旧 device post-hoc reduce / stage compare `rank_stats` 链条。
+- ✅ 对齐 K3 V3 LL no-tail-reduce：使用 LL pure 5pack 主体和 V3 pack5 L2 layout，写 `row_combine_ptrs` combine buffer，外部 `rank_barrier + reduce_local_combine` 继续复用；固定验证 32/128 tokens。
+- ✅ 对齐 K3 V3 LL tail-reduce：在 LL kernel 内完成 combine 写入后的本地 reduce 和跨 rank signal；32/128 tokens 三轮 8 卡 correctness 通过。
+- ✅ K3 pure-vs-fused 劣化检查点已建立：LL 记录 pure/local/staged rowptr delta，normal ASM-pack5 记录 pure/direct/remote-store ceiling。
+- ✅ K3 实际 staged 通信链路 vs 原始 C 5pack groupgemm/pure kernel 的分项耗时对照已记录；normal C/aicc raw 对照只保留为历史。
+- ✅ K3 fused residual 已归因为 remote/scattered combine store 数据通路；低风险 store/wait/locality A/B 已反证或收口，剩余为 optional backlog。
+- ✅ 明确跨 rank store 完成语义，保持与现有 tail signal / barrier 语义等价或更保守。
+- 状态：✅ 已完成（production gate 通过）（normal C/raw K3 历史路线已遗弃；remote-store/contract 大改仅保留 optional backlog）
 
 ### Phase 4: Eager staged fused 集成
-- [✅] 在 `opt.py` 或 K1/K3 wrapper 层做最小分流：`MEGAMOE_DCU_USE_OPT_3STAGE=1 && USE_MEGAMOE_V3=1` 才调用 V3；若 3-stage 未 forced，`USE_MEGAMOE_V3` 不影响原路径。
-- [✅] normal K1-only staged correctness gate：V3 K1 fused normal + 原 K2 + 原 K3 ASM 用于隔离 K1 correctness 和 layout/metadata 问题，L1 使用 V3 pack5，L2 保持原 ASM layout；1024/4096 tokens tail-reduce on/off 均通过 baseline correctness。
-- [✅] LL K1-only staged correctness gate：V3 K1 fused LL + 原 K2 + 原 K3 ASM，L1 使用 V3 pack5，L2 保持原 ASM layout；32/128 tokens、tail-reduce on/off 均通过 baseline correctness。注意：该阶段为 K1-only staged gate，不是完整 V3 e2e；为兼容原 K3 ASM 使用 256-row/expert stride。
-- [✅] K1-only staged gate 后已接 K3 V3 staged，no-tail/tail 均已进入当前 V3 production gate。
-- [✅] K2、workspace/state/cache 外部逻辑保持复用；只保留 V3 backend/layout 必要分流。
-- [✅] 执行流程和 benchmark 流程不插入权重处理 kernel、权重重排 kernel 或额外 launch。
-- [✅] 四种 eager 组合已覆盖：LL/normal × tail_reduce on/off。
-- 状态：✅ complete for production gate
+- ✅ 在 `opt.py` 或 K1/K3 wrapper 层做最小分流：`MEGAMOE_DCU_USE_OPT_3STAGE=1 && USE_MEGAMOE_V3=1` 才调用 V3；若 3-stage 未 forced，`USE_MEGAMOE_V3` 不影响原路径。
+- ✅ normal K1-only staged correctness gate：V3 K1 fused normal + 原 K2 + 原 K3 ASM 用于隔离 K1 correctness 和 layout/metadata 问题，L1 使用 V3 pack5，L2 保持原 ASM layout；1024/4096 tokens tail-reduce on/off 均通过 baseline correctness。
+- ✅ LL K1-only staged correctness gate：V3 K1 fused LL + 原 K2 + 原 K3 ASM，L1 使用 V3 pack5，L2 保持原 ASM layout；32/128 tokens、tail-reduce on/off 均通过 baseline correctness。注意：该阶段为 K1-only staged gate，不是完整 V3 e2e；为兼容原 K3 ASM 使用 256-row/expert stride。
+- ✅ K1-only staged gate 后已接 K3 V3 staged，no-tail/tail 均已进入当前 V3 production gate。
+- ✅ K2、workspace/state/cache 外部逻辑保持复用；只保留 V3 backend/layout 必要分流。
+- ✅ 执行流程和 benchmark 流程不插入权重处理 kernel、权重重排 kernel 或额外 launch。
+- ✅ 四种 eager 组合已覆盖：LL/normal × tail_reduce on/off。
+- 状态：✅ 已完成（production gate 通过）
 
 ### Phase 5: Correctness、CLI 与默认路径回归
-- [✅] 默认路径回归：`USE_MEGAMOE_V3=0` 的 legacy opt tail 32 通过 baseline correctness 和性能 smoke。
-- [✅] 兼容性回归：`megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` 继续作为主入口，V3 通过 env/backend/layout 分流，不新增测试专用热路径。
-- [✅] V3 单测只在 setup/fixture 阶段提前转好权重；执行、bench 参数和主流程继续复用。
-- [✅] V3 correctness：本轮远端矩阵用 DeepEP/DeepGEMM baseline 作为 oracle，覆盖 normal tail/no-tail、normal uneven、normal graph、LL tail/no-tail；所有 JSON 结果 `correct=True`。
-- [✅] tail reduce on/off 均已覆盖：normal 32/4096 tail/no-tail、LL 32 tail/no-tail 均通过；normal/LL graph replay 在 uneven bucket 下无性能劣化。
-- 状态：✅ complete for cleanup validation（更大 token 档位和长期性能优化记录继续保留在 Phase 6/6b 历史与 backlog）
+- ✅ 默认路径回归：`USE_MEGAMOE_V3=0` 的 legacy opt tail 32 通过 baseline correctness 和性能 smoke。
+- ✅ 兼容性回归：`megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` 继续作为主入口，V3 通过 env/backend/layout 分流，不新增测试专用热路径。
+- ✅ V3 单测只在 setup/fixture 阶段提前转好权重；执行、bench 参数和主流程继续复用。
+- ✅ V3 correctness：本轮远端矩阵用 DeepEP/DeepGEMM baseline 作为 oracle，覆盖 normal tail/no-tail、normal uneven、normal graph、LL tail/no-tail；所有 JSON 结果 `correct=True`。
+- ✅ tail reduce on/off 均已覆盖：normal 32/4096 tail/no-tail、LL 32 tail/no-tail 均通过；normal/LL graph replay 在 uneven bucket 下无性能劣化。
+- 状态：✅ 已完成 for cleanup validation（更大 token 档位和长期性能优化记录继续保留在 Phase 6/6b 历史与 backlog）
 
 ### Phase 6: Performance gate
-- [✅] 建立 retained production gate 的性能对照：V3 normal/LL 均已完成 8 卡 correctness/perf 验收，normal 覆盖 32、4096、tail/no-tail、uneven graph，LL 覆盖 32、tail/no-tail、uneven graph；4096 normal no-tail/tail 分别为 `5.808258/5.838198 ms`，相对 baseline `9.460317/9.513697 ms`，约 `1.63x`。
-- [✅] normal no-tail performance 收口：当前 retained champion 为 K1 dynamic/parallel staged producer + K3 isolated ASM-pack5 no-tail；旧 normal C/aicc K3 scalar/rowptr/store 调参链路已停止作为生产计划推进。
-- [✅] normal tail ASM-pack5 迁移收口：V3 normal plain-pack5 tail code object、Python/C++ wrapper、signal generation 协议和 default gate 已接入；cleanup refresh 已补 4096 formal repeat，tail fused `5.838198 ms`，baseline `9.513697 ms`，未复现早期 baseline VMFault/卡住。
-- [✅] LL residual refresh 收口：保留 LL C pack5 K1/K3 路线，32/128 历史 formal、cleanup 32 tail/no-tail、LL uneven graph no-tail/tail 均通过；当前低风险微调暂无新的必做候选。
-- [🚫] 历史项/遗弃：normal C/aicc no-tail stage-delta 优化、normal C/raw tail-reduce、normal K3 C scalar rowptr/store 主线、fixed-route/raw/stub/availability 相关 bring-up helper 均不再作为 active 计划；相关反证只作为历史依据保留在 findings/progress。
-- [🚫] 历史项/遗弃：K3 rowptr4/rowptr8 batch-load、staged-vector-store、rowaddr reuse、resource/load-family 摆动、no-tail internal signal、device-scope fence 等 C/aicc A/B 已反证或被 ASM-pack5 生产路径替代，不再重复。
-- 状态：✅ complete for production gate（Phase 6 不再保留性能余量类 optional backlog；后续若 Phase 10 sweep 暴露明确回归，再按新证据重新立项）
+- ✅ 建立 retained production gate 的性能对照：V3 normal/LL 均已完成 8 卡 correctness/perf 验收，normal 覆盖 32、4096、tail/no-tail、uneven graph，LL 覆盖 32、tail/no-tail、uneven graph；4096 normal no-tail/tail 分别为 `5.808258/5.838198 ms`，相对 baseline `9.460317/9.513697 ms`，约 `1.63x`。
+- ✅ normal no-tail performance 收口：当前 retained champion 为 K1 dynamic/parallel staged producer + K3 isolated ASM-pack5 no-tail；旧 normal C/aicc K3 scalar/rowptr/store 调参链路已停止作为生产计划推进。
+- ✅ normal tail ASM-pack5 迁移收口：V3 normal plain-pack5 tail code object、Python/C++ wrapper、signal generation 协议和 default gate 已接入；cleanup refresh 已补 4096 formal repeat，tail fused `5.838198 ms`，baseline `9.513697 ms`，未复现早期 baseline VMFault/卡住。
+- ✅ LL residual refresh 收口：保留 LL C pack5 K1/K3 路线，32/128 历史 formal、cleanup 32 tail/no-tail、LL uneven graph no-tail/tail 均通过；当前低风险微调暂无新的必做候选。
+- 🚫 历史项/遗弃：normal C/aicc no-tail stage-delta 优化、normal C/raw tail-reduce、normal K3 C scalar rowptr/store 主线、fixed-route/raw/stub/availability 相关 bring-up helper 均不再作为 active 计划；相关反证只作为历史依据保留在 findings/progress。
+- 🚫 历史项/遗弃：K3 rowptr4/rowptr8 batch-load、staged-vector-store、rowaddr reuse、resource/load-family 摆动、no-tail internal signal、device-scope fence 等 C/aicc A/B 已反证或被 ASM-pack5 生产路径替代，不再重复。
+- 状态：✅ 已完成（production gate 通过）（Phase 6 不再保留性能余量类 optional backlog；后续若 Phase 10 sweep 暴露明确回归，再按新证据重新立项）
 
 ### Phase 6b: LL 进一步优化
-- [✅] LL retained path PMC/ISA attribution：当前默认 LL K1 block32 无 spill，block64 有 `private_segment=272` 并解释 block64 回退；K3 block32 no-tail 无 spill，128 residual 仍指向 remote rowptr combine 数据通路。
-- [✅] LL K1 parallel stage-copy 与 active-row/padded-zero 收口：block32/CUS64 固定保留 parallel stage-copy；32/128 correctness 与 formal 性能均通过，K2/blockM 变体复测后继续保留 default。
-- [✅] LL K3 remote combine microtuning 收口：store modifier、deferred wait、CUS、dest-sort、rowaddr wave-shuffle、store-burst、compact mapped-reduce 和 current split 复核均无稳定正收益，当前不再推进本地 epilogue/store-order 小改。
-- [✅] LL graph/uneven 覆盖补齐：cleanup refresh 已补 LL no-tail/tail uneven graph，graph replay 均快于 eager，不劣化。
-- [🧭] optional backlog：若后续要继续压 LL 128，优先从真实 remote/scattered combine 数据通路、合同级 reduce/chunk-readiness 或新 profiling 证据切入；不基于已反证的 rank-bucket stride mismatch artifact 规划大改。
-- 状态：✅ complete for current retained LL（remaining items are optional backlog）
+- ✅ LL retained path PMC/ISA attribution：当前默认 LL K1 block32 无 spill，block64 有 `private_segment=272` 并解释 block64 回退；K3 block32 no-tail 无 spill，128 residual 仍指向 remote rowptr combine 数据通路。
+- ✅ LL K1 parallel stage-copy 与 active-row/padded-zero 收口：block32/CUS64 固定保留 parallel stage-copy；32/128 correctness 与 formal 性能均通过，K2/blockM 变体复测后继续保留 default。
+- ✅ LL K3 remote combine microtuning 收口：store modifier、deferred wait、CUS、dest-sort、rowaddr wave-shuffle、store-burst、compact mapped-reduce 和 current split 复核均无稳定正收益，当前不再推进本地 epilogue/store-order 小改。
+- ✅ LL graph/uneven 覆盖补齐：cleanup refresh 已补 LL no-tail/tail uneven graph，graph replay 均快于 eager，不劣化。
+- 🧭 optional backlog：若后续要继续压 LL 128，优先从真实 remote/scattered combine 数据通路、合同级 reduce/chunk-readiness 或新 profiling 证据切入；不基于已反证的 rank-bucket stride mismatch artifact 规划大改。
+- 状态：✅ 已完成 for current retained LL（remaining items are optional backlog）
 
 ### Phase 7: Uneven tokens 与 cuda graph 对齐
-- [✅] 准备 LL uneven correctness 快速入口：`hygon_tmp/debug/run_v3_ll_correctness_matrix.sh` 固定 V3 LL no-tail/tail uneven token 列表，等待 8 卡空闲后执行。
-- [✅] 收紧 V3 graph 边界：normal backend graph 仍显式 guard；LL backend 已接入 V3 K1/K3 graph wrapper，避免 V3 pack5 L2 误落到原 K3 ASM graph fallback。
-- [✅] 对齐 V3 LL uneven tokens：rank 间 token 数不均时 metadata、tail reduce、local combine 和输出顺序一致；K1 LL 已按 per-source `sections.num_tokens` 扫描 route，no-tail/tail uneven matrix 通过。
-- [✅] 对齐 V3 LL cuda graph：runtime token tensor、capture-safe launch arg storage、tail signal/reset 覆盖 uniform 32/128 和 uneven 64 bucket，no-tail/tail graph replay 均通过。
-- [✅] 图模式保持 V3 门控和 backend/layout 分流：V3 LL graph 生效，V3 normal graph 继续 fail-fast，不影响原 graph path。
-- [✅] V3 LL 功能补齐后性能哨兵：默认 eager 32/128 no-tail `0.8276/1.0278 ms`，tail `0.8305/1.0400 ms`，相对最近 retained 无明显劣化。
-- [✅] V3 LL graph-vs-eager 性能哨兵：修复 graph K1 容量误按 `sym_buffer.num_max_tokens_per_rank=384` 放大的问题；after-fix graph replay 32/128 no-tail `0.6860/0.8723 ms`、tail `0.7293/0.9198 ms`，均快于对应 eager `0.8276/1.0278 ms`、`0.8305/1.0400 ms`。
-- [✅] V3 normal uneven eager parity：normal ASM-pack5 no-tail/tail 在 token list `1024,768,512,896,640,384,256,128` 下均通过，`max_abs=0.000488281`。
-- [✅] V3 normal cuda graph 基础支持：normal graph 不再 fail-fast；K1 normal graph 走 ASM-pack5，K3 no-tail ASM-pack5 透传 active_tiles，tail ASM-pack5 复用 generation/runtime active-tile 合同；uniform 1024 bucket replay 512/1024、uneven 1024 bucket no-tail/tail 曾通过基础 smoke。
-- [✅] 必做/BUG：V3 normal ASM graph multi-token replay correctness 已修复。根因是 V3 normal graph 走 K1 ASM-pack5，但 K1 graph `staged_flags/meta_flags` reset layout 只覆盖 legacy backend，导致 captured `flag_generation` 复用时读到上一轮 ready flag。修复后 no-tail `512,1024` replay=5 通过，tail `512,1024` repeat 4/4 通过，512/1024 均 `max_abs=0.000488281`。
-- [✅] V3 normal graph-vs-eager 性能哨兵：uniform 1024 bucket replay 512/1024 no-tail `1.616/1.983 ms` vs eager `1.692/2.075 ms`，tail `1.658/1.954 ms` vs eager `1.747/1.994 ms`；uneven no-tail graph `1.663 ms` vs eager `1.787 ms`，tail graph `1.724 ms` vs eager `1.825 ms`，均无劣化。
-- [✅] baseline timing VMFault/卡住排查：当前 V3 normal no-tail/tail 1024/4096、graph 前置 tail/no-tail 1024、以及旧 no-large 128 复现矩阵均可完成 `before_baseline_timing -> after_baseline_timing`；旧 VMFault 日志归类为早期 K3 raw/persistent/环境污染或并发端口冲突，不是当前 baseline oracle/timing 的稳定回归。
-- [✅] 2026-06-15 cleanup validation refresh：normal tail uneven `17,31,48,64,79,96,112,127` 通过；同一 uneven bucket 的 normal graph replay 32/96/128 token 均通过且快于 eager。
-- [✅] 2026-06-15 LL graph uneven 补测：同一 uneven token list 下 LL no-tail/tail graph replay 32/96/128 token 均通过且快于 eager。
-- 状态：✅ complete for graph correctness refresh（normal graph multi-token replay bug 已关闭；若后续 full sweep 出现新回归，再按新证据重新立项）
+- ✅ 准备 LL uneven correctness 快速入口：`hygon_tmp/debug/run_v3_ll_correctness_matrix.sh` 固定 V3 LL no-tail/tail uneven token 列表，等待 8 卡空闲后执行。
+- ✅ 收紧 V3 graph 边界：normal backend graph 仍显式 guard；LL backend 已接入 V3 K1/K3 graph wrapper，避免 V3 pack5 L2 误落到原 K3 ASM graph fallback。
+- ✅ 对齐 V3 LL uneven tokens：rank 间 token 数不均时 metadata、tail reduce、local combine 和输出顺序一致；K1 LL 已按 per-source `sections.num_tokens` 扫描 route，no-tail/tail uneven matrix 通过。
+- ✅ 对齐 V3 LL cuda graph：runtime token tensor、capture-safe launch arg storage、tail signal/reset 覆盖 uniform 32/128 和 uneven 64 bucket，no-tail/tail graph replay 均通过。
+- ✅ 图模式保持 V3 门控和 backend/layout 分流：V3 LL graph 生效，V3 normal graph 继续 fail-fast，不影响原 graph path。
+- ✅ V3 LL 功能补齐后性能哨兵：默认 eager 32/128 no-tail `0.8276/1.0278 ms`，tail `0.8305/1.0400 ms`，相对最近 retained 无明显劣化。
+- ✅ V3 LL graph-vs-eager 性能哨兵：修复 graph K1 容量误按 `sym_buffer.num_max_tokens_per_rank=384` 放大的问题；after-fix graph replay 32/128 no-tail `0.6860/0.8723 ms`、tail `0.7293/0.9198 ms`，均快于对应 eager `0.8276/1.0278 ms`、`0.8305/1.0400 ms`。
+- ✅ V3 normal uneven eager parity：normal ASM-pack5 no-tail/tail 在 token list `1024,768,512,896,640,384,256,128` 下均通过，`max_abs=0.000488281`。
+- ✅ V3 normal cuda graph 基础支持：normal graph 不再 fail-fast；K1 normal graph 走 ASM-pack5，K3 no-tail ASM-pack5 透传 active_tiles，tail ASM-pack5 复用 generation/runtime active-tile 合同；uniform 1024 bucket replay 512/1024、uneven 1024 bucket no-tail/tail 曾通过基础 smoke。
+- ✅ 必做/BUG：V3 normal ASM graph multi-token replay correctness 已修复。根因是 V3 normal graph 走 K1 ASM-pack5，但 K1 graph `staged_flags/meta_flags` reset layout 只覆盖 legacy backend，导致 captured `flag_generation` 复用时读到上一轮 ready flag。修复后 no-tail `512,1024` replay=5 通过，tail `512,1024` repeat 4/4 通过，512/1024 均 `max_abs=0.000488281`。
+- ✅ V3 normal graph-vs-eager 性能哨兵：uniform 1024 bucket replay 512/1024 no-tail `1.616/1.983 ms` vs eager `1.692/2.075 ms`，tail `1.658/1.954 ms` vs eager `1.747/1.994 ms`；uneven no-tail graph `1.663 ms` vs eager `1.787 ms`，tail graph `1.724 ms` vs eager `1.825 ms`，均无劣化。
+- ✅ baseline timing VMFault/卡住排查：当前 V3 normal no-tail/tail 1024/4096、graph 前置 tail/no-tail 1024、以及旧 no-large 128 复现矩阵均可完成 `before_baseline_timing -> after_baseline_timing`；旧 VMFault 日志归类为早期 K3 raw/persistent/环境污染或并发端口冲突，不是当前 baseline oracle/timing 的稳定回归。
+- ✅ 2026-06-15 cleanup validation refresh：normal tail uneven `17,31,48,64,79,96,112,127` 通过；同一 uneven bucket 的 normal graph replay 32/96/128 token 均通过且快于 eager。
+- ✅ 2026-06-15 LL graph uneven 补测：同一 uneven token list 下 LL no-tail/tail graph replay 32/96/128 token 均通过且快于 eager。
+- 状态：✅ 已完成 for graph correctness refresh（normal graph multi-token replay bug 已关闭；若后续 full sweep 出现新回归，再按新证据重新立项）
 
 ### Phase 8: Symm buffer / route_scratch 显存审计
-- [✅] symm buffer 结构已复核：DCU `get_symm_buffer_size_for_mega_moe()` 只分配 peer pointer header、runtime token、输入 `x/x_sf/topk_idx/topk_weights` 和 BF16 combine 区；`l1_acts/l1_acts_sf/l2_acts/l2_acts_sf` 在 DCU API 中是空 view，未继承 CUDA 原版的大中间激活存储。
-- [✅] combine 区当前不是冗余：big fused、legacy staged、V3 normal ASM-pack5 和 V3 LL 都通过 K1 生成的 `row_combine_ptrs` 写入同一 slot-major combine layout；no-tail 外部 reduce 和 tail K3 in-kernel reduce 都依赖该合同。
-- [✅] route_scratch 结构已复核：全局分配采用 big-fused `dcu_route_scratch_bytes()`，前段为 K1 route task workspace，后段为通用 route tile scratch；staged fused 复用后段 `x_fp8/act_bf16/act_fp8/act_scale` 区域作为 `staged_x/l1_out/act_fp8/act_scale`，没有额外再分一套 Python tensor workspace。
-- [✅] 主要冗余来源已定位：当前 `SymmBuffer` 同时服务 big fused、legacy staged、V3 normal、V3 LL，因此 route_scratch 按 big-fused 通用 layout 和 384 token 对齐容量一次性分配。小 token LL 实际 rows 远少于通用 layout，4096 normal 也远少于 route tile worst-case rows。
-- [✅] route_scratch planned direction 已由 Phase 12 落地：不再兼容 full `dcu_route_tile_scratch_layout`，DSV4 V3 staged 主路径按 retained V3 contract 缩容。
-- [✅] legacy staged fused / big fused 相关 scratch 预留已从 DSV4 V3 主路径移除；非 DSV4 fallback 仅作为兼容边界保留。
-- [✅] V3-only/staged-only route_scratch size/layout 公式已实现：K1 metadata/task workspace、`staged_x`、`l1_out`、`act_fp8`、`act_scale`、K3 `prob_storage`、graph runtime token、tail done counter/signal addrs、K1 graph flags/meta flags。
-- [✅] V3 LL/normal scratch 分配已按 backend/token bucket 与 normal fixed-capacity 上界收敛，不再按 big-fused route tile worst-case rows 预留。
-- [✅] route_scratch 缩容验证已覆盖 V3 normal/LL、tail/no-tail、eager/graph、uniform/uneven；Phase 13 矩阵 40/40 case pass。
-- 状态：✅ audit complete（big fused DSV4 主路径退役后，route_scratch 缩容已进入 Phase 12 生产实现）
+- ✅ symm buffer 结构已复核：DCU `get_symm_buffer_size_for_mega_moe()` 只分配 peer pointer header、runtime token、输入 `x/x_sf/topk_idx/topk_weights` 和 BF16 combine 区；`l1_acts/l1_acts_sf/l2_acts/l2_acts_sf` 在 DCU API 中是空 view，未继承 CUDA 原版的大中间激活存储。
+- ✅ combine 区当前不是冗余：big fused、legacy staged、V3 normal ASM-pack5 和 V3 LL 都通过 K1 生成的 `row_combine_ptrs` 写入同一 slot-major combine layout；no-tail 外部 reduce 和 tail K3 in-kernel reduce 都依赖该合同。
+- ✅ route_scratch 结构已复核：全局分配采用 big-fused `dcu_route_scratch_bytes()`，前段为 K1 route task workspace，后段为通用 route tile scratch；staged fused 复用后段 `x_fp8/act_bf16/act_fp8/act_scale` 区域作为 `staged_x/l1_out/act_fp8/act_scale`，没有额外再分一套 Python tensor workspace。
+- ✅ 主要冗余来源已定位：当前 `SymmBuffer` 同时服务 big fused、legacy staged、V3 normal、V3 LL，因此 route_scratch 按 big-fused 通用 layout 和 384 token 对齐容量一次性分配。小 token LL 实际 rows 远少于通用 layout，4096 normal 也远少于 route tile worst-case rows。
+- ✅ route_scratch planned direction 已由 Phase 12 落地：不再兼容 full `dcu_route_tile_scratch_layout`，DSV4 V3 staged 主路径按 retained V3 contract 缩容。
+- ✅ legacy staged fused / big fused 相关 scratch 预留已从 DSV4 V3 主路径移除；非 DSV4 fallback 仅作为兼容边界保留。
+- ✅ V3-only/staged-only route_scratch size/layout 公式已实现：K1 metadata/task workspace、`staged_x`、`l1_out`、`act_fp8`、`act_scale`、K3 `prob_storage`、graph runtime token、tail done counter/signal addrs、K1 graph flags/meta flags。
+- ✅ V3 LL/normal scratch 分配已按 backend/token bucket 与 normal fixed-capacity 上界收敛，不再按 big-fused route tile worst-case rows 预留。
+- ✅ route_scratch 缩容验证已覆盖 V3 normal/LL、tail/no-tail、eager/graph、uniform/uneven；Phase 13 矩阵 40/40 case pass。
+- 状态：✅ 已完成（audit complete）（big fused DSV4 主路径退役后，route_scratch 缩容已进入 Phase 12 生产实现）
 
 ### Phase 9: K1 source-rank address contract / >4GB span 优化
-- [✅] 当前主动项：借 8192 放大 `symm_x_span > UINT32_MAX` 问题，拆清 K1 normal ASM 的 fast uint32-offset、absolute pointer、rank-local bit2 三类路径耗时，优先找通用优化，不做 8192 特化。
-- [✅] 诊断：4096 warmup=1 可把 `v3_symm_span` 压到 `3781689344 <= UINT32_MAX`，K1 median 约 `2.70-2.77 ms`；warmup=0 时 `v3_symm_span=5683806208`，K1 median 约 `3.33-3.38 ms`，说明 4GB span 对 K1 有明确影响。
-- [✅] 诊断：8192 warmup=0/1 都仍 `symm_x_span > UINT32_MAX`，K1 median 都约 `5.36-5.41 ms`，warmup 无法解决 8192；K3 warmup A/B 对 remote combine 基本无正收益，4GB span 主要伤 K1 地址路径而非 K3 peer-store 本体。
-- [✅] 历史诊断：8192 旧 `K1_PREBUILD_MODE=auto/asm/compact` A/B 显示当时 auto 与 asm-route 等价，K1 约 `5.37 ms`；旧 compact 因为 `symm_x_span > UINT32_MAX` 时走 absolute pointer，虽把 rows 从 `57344` 降到 `54272`，但 K1 变慢到约 `6.50 ms`。该结论只适用于 absolute compact 旧实现。
-- [✅] 诊断：已隔离 asm-route bit2 `{rank-local x offset, source rank}` 与 asm-route absolute pointer；同为 8192/rows `57344` 时 bit2 约 `5.33 ms`，absolute 约 `6.40 ms`，因此不能把 `>4GB` 路径简单切到 absolute。
-- [✅] 诊断：K3 remote combine locality / peer-write A/B 已覆盖 2048/4096/8192。简单 dest-sort 在 8192 从约 `5.98 ms` 退化到约 `8.07 ms`，rank-bucket compact 在 2048/4096 仅噪声级小幅变化、8192 两轮一正一负；当前没有可直接生产化的 K3 rowptr locality 改动。
-- [✅] 生产收口：K1 compact/graph prebuild 在 `symm_x_span > UINT32_MAX` 时不再写 absolute x pointer，也不再设置 `reserved_c0` bit1；row_x_ptrs 改写为 bit2 `{rank-local x offset, source rank}`，graph/compact 与 asm-route 使用同一 MUBUF source-load 合同。
-- [✅] 验证：远端 source pytest 6/6、K1 object 强制重编通过；`K1_PREBUILD_MODE=compact` 8192 no-tail e2e correctness 通过，fused `10.667 ms`；K1-only compact 8192 `v3_symm_span_gt_u32=true`、rows `54272`、median `5.156 ms`，相较旧 compact absolute `~6.50 ms` 明显恢复；normal graph no-tail/tail replay 512/1024 均 correct 且无性能劣化。
-- [✅] 生产 auto 收口：降低 auto compact 门槛后，8192 `K1_PREBUILD_MODE=auto` 已选择 compact/bit2，K1-only rows/active `54272/54272`、median `5.158 ms`，与强制 compact `5.187 ms` 等价；full e2e no-tail auto correctness 通过，fused `10.792 ms`，强制 compact `10.859 ms`。
-- [✅] 12ms+ 复现与归因：强制旧 `K1_PREBUILD_MODE=asm` full e2e no-tail 可复现 `12.712 ms`，说明当前 auto 不复现 12ms+ 是因为默认路径改变；K3 拆分显示 rows `57344 -> 54272` 后 `staged_rowptr` 从 `5.943 ms` 降到 `4.671 ms`，full e2e 约 `1.9 ms` 改善主要来自 K3/rowptr 下游压力下降，而不是 K1 kernel 本体单独贡献。
-- [✅] 生产清理：K1 ASM `reserved_c0` bit1 absolute pointer 死分支已从 route emit 和 stage source-load 中移除；bit2 `{rank-local offset, source_rank}` 与默认 uint32-offset 路径保留，source guard 防止 absolute label/旧 host bitfield 回流。
-- [✅] auto 规则细化：auto 现在同时要求 per-expert fractional saving `>=5%` 且 local tile saving `>=8 tiles`，并额外把 `fixed_capacity_tiles_per_expert >= 7` 的大 rowptr 档切到 compact；后者覆盖 8192/8448 这类 K1 不明显变快但 K3 rowptr/remote combine 明显受益的场景。
-- [✅] 8448 复核：初版 auto 因 compact capacity rows 与 fixed rows 同为 `57344` 而保持 asm，K1-only `5.390 ms`、e2e `12.864 ms`；强制 compact 虽未降低 capacity rows，但 prebuild 后 K3 `staged_rowptr` 从约 `6.22 ms` 降到 `4.78 ms`，e2e `11.248 ms`；加入大 rowptr 规则后 auto 选择 compact，K1 rows/active `57344/57344`、e2e correct 且 fused `11.202 ms`。
-- [✅] 代表 size e2e 矩阵：normal eager no-tail 覆盖 `256,512,1024,1025,2048,2050,4096,4097,8192,8448` 的 `asm/compact/auto`，30/30 correctness 通过；auto 对齐当前强制最优或在噪声容限内。2048 首轮 compact 轻微领先但三轮复核 asm 更优，因此规则保持 `2048/2050 -> asm`。
-- [✅] tail-reduce 哨兵已补：后续 latest matrix 与 normal graph/eager 回归已覆盖 4096/8192 tail/no-tail、eager/graph、uniform/uneven；未见 correctness 回退，性能处于历史预期区间。
-- [🚫] 当前不继续推进：ASM hot loop 内减少 `source_rank -> peer pointer table -> s_load_dwordx2`、SRD 缓存、source-rank grouped row emission 都属于高风险合同级改动；在 compact/bit2 + auto 规则后，8192/8448 e2e 已恢复到目标区间，暂无足够收益证据支撑继续改生产路径。
-- [🧭] optional backlog：短期继续保留 `_v3_normal_symm_warmup_enabled` 作为低风险生产保护；它只提高 first production `symm_x_span <= UINT32_MAX` 的概率，不作为长期地址合同。
-- [🧭] optional backlog：只有未来 profiler 再证明 K1 `source_rank`/peer pointer lookup 是 4096/8192/8448 的主瓶颈时，才重新评估 per-rank pointer table、显式 `{source_rank, rank_local_offset}` row metadata、source-rank grouped row emission 等合同级方案；不得作为小 ASM patch 直接推进。
-- [🧭] optional backlog：更大改造方向是 DeepEP/Flux 风格的 rank/channel staging：先按 source rank/channel 把 remote x 拉到 local `staged_x`，GEMM 主体只消费 local staged input；该方案会触及 K1 route emission、staged_x layout、graph/uneven、tail/no-tail 合同，必须等 V3-only scratch/route_scratch 收敛后再评估。
-- [🧭] optional verification：任何去 4GB span 依赖的方案都必须满足 correctness 覆盖 V3 normal no-tail/tail、eager/graph、uniform/uneven，并且 4096/8192 K1 与 e2e 不劣化到当前 warmup fast path 之外；4096 参考 guard 以当前 cleanup refresh `~5.81/5.84 ms` e2e 和历史 K1 `~2.94-2.95 ms` fast path 为准。
-- 状态：✅ production optimization complete（absolute pointer 已移除，compact/bit2 与 auto 规则已通过代表矩阵和 tail-reduce 哨兵验证；剩余仅长期合同级 backlog）
+- ✅ 当前主动项：借 8192 放大 `symm_x_span > UINT32_MAX` 问题，拆清 K1 normal ASM 的 fast uint32-offset、absolute pointer、rank-local bit2 三类路径耗时，优先找通用优化，不做 8192 特化。
+- ✅ 诊断：4096 warmup=1 可把 `v3_symm_span` 压到 `3781689344 <= UINT32_MAX`，K1 median 约 `2.70-2.77 ms`；warmup=0 时 `v3_symm_span=5683806208`，K1 median 约 `3.33-3.38 ms`，说明 4GB span 对 K1 有明确影响。
+- ✅ 诊断：8192 warmup=0/1 都仍 `symm_x_span > UINT32_MAX`，K1 median 都约 `5.36-5.41 ms`，warmup 无法解决 8192；K3 warmup A/B 对 remote combine 基本无正收益，4GB span 主要伤 K1 地址路径而非 K3 peer-store 本体。
+- ✅ 历史诊断：8192 旧 `K1_PREBUILD_MODE=auto/asm/compact` A/B 显示当时 auto 与 asm-route 等价，K1 约 `5.37 ms`；旧 compact 因为 `symm_x_span > UINT32_MAX` 时走 absolute pointer，虽把 rows 从 `57344` 降到 `54272`，但 K1 变慢到约 `6.50 ms`。该结论只适用于 absolute compact 旧实现。
+- ✅ 诊断：已隔离 asm-route bit2 `{rank-local x offset, source rank}` 与 asm-route absolute pointer；同为 8192/rows `57344` 时 bit2 约 `5.33 ms`，absolute 约 `6.40 ms`，因此不能把 `>4GB` 路径简单切到 absolute。
+- ✅ 诊断：K3 remote combine locality / peer-write A/B 已覆盖 2048/4096/8192。简单 dest-sort 在 8192 从约 `5.98 ms` 退化到约 `8.07 ms`，rank-bucket compact 在 2048/4096 仅噪声级小幅变化、8192 两轮一正一负；当前没有可直接生产化的 K3 rowptr locality 改动。
+- ✅ 生产收口：K1 compact/graph prebuild 在 `symm_x_span > UINT32_MAX` 时不再写 absolute x pointer，也不再设置 `reserved_c0` bit1；row_x_ptrs 改写为 bit2 `{rank-local x offset, source rank}`，graph/compact 与 asm-route 使用同一 MUBUF source-load 合同。
+- ✅ 验证：远端 source pytest 6/6、K1 object 强制重编通过；`K1_PREBUILD_MODE=compact` 8192 no-tail e2e correctness 通过，fused `10.667 ms`；K1-only compact 8192 `v3_symm_span_gt_u32=true`、rows `54272`、median `5.156 ms`，相较旧 compact absolute `~6.50 ms` 明显恢复；normal graph no-tail/tail replay 512/1024 均 correct 且无性能劣化。
+- ✅ 生产 auto 收口：降低 auto compact 门槛后，8192 `K1_PREBUILD_MODE=auto` 已选择 compact/bit2，K1-only rows/active `54272/54272`、median `5.158 ms`，与强制 compact `5.187 ms` 等价；full e2e no-tail auto correctness 通过，fused `10.792 ms`，强制 compact `10.859 ms`。
+- ✅ 12ms+ 复现与归因：强制旧 `K1_PREBUILD_MODE=asm` full e2e no-tail 可复现 `12.712 ms`，说明当前 auto 不复现 12ms+ 是因为默认路径改变；K3 拆分显示 rows `57344 -> 54272` 后 `staged_rowptr` 从 `5.943 ms` 降到 `4.671 ms`，full e2e 约 `1.9 ms` 改善主要来自 K3/rowptr 下游压力下降，而不是 K1 kernel 本体单独贡献。
+- ✅ 生产清理：K1 ASM `reserved_c0` bit1 absolute pointer 死分支已从 route emit 和 stage source-load 中移除；bit2 `{rank-local offset, source_rank}` 与默认 uint32-offset 路径保留，source guard 防止 absolute label/旧 host bitfield 回流。
+- ✅ auto 规则细化：auto 现在同时要求 per-expert fractional saving `>=5%` 且 local tile saving `>=8 tiles`，并额外把 `fixed_capacity_tiles_per_expert >= 7` 的大 rowptr 档切到 compact；后者覆盖 8192/8448 这类 K1 不明显变快但 K3 rowptr/remote combine 明显受益的场景。
+- ✅ 8448 复核：初版 auto 因 compact capacity rows 与 fixed rows 同为 `57344` 而保持 asm，K1-only `5.390 ms`、e2e `12.864 ms`；强制 compact 虽未降低 capacity rows，但 prebuild 后 K3 `staged_rowptr` 从约 `6.22 ms` 降到 `4.78 ms`，e2e `11.248 ms`；加入大 rowptr 规则后 auto 选择 compact，K1 rows/active `57344/57344`、e2e correct 且 fused `11.202 ms`。
+- ✅ 代表 size e2e 矩阵：normal eager no-tail 覆盖 `256,512,1024,1025,2048,2050,4096,4097,8192,8448` 的 `asm/compact/auto`，30/30 correctness 通过；auto 对齐当前强制最优或在噪声容限内。2048 首轮 compact 轻微领先但三轮复核 asm 更优，因此规则保持 `2048/2050 -> asm`。
+- ✅ tail-reduce 哨兵已补：后续 latest matrix 与 normal graph/eager 回归已覆盖 4096/8192 tail/no-tail、eager/graph、uniform/uneven；未见 correctness 回退，性能处于历史预期区间。
+- 🚫 当前不继续推进：ASM hot loop 内减少 `source_rank -> peer pointer table -> s_load_dwordx2`、SRD 缓存、source-rank grouped row emission 都属于高风险合同级改动；在 compact/bit2 + auto 规则后，8192/8448 e2e 已恢复到目标区间，暂无足够收益证据支撑继续改生产路径。
+- 🧭 optional backlog：短期继续保留 `_v3_normal_symm_warmup_enabled` 作为低风险生产保护；它只提高 first production `symm_x_span <= UINT32_MAX` 的概率，不作为长期地址合同。
+- 🧭 optional backlog：只有未来 profiler 再证明 K1 `source_rank`/peer pointer lookup 是 4096/8192/8448 的主瓶颈时，才重新评估 per-rank pointer table、显式 `{source_rank, rank_local_offset}` row metadata、source-rank grouped row emission 等合同级方案；不得作为小 ASM patch 直接推进。
+- 🧭 optional backlog：更大改造方向是 DeepEP/Flux 风格的 rank/channel staging：先按 source rank/channel 把 remote x 拉到 local `staged_x`，GEMM 主体只消费 local staged input；该方案会触及 K1 route emission、staged_x layout、graph/uneven、tail/no-tail 合同，必须等 V3-only scratch/route_scratch 收敛后再评估。
+- 🧭 optional verification：任何去 4GB span 依赖的方案都必须满足 correctness 覆盖 V3 normal no-tail/tail、eager/graph、uniform/uneven，并且 4096/8192 K1 与 e2e 不劣化到当前 warmup fast path 之外；4096 参考 guard 以当前 cleanup refresh `~5.81/5.84 ms` e2e 和历史 K1 `~2.94-2.95 ms` fast path 为准。
+- 状态：✅ 已完成（production optimization complete）（absolute pointer 已移除，compact/bit2 与 auto 规则已通过代表矩阵和 tail-reduce 哨兵验证；剩余仅长期合同级 backlog）
 
 ### Phase 10: Required V3 performance sweep
-- [✅] 必做：运行前检查远端 8 卡状态，确保无残留 KFD 进程；同步当前 workspace 到 `hg@10.17.176.11` / `sglang_megamoe` / `/workspace/DeepGEMM`，并重跑 `compileall`、`megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 和 `build_ext --inplace` 确认产物新鲜。
-- [✅] 必做/BUG：V3 LL row-capacity bug 已修复。根因是 K1 LL host 侧 `rows_per_expert` 只按平均路由数对齐，随机 routing 中部分 local expert 超过容量后被截断，导致 fused stats mismatch 或较大 numerical diff；1024 capture 失败后，exact 256 eager 也暴露同类 overflow，因此当前策略改为 `expected rows/expert >= 48` 时补 64 rows，保留 32/128 tiny bucket 原容量，同时保证 LL 实际执行至少支持到 512 tokens/rank。graph capture bucket 可以更大，但不能替代 exact eager bucket 的容量安全验证。
-- [✅] 必做：V3 LL 使用 graph 模式完整刷 uniform tokens per rank `8,32,64,128,256,512,1024`；graph capture bucket 固定按 `1024`，已记录 replay 性能表。旧 `phase10_ll_graph_20260615_232857` 慢表仅代表 K1 row-capacity correctness 修复后的中间状态，已被 runtime-row K3 graph 修复后的新结果覆盖。
-- [✅] 历史验证：V3 LL graph sweep 曾覆盖 `K3_USE_ASM_TAIL_REDUCE=0` no-tail 与 `K3_USE_ASM_TAIL_REDUCE=1` tail；K1 row-capacity correctness 和 K3 graph fixed-row 性能问题均已修复，全档位均通过，graph replay 性能已落盘。2026-06-21 生产化收口后，LL tail-reduce-0/no-tail 路径已退休，不再作为 active 测试轴。
-- [✅] 必做/BUG：V3 LL tail reduce/signal graph replay 已改为 runtime-token 化。K3 tail reducer 现在从 graph runtime token tensor 读取 replay tokens 并 clamp 到 capture bucket，capture1024/replay8..512 不再按 1024 token 做 reduce；capture8192 下 K2 graph 固定-row block 开销已通过现有 K2 reg kernel 的 grid-stride row loop + 内部 `max_row_blocks=2048` 收敛，不新增 kernel、不引入 D2H sync，LL replay 8 token 已恢复到 `~0.56 ms`。
-- [✅] 2026-06-17 cleanup follow-up：LL tail eager 不再误传 graph runtime token output；eager 128/512 with `num_max_tokens_per_rank=1024` tail correctness 通过，graph capture1024 replay 32/96/128/256/512 tail correctness 通过。确认 eager 有效 rows 不被 max 放大，max 只作为 symm combine stride / scratch capacity 合同。
-- [✅] 2026-06-20 latency follow-up：LL tail-reduce=1 的 K1 前 standalone `rank_barrier` launch 已内联进 K1 C pack5 start path；同步语义仍保留在 K1 block0 + existing local grid barrier 中。LL tail eager 8/32/128/256、LL tail graph capture256 replay 8/32/128/256、LL no-tail eager 32 smoke 均通过。normal/no-tail/post-K3 external reduce 不在本轮移除范围内。
-- [✅] 2026-06-20 LL overlap follow-up：K1/K2 已完成 metadata 级融合，K1 在 `actual_m` 后写 `max(actual_m)`，K2 直接消费并统一 clamp actual rows；K3 tail reducer 增加 runtime-token active reducer worker 收缩，capture8192 replay `<=256` 使用 64 worker、512+ 保持 128 worker。LL tail/no-tail eager/graph representative smoke 均通过，未新增 kernel/D2H/H2D。
-- [✅] 2026-06-20 LL K3 true split-tail：新增 K3 local groupgemm 无通信写本地 workspace，然后由独立 combine/reduce kernel 读取本地 K3 输出并完成 peer combine + tail reduce。active-row copy + rowptr wave-broadcast 后，uniform graph capture8192 replay `8/32/128/256/512/513` 为 `0.548/0.646/0.794/1.176/1.968/1.968 ms`，对比 fused tail `0.549/0.645/0.847/1.295/2.287/2.248 ms`；uniform eager split `8/32/128/256/512/513` 为 `0.576/0.630/0.780/1.162/1.951/1.970 ms`。uneven edge513 也已通过，split eager `1.044 ms`、graph replay513 `1.030 ms`，明显优于 fused tail `1.468/1.582 ms`。split-only reduce 阈值 512 已反证并撤回，512/513 保持 128 reducer 分片更稳。
-- [✅] 2026-06-21 LL K3 true split-tail 生产化收口：当时 LL `K3_USE_ASM_TAIL_REDUCE=0` no-tail/tail0 路径在 `opt.py` 和 K3 wrapper 均 fail-fast（2026-06-22 已改为 LL 忽略该 env、始终 fused tail），normal no-tail 不受影响。完整收口矩阵通过：uniform eager `8,32,33,64,96,127,128,129,256,257,512,513` 全 correct；graph cap256 replay `8,32,64,128,256` 全 correct；graph cap8192 replay `8,32,128,256,512,513` 全 correct；uneven mix129/edge513 eager 和 graph 均 correct。代表性能：eager `32/127/128/256/512/513 = 0.625/0.836/0.776/1.162/1.960/1.978 ms`，graph cap8192 replay `8/32/128/256/512/513 = 0.546/0.650/0.791/1.179/2.004/1.979 ms`，edge513 graph replay `32/256/513 = 0.650/0.873/1.033 ms`。远端 build/source guard/smoke 均通过。2026-06-21 框架接入复核后改为保守默认：LL 默认走 fused tail，只有显式 `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1` 才启用 true split-tail，避免 cap256 graph / 8-token 框架场景被 split-tail 固定开销影响。
-- [🚫] 2026-06-21 LL K1 split-stage 反证：尝试过 K1 `stage/route/copy` 单 kernel + local groupgemm 单 kernel 的 split 形态，stage64 和 stage32 均 correctness 通过但没有稳定性能收益。默认 K1 fused eager 32/256 为 `0.625/1.259 ms`，split64 为 `0.629/1.264 ms`，split32 为 `0.633/1.350 ms`；graph capture8192 与 K3 split-tail 叠加后也未优于 K3 split-tail 单独路径。因此 K1 split 代码和 env 已撤回，后续不把“机械拆 K1 kernel”作为优化方向。
-- [✅] 必做：V3 normal 使用 eager 模式刷 uniform tokens per rank `256,512,1024,1025,2048,2050,4096,4097,8192`；不把 graph 结果代替本轮 normal eager sweep。
-- [✅] 必做：V3 normal eager sweep 同时覆盖 no-tail/tail；所有档位 correctness 通过，1024/1025、2048/2050、4096/4097 边界点未见 correctness 异常或明显性能台阶。
-- [✅] 必做：normal eager 结果落盘到 `hygon_tmp/debug/phase10_v3_sweep_20260615_196S/`；最终 LL graph 补测结果落盘到 `hygon_tmp/debug/ll_graph_dynamic_verify_20260615_235731/`，包含日志、case status、JSON 和 `summary.csv`；已回写 `progress.md` / `findings.md` / 本 Phase 状态。
-- [🧭] optional backlog：K2 计算级融入 K1 只在后续 profiler 证明 K2 + `l1_out` 中间读写占 LL graph replay 的显著比例时再恢复；当前保留 metadata 级融合。直接把 SwiGLU/row-wise scale/FP8 quant 塞进 K1 epilogue 有较高 occupancy 和跨 N tile reduction 风险，暂不作为生产优化。
-- 状态：✅ complete for required sweep（normal eager sweep、LL 1024 row-capacity bug fix、LL graph `8..1024` no-tail/tail runtime-row replay sweep 均已完成；LL 1024 仍只作为 graph capture/correctness 覆盖，不作为大 token 生产推荐路径）
+- ✅ 必做：运行前检查远端 8 卡状态，确保无残留 KFD 进程；同步当前 workspace 到 `hg@10.17.176.11` / `sglang_megamoe` / `/workspace/DeepGEMM`，并重跑 `compileall`、`megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 和 `build_ext --inplace` 确认产物新鲜。
+- ✅ 必做/BUG：V3 LL row-capacity bug 已修复。根因是 K1 LL host 侧 `rows_per_expert` 只按平均路由数对齐，随机 routing 中部分 local expert 超过容量后被截断，导致 fused stats mismatch 或较大 numerical diff；1024 capture 失败后，exact 256 eager 也暴露同类 overflow，因此当前策略改为 `expected rows/expert >= 48` 时补 64 rows，保留 32/128 tiny bucket 原容量，同时保证 LL 实际执行至少支持到 512 tokens/rank。graph capture bucket 可以更大，但不能替代 exact eager bucket 的容量安全验证。
+- ✅ 必做：V3 LL 使用 graph 模式完整刷 uniform tokens per rank `8,32,64,128,256,512,1024`；graph capture bucket 固定按 `1024`，已记录 replay 性能表。旧 `phase10_ll_graph_20260615_232857` 慢表仅代表 K1 row-capacity correctness 修复后的中间状态，已被 runtime-row K3 graph 修复后的新结果覆盖。
+- ✅ 历史验证：V3 LL graph sweep 曾覆盖 `K3_USE_ASM_TAIL_REDUCE=0` no-tail 与 `K3_USE_ASM_TAIL_REDUCE=1` tail；K1 row-capacity correctness 和 K3 graph fixed-row 性能问题均已修复，全档位均通过，graph replay 性能已落盘。2026-06-21 生产化收口后，LL tail-reduce-0/no-tail 路径已退休，不再作为 active 测试轴。
+- ✅ 必做/BUG：V3 LL tail reduce/signal graph replay 已改为 runtime-token 化。K3 tail reducer 现在从 graph runtime token tensor 读取 replay tokens 并 clamp 到 capture bucket，capture1024/replay8..512 不再按 1024 token 做 reduce；capture8192 下 K2 graph 固定-row block 开销已通过现有 K2 reg kernel 的 grid-stride row loop + 内部 `max_row_blocks=2048` 收敛，不新增 kernel、不引入 D2H sync，LL replay 8 token 已恢复到 `~0.56 ms`。
+- ✅ 2026-06-17 cleanup follow-up：LL tail eager 不再误传 graph runtime token output；eager 128/512 with `num_max_tokens_per_rank=1024` tail correctness 通过，graph capture1024 replay 32/96/128/256/512 tail correctness 通过。确认 eager 有效 rows 不被 max 放大，max 只作为 symm combine stride / scratch capacity 合同。
+- ✅ 2026-06-20 latency follow-up：LL tail-reduce=1 的 K1 前 standalone `rank_barrier` launch 已内联进 K1 C pack5 start path；同步语义仍保留在 K1 block0 + existing local grid barrier 中。LL tail eager 8/32/128/256、LL tail graph capture256 replay 8/32/128/256、LL no-tail eager 32 smoke 均通过。normal/no-tail/post-K3 external reduce 不在本轮移除范围内。
+- ✅ 2026-06-20 LL overlap follow-up：K1/K2 已完成 metadata 级融合，K1 在 `actual_m` 后写 `max(actual_m)`，K2 直接消费并统一 clamp actual rows；K3 tail reducer 增加 runtime-token active reducer worker 收缩，capture8192 replay `<=256` 使用 64 worker、512+ 保持 128 worker。LL tail/no-tail eager/graph representative smoke 均通过，未新增 kernel/D2H/H2D。
+- ✅ 2026-06-20 LL K3 true split-tail：新增 K3 local groupgemm 无通信写本地 workspace，然后由独立 combine/reduce kernel 读取本地 K3 输出并完成 peer combine + tail reduce。active-row copy + rowptr wave-broadcast 后，uniform graph capture8192 replay `8/32/128/256/512/513` 为 `0.548/0.646/0.794/1.176/1.968/1.968 ms`，对比 fused tail `0.549/0.645/0.847/1.295/2.287/2.248 ms`；uniform eager split `8/32/128/256/512/513` 为 `0.576/0.630/0.780/1.162/1.951/1.970 ms`。uneven edge513 也已通过，split eager `1.044 ms`、graph replay513 `1.030 ms`，明显优于 fused tail `1.468/1.582 ms`。split-only reduce 阈值 512 已反证并撤回，512/513 保持 128 reducer 分片更稳。
+- ✅ 2026-06-21 LL K3 true split-tail 生产化收口：当时 LL `K3_USE_ASM_TAIL_REDUCE=0` no-tail/tail0 路径在 `opt.py` 和 K3 wrapper 均 fail-fast（2026-06-22 已改为 LL 忽略该 env、始终 fused tail），normal no-tail 不受影响。完整收口矩阵通过：uniform eager `8,32,33,64,96,127,128,129,256,257,512,513` 全 correct；graph cap256 replay `8,32,64,128,256` 全 correct；graph cap8192 replay `8,32,128,256,512,513` 全 correct；uneven mix129/edge513 eager 和 graph 均 correct。代表性能：eager `32/127/128/256/512/513 = 0.625/0.836/0.776/1.162/1.960/1.978 ms`，graph cap8192 replay `8/32/128/256/512/513 = 0.546/0.650/0.791/1.179/2.004/1.979 ms`，edge513 graph replay `32/256/513 = 0.650/0.873/1.033 ms`。远端 build/source guard/smoke 均通过。2026-06-21 框架接入复核后改为保守默认：LL 默认走 fused tail，只有显式 `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1` 才启用 true split-tail，避免 cap256 graph / 8-token 框架场景被 split-tail 固定开销影响。
+- 🚫 2026-06-21 LL K1 split-stage 反证：尝试过 K1 `stage/route/copy` 单 kernel + local groupgemm 单 kernel 的 split 形态，stage64 和 stage32 均 correctness 通过但没有稳定性能收益。默认 K1 fused eager 32/256 为 `0.625/1.259 ms`，split64 为 `0.629/1.264 ms`，split32 为 `0.633/1.350 ms`；graph capture8192 与 K3 split-tail 叠加后也未优于 K3 split-tail 单独路径。因此 K1 split 代码和 env 已撤回，后续不把“机械拆 K1 kernel”作为优化方向。
+- ✅ 必做：V3 normal 使用 eager 模式刷 uniform tokens per rank `256,512,1024,1025,2048,2050,4096,4097,8192`；不把 graph 结果代替本轮 normal eager sweep。
+- ✅ 必做：V3 normal eager sweep 同时覆盖 no-tail/tail；所有档位 correctness 通过，1024/1025、2048/2050、4096/4097 边界点未见 correctness 异常或明显性能台阶。
+- ✅ 必做：normal eager 结果落盘到 `hygon_tmp/debug/phase10_v3_sweep_20260615_196S/`；最终 LL graph 补测结果落盘到 `hygon_tmp/debug/ll_graph_dynamic_verify_20260615_235731/`，包含日志、case status、JSON 和 `summary.csv`；已回写 `progress.md` / `findings.md` / 本 Phase 状态。
+- 🧭 optional backlog：K2 计算级融入 K1 只在后续 profiler 证明 K2 + `l1_out` 中间读写占 LL graph replay 的显著比例时再恢复；当前保留 metadata 级融合。直接把 SwiGLU/row-wise scale/FP8 quant 塞进 K1 epilogue 有较高 occupancy 和跨 N tile reduction 风险，暂不作为生产优化。
+- 状态：✅ 已完成 for required sweep（normal eager sweep、LL 1024 row-capacity bug fix、LL graph `8..1024` no-tail/tail runtime-row replay sweep 均已完成；LL 1024 仍只作为 graph capture/correctness 覆盖，不作为大 token 生产推荐路径）
 
 ### Phase 11: V3 转正为 DCU MegaMoE 主路径
-- [✅] 梳理当前 public DCU MegaMoE 入口、`opt.py`、`__init__.py`、tests 和 README 中的 big fused / legacy staged / V3 gate 分支，确认哪些是生产入口、哪些只剩历史引用。
-- [✅] 将默认 DCU MegaMoE 主路径切到 V3 staged dispatcher：实际 tokens per rank `<=256` 选择 LL，`>256` 选择 normal；保留外部调用参数和单测使用方式，权重 layout 差异仍由 V3 pack5 helper/fixture 处理。
-- [✅] 处理 graph 与 uneven backend 选择：graph 不用 capture max tokens 误判 backend；uneven 使用 dispatch/global bucket，确保 8 rank backend 一致。
-- [✅] 移除 `USE_MEGAMOE_V3` 和 `MEGAMOE_DCU_V3_BACKEND` 对生产路径的控制；同步删除 source guards、测试 env 组合和 README 实验开关说明。
-- [✅] 清理之前 big fused 主路径相关代码/默认入口/测试引用，以 V3 LL 覆盖小 token 主路径；DSV4 public eager/graph 已默认进入 V3 staged，public API 改为显式 `megamoe_backend="ll"|"normal"` 加 `graph=True|False`，不再保留旧 `big_fused_cuda_graph` / `stages_fused_cuda_graph` / `ll_cuda_graph` / `normal_cuda_graph` 语义。
-- [✅] 清理之前 legacy staged fused 主路径相关代码/默认入口/测试引用，以 V3 normal 覆盖大 token 主路径；Python 旧 K1/K3 非-pack5 staged wrapper 已删除，V3 normal 只通过 isolated ASM-pack5 entry 表达。
-- [✅] 保留并验证仍有意义的非 V3 参数/env：tail/no-tail、K1 auto/compact 策略、`MEGAMOE_DCU_OPT_VERBOSE_BUILD` 仍保留；`USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND` 等实验 env 已不再被生产路径消费。
-- [✅] retained compatibility：底层 `_C.fp8_mega_moe*` 作为非 DSV4 shape fallback 保留；DSV4 route_scratch size 已按 V3-only staged layout 缩容，旧 persistent big-fused 不再作为 DSV4 私有直调用路径。
-- 状态：✅ complete for public V3 main path（底层非 DSV4 `_C` fallback 作为兼容保留，不再列为 V3 主路径阻塞项）
+- ✅ 梳理当前 public DCU MegaMoE 入口、`opt.py`、`__init__.py`、tests 和 README 中的 big fused / legacy staged / V3 gate 分支，确认哪些是生产入口、哪些只剩历史引用。
+- ✅ 将默认 DCU MegaMoE 主路径切到 V3 staged dispatcher：实际 tokens per rank `<=256` 选择 LL，`>256` 选择 normal；保留外部调用参数和单测使用方式，权重 layout 差异仍由 V3 pack5 helper/fixture 处理。
+- ✅ 处理 graph 与 uneven backend 选择：graph 不用 capture max tokens 误判 backend；uneven 使用 dispatch/global bucket，确保 8 rank backend 一致。
+- ✅ 移除 `USE_MEGAMOE_V3` 和 `MEGAMOE_DCU_V3_BACKEND` 对生产路径的控制；同步删除 source guards、测试 env 组合和 README 实验开关说明。
+- ✅ 清理之前 big fused 主路径相关代码/默认入口/测试引用，以 V3 LL 覆盖小 token 主路径；DSV4 public eager/graph 已默认进入 V3 staged，public API 改为显式 `megamoe_backend="ll"|"normal"` 加 `graph=True|False`，不再保留旧 `big_fused_cuda_graph` / `stages_fused_cuda_graph` / `ll_cuda_graph` / `normal_cuda_graph` 语义。
+- ✅ 清理之前 legacy staged fused 主路径相关代码/默认入口/测试引用，以 V3 normal 覆盖大 token 主路径；Python 旧 K1/K3 非-pack5 staged wrapper 已删除，V3 normal 只通过 isolated ASM-pack5 entry 表达。
+- ✅ 保留并验证仍有意义的非 V3 参数/env：tail/no-tail、K1 auto/compact 策略、`MEGAMOE_DCU_OPT_VERBOSE_BUILD` 仍保留；`USE_MEGAMOE_V3` / `MEGAMOE_DCU_V3_BACKEND` 等实验 env 已不再被生产路径消费。
+- ✅ retained compatibility：底层 `_C.fp8_mega_moe*` 作为非 DSV4 shape fallback 保留；DSV4 route_scratch size 已按 V3-only staged layout 缩容，旧 persistent big-fused 不再作为 DSV4 私有直调用路径。
+- 状态：✅ 已完成 for public V3 main path（底层非 DSV4 `_C` fallback 作为兼容保留，不再列为 V3 主路径阻塞项）
 
 ### Phase 12: V3-only route_scratch / symm footprint 优化
-- [✅] 在 DSV4 V3 staged 主路径上重新定义 retained route_scratch 合同：K1 metadata workspace、`staged_x`、normal ASM K1 graph flags/meta/GpuProb、`l1_out`、`act_fp8`、`act_scale`、K3 `prob_storage`、graph runtime token、tail done/signal addrs。
-- [✅] DSV4 size API 不再按 legacy big-fused `DcuRouteTileScratchLayout` full layout 分配，不再预留 L2 queue、tile pull/done counters、tile rowptr arrays、persistent kernel scratch 等空间；非 DSV4 shape 暂留 legacy fallback。
-- [✅] 按 V3 backend/token bucket 缩容：小 buffer 按 LL rows/headroom；大 buffer 按 normal fixed-capacity 上界覆盖 auto compact/graph compact；实测 8192 requested max 对齐 8448 后 route_scratch 为 `0.830 GiB`，旧约 `4.013 GiB`。
-- [✅] 校验 symm buffer 的 combine 区、runtime token、peer pointer header 是否仍是 retained V3 path 必需；combine 区仍被 K3 no-tail 外部 reduce 与 tail in-kernel reduce 共同消费，runtime token/peer header 仍是 graph/跨 rank 合同的一部分，当前不做高风险 shrink。
-- [✅] 覆盖完整 eager/graph、uniform/uneven、tail/no-tail 的 route_scratch 缩容验证；Phase 13 矩阵 40/40 case pass，LL/normal eager、graph replay、uneven eager/graph 均通过。
-- 状态：✅ complete（DSV4 route_scratch shrink 已落地，symm buffer retained 区域暂无可安全删除项）
+- ✅ 在 DSV4 V3 staged 主路径上重新定义 retained route_scratch 合同：K1 metadata workspace、`staged_x`、normal ASM K1 graph flags/meta/GpuProb、`l1_out`、`act_fp8`、`act_scale`、K3 `prob_storage`、graph runtime token、tail done/signal addrs。
+- ✅ DSV4 size API 不再按 legacy big-fused `DcuRouteTileScratchLayout` full layout 分配，不再预留 L2 queue、tile pull/done counters、tile rowptr arrays、persistent kernel scratch 等空间；非 DSV4 shape 暂留 legacy fallback。
+- ✅ 按 V3 backend/token bucket 缩容：小 buffer 按 LL rows/headroom；大 buffer 按 normal fixed-capacity 上界覆盖 auto compact/graph compact；实测 8192 requested max 对齐 8448 后 route_scratch 为 `0.830 GiB`，旧约 `4.013 GiB`。
+- ✅ 校验 symm buffer 的 combine 区、runtime token、peer pointer header 是否仍是 retained V3 path 必需；combine 区仍被 K3 no-tail 外部 reduce 与 tail in-kernel reduce 共同消费，runtime token/peer header 仍是 graph/跨 rank 合同的一部分，当前不做高风险 shrink。
+- ✅ 覆盖完整 eager/graph、uniform/uneven、tail/no-tail 的 route_scratch 缩容验证；Phase 13 矩阵 40/40 case pass，LL/normal eager、graph replay、uneven eager/graph 均通过。
+- 状态：✅ 已完成（DSV4 route_scratch shrink 已落地，symm buffer retained 区域暂无可安全删除项）
 
 ### Phase 13: README、测试与最终回归矩阵
-- [✅] 更新工程 README 的 DCU MegaMoE 部分：V3 成为主路径、权重 pack5 layout 要求、框架/测试层 `<=256` LL / `>256` normal 策略、保留参数/env、移除 V3 gate/backend env；graph 示例使用 `megamoe_backend` + `graph=True`，不再沿用旧 graph flag 名称。
-- [✅] 更新 `megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` 和 `megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py`：尽量复用原参数和使用方法，删除 V3 env-gated 专用断言，新增默认主路径、auto backend、retired symbol 和 route_scratch shrink 合同测试。
-- [✅] 本地静态验证：`compileall`、`git diff --check` 通过；本地无 pytest 环境，source pytest 在远端容器执行。
-- [✅] 远端构建验证：同步到 `/workspace/DeepGEMM`，`compileall`、`PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 7/7 通过，`MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过。
-- [✅] 远端功能/精度验证：LL/normal、tail/no-tail、eager/graph、uniform/uneven 均通过；结果目录 `hygon_tmp/debug/phase13_final_20260616_181534/`。
-- [✅] 远端性能 sweep：LL 刷 `8,32,64,128,256`；normal main path 刷 `512,1024,1025,2048,2050,4096,4097,8192`，另补 normal actual256/dispatch512 boundary；对照历史 progress 表，未见功能回退，8192 当前稳定在 `~10.9-11.0 ms`，相对最近 `~10.75-10.79 ms` 有约 1-2% 漂移但仍优于旧 `12ms+` 档。
-- [✅] README 命令验证：`scripts/run_dcu_megamoe_opt.sh` 以 `TOKENS_LIST=512 SKIP_BENCH=1` smoke 通过，验证 README/script 入口可执行。
-- [✅] 2026-06-17 follow-up：上层 API 再收敛为 `megamoe_backend` + `graph`；auto/threshold/env 只存在于 `megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` 作为框架选择模拟；旧 `dispatch_num_tokens` public/CLI 参数删除，eager-only 容量上界改名为 `capacity_num_tokens`，不参与分化、不进入 graph。远端 build、source tests、LL/normal eager/graph smoke 已通过。
-- [✅] 2026-06-17 latest matrix：K2 actual_m replay pruning 与 LL 8192 headroom 修复后，重刷 LL `8,32,33,64,128,129,256,257,512,513` eager/graph、normal `256,512,1024,1025,2048,2050,3072,4096,4097,8192` eager/graph，graph 均 capture8192；LL/normal eager/graph uneven smoke 均 `correct=True`，README smoke v2 通过。结果落盘 `hygon_tmp/debug/full_matrix_latest_20260617_191221`，表格已写入 `progress.md`。
-- 状态：✅ complete（最终回归矩阵通过，8192 轻微性能漂移已记录为后续观察项）
+- ✅ 更新工程 README 的 DCU MegaMoE 部分：V3 成为主路径、权重 pack5 layout 要求、框架/测试层 `<=256` LL / `>256` normal 策略、保留参数/env、移除 V3 gate/backend env；graph 示例使用 `megamoe_backend` + `graph=True`，不再沿用旧 graph flag 名称。
+- ✅ 更新 `megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` 和 `megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py`：尽量复用原参数和使用方法，删除 V3 env-gated 专用断言，新增默认主路径、auto backend、retired symbol 和 route_scratch shrink 合同测试。
+- ✅ 本地静态验证：`compileall`、`git diff --check` 通过；本地无 pytest 环境，source pytest 在远端容器执行。
+- ✅ 远端构建验证：同步到 `/workspace/DeepGEMM`，`compileall`、`PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` 7/7 通过，`MAX_JOBS=16 python3 setup.py build_ext --inplace` 通过。
+- ✅ 远端功能/精度验证：LL/normal、tail/no-tail、eager/graph、uniform/uneven 均通过；结果目录 `hygon_tmp/debug/phase13_final_20260616_181534/`。
+- ✅ 远端性能 sweep：LL 刷 `8,32,64,128,256`；normal main path 刷 `512,1024,1025,2048,2050,4096,4097,8192`，另补 normal actual256/dispatch512 boundary；对照历史 progress 表，未见功能回退，8192 当前稳定在 `~10.9-11.0 ms`，相对最近 `~10.75-10.79 ms` 有约 1-2% 漂移但仍优于旧 `12ms+` 档。
+- ✅ README 命令验证：`scripts/run_dcu_megamoe_opt.sh` 以 `TOKENS_LIST=512 SKIP_BENCH=1` smoke 通过，验证 README/script 入口可执行。
+- ✅ 2026-06-17 follow-up：上层 API 再收敛为 `megamoe_backend` + `graph`；auto/threshold/env 只存在于 `megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` 作为框架选择模拟；旧 `dispatch_num_tokens` public/CLI 参数删除，eager-only 容量上界改名为 `capacity_num_tokens`，不参与分化、不进入 graph。远端 build、source tests、LL/normal eager/graph smoke 已通过。
+- ✅ 2026-06-17 latest matrix：K2 actual_m replay pruning 与 LL 8192 headroom 修复后，重刷 LL `8,32,33,64,128,129,256,257,512,513` eager/graph、normal `256,512,1024,1025,2048,2050,3072,4096,4097,8192` eager/graph，graph 均 capture8192；LL/normal eager/graph uneven smoke 均 `correct=True`，README smoke v2 通过。结果落盘 `hygon_tmp/debug/full_matrix_latest_20260617_191221`，表格已写入 `progress.md`。
+- 状态：✅ 已完成（最终回归矩阵通过，8192 轻微性能漂移已记录为后续观察项）
 
 ### Phase 14: V3 pack5 weight layout policy
-- [✅] 已验证：single/unified ABI（LL transposed layout + normal ASM `logical ni -> physical ni` 映射）功能完整，但 normal 4096/8192 相比历史双-layout 最优有约 `8%` 回退；该路径不再作为默认性能路径。
-- [✅] 默认策略改为 dual layout：LL 继续使用 transposed pack5，normal ASM 使用 plain pack5；public API 可接收 `{ "ll": ..., "normal": ... }` 权重 dict，由 `megamoe_backend` 选择对应 layout。框架 PD 分离或显存允许时用该默认路径追极致性能。
-- [✅] 兼容策略：新增 `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1`，打开后使用 `{ "unified": ... }` 或旧 tuple 权重，并加载 `_UNIFIED_PACK5` code object，保留单 ABI/单权重占用路径；该开关不是默认性能路径。
-- [✅] 构建面：新增 K1/K3 no-tail/tail `_UNIFIED_PACK5.s` 和对应 setup code-object build；默认 PACK5 ASM 恢复 plain `ni`，unified PACK5 ASM 保留 transposed physical `ni` 映射。
-- [✅] 代表验证：远端 `build_ext --inplace`、source pytest `9/9` 通过；默认 dual layout eager LL 32/512 为 `0.641/2.297 ms`，normal 512/4096/5120/8192 为 `1.753/5.798/7.403/10.886 ms`；unified normal4096 为 `6.274 ms`。
-- [✅] graph 代表验证：默认 dual layout graph capture8192 下 LL replay 32/512 为 `0.661/2.258 ms`，normal replay 4096/8192 为 `5.687/10.485 ms`；unified normal4096 replay 为 `6.180 ms`。
-- [✅] 第一轮重新挖掘结论：DCU KB 与本工程 CUDA MegaMoE 参考均支持“layout 是 global-load/LDS/MMAC fragment 合同”的判断；当前 LL transposed 与 normal plain 分别匹配各自 kernel 热路径，是默认双 layout 下的最佳已知安全基线。暂未找到可低风险替换的第三种共同 layout 或单侧新 layout。
-- [✅] source-backed 参考已读：`ds_read_m32x16_b16_{normalxalt,altxalt,swizzle}.cpp` 可作为后续 normal 新 code object 的 LDS/matrix-read 合同参考，但它要求同步改 LDS write/read/MMAC/store，不能作为默认 ASM 的几行局部 remap。
-- [🚫] 已证伪方向仍不重复：plain layout + LL direct mapped load、plain layout + LL B-side register shuffle、plain layout + 不改 LL 合同、transposed layout + normal local-read/LDS fragment remap、normal store-side remap。
-- [🧭] optional backlog：dual layout 默认策略已恢复历史性能档位；后续只有在有 profiler/ISA/source-backed 证据时，才重新挖掘 LL/normal 各自最佳 layout/kernel 组合。任一新候选必须同时覆盖 LL `32/512` 与 normal `512/4096/8192/5120`，并不得低于当前默认 dual-layout 代表性能。
-- [🧭] 可选长期方向：如果双 layout 仍有显存压力或 PD 分离之外也需要单权重，可重新设计第三种共同 layout；进入条件是有 profiler/ISA/source-backed 证据，不再靠单点 permutation 猜测。
-- 状态：✅ complete for current dual-layout policy（unified 作为兼容开关保留；后续 layout 深挖降级为证据驱动 optional backlog。）
+- ✅ 已验证：single/unified ABI（LL transposed layout + normal ASM `logical ni -> physical ni` 映射）功能完整，但 normal 4096/8192 相比历史双-layout 最优有约 `8%` 回退；该路径不再作为默认性能路径。
+- ✅ 默认策略改为 dual layout：LL 继续使用 transposed pack5，normal ASM 使用 plain pack5；public API 可接收 `{ "ll": ..., "normal": ... }` 权重 dict，由 `megamoe_backend` 选择对应 layout。框架 PD 分离或显存允许时用该默认路径追极致性能。
+- ✅ 兼容策略：新增 `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1`，打开后使用 `{ "unified": ... }` 或旧 tuple 权重，并加载 `_UNIFIED_PACK5` code object，保留单 ABI/单权重占用路径；该开关不是默认性能路径。
+- ✅ 构建面：新增 K1/K3 no-tail/tail `_UNIFIED_PACK5.s` 和对应 setup code-object build；默认 PACK5 ASM 恢复 plain `ni`，unified PACK5 ASM 保留 transposed physical `ni` 映射。
+- ✅ 代表验证：远端 `build_ext --inplace`、source pytest `9/9` 通过；默认 dual layout eager LL 32/512 为 `0.641/2.297 ms`，normal 512/4096/5120/8192 为 `1.753/5.798/7.403/10.886 ms`；unified normal4096 为 `6.274 ms`。
+- ✅ graph 代表验证：默认 dual layout graph capture8192 下 LL replay 32/512 为 `0.661/2.258 ms`，normal replay 4096/8192 为 `5.687/10.485 ms`；unified normal4096 replay 为 `6.180 ms`。
+- ✅ 第一轮重新挖掘结论：DCU KB 与本工程 CUDA MegaMoE 参考均支持“layout 是 global-load/LDS/MMAC fragment 合同”的判断；当前 LL transposed 与 normal plain 分别匹配各自 kernel 热路径，是默认双 layout 下的最佳已知安全基线。暂未找到可低风险替换的第三种共同 layout 或单侧新 layout。
+- ✅ source-backed 参考已读：`ds_read_m32x16_b16_{normalxalt,altxalt,swizzle}.cpp` 可作为后续 normal 新 code object 的 LDS/matrix-read 合同参考，但它要求同步改 LDS write/read/MMAC/store，不能作为默认 ASM 的几行局部 remap。
+- 🚫 已证伪方向仍不重复：plain layout + LL direct mapped load、plain layout + LL B-side register shuffle、plain layout + 不改 LL 合同、transposed layout + normal local-read/LDS fragment remap、normal store-side remap。
+- 🧭 optional backlog：dual layout 默认策略已恢复历史性能档位；后续只有在有 profiler/ISA/source-backed 证据时，才重新挖掘 LL/normal 各自最佳 layout/kernel 组合。任一新候选必须同时覆盖 LL `32/512` 与 normal `512/4096/8192/5120`，并不得低于当前默认 dual-layout 代表性能。
+- 🧭 可选长期方向：如果双 layout 仍有显存压力或 PD 分离之外也需要单权重，可重新设计第三种共同 layout；进入条件是有 profiler/ISA/source-backed 证据，不再靠单点 permutation 猜测。
+- 状态：✅ 已完成（当前 dual-layout 策略）（unified 作为兼容开关保留；后续 layout 深挖降级为证据驱动 optional backlog。）
 
 ### Phase 15: LL low-latency baseline 与 DeepEP-style readiness 优化
-- [✅] 已补 DeepEP low-latency combine / `combine_sbo` standalone 数据：non-overlap combine kernel `8/32/64/128/256 = 56/63/102/94/154 us`，SBO combine kernel `66/76/92/138/222 us`；SBO 只在部分档位优于 non-overlap，不作为直接默认替换。
-- [✅] 已补 DeepGEMM masked K1/K3 与 K2 standalone 下限：K2 约 `31-32 us`；`DeepEP LL dispatch+combine + masked K1 + K2 + masked K3` 加和下限为 `0.700/0.815/0.998/0.838/0.992 ms`，对应 `8/32/64/128/256` tokens/rank。
-- [✅] 已对比当前 MegaMoE LL e2e：`0.574/0.624/0.679/0.835/1.266 ms`。结论是 `8/32/64` 已明显优于拆分 baseline 下限，`128` 基本持平，`256` 有继续挖掘空间但不能忽略 packed-row route-weight glue。
-- [✅] 已补 SGLang framework trace 口径校准：step300 decode 实际为 `8 tokens/rank`；框架 trace 均摊 DeepEP low-latency core 约 `311 us/MoE`，MegaMoE fused/no-split cap256 约 `349 us/MoE`，MegaMoE split cap256 约 `427 us/MoE`。standalone 单测不复现 DeepEP 更快，因为 baseline 不是 SGLang 线上 DeepEP dispatcher/graph 调度的同一口径。
-- [✅] 已试跑 DeepEP-style per-destination-token-chunk readiness 合同：chunk_m=64，signal slot 22..25，expected=`tokens_in_chunk * topk`，K3 split-tail copy 侧按 expert 完成后汇总 destination chunk 计数并发布，reduce 侧按 chunk 等待。standalone cap256 A/B 全 correct；chunk-ready 在 eager `8/32/64/128/256` 为 `0.565/0.613/0.647/0.747/1.133 ms`，优于 fused tail `0.569/0.625/0.681/0.836/1.261 ms`；graph capture256 replay `8/32/64/128/256` 为 `0.521/0.615/0.655/0.747/1.135 ms`，优于 fused tail `0.526/0.628/0.686/0.826/1.273 ms`。
-- [✅] 已补 chunk-ready uneven 验证并修复 publish gating：`8,33,64,129,32,0,96,17` 和 `256,129,64,32,16,8,4,0` 的 eager/graph capture256 全 correct。修复点是 reduce 侧按本地 runtime token 等待，copy/publish 侧按 peer runtime token 最大值启用并按 destination runtime token 过滤发布。chunk-ready 在 eager 两组均最快，graph capture256 replay128/256 也最快；graph capture256 replay32 下 fused tail 仍略快，因此 split 仍不默认打开。
-- [✅] 已按用户确认退役 split baseline：`MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1` 现在直接表示 split + chunk-ready；`MEGAMOE_DCU_LL_K3_SPLIT_TAIL_CHUNK_READY`、`use_chunk_ready` 参数和 kernel 内 peer-signal split baseline fallback 已删除。代表验证只设置 split-tail 开关：uniform graph capture256 replay32/128/256 correct，uneven `8,33,64,129,32,0,96,17` eager correct，uneven `256,129,64,32,16,8,4,0` graph capture256 replay32/128/256 correct。默认 LL 仍保持 fused tail。
-- [🚫] 2026-06-22 已按用户要求停止 split-tail/SBO 方向，并从生产代码完全移除 split-tail 实现：删除 `MEGAMOE_DCU_LL_K3_SPLIT_TAIL`、`ll_split_tail`、`k3_v3_ll_combine_tail_split` pybind、多流 host launcher、`V3_K3_LowLatencyCombineReduceKernel`、chunk-ready/expert-done helper、slot 22..25 reset 和 `done_counter[48..111]` 扩展；LL K3 回到单一 fused-tail 路径，tail counter scratch 回到 48 int。
-- [🚫] 完整 DeepEP LL dispatch + DeepGEMM masked K1/K3 + MegaMoE K2 + DeepEP LL combine baseline 不再作为当前 active 项；RocSHMEM 初始化不稳定且 standalone component 相加不能代表生产口径，后续只有用户重新点名并给出稳定环境时再重启。
-- [✅] 生产优化方向已被 Phase 16-18 接管：K3 combine/reduce chunk readiness 以 split-tail + chunk-ready + copy-done fallback 形式恢复并验证；K1 route scan 优先保留 no-atomic peer-match 优化，dispatch-ready rank-barrier shrink 已反证。
-- 状态：✅ complete/superseded by Phase 16-18（DeepEP baseline 拆解作为历史依据保留；当前主线只保留 split-tail opt-in 和 K1 no-atomic 已验证实现。）
+- ✅ 已补 DeepEP low-latency combine / `combine_sbo` standalone 数据：non-overlap combine kernel `8/32/64/128/256 = 56/63/102/94/154 us`，SBO combine kernel `66/76/92/138/222 us`；SBO 只在部分档位优于 non-overlap，不作为直接默认替换。
+- ✅ 已补 DeepGEMM masked K1/K3 与 K2 standalone 下限：K2 约 `31-32 us`；`DeepEP LL dispatch+combine + masked K1 + K2 + masked K3` 加和下限为 `0.700/0.815/0.998/0.838/0.992 ms`，对应 `8/32/64/128/256` tokens/rank。
+- ✅ 已对比当前 MegaMoE LL e2e：`0.574/0.624/0.679/0.835/1.266 ms`。结论是 `8/32/64` 已明显优于拆分 baseline 下限，`128` 基本持平，`256` 有继续挖掘空间但不能忽略 packed-row route-weight glue。
+- ✅ 已补 SGLang framework trace 口径校准：step300 decode 实际为 `8 tokens/rank`；框架 trace 均摊 DeepEP low-latency core 约 `311 us/MoE`，MegaMoE fused/no-split cap256 约 `349 us/MoE`，MegaMoE split cap256 约 `427 us/MoE`。standalone 单测不复现 DeepEP 更快，因为 baseline 不是 SGLang 线上 DeepEP dispatcher/graph 调度的同一口径。
+- ✅ 已试跑 DeepEP-style per-destination-token-chunk readiness 合同：chunk_m=64，signal slot 22..25，expected=`tokens_in_chunk * topk`，K3 split-tail copy 侧按 expert 完成后汇总 destination chunk 计数并发布，reduce 侧按 chunk 等待。standalone cap256 A/B 全 correct；chunk-ready 在 eager `8/32/64/128/256` 为 `0.565/0.613/0.647/0.747/1.133 ms`，优于 fused tail `0.569/0.625/0.681/0.836/1.261 ms`；graph capture256 replay `8/32/64/128/256` 为 `0.521/0.615/0.655/0.747/1.135 ms`，优于 fused tail `0.526/0.628/0.686/0.826/1.273 ms`。
+- ✅ 已补 chunk-ready uneven 验证并修复 publish gating：`8,33,64,129,32,0,96,17` 和 `256,129,64,32,16,8,4,0` 的 eager/graph capture256 全 correct。修复点是 reduce 侧按本地 runtime token 等待，copy/publish 侧按 peer runtime token 最大值启用并按 destination runtime token 过滤发布。chunk-ready 在 eager 两组均最快，graph capture256 replay128/256 也最快；graph capture256 replay32 下 fused tail 仍略快，因此 split 仍不默认打开。
+- ✅ 已按用户确认退役 split baseline：`MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1` 现在直接表示 split + chunk-ready；`MEGAMOE_DCU_LL_K3_SPLIT_TAIL_CHUNK_READY`、`use_chunk_ready` 参数和 kernel 内 peer-signal split baseline fallback 已删除。代表验证只设置 split-tail 开关：uniform graph capture256 replay32/128/256 correct，uneven `8,33,64,129,32,0,96,17` eager correct，uneven `256,129,64,32,16,8,4,0` graph capture256 replay32/128/256 correct。默认 LL 仍保持 fused tail。
+- 🚫 2026-06-22 已按用户要求停止 split-tail/SBO 方向，并从生产代码完全移除 split-tail 实现：删除 `MEGAMOE_DCU_LL_K3_SPLIT_TAIL`、`ll_split_tail`、`k3_v3_ll_combine_tail_split` pybind、多流 host launcher、`V3_K3_LowLatencyCombineReduceKernel`、chunk-ready/expert-done helper、slot 22..25 reset 和 `done_counter[48..111]` 扩展；LL K3 回到单一 fused-tail 路径，tail counter scratch 回到 48 int。
+- 🚫 完整 DeepEP LL dispatch + DeepGEMM masked K1/K3 + MegaMoE K2 + DeepEP LL combine baseline 不再作为当前 active 项；RocSHMEM 初始化不稳定且 standalone component 相加不能代表生产口径，后续只有用户重新点名并给出稳定环境时再重启。
+- ✅ 生产优化方向已被 Phase 16-18 接管：K3 combine/reduce chunk readiness 以 split-tail + chunk-ready + copy-done fallback 形式恢复并验证；K1 route scan 优先保留 no-atomic peer-match 优化，dispatch-ready rank-barrier shrink 已反证。
+- 状态：✅ 已完成（已由 Phase 16-18 接管）（DeepEP baseline 拆解作为历史依据保留；当前主线只保留 split-tail opt-in 和 K1 no-atomic 已验证实现。）
 
 ## 讨论用接口对照草案
 
@@ -448,63 +458,63 @@ This section supersedes the abandoned `dcu_megamoe_ll_v2` plan for current work.
 
 ### Phase 16: Restore K3 LL Split Tail
 
-- [x] Re-activate the historical K3 LL split-tail concept under a single opt-in switch: `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1`.
-- [x] Keep the default LL path on fused tail while split-tail is under measurement.
-- [x] Use exactly two K3 kernels for this path:
+- ✅ Re-activate the historical K3 LL split-tail concept under a single opt-in switch: `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=1`.
+- ✅ Keep the default LL path on fused tail while split-tail is under measurement.
+- ✅ Use exactly two K3 kernels for this path:
   - pure local K3 groupgemm writes `output_workspace` and does no peer communication;
   - split combine/reduce kernel copies local K3 rows to peer combine buffers and performs chunk-ready tail reduce.
-- [x] Keep the chunk-ready contract, not the retired split baseline: chunk size 64, signal slots 22..25, publish side derives destination chunk from valid `row_combine_ptr` addresses, reduce side waits by local runtime token, and no hot-path host clear.
-- [x] Restore and validate functional support for uniform eager, uniform graph capture256 replay, uneven eager, and uneven graph capture256 replay.
-- [x] Add source guards for the split-tail pybind, wrapper, signal slots, and single env switch.
-- [x] Confirm the current split-tail diff introduces only one new env switch, `MEGAMOE_DCU_LL_K3_SPLIT_TAIL`; no LL_V2/chunk-ready/zero-topk diagnostic env was reintroduced.
-- [x] Default enable gate: split-tail is promoted to the default LL K3 path for token buckets `<=512`; `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` remains the fallback to force fused tail.
+- ✅ Keep the chunk-ready contract, not the retired split baseline: chunk size 64, signal slots 22..25, publish side derives destination chunk from valid `row_combine_ptr` addresses, reduce side waits by local runtime token, and no hot-path host clear.
+- ✅ Restore and validate functional support for uniform eager, uniform graph capture256 replay, uneven eager, and uneven graph capture256 replay.
+- ✅ Add source guards for the split-tail pybind, wrapper, signal slots, and single env switch.
+- ✅ Confirm the current split-tail diff introduces only one new env switch, `MEGAMOE_DCU_LL_K3_SPLIT_TAIL`; no LL_V2/chunk-ready/zero-topk diagnostic env was reintroduced.
+- ✅ Default enable gate: split-tail is promoted to the default LL K3 path for token buckets `<=512`; `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` remains the fallback to force fused tail.
 
 ### Phase 17: Optimize Split Combine/Reduce Kernel
 
-- [x] Baseline restored split-tail is correct but slower than historical best; bottleneck is the second combine/reduce kernel.
-- [x] Add aggregated destination-rank/chunk publish so the final copy CTA performs one system atomic per non-empty peer chunk instead of one system atomic per row.
-- [x] Test and reject rowptr wave-broadcast as the default shape; it helps some uneven points but is not a broad win.
-- [x] Test and reject `kCopyRows=32` as the default shape; it improves a few tiny-token cases but regresses 64/128.
-- [x] Test and reject active-copy CTA pooling (`kMaxCopyBlocks=1024`); it adds grid-stride empty-task scanning and regresses timing.
-- [x] Test and reject wider split-reduce hidden tile (`kReduceHidden=512`); it reduces reducer CTA count but worsens important 128/256 and uneven points.
-- [x] Test and reject expert-hidden copy CTA coarsening; it helps a few tiny/graph points but regresses 32/64/128 and uneven eager.
-- [x] Test and reject explicit vector store asm on peer-combine copy and reduce-y store paths; both are mixed and not broad defaults.
-- [x] Test and reject active-row-block copy-grid mapping; it removes many empty capacity CTAs but adds per-CTA `actual_m` scan overhead and does not recover historical split+chunk performance.
-- [x] Test and reject row-block-major copy ordering; it slightly reshuffles scheduler order but is mixed/regressive versus expert-major capacity mapping.
-- [x] Test and reject dynamic max-copy boundary from `actual_m` max row count; it helps tiny graph/eager points but is not a broad win and changes the split m_indices contract unnecessarily.
-- [x] Test and reject removing the split kernel's device-side peer runtime max scan; correctness passes, but timing is mixed and regresses 256-token/uneven graph points.
-- [x] Keep split-reduce single-load accumulation: load each topk `uint4` once and accumulate x/y/z/w lanes together instead of reloading the same vector for each field.
-- [x] Re-test dynamic max-copy boundary on top of the single-load reducer and reject it again; it helps a few tiny graph points but regresses important 32/128 and uneven graph buckets, so the split contract remains one row-count per local expert.
-- [x] Revert back to the best current shape: row-block copy capacity grid + shared row address prefetch + aggregated publish.
-- [x] Test simple tiny max-copy hybrid on top of the single-load reducer: it improves graph tiny points and edge128, but regresses mix129 graph128/256.
-- [x] Test and reject per-CTA peer-aware dynamic gating: it uses peer runtime scans inside every combine/reduce CTA and causes large graph regressions.
-- [x] Test and reject K1-computed split-copy-shrink strategy: full peer scan, parallel peer scan, and sentinel heuristics all failed to fix mix129 graph128/256 without adding K1 overhead or causing graph regressions. Reverted this parameter/scratch path.
-- [x] Re-run clean post-shrink split/fused matrix: split now wins all uniform eager/graph points, uneven eager, and edge256 graph; remaining miss is `mix129` graph replay128 by about `19 us` with replay256 effectively tied.
-- [x] Test and reject tightening optional tiny max-row shrink from `<=16` rows to `<=8` rows: it improves `mix129` graph replay128 by about `13 us`, but regresses edge graph and uneven eager, so it is not a broad default.
-- [x] Test and reject chunk-first reduce block ordering: issuing the per-chunk wait leaders before sibling hidden tiles increases early spin pressure and regresses mix/edge graph128.
-- [x] Test and reject row-block-level chunk publish: correctness passes, but multiplying chunk-ready signals by hidden tiles explodes system-atomic traffic and badly regresses all non-tiny points.
-- [x] Test and reject explicit topk=6 split-reduce unroll: it slightly helps some uniform points, but regresses uneven graph128, likely from code-size/register-pressure effects in the second kernel.
-- [x] Test and reject split-reduce vec-address-only pointer arithmetic: it improves `mix129` graph128 but regresses other uneven graph buckets, so the original reduce addressing stays as the retained shape.
-- [x] Remove redundant publish-side destination-runtime filtering after framework split-tail timeout. This keeps reduce-side local-runtime expected counts, but avoids under-publishing if publish observes stale or cross-layer destination runtime state. Validation: source guard passed; framework-like cap4096 edge256 external-token graph and four-call graph passed; split-only matrix stayed correct and performance-neutral.
-- [x] Fix split-tail local-ready timeout by aligning reduce CTA indexing with the static launch grid. The kernel is launched with static `copy_blocks + reduce_blocks`, so reduce mapping must subtract `copy_blocks` rather than dynamic `active_copy_blocks`; otherwise tiny max-copy shrink can drop some reduce hidden tiles and leave local-ready counters at zero. Validation: source guard passed; tiny-token smoke, edge256 graph, framework-like cap4096 tokens=64, and full split-only matrix all passed.
-- [x] Add framework graph-capture EP alignment for split-tail trial. SGLang capture/warmup previously aligned only the TP group, while K3 split-tail waits on EP peer chunk signals. The framework patch calls the EP CPU-group barrier immediately before the LL split-tail MegaMoE call only during graph capture mode, so replay/eager hot paths are unchanged. Validation: SGLang `mega_moe.py` `py_compile` passed, patch synced to the remote framework tree, and MegaMoE split-tail source guard still passed.
-- [x] Add framework graph-capture runtime-token maintenance for split-tail. SGLang replay already updates MegaMoE `cuda_graph_num_tokens`, but capture/warmup skipped that fill by default. The framework patch now fills the scalar for LL split-tail during graph warmup/pre-capture only, guarded by `not torch.cuda.is_current_stream_capturing()`, so replay remains dynamic and no static fill is captured. Validation: local/remote `py_compile` passed and MegaMoE split-tail source guard passed.
-- [x] Try and revert split-tail copy-side row pointer validation before peer-combine stores. The guard did not resolve the real framework VMFault and adds extra hot-path work, so code is restored to the prior unit-test-stable/current-best split-tail implementation. Keep the diagnostic finding that split-tail has a different memory/signal failure surface than fused-tail; let framework-side investigation continue with actual failing call dumps.
-- [x] Fix real SGLang graph-capture split-tail VMFault by adding a copy-done fallback to the K3 split-tail chunk-ready protocol. Reduce hidden-tile 0 still waits for exact chunk count in the normal fast path, but it can now release once all peer copy phases are complete, which handles capture-time sparse/padded routed rows without deadlock. Validation: remote build passed; source guard passed `9 passed`; real SGLang repro completed cuda graph capture and reached server ready with no VMFault/timeout/Fatal Python error; current split-only matrix stayed correct and performance-neutral versus the previous split champion.
-- [🧭] Optional next optimization：只继续有证据的第二 kernel 小改，且必须保持低延迟约束：无额外 hot-path launch、无 host reset/copy、graph replay safe、uneven runtime-token gating intact。当前不保留无 owner 的悬挂优化项。
+- ✅ Baseline restored split-tail is correct but slower than historical best; bottleneck is the second combine/reduce kernel.
+- ✅ Add aggregated destination-rank/chunk publish so the final copy CTA performs one system atomic per non-empty peer chunk instead of one system atomic per row.
+- ✅ Test and reject rowptr wave-broadcast as the default shape; it helps some uneven points but is not a broad win.
+- ✅ Test and reject `kCopyRows=32` as the default shape; it improves a few tiny-token cases but regresses 64/128.
+- ✅ Test and reject active-copy CTA pooling (`kMaxCopyBlocks=1024`); it adds grid-stride empty-task scanning and regresses timing.
+- ✅ Test and reject wider split-reduce hidden tile (`kReduceHidden=512`); it reduces reducer CTA count but worsens important 128/256 and uneven points.
+- ✅ Test and reject expert-hidden copy CTA coarsening; it helps a few tiny/graph points but regresses 32/64/128 and uneven eager.
+- ✅ Test and reject explicit vector store asm on peer-combine copy and reduce-y store paths; both are mixed and not broad defaults.
+- ✅ Test and reject active-row-block copy-grid mapping; it removes many empty capacity CTAs but adds per-CTA `actual_m` scan overhead and does not recover historical split+chunk performance.
+- ✅ Test and reject row-block-major copy ordering; it slightly reshuffles scheduler order but is mixed/regressive versus expert-major capacity mapping.
+- ✅ Test and reject dynamic max-copy boundary from `actual_m` max row count; it helps tiny graph/eager points but is not a broad win and changes the split m_indices contract unnecessarily.
+- ✅ Test and reject removing the split kernel's device-side peer runtime max scan; correctness passes, but timing is mixed and regresses 256-token/uneven graph points.
+- ✅ Keep split-reduce single-load accumulation: load each topk `uint4` once and accumulate x/y/z/w lanes together instead of reloading the same vector for each field.
+- ✅ Re-test dynamic max-copy boundary on top of the single-load reducer and reject it again; it helps a few tiny graph points but regresses important 32/128 and uneven graph buckets, so the split contract remains one row-count per local expert.
+- ✅ Revert back to the best current shape: row-block copy capacity grid + shared row address prefetch + aggregated publish.
+- ✅ Test simple tiny max-copy hybrid on top of the single-load reducer: it improves graph tiny points and edge128, but regresses mix129 graph128/256.
+- ✅ Test and reject per-CTA peer-aware dynamic gating: it uses peer runtime scans inside every combine/reduce CTA and causes large graph regressions.
+- ✅ Test and reject K1-computed split-copy-shrink strategy: full peer scan, parallel peer scan, and sentinel heuristics all failed to fix mix129 graph128/256 without adding K1 overhead or causing graph regressions. Reverted this parameter/scratch path.
+- ✅ Re-run clean post-shrink split/fused matrix: split now wins all uniform eager/graph points, uneven eager, and edge256 graph; remaining miss is `mix129` graph replay128 by about `19 us` with replay256 effectively tied.
+- ✅ Test and reject tightening optional tiny max-row shrink from `<=16` rows to `<=8` rows: it improves `mix129` graph replay128 by about `13 us`, but regresses edge graph and uneven eager, so it is not a broad default.
+- ✅ Test and reject chunk-first reduce block ordering: issuing the per-chunk wait leaders before sibling hidden tiles increases early spin pressure and regresses mix/edge graph128.
+- ✅ Test and reject row-block-level chunk publish: correctness passes, but multiplying chunk-ready signals by hidden tiles explodes system-atomic traffic and badly regresses all non-tiny points.
+- ✅ Test and reject explicit topk=6 split-reduce unroll: it slightly helps some uniform points, but regresses uneven graph128, likely from code-size/register-pressure effects in the second kernel.
+- ✅ Test and reject split-reduce vec-address-only pointer arithmetic: it improves `mix129` graph128 but regresses other uneven graph buckets, so the original reduce addressing stays as the retained shape.
+- ✅ Remove redundant publish-side destination-runtime filtering after framework split-tail timeout. This keeps reduce-side local-runtime expected counts, but avoids under-publishing if publish observes stale or cross-layer destination runtime state. Validation: source guard passed; framework-like cap4096 edge256 external-token graph and four-call graph passed; split-only matrix stayed correct and performance-neutral.
+- ✅ Fix split-tail local-ready timeout by aligning reduce CTA indexing with the static launch grid. The kernel is launched with static `copy_blocks + reduce_blocks`, so reduce mapping must subtract `copy_blocks` rather than dynamic `active_copy_blocks`; otherwise tiny max-copy shrink can drop some reduce hidden tiles and leave local-ready counters at zero. Validation: source guard passed; tiny-token smoke, edge256 graph, framework-like cap4096 tokens=64, and full split-only matrix all passed.
+- ✅ Add framework graph-capture EP alignment for split-tail trial. SGLang capture/warmup previously aligned only the TP group, while K3 split-tail waits on EP peer chunk signals. The framework patch calls the EP CPU-group barrier immediately before the LL split-tail MegaMoE call only during graph capture mode, so replay/eager hot paths are unchanged. Validation: SGLang `mega_moe.py` `py_compile` passed, patch synced to the remote framework tree, and MegaMoE split-tail source guard still passed.
+- ✅ Add framework graph-capture runtime-token maintenance for split-tail. SGLang replay already updates MegaMoE `cuda_graph_num_tokens`, but capture/warmup skipped that fill by default. The framework patch now fills the scalar for LL split-tail during graph warmup/pre-capture only, guarded by `not torch.cuda.is_current_stream_capturing()`, so replay remains dynamic and no static fill is captured. Validation: local/remote `py_compile` passed and MegaMoE split-tail source guard passed.
+- ✅ Try and revert split-tail copy-side row pointer validation before peer-combine stores. The guard did not resolve the real framework VMFault and adds extra hot-path work, so code is restored to the prior unit-test-stable/current-best split-tail implementation. Keep the diagnostic finding that split-tail has a different memory/signal failure surface than fused-tail; let framework-side investigation continue with actual failing call dumps.
+- ✅ Fix real SGLang graph-capture split-tail VMFault by adding a copy-done fallback to the K3 split-tail chunk-ready protocol. Reduce hidden-tile 0 still waits for exact chunk count in the normal fast path, but it can now release once all peer copy phases are complete, which handles capture-time sparse/padded routed rows without deadlock. Validation: remote build passed; source guard passed `9 passed`; real SGLang repro completed cuda graph capture and reached server ready with no VMFault/timeout/Fatal Python error; current split-only matrix stayed correct and performance-neutral versus the previous split champion.
+- 🧭 Optional next optimization：只继续有证据的第二 kernel 小改，且必须保持低延迟约束：无额外 hot-path launch、无 host reset/copy、graph replay safe、uneven runtime-token gating intact。当前不保留无 owner 的悬挂优化项。
 
 ### Phase 18: K1 LL Rank-Barrier Trim
 
-- [x] Inspect current inline K1 LL start barrier/reset cost and identify which waits/clears amplify uneven cases.
-- [x] Remove the redundant graph-path serial clear of split expert-done counters `tail_done_counter[48..79]`; they are already reset in parallel before the rank barrier and protected by the existing system fence/barrier visibility boundary.
-- [x] Retain parallel K1 uniform-runtime peer scan for the current experimental branch.
-- [x] K1-5 A/B replaced the shared `atomicAnd` uniform-token reduction with per-peer shared match slots plus a thread0 reduction. Result directory: `hygon_tmp/debug/v3_split_tail_k1_match_noatomic_20260624`. This keeps uniform performance essentially flat versus the atomic parallel scan and recovers much of the uneven graph regression, so the no-atomic version is retained.
-- [x] K1 dispatch-ready rank-barrier shrink ablation tested and rejected. Result directory: `hygon_tmp/debug/v3_split_tail_k1_dispatch_ready_20260624`. The variant published per-rank ready generations and let K1 route scan wait each source rank instead of the release-slot barrier; correctness passed, but uniform/eager performance regressed broadly and only uneven graph replay128/256 improved. Source was reverted to the no-atomic peer-match champion and remote K1 was rebuilt.
-- [x] Remove unused LL kernel template toggles: K1 no longer exposes the always-true `kUseSymmStage`; K3 no longer exposes the always-false `kUseFixedRows` or the single-value store-mask toggle, while preserving the current row-mask behavior.
-- [x] Optimize inside the existing fused K1 contract first. Do not reintroduce the previously rejected extra K1 split-stage launch.
-- [✅] Current checkpoint keeps graph safety and visibility semantics: runtime token publication, K3 fused/split signal reset, per-rank peer visibility before K1 consumes input rows, and no stale signal reuse across graph replay.
-- [x] Validate K1-5 together with K3 split-tail using uniform/uneven eager and graph capture256 replay. All cases passed correctness.
-- [x] Refresh the current-best split-tail data for framework trial. Result directory: `hygon_tmp/debug/v3_split_tail_current_best_20260624`.
+- ✅ Inspect current inline K1 LL start barrier/reset cost and identify which waits/clears amplify uneven cases.
+- ✅ Remove the redundant graph-path serial clear of split expert-done counters `tail_done_counter[48..79]`; they are already reset in parallel before the rank barrier and protected by the existing system fence/barrier visibility boundary.
+- ✅ Retain parallel K1 uniform-runtime peer scan for the current experimental branch.
+- ✅ K1-5 A/B replaced the shared `atomicAnd` uniform-token reduction with per-peer shared match slots plus a thread0 reduction. Result directory: `hygon_tmp/debug/v3_split_tail_k1_match_noatomic_20260624`. This keeps uniform performance essentially flat versus the atomic parallel scan and recovers much of the uneven graph regression, so the no-atomic version is retained.
+- ✅ K1 dispatch-ready rank-barrier shrink ablation tested and rejected. Result directory: `hygon_tmp/debug/v3_split_tail_k1_dispatch_ready_20260624`. The variant published per-rank ready generations and let K1 route scan wait each source rank instead of the release-slot barrier; correctness passed, but uniform/eager performance regressed broadly and only uneven graph replay128/256 improved. Source was reverted to the no-atomic peer-match champion and remote K1 was rebuilt.
+- ✅ Remove unused LL kernel template toggles: K1 no longer exposes the always-true `kUseSymmStage`; K3 no longer exposes the always-false `kUseFixedRows` or the single-value store-mask toggle, while preserving the current row-mask behavior.
+- ✅ Optimize inside the existing fused K1 contract first. Do not reintroduce the previously rejected extra K1 split-stage launch.
+- ✅ Current checkpoint keeps graph safety and visibility semantics: runtime token publication, K3 fused/split signal reset, per-rank peer visibility before K1 consumes input rows, and no stale signal reuse across graph replay.
+- ✅ Validate K1-5 together with K3 split-tail using uniform/uneven eager and graph capture256 replay. All cases passed correctness.
+- ✅ Refresh the current-best split-tail data for framework trial. Result directory: `hygon_tmp/debug/v3_split_tail_current_best_20260624`.
 
 ## 2026-06-24 Current Checkpoint
 
@@ -533,26 +543,26 @@ This section supersedes the abandoned `dcu_megamoe_ll_v2` plan for current work.
 
 ## 2026-06-24 Phase 19: Fine-Grained LL Profiling And Ablation
 
-- [x] K1 rank-barrier profiling pass 1:
+- ✅ K1 rank-barrier profiling pass 1:
   - measure the cost around the K1 pre-GEMM visibility/reset/barrier path at finer granularity than e2e timing;
   - build ablations that isolate reset, signal wait, peer runtime scan, and route scan interaction when possible;
   - result: local reset and peer-runtime scan are small; large stalls come from cross-rank arrival skew in the release-slot barrier, especially first uneven generations.
-- [🚫] K1 follow-up implementation:
+- 🚫 K1 follow-up implementation:
   - do not retry the already-rejected dispatch-ready replacement;
   - current decision: not pursuing this now because the direct replacement regressed broad uniform/eager performance and no new generation/reuse contract is available.
-- [x] K3 split copy/reduce profiling pass 1:
+- ✅ K3 split copy/reduce profiling pass 1:
   - split the second kernel cost into peer-copy/store, chunk publish/signal wait, local-ready handoff, and reduce accumulation/store;
   - use ablation kernels or timing counters to decide whether the next target is peer write locality, reduce tiling/slicing, signal wait, or another measured bottleneck;
   - result: vector copy/peer write and reduce body are both about 80 us-class costs under hipprof; signal/local-ready wait is also visible but direct-ready did not improve the kernel.
-- [🚫] K3 follow-up implementation:
+- 🚫 K3 follow-up implementation:
   - prioritize peer write locality/continuous access or reduce-body work;
   - direct hidden-tile system wait and blockDim=128 are rejected for now;
   - current decision: no active K3 split-tail microtuning now; keep the current copy-done fallback and graph safety contract intact.
-- [x] Test and reject K3 combine/reduce split into two kernels:
+- ✅ Test and reject K3 combine/reduce split into two kernels:
   - local K3 groupgemm + combine communication kernel + local reduce kernel was correct on uniform128 and edge256 graph smoke;
   - performance regressed versus the current combined second-kernel split-tail, so the stable combined implementation is restored;
   - result directory: `hygon_tmp/debug/v3_split_tail_3kernel_20260624`.
-- [🧭] Validation gate for any future retained Phase 19-style change:
+- 🧭 Validation gate for any future retained Phase 19-style change:
   - remote build passes;
   - split-tail source guard passes;
   - uniform and uneven split-tail matrices pass for eager and graph capture256 replay;
@@ -561,28 +571,42 @@ This section supersedes the abandoned `dcu_megamoe_ll_v2` plan for current work.
 
 ## 2026-06-25 Phase 20: LL Strong-Sync Reduction Follow-up Only
 
-- [x] Map the current LL strong synchronization points:
+- ✅ Map the current LL strong synchronization points:
   - K1 start path has the coarse EP-rank arrival/release barrier inside `v3_k1_ll_start_rank_barrier_device`;
   - K3 fused tail has reducer-leader peer generation wait before tail reduce;
   - K3 split-tail has per-chunk ready counters plus copy-done fallback, which is already finer than a whole-tail rank barrier.
-- [x] Contrast with DeepEP LL:
+- ✅ Contrast with DeepEP LL:
   - DeepEP LL still synchronizes, but it scopes synchronization through low-latency layout buffers, phase signals, ready counters, and completion signals;
   - it avoids making every consumer wait on a single coarse all-rank hot-path barrier when finer data-readiness is sufficient.
-- [x] Confirm this is not a fresh optimization direction:
+- ✅ Confirm this is not a fresh optimization direction:
   - K1 direct dispatch-ready rank-barrier shrink was already tested and rejected because it regressed broad uniform/eager performance;
   - K3 split-tail chunk-ready plus copy-done fallback is already the retained fine-grained readiness path;
   - K3 direct hidden-tile system wait and combine-copy/local-reduce three-kernel split were already tested and rejected.
-- [🚫] Optional K1-only follow-up if more evidence is needed:
+- 🚫 Optional K1-only follow-up if more evidence is needed:
   - profile all ranks, not only rank0, around arrival ticket/release wait and first useful K1 work;
   - not active now; only revisit with a concrete new single-buffer generation/reuse design.
-- [🚫] Optional K3-only follow-up if more evidence is needed:
+- 🚫 Optional K3-only follow-up if more evidence is needed:
   - measure how often split-tail takes the copy-done fallback versus exact chunk-ready under real SGLang graph/uneven cases;
   - not active now; do not re-run direct-ready or three-kernel split unless a new overlap mechanism removes their known launch/scheduling cost.
 
 ## 2026-06-25 Phase 21: Split-tail Default And Fast-math Parity
 
-- [x] Promote LL K3 split-tail to the default branch for LL token buckets `<=256`, while keeping `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` as a fallback.
-- [x] Compare CUDA MegaMoE fast_math behavior: CUDA JIT specializes the SwiGLU math path with fast `__expf` versus precise `expf`.
-- [x] Add DCU K2 fast/precise SwiGLU selection and pass public `fast_math` through both normal and LL staged paths.
-- [x] Refresh README DCU MegaMoE section for split-tail default, fallback knobs, fast_math, and recent retained changes.
-- [x] Run source guard / lightweight verification after code and docs update.
+- ✅ Promote LL K3 split-tail to the default branch for LL token buckets `<=256`, while keeping `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` as a fallback.
+- ✅ Compare CUDA MegaMoE fast_math behavior: CUDA JIT specializes the SwiGLU math path with fast `__expf` versus precise `expf`.
+- ✅ Add DCU K2 fast/precise SwiGLU selection and pass public `fast_math` through both normal and LL staged paths.
+- ✅ Refresh README DCU MegaMoE section for split-tail default, fallback knobs, fast_math, and recent retained changes.
+- ✅ Run source guard / lightweight verification after code and docs update.
+
+## 2026-06-29 计划执行情况
+
+- ✅ DCU MegaMoE V3 主路径迁入 `megamoe/dcu_megamoe_opt`，并保留 normal / LL 后端选择逻辑。
+- ✅ LL K3 split-tail 已成为默认 LL tail 路径，支持到 512-token bucket；大 token prefill 仍通过 normal 后端规避 LL split-tail 容量边界。
+- ✅ normal K3 ASM tail-reduce 已成为默认 normal tail 路径。
+- ✅ K1 uniform scan 并行化已保留；更激进的 dispatch-ready / double-buffer readiness 方向已验证投入大且收益不稳定，当前不再主动推进。
+- ✅ `mega_moe_pre_dispatch` 已作为 DCU 公开 pre-dispatch API，显式传入 `num_tokens`，用于融合输入量化、topk dtype cast 和 graph 友好的前置准备。
+- ✅ LL baseline 新增 `ll-masked`，用于 DeepEP LL dispatch + DeepGEMM masked groupgemm 对照；normal baseline 仍为 `normal-contiguous`。
+- ✅ README 已记录 DCU 关键运行方式、baseline 选择、DeepGEMM 版本可复现提示和必要环境变量说明。
+- 🚫 `dcu_megamoe_ll_v2` 重新设计路线不再继续，历史记录只作为反证参考。
+- 🧭 K3 split-tail 后续只在 profiler 指向明确瓶颈时继续做 peer write locality、reduce 分片或信号等待优化。
+- 🧭 K1 rank barrier 进一步缩小需要新的 readiness 语义和框架配合，当前不在主线继续尝试。
+- 🧭 超节点支持在 `.planning/dcu_megamoe_supernode` 单独跟踪，不混入本 V3 主线计划。

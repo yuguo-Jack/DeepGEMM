@@ -13,7 +13,7 @@
   - 使用 `USE_MEGAMOE_V3` 做隔离；
   - `USE_MEGAMOE_V3` 未开启时保持原始 DCU MegaMoE 逻辑；
   - 先讨论计划，定具体后再开始实现。
-- 已完成：
+- ✅ 完成：
   - 读取 planning-with-files / karpathy / dcu-rag-kb / hygon optimizer 相关约束；
   - 初步梳理 `megamoe/large_opt.py`、K1/K3 large_opt wrapper 与 ext；
   - 运行 DCU KB 初始检索；
@@ -38,7 +38,7 @@
 - 性能目标更新为：
   - tokens per rank `<512` 时，V3 快于 `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=0`；
   - tokens per rank `>=512` 时，V3 快于 `MEGAMOE_DCU_USE_LARGE_OPT_3STAGE=1` 且 `USE_MEGAMOE_V3=0`。
-- 已完成：
+- ✅ 完成：
   - 更新 `.planning/dcu_megamoe_v3/task_plan.md`；
   - 更新 `.planning/dcu_megamoe_v3/findings.md`；
   - 记录当前进度。
@@ -54,7 +54,7 @@
   - 显式设置 `MEGAMOE_DCU_V3_BACKEND=ll` 才走 LL；
   - V3 权重 layout 分流新增显式 V3 transform/helper，外部 CLI 保持兼容；
   - K1 前 rank barrier 第一版 V3 先保留，功能跑通后再单独 A/B 尝试移除。
-- 已完成：
+- ✅ 完成：
   - 更新 `.planning/dcu_megamoe_v3/task_plan.md`；
   - 更新 `.planning/dcu_megamoe_v3/findings.md`；
   - 记录当前进度。
@@ -66,7 +66,7 @@
   - 权重 layout 差异在单测中提前转好；
   - 执行和 benchmark 流程不要引入权重处理 kernel；
   - 其他单测和命令行参数少改动，尽量复用现有入口。
-- 已完成：
+- ✅ 完成：
   - 将 V3 plan 中的权重分流改成测试/离线准备侧处理；
   - 明确 runtime/bench 只消费已转换好的 V3 pack5 权重；
   - 明确除替换 K1/K3 计算 kernel 本身外，不在 `dcu_megamoe_large_opt` 集成中引入额外 kernel。
@@ -78,13 +78,13 @@
   - 有人占显存但仍能推进时继续跑；
   - 如果卡都被占用，则监控等待，不中断计划；
   - 每完成一个工作项就在计划里打勾，再继续下一项，尽量持续推进。
-- 已完成：
+- ✅ 完成：
   - 在 `task_plan.md` 增加 8 卡实验环境检查项；
   - 增加实验运行策略，记录显存占用、env 组合和监控等待规则。
 
 ## 2026-06-04 - Phase 0 完成 large_opt.py flow 梳理
 
-- 已完成：
+- ✅ 完成：
   - 梳理 `fp8_mega_moe_large_opt_3stage()` eager staged flow；
   - 梳理 `_run_large_opt_3stage_graph()` graph staged flow；
   - 在 `findings.md` 记录 K1/K2/K3、tail-reduce/no-tail、graph runtime token 和 active_tiles 关系；
@@ -102,7 +102,7 @@
   - 再把对应 5pack C pure normal/LL 扩成带通信语义的 fused K1/K3；
   - 性能要保证相对 pure 少劣化；
   - 计划表完成项用 ✅，进行中项用 ⏳。
-- 已完成：
+- ✅ 完成：
   - 更新 `task_plan.md` 的状态符号约定；
   - 将 Phase 0 已完成项改为 ✅，当前 K1 ASM 接口梳理项标为 ⏳；
   - 在 `findings.md` 记录 pure normal/LL 到 fused V3 的扩展原则。
@@ -116,7 +116,7 @@
 - 用户进一步明确：
   - 如果 fused 相对 pure 劣化太多，需要提前进一步优化；
   - 最终仍以 Phase 6 Performance gate 的要求为准。
-- 已完成：
+- ✅ 完成：
   - 在 `task_plan.md` 成功标准、Phase 2、Phase 3 和风险中补充提前优化触发条件；
   - 在 `findings.md` 补充 pure-vs-fused 劣化明显时提前定位优化的原则。
 
@@ -125,7 +125,7 @@
 - 用户进一步明确：
   - baseline 只做正确性验证；
   - V3 相比 baseline 性能好不具有决定意义。
-- 已完成：
+- ✅ 完成：
   - 在 `task_plan.md` 成功标准和 Phase 5 中明确 baseline 只作为 correctness oracle；
   - 在 `findings.md` 记录 baseline timing 只可参考，不参与 Phase 6 是否通过的判断。
 - 未开始：
@@ -138,7 +138,7 @@
   - LL 骨架适用于 tokens per rank `<512`；
   - normal 骨架适用于 tokens per rank `>=512`；
   - bench size 固定为 32/128 跑 LL，1024/4096 跑 normal。
-- 已完成：
+- ✅ 完成：
   - 在 `task_plan.md` 成功标准和 Phase 6 中写入 backend/token 档位绑定；
   - 在 `findings.md` 将原建议档位收敛为 32/128(LL) 和 1024/4096(normal)。
 - 未开始：
@@ -150,7 +150,7 @@
 - 用户进一步明确：
   - C 实现相对更好改；
   - 希望融合的通信操作彻底隐藏在 GEMM pipeline 里。
-- 已完成：
+- ✅ 完成：
   - 在 `task_plan.md` 增加 pipeline-internal 通信融合原则；
   - 在 Phase 2 写入 K1 dispatch-pull 应融进 load/route/tile scheduling；
   - 在 Phase 3 写入 K3 combine/tail-reduce 应融进 epilogue/store/reduce；
@@ -164,7 +164,7 @@
 - 用户进一步明确：
   - 不要破坏原 kernel 内的 GEMM 流水；
   - 融合通信后的性能要尽可能少劣化。
-- 已完成：
+- ✅ 完成：
   - 在 `task_plan.md` 增加保护原 5pack C GEMM load/compute/store pipeline 的硬约束；
   - 在 Phase 2/3 补充 K1/K3 通信只嵌入自然插入点，不重排核心 compute pipeline；
   - 在 `findings.md` 记录“若为通信融合打乱原流水，风险高于通信逻辑本身”的原则。
@@ -174,7 +174,7 @@
 
 ## 2026-06-10 - 恢复 V3 工作上下文
 
-- 已完成：
+- ✅ 完成：
   - 确认当前分支为 `dcu_mega_v3`；
   - 读取并遵守 `planning-with-files`、`dcu-rag-kb`、`hygon-hip-kernel-optimizer`、`remote-ssh-docker-workflow` 的本轮约束；
   - 读取 `.planning/dcu_megamoe_v3/task_plan.md`、`findings.md`、`progress.md`；
@@ -189,7 +189,7 @@
 
 ## 2026-06-10 - Phase 0 接口梳理完成
 
-- 已完成：
+- ✅ 完成：
   - 复读 `large_opt.py` eager/graph staged flow，确认 K1/K2/K3、tail-reduce/no-tail、graph runtime token 和 active_tiles 关系；
   - 复读 `K1_fused/k1_fused.py` 与 `k1_fused_ext.cu`，记录 K1 route_scratch 内部切片、`GpuProb` 布局、compact/asm-route bitfield、graph flag reset 合同；
   - 复读 `K3_fused/k3_fused.py` 与 `k3_fused_ext.cu`，记录 no-tail combine、tail signal、tail-reduce、prob_storage、active_tiles/graph offset 合同；
@@ -242,7 +242,7 @@
 
 ## 2026-06-10 - Phase 1 收口并进入 Phase 2
 
-- 已完成：
+- ✅ 完成：
   - 在 `tests/test_dcu_megamoe_v3.py` 增加 source-level guard，确认 `large_opt.py` 不导入 `v3_layout`，避免 runtime/bench 执行路径引入权重处理；
   - 最终本地综合验证通过：`python -m compileall ...`、inline Python `v3 local assertions passed`、`git diff --check`。
 - 已更新：
@@ -254,7 +254,7 @@
 
 ## 2026-06-10 - Phase 2 K1 build/module 边界确认
 
-- 已完成：
+- ✅ 完成：
   - 重读 `task_plan.md`、`findings.md`、`progress.md` 后继续 Phase 2；
   - 静态检查 `setup.py`，确认 large-opt K1 extension 目前只编译 `K1_fused/k1_fused_ext.cu`；
   - 对照 V2 K1 extension 的 split pybind/kernel 结构，确认 V2 kernel source 仍通过 include `csrc/kernels/dcu_megamoe_v2/k1_groupgemm_v2.cpp` 复用；
@@ -321,7 +321,7 @@
   - remote skill / `.vscode/sftp.json` 应使用 `hg@10.17.176.11:22`；
   - Docker container 为 `sglang_megamoe`；
   - repo 路径为 `/home/hg/yuguo/DeepGEMM` -> `/workspace/DeepGEMM`。
-- 已完成：
+- ✅ 完成：
   - 重新读取 planning 三文件和 remote skill；
   - 核对 11 节点 SSH、容器状态、mount：`/home/hg/yuguo` bind 到 `/workspace`；
   - 确认容器内 repo 为 `/workspace/DeepGEMM`；
@@ -338,7 +338,7 @@
 
 ## 2026-06-10 - Phase 2 K1 默认编译恢复
 
-- 已完成：
+- ✅ 完成：
   - 检查长时间编译状态，确认没有残留 `setup.py build_ext`、`dcc`、`hipcc` 进程；
   - 定位默认 build 卡在 `k1_v3_fused_ext.hip` 的重模板 codegen；
   - 将临时 build flag 从误导性的 `DG_BUILD_MEGAMOE_V3_PACK5` 改为 `DG_BUILD_MEGAMOE_V3_K1_RAW_KERNELS`；
@@ -378,7 +378,7 @@
   - `hygon_tmp/K1_groupgemm_fp8/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16.s` 是原始 DeepGEMM 汇编文件；
   - 原 DCU MegaMoE K1 fused / K3 fused ASM 是在该原始 GEMM ASM 基础上扩通信；
   - V3 扩通信可以参考这些 ASM，但仍要守住 pure C 5pack GEMM 主干流水并把通信尽量隐藏进计算 pipeline。
-- 已完成：
+- ✅ 完成：
   - 运行本地 DCU KB 检索，确认原始 grouped fp8/bf16 GEMM 参考与当前 `hygon_tmp/K1_groupgemm_fp8` pure source 对齐；
   - 更新 `task_plan.md` 和 `findings.md`，明确 ASM 是 fused 语义/同步插入点参考，不是 V3 GEMM 主体来源。
 - 下一步：
@@ -387,7 +387,7 @@
 
 ## 2026-06-10 - K1 pure source 纠偏本地验证完成
 
-- 已完成：
+- ✅ 完成：
   - 删除/移除 V3 路径对旧 `k1_v3_groupgemm_impl.cuh` 的依赖；
   - `k1_v3_fused_ext.cu` 退为 raw availability/stub，真正 pure raw TU 收敛到单文件 `k1_v3_pure_ext.cu`，避免启用 raw 编译时重复定义 kernel；
   - `k1_v3_pure_groupgemm_impl.cuh` 中 normal / LL kernel body 与 `hygon_tmp/K1_groupgemm_fp8/k1_gemm.cpp` 原始 pure kernel 逐字对齐，仅做 V3 kernel 名替换；
@@ -407,7 +407,7 @@
 
 ## 2026-06-10 - K1 backend-scoped build gate 远端验证
 
-- 已完成：
+- ✅ 完成：
   - 重新从 `.vscode/sftp.json` 读取 11 节点参数，使用 `sglang_megamoe` 容器和 `/workspace/DeepGEMM` repo；
   - 将当前 V3 K1 pure source、setup、测试和 planning 文件打包同步到 `hygon_tmp/sglang_debug/deepgemm_v3_sync_20260610_153518.tar`；
   - 容器内确认 `setup.py` 已包含 `DG_BUILD_MEGAMOE_V3_K1_RAW_BACKEND`，`k1_v3_pure_ext.cu` 已包含 normal raw 宏，旧 `k1_v3_groupgemm_impl.cuh` 不存在；
@@ -423,7 +423,7 @@
 
 ## 2026-06-10 - 复核 V2 编译超时历史并修正 V3 raw flags
 
-- 已完成：
+- ✅ 完成：
   - 按用户指定复核 session `019e6ecc-aaed-74e1-aa6e-78b8ee3133f3`；
   - 确认 V2 编译处理的两个要点：extension/raw K1 路径带 `-mllvm -enable-num-vgprs-768=true`，并用独立 Makefile/script 做 raw kernel bring-up；
   - 对照当前 `setup.py`，发现 V3 large-opt K1 raw flags 缺少 V2 使用的 VGPR codegen 限制；
@@ -455,7 +455,7 @@
   - V2 不要管；
   - V2 不要编；
   - 当前 V3 工作中就当 V2 不存在。
-- 已完成：
+- ✅ 完成：
   - `setup.py` 中 `DG_BUILD_MEGAMOE_V2_EXT` 默认值改为 `0`；
   - 默认 extension build 不再包含 `megamoe.dcu_megamoe_v2.K1_fused.k1_fused_ext` 和 `megamoe.dcu_megamoe_v2.K3_fused.k3_fused_ext`；
   - `tests/test_dcu_megamoe_v3.py` 增加 source guard，要求 V2 extension 默认不编；
@@ -492,7 +492,7 @@
 
 ## 2026-06-10 - K1 V3 normal low-level smoke 跑通
 
-- 已完成：
+- ✅ 完成：
   - 使用 `DG_BUILD_MEGAMOE_V3_K1_RAW_KERNELS=1`、`DG_BUILD_MEGAMOE_V3_K1_RAW_BACKEND=normal`、`DG_BUILD_MEGAMOE_V3_NORMAL_AICC=1` 构建 large-opt K1 extension；
   - 构建日志确认 K1 normal raw path 通过 `hygon_tmp/sglang_debug/v3_aicc_rocm/bin/hipcc -> /workspace/dtk_aicc/bin/aicc` 编译；
   - 新增临时 smoke 脚本 `hygon_tmp/sglang_debug/k1_v3_normal_smoke.py`，只作为 debug/bring-up 用例，不进入生产路径；
@@ -538,7 +538,7 @@
 
 ## 2026-06-10 - K1 V3 normal 删除 grid memset bring-up op
 
-- 已完成：
+- ✅ 完成：
   - 删除 `k1_symm_fused_l1_v3_pack5()` normal bring-up 中的 `hipMemsetAsync(grid_barrier, ...)`；
   - 更新 source guard，要求 `k1_fused_ext.cu` 不再包含 `hipMemsetAsync` 和 `k1_v3_stage_rows_from_ptrs_kernel`；
   - 更新 smoke 脚本的输出统计为 active rows only，避免 padded/inactive rows 的未初始化值影响判断。
@@ -587,7 +587,7 @@
 - 用户提醒：
   - K1 route build 应复用原始 DCU MegaMoE 已有 compact prebuild kernels，不应另造 V3 route build；
   - K3 继续推进时同样要避免把 V2 生产实现当作 V3 core。
-- 已完成：
+- ✅ 完成：
   - 重读 `task_plan.md`、`progress.md`、`findings.md`；
   - 复读 `setup.py`、large-opt `K3_fused/k3_fused_ext.cu`、`K3_fused/k3_fused.py` 和现有 V3 source guard；
   - 更新 Phase 3 计划措辞：K3 V3 先建立 stage-owned default-stub/heavy-TU build 边界，生产 V3 代码不得 include `dcu_megamoe_v2`。
@@ -669,7 +669,7 @@
 
 ## 2026-06-10 - original ASM diff 初版落盘
 
-- 已完成：
+- ✅ 完成：
   - 按用户新强调的约束，把 `original groupgemm ASM -> 原 K1/K3 fused ASM -> V3 pure C 5pack` 的派生路径写入 `task_plan.md` 的确认设计点和 Phase 任务；
   - 对比 original groupgemm ASM、K1 dispatch-pull ASM、K3 combine ASM、K3 tail-reduce ASM，形成初版差异图；
   - 将 K1 差异归纳为 `SYMMROUTE stage` + `MegaMoE dispatch-pull stage`：metadata 生成、staged_x pull、staged_flags done/generation、pointer mode 和 invalid row zero-fill；
@@ -684,7 +684,7 @@
 
 ## 2026-06-10 - K3 pure source 初筛
 
-- 已完成：
+- ✅ 完成：
   - 搜索 `hygon_tmp` 与 `megamoe/dcu_megamoe_large_opt`，并显式排除 V2 目录；
   - 未发现非 V2 的独立 K3 pure C pack5 production source；
   - 确认 large-opt K3 当前可信代码边界仍是 ASM wrapper、K3 ASM 文件和 V3 stub/heavy 壳。
@@ -772,7 +772,7 @@
   - 预期差异主要是 weight layout 和通信语义注入；
   - V3 应尽可能复用现有 DCU MegaMoE 周边实现，只有个别无法复用的边界代码才重写；
   - V2 fused/real-flow 实现不应干扰 V3 主 kernel 结构。
-- 已完成：
+- ✅ 完成：
   - 更新 `task_plan.md` 设计点 3c，固定不确定时的判定顺序为 original ASM diff -> pure C 5pack 主体；
   - 在风险中补充“可复用 DCU MegaMoE 周边实现时不重写整段周边流程”的约束。
 - 下一步：
@@ -780,7 +780,7 @@
 
 ## 2026-06-10 - K3 tail-reduce 同步语义复核
 
-- 已完成：
+- ✅ 完成：
   - 使用 `dcu-rag-kb-query` 查询 `hygon-extend gfx938 HIP system scope atomic threadfence_system signal wait tail reduce allreduce`；
   - 使用 `dcu-rag-kb-optimize` 查询 `MegaMoE K3 combine tail reduce signal kernel`；
   - 对照原 K3 tail-reduce ASM 的 `K3_TAIL_ATOMIC_SIGNAL`、`K3_TAIL_WAIT_SIGNAL`、combine scatter 后 done counter、last-local-WG signal/reduce 和 extra reducer WG；
@@ -794,7 +794,7 @@
 
 ## 2026-06-10 - V3 约束复核与本地 source guard
 
-- 已完成：
+- ✅ 完成：
   - 复读 `.planning/dcu_megamoe_v3/task_plan.md`、`findings.md`、`progress.md`；
   - 确认用户新增要求已落到计划：V3 K1/K3 fused normal/LL 主 kernel 的默认派生顺序为 original groupgemm ASM vs 原 DCU MegaMoE fused ASM 差异图，再映射到 pure C 5pack 主体；V2 不参与生产 kernel 结构决策；
   - 本地 `python -m compileall setup.py tests/test_dcu_megamoe_v3.py megamoe/large_opt.py megamoe/dcu_megamoe_large_opt/K3_fused/k3_fused.py` 通过；
@@ -868,7 +868,7 @@
 
 ## 2026-06-10 - K3 tail raw smoke 通过
 
-- 已完成：
+- ✅ 完成：
   - 新增临时脚本 `hygon_tmp/sglang_debug/k3_v3_normal_tail_smoke.py`；
   - smoke 使用 K3 V3 normal raw tail API，单 rank all-ones，row pointer 直接指向 sym-buffer combine 区；
   - 首轮 topk=1 暴露 row1 全 0，定位为 tail reduce worker 用 `blockDim.x=768` 分片，而 last GEMM block 只有前 512 compute threads 能进入 tail reduce；
@@ -991,7 +991,7 @@
 - 用户纠正：
   - 当前 fixed-route staged run 不能被称为 e2e correctness；
   - 功能必须先对齐原 DCU MegaMoE K1 fused contract。
-- 已完成：
+- ✅ 完成：
   - 将 `task_plan.md` 中 fixed-route staged run 的完成项改成 debug/bring-up 定位验证，不再写成 correctness 通过；
   - 在 `findings.md` 记录该 run 只证明容量内 fixed-route launch/metadata/K2/原 K3 链路能跑完；
   - 明确 public V3 staged wrapper 仍默认 fail-fast，只有 `MEGAMOE_DCU_V3_ALLOW_FIXED_ROUTE_BRINGUP=1` 才能跑当前 skeleton，且不能用于 correctness claims。
@@ -1222,7 +1222,7 @@
 - 用户纠正：
   - K1-only staged gate 不是 e2e correctness；
   - 功能必须对齐原 DCU MegaMoE 语义，K3 V3 no-tail 需要先和原 K3 ASM/直接 reference 对齐。
-- 已完成：
+- ✅ 完成：
   - 远端 11 节点 `sglang_megamoe` 重新强制编译 K3 V3 raw normal，aicc 编译约 56s/54s，未触发 V2；
   - `tests/test_dcu_megamoe_v3.py` 远端通过：`8 passed`；
   - K3 raw full-tile smoke 通过：ones 和 pattern 均 `max_abs_err=0`；
@@ -1251,7 +1251,7 @@
 
 ## 2026-06-11 - K3 V3 no-mask/prezero 反证与当前定位
 
-- 已完成：
+- ✅ 完成：
   - 诊断脚本增加 `K3_V3_COMPARE_PREZERO_ACT=1`，可在 K2 前预清零 `act_fp8/act_scale`；
   - 临时验证 K3 V3 去掉 active mask 后，即使 prezero 也仍失败，random partial `max_abs=28.875`、`mean_abs=0.0259957`；
   - 代码已恢复到 `<256,256,true>` + logical-row active mask + lowlat shuffle。
@@ -1262,7 +1262,7 @@
 
 ## 2026-06-11 - K3 V3 normal partial-tile raw compare 通过
 
-- 已完成：
+- ✅ 完成：
   - `hygon_tmp/sglang_debug/k3_v3_normal_stage_compare.py` 增加 wave-validity 统计，避免只看单个 max 误判；
   - 反证 wave-level unmasked store 与 `mask==0xf` 分流后，改为所有 compute waves 统一执行 GEMM loop，B-load 用 logical rowptr mask，store 统一走 rowptr-guarded unmasked helper；
   - 清理不再使用的 masked store / valid-mask helper，避免后续误用已反证路径。
@@ -1566,7 +1566,7 @@
 - 重新开始定位 clean no-tail 多轮失败前，远端 `tests/test_dcu_megamoe_v3.py` source guard 暴露一个测试自身问题：
   - 同一文件中仍残留旧断言，要求 K1 metadata 完成前使用普通 `__threadfence()`；
   - K1 V3 header 已经改为 `__threadfence_system()`，因此该旧 guard 与当前 release/acquire 假设相冲突。
-- 已完成：
+- ✅ 完成：
   - 本地修正 `tests/test_dcu_megamoe_v3.py`，把 guard 改为检查整份 K1 V3 header 中 `kCountDoneSlot` / `kEmitDoneSlot` 完成计数前均为 `__threadfence_system()`；
   - 本地 `python -m compileall tests/test_dcu_megamoe_v3.py` 通过；
   - 本地 `git diff --check -- tests/test_dcu_megamoe_v3.py` 通过；
@@ -1645,7 +1645,7 @@
 
 ## 2026-06-11 - K3 tail wait invalidate 补丁已编译但 e2e 被环境 OOM 阻塞
 
-- 已完成：
+- ✅ 完成：
   - 按 tail ASM extra reducer wait 后的 `s_barrier + buffer_wbinvl1_vol` 线索，在 V3 tail wait helper 中增加 wait 后全 block barrier 与 invalidate；
   - 远端 source guard 曾验证通过，V3 K1/K3 normal aicc rebuild 成功，log `hygon_tmp/sglang_debug/rebuild_v3_k3_tail_wait_invalidate_20260611_163241.log`。
 - 直接 e2e 结果：
@@ -2686,7 +2686,7 @@
 
 ## 2026-06-12 - LL K3 PMC read/write 对照
 
-- 已完成：
+- ✅ 完成：
   - 从 11 节点拉回 `pmc_v3_ll_k3_notail128_20260612_153148.csv`；
   - 新增临时解析脚本 `hygon_tmp/sglang_debug/parse_pmc_k3.py`；
   - 给 `bench_k3_ll_rowptr_modes.py` 增加 `--modes`，保证单 mode profiler 不混入其他 rowptr 模式；
@@ -5858,12 +5858,12 @@
   - normal eager：tokens per rank `256,512,1024,1025,2048,2050,4096,4097,8192`；
   - LL/normal 都要覆盖 no-tail/tail。
 - 已更新：
-  - `task_plan.md` 明确未完成必做项继续使用 `[ ]` 空勾选，用于和 `🧭 optional backlog` 区分；
+  - `task_plan.md` 明确未完成必做项继续使用 “待办”文字状态，用于和 `🧭 optional backlog` 区分；
   - 新增 Phase 10 `Required V3 performance sweep`，把远端准备、LL graph、normal eager、结果落盘和回写计划都列为必做；
   - `findings.md` 记录该矩阵是 required sweep，已有 smoke 结果不能替代。
 - 当前状态：
   - 本轮只更新 planning，不跑远端；
-  - Phase 10 现在是明确未完成的必做项，按 `[ ]` 空勾选展示。
+  - Phase 10 现在是明确未完成的必做项，按 “待办”文字状态展示。
 
 ## 2026-06-15 - Phase 10 远端刷数与 LL graph 1024 bug
 
@@ -6765,7 +6765,7 @@
   - 更新 README DCU 部分；
   - big fused 去掉后继续 Phase 8 的 `route_scratch` 等显存空间优化；
   - 最后重刷 README 测试、功能、精度和各 size 性能。
-- 已完成：
+- ✅ 完成：
   - 重读 `task_plan.md`、`progress.md`、`findings.md` 恢复上下文；
   - `git status --short` 显示当前只有 `.planning/dcu_megamoe_v3/progress.md` 已有未提交改动；
   - 在 `task_plan.md` 增加“V3 转正目标更新”，明确旧 env-gated 目标被新主路径目标取代；
@@ -7056,7 +7056,7 @@
   - LL graph tail capture1024 replay `32,96,128,256,512` 全部 correct，replay max_abs <= `0.000488281`；
   - LL graph tail capture1024 replay bench smoke：32 `0.982 ms` median / `0.636 ms` min，128 `0.845 ms` median，256 `1.285 ms` median；
   - 远端 `PYTHONPATH=. python3 -m pytest -q tests/test_dcu_megamoe_v3.py` 通过，`8 passed`。
-- 状态：✅ LL tail eager/graph cleanup regression closed；保留 graph runtime-token 化修复，删除 eager 误用参数。
+- 状态：✅ 已完成 LL tail eager/graph cleanup regression closed；保留 graph runtime-token 化修复，删除 eager 误用参数。
 
 ## 2026-06-17 - latest V3 validation sweep after remote cleanup
 
@@ -8453,7 +8453,7 @@
 ## 2026-06-22 - Retire dormant K3 LL no-tail pybind
 
 - 用户确认清理 `k3_v3_ll_combine`。
-- 已完成：
+- ✅ 完成：
   - 删除 `K3_fused/k3_v3_fused_ext.cu` 中的 `k3_v3_ll_combine` no-tail wrapper 与 pybind；
   - `dcu_megamoe_v3_launch_k3_ll_combine_pack5` 从 runtime `tail_reduce` 分支收敛为 tail-only launcher，只保留 `k3_v3_ll_combine_tail` 对外入口；
   - source guard 增加对 `void k3_v3_ll_combine(` 与 `m.def("k3_v3_ll_combine", ...)` 的缺失断言。
@@ -9365,7 +9365,7 @@
 - Converted completed historical `🧭` route_scratch / compatibility directions to `✅`.
 - Converted no-longer-active DeepEP full baseline item to `🚫`.
 - Downgraded non-current layout mining and split-tail default-enable/perf tuning items to `🧭 optional backlog`.
-- Cleared remaining real `[ ]` task entries from `task_plan.md`; only explanatory legend text still mentions `[ ]`.
+- Cleared remaining real 待办 task entries from `task_plan.md`; only explanatory legend text still mentions `[ ]`.
 
 ## 2026-06-24 - Phase 19 profiling request added
 
@@ -10095,3 +10095,13 @@
     bucket tested;
   - uneven buckets show larger relative gains, matching the earlier LL trend;
   - after the run, `hy-smi` again showed all 8 HCUs at 0% HCU/VRAM.
+## 2026-06-29 - 规整 V3 planning 状态标记
+
+- ✅ 将 `task_plan.md` 中历史 checkbox / emoji 状态统一改为文字状态前缀。
+- ✅ 补充“状态标记约定”和“当前有效状态”，明确 checked checkbox 的历史含义就是“已完成”。
+- ✅ 在 `findings.md` 顶部增加当前索引，避免旧 LL V2 / split-tail 反证记录干扰当前判断。
+- 说明：超节点支持仍由 `.planning/dcu_megamoe_supernode` 单独跟踪，V3 主线 planning 不混入超节点待办。
+## 2026-06-29 - 调整 task_plan 执行情况位置
+
+- ✅ 按用户要求，将 `task_plan.md` 中 `2026-06-29 当前有效状态` 改名为 `2026-06-29 计划执行情况`。
+- ✅ 将该段从文件顶部移到末尾，保持前面是状态规则、目标和阶段计划，后面是执行结果。
