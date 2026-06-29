@@ -92,7 +92,7 @@ def cast_to_fp8_channelwise(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     return fp8.contiguous(), scale.float().contiguous()
 
 
-def pre_dispatch_fp8_channelwise_out(
+def mega_moe_pre_dispatch(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -146,10 +146,10 @@ def pre_dispatch_fp8_channelwise_out(
         topk_weights if topk_weights.is_contiguous() else topk_weights.contiguous()
     )
     try:
-        pre_dispatch = _C.pre_dispatch_fp8_channelwise_out
+        pre_dispatch = _C.mega_moe_pre_dispatch
     except AttributeError:
         raise RuntimeError(
-            "DCU W8A8 MegaMoE requires _C.pre_dispatch_fp8_channelwise_out; "
+            "DCU W8A8 MegaMoE requires _C.mega_moe_pre_dispatch; "
             "rebuild the megamoe HIP extension"
         ) from None
 
@@ -662,7 +662,7 @@ except Exception:
 __all__ = [
     "SymmBuffer",
     "cast_to_fp8_channelwise",
-    "pre_dispatch_fp8_channelwise_out",
+    "mega_moe_pre_dispatch",
     "cast_grouped_weight_to_fp8_channelwise",
     "weight8bit_nt_kpack2_marlin",
     "weight8bit_nt_kpack2_marlin_masked",

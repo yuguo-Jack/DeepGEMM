@@ -815,7 +815,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     normal_baseline_predispatch_buffers = {}
 
     def copy_inputs_to_sym_buffer():
-        megamoe.pre_dispatch_fp8_channelwise_out(
+        megamoe.mega_moe_pre_dispatch(
             x_bf16,
             topk_idx,
             topk_weights,
@@ -903,7 +903,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             )
             normal_baseline_predispatch_buffers[cache_key] = cached
         baseline_x_fp8, baseline_x_scale, baseline_topk_idx, baseline_topk_weights = cached
-        megamoe.pre_dispatch_fp8_channelwise_out(
+        megamoe.mega_moe_pre_dispatch(
             x_bf16_arg,
             topk_idx_arg,
             topk_weights_arg,
@@ -1073,7 +1073,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             return local_token_count
 
         def run_graph_bucket_once():
-            megamoe.pre_dispatch_fp8_channelwise_out(
+            megamoe.mega_moe_pre_dispatch(
                 graph_x_bf16,
                 graph_topk_idx,
                 graph_topk_weights,
