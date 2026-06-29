@@ -374,7 +374,9 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "flatten_pack5_weight" in api_source
     assert "flatten_pack5_weight_asm_normal" in api_source
     assert "def mega_moe_pre_dispatch(" in api_source
+    assert "num_tokens: int" in api_source
     assert 'm.def("mega_moe_pre_dispatch"' in c_api_source
+    assert 'pybind11::arg("num_tokens"))' in c_api_source
     assert "mega_moe_pre_dispatch_fp8_channelwise_kernel" in c_kernel_source
     assert "stage_topk_route<TopkIdxI64, TopkWeightsBf16>" in c_kernel_source
     assert "mega_moe_pre_dispatch_fp8_channelwise_vec16_4096_kernel" in c_kernel_source
@@ -394,6 +396,10 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "fused_input_quant_in_timed_path" not in test_source
     assert "includes_input_quantization" not in test_source
     assert "megamoe.mega_moe_pre_dispatch(" in test_source
+    assert "num_tokens=num_tokens" in test_source
+    assert "num_tokens=capture_tokens" in test_source
+    assert "sym_buffer.x[:num_tokens]" not in test_source
+    assert "sym_buffer.x[:capture_tokens]" not in test_source
     assert "normal_baseline_predispatch_buffers = {}" in test_source
     assert "\n    baseline_predispatch_buffers = {}" not in test_source
     assert "cast_input_for_test_baseline" not in test_source

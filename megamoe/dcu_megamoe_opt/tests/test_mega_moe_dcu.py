@@ -819,10 +819,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             x_bf16,
             topk_idx,
             topk_weights,
-            sym_buffer.x[:num_tokens],
-            sym_buffer.x_sf[:num_tokens],
-            sym_buffer.topk_idx[:num_tokens],
-            sym_buffer.topk_weights[:num_tokens],
+            sym_buffer.x,
+            sym_buffer.x_sf,
+            sym_buffer.topk_idx,
+            sym_buffer.topk_weights,
+            num_tokens=num_tokens,
         )
 
     def run_fused(reset_stats: bool = False):
@@ -911,6 +912,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             baseline_x_scale,
             baseline_topk_idx,
             baseline_topk_weights,
+            num_tokens=rows,
         )
         layout_cache = get_baseline_layout_cache() if use_layout_cache else None
         return run_deepgemm_megamoe_baseline(
@@ -1077,10 +1079,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 graph_x_bf16,
                 graph_topk_idx,
                 graph_topk_weights,
-                sym_buffer.x[:capture_tokens],
-                sym_buffer.x_sf[:capture_tokens],
-                sym_buffer.topk_idx[:capture_tokens],
-                sym_buffer.topk_weights[:capture_tokens],
+                sym_buffer.x,
+                sym_buffer.x_sf,
+                sym_buffer.topk_idx,
+                sym_buffer.topk_weights,
+                num_tokens=capture_tokens,
             )
             megamoe.fp8_w8a8_mega_moe(
                 y_graph,
