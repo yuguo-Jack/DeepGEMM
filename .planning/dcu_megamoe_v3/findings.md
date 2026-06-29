@@ -1,5 +1,13 @@
 # DCU MegaMoE V3 Findings
 
+## 2026-06-29 当前索引
+
+- ✅ V3 当前生产主线是 normal / LL 双后端；LL 默认使用 K3 split-tail，normal 默认使用 ASM tail-reduce。
+- ✅ `mega_moe_pre_dispatch(num_tokens, ...)` 是当前 DCU 前置融合接口，避免框架侧额外 slice/copy，并对齐 graph replay 需求。
+- ✅ LL 对照 baseline 为 `--baseline-kind ll-masked`，走 DeepEP LL dispatch + DeepGEMM masked groupgemm；normal 对照 baseline 为 `normal-contiguous`。
+- 🚫 LL V2 全量重构、K3 normal split-tail、K1 double-buffer readiness 都作为历史反证保留，不再列为当前待办。
+- 🧭 后续优化优先依赖 profiler 证据，避免再次引入高延迟冗余 kernel 或复杂环境变量。
+
 ## 初始代码地图
 
 - `megamoe/large_opt.py` 是现有 DCU MegaMoE staged K1/K2/K3 编排入口。
