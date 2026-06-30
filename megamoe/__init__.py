@@ -255,19 +255,40 @@ def weight8bit_nt_kpack2_marlin(
     )
 
 
-def weight8bit_nt_kpack2_marlin_contiguous(
+def weight8bit_nt_kpack2_marlin_contiguous_k64n16(
     weight: torch.Tensor,
     k_tile: int = 16,
     k_tile_group: int = 4,
     n_tile: int = 16,
 ) -> torch.Tensor:
-    if weight.dim() != 3:
-        raise ValueError("contiguous DeepGEMM Marlin weight layout expects a 3D grouped weight tensor")
+    if weight.dim() not in (2, 3):
+        raise ValueError("contiguous K64/N16 Marlin weight layout expects a 2D or 3D tensor")
     if k_tile != 16 or k_tile_group != 4 or n_tile != 16:
-        raise ValueError("DCU contiguous DeepGEMM currently supports only 16x4 by 16 tiles")
+        raise ValueError("DCU contiguous DeepGEMM K64/N16 layout supports only 16x4 by 16 tiles")
+
+    if weight.dim() == 2:
+        rows, k = weight.shape
+        if rows % n_tile != 0 or k % (k_tile * k_tile_group) != 0:
+            raise ValueError(
+                "contiguous K64/N16 weights require rows divisible by 16 and K divisible by 64"
+            )
+        return (
+            weight.reshape(
+                rows // n_tile,
+                n_tile,
+                k // (k_tile * k_tile_group),
+                k_tile_group,
+                k_tile,
+            )
+            .permute(2, 0, 3, 1, 4)
+            .contiguous()
+        )
+
     num_groups, rows, k = weight.shape
     if rows % n_tile != 0 or k % (k_tile * k_tile_group) != 0:
-        raise ValueError("contiguous DeepGEMM Marlin weights require rows divisible by 16 and K divisible by 64")
+        raise ValueError(
+            "contiguous K64/N16 weights require rows divisible by 16 and K divisible by 64"
+        )
     return (
         weight.reshape(
             num_groups,
@@ -765,7 +786,7 @@ __all__ = [
     "mega_moe_pre_dispatch",
     "cast_grouped_weight_to_fp8_channelwise",
     "weight8bit_nt_kpack2_marlin",
-    "weight8bit_nt_kpack2_marlin_contiguous",
+    "weight8bit_nt_kpack2_marlin_contiguous_k64n16",
     "weight8bit_nt_kpack2_marlin_masked",
     "get_mega_moe_hip_build_config",
     "get_symm_buffer_for_mega_moe",

@@ -64,6 +64,60 @@ def baseline_kind_description(kind: str, prepost_backend: str) -> str:
     )
 
 
+_DEEPGEMM_CONTIGUOUS_WEIGHT_LAYOUT: str | None = None
+
+
+def _probe_deepgemm_contiguous_weight_layout(device: torch.device) -> str:
+    global _DEEPGEMM_CONTIGUOUS_WEIGHT_LAYOUT
+    if _DEEPGEMM_CONTIGUOUS_WEIGHT_LAYOUT is not None:
+        return _DEEPGEMM_CONTIGUOUS_WEIGHT_LAYOUT
+
+    a_fp8 = torch.zeros((64, 128), device=device, dtype=torch.float8_e4m3fn)
+    a_scale = torch.ones((64,), device=device, dtype=torch.float32)
+    b_fp8 = torch.zeros((1, 256, 128), device=device, dtype=torch.float8_e4m3fn)
+    b_scale = torch.ones((1, 256), device=device, dtype=torch.float32)
+    output = torch.empty((64, 256), device=device, dtype=torch.bfloat16)
+    m_indices = torch.zeros((64,), device=device, dtype=torch.int32)
+    candidates = (
+        (
+            "k64n16_7d",
+            lambda: megamoe.weight8bit_nt_kpack2_marlin_contiguous_k64n16(b_fp8),
+        ),
+        (
+            "legacy_n16_flat",
+            lambda: megamoe.weight8bit_nt_kpack2_marlin(b_fp8),
+        ),
+    )
+    errors = []
+    for name, pack in candidates:
+        try:
+            deepgemm.m_grouped_fp8_gemm_nt_contiguous(
+                (a_fp8, a_scale),
+                (pack(), b_scale),
+                output,
+                m_indices,
+            )
+            torch.cuda.synchronize()
+            _DEEPGEMM_CONTIGUOUS_WEIGHT_LAYOUT = name
+            return name
+        except Exception as exc:
+            torch.cuda.synchronize()
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+    raise RuntimeError(
+        "unable to find a compatible DeepGEMM contiguous weight layout: "
+        + " | ".join(errors)
+    )
+
+
+def pack_deepgemm_contiguous_weight(weight: torch.Tensor) -> tuple[torch.Tensor, str]:
+    layout = _probe_deepgemm_contiguous_weight_layout(weight.device)
+    if layout == "k64n16_7d":
+        return megamoe.weight8bit_nt_kpack2_marlin_contiguous_k64n16(weight), layout
+    if layout == "legacy_n16_flat":
+        return megamoe.weight8bit_nt_kpack2_marlin(weight), layout
+    raise RuntimeError(f"unknown DeepGEMM contiguous weight layout: {layout}")
+
+
 def parse_int_list(value: str) -> list[int]:
     return [int(item) for item in value.replace(",", " ").split() if item]
 
@@ -799,32 +853,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
     l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
+    baseline_contiguous_weight_layout = None
     if ll_masked_baseline:
         baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l1_fp8), l1_scale)
         baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l2_fp8), l2_scale)
     else:
-        baseline_weight_layout = os.getenv("MEGAMOE_DCU_BASELINE_WEIGHT_LAYOUT", "auto").strip().lower()
-        if baseline_weight_layout == "auto":
-            deepgemm_file = str(getattr(deepgemm, "__file__", ""))
-            baseline_weight_layout = (
-                "old-marlin"
-                if "/yuguo/" in deepgemm_file or "deepgemm_old" in deepgemm_file
-                else "contiguous"
+        baseline_l1_packed, baseline_contiguous_weight_layout = pack_deepgemm_contiguous_weight(l1_fp8)
+        baseline_l2_packed, l2_contiguous_weight_layout = pack_deepgemm_contiguous_weight(l2_fp8)
+        if l2_contiguous_weight_layout != baseline_contiguous_weight_layout:
+            raise RuntimeError(
+                "DeepGEMM contiguous baseline selected inconsistent L1/L2 layouts: "
+                f"{baseline_contiguous_weight_layout} vs {l2_contiguous_weight_layout}"
             )
-        if baseline_weight_layout in ("old", "old-marlin", "marlin"):
-            baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin(l1_fp8), l1_scale)
-            baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin(l2_fp8), l2_scale)
-            baseline_weight_layout = "old-marlin"
-        elif baseline_weight_layout in ("contiguous", "contig"):
-            baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin_contiguous(l1_fp8), l1_scale)
-            baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin_contiguous(l2_fp8), l2_scale)
-            baseline_weight_layout = "contiguous"
-        else:
-            raise ValueError(
-                "MEGAMOE_DCU_BASELINE_WEIGHT_LAYOUT supports auto/old-marlin/contiguous, "
-                f"got {baseline_weight_layout!r}"
-            )
-        print_once(rank, f" > baseline normal DeepGEMM weight layout: {baseline_weight_layout}")
+        baseline_l1_weights = (baseline_l1_packed, l1_scale)
+        baseline_l2_weights = (baseline_l2_packed, l2_scale)
     if weight_layout == "normal":
         fused_l1_weights = {
             "normal": (megamoe.flatten_pack5_weight_asm_normal(l1_fp8), l1_scale),
@@ -842,6 +884,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         }
         layout_desc = "single unified transposed pack5"
     print_once(rank, f" > V3 staged layout: {layout_desc}")
+    if baseline_contiguous_weight_layout is not None:
+        print_once(
+            rank,
+            f" > DeepGEMM contiguous baseline weight layout: {baseline_contiguous_weight_layout}",
+        )
     stats_initial = torch.randint(0, 100, (num_experts_per_rank,), dtype=torch.int32, device="cuda")
     stats_fused = stats_initial.clone()
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
