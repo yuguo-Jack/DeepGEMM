@@ -276,3 +276,9 @@
 - ✅ Re-checked K3 normal eager/graph: `_tail_reduce_enabled_for_backend()` returns `False` for non-LL `num_ranks > 8`, so EP16/EP32 normal use K3 no-tail ASM plus the separate local combine reduce kernel.
 - ✅ Re-checked normal graph support: `graph=True, megamoe_backend="normal"` enters `_run_opt_3stage_graph`; K1 graph uses compact prebuild with `runtime_num_tokens`, K3 graph uses no-tail ASM with `active_tiles`, then `reduce_local_combine_graph`.
 - [ ] Runtime validation remains pending because TX32 nodes are unavailable.
+
+## 2026-06-30 - DeepEP LL Baseline MNNVL Selection Cleanup
+- ✅ Replaced the outdated DeepEP LL baseline `allow_mnnvl = num_ranks > torch.cuda.device_count()` heuristic with the same explicit peer-memory policy as MegaMoE: default IPC, and `MEGAMOE_DCU_PEER_MEMORY=rpc/fabric/mnvl/1/true` enables Fabric/MNNVL-style handles.
+- ✅ Re-scanned the supernode deltas and found no remaining hostname/device-count based peer-memory selection. Rank-count checks that remain are shape/path guardrails only, such as forcing K1 compact prebuild for EP16/EP32.
+- ✅ Verified local syntax and whitespace checks: `python -m py_compile megamoe/__init__.py megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` and `git diff --check`.
+- [ ] Runtime validation remains pending because TX32 nodes are unavailable.

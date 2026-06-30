@@ -50,6 +50,11 @@ def env_flag_enabled(name: str) -> bool:
     return os.getenv(name, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def dcu_peer_memory_fabric_enabled() -> bool:
+    value = os.getenv("MEGAMOE_DCU_PEER_MEMORY", "ipc").strip().lower()
+    return value in {"1", "true", "yes", "on", "rpc", "fabric", "mnvl"}
+
+
 def print_once(rank: int, msg: str = ""):
     if rank == 0:
         print(msg, flush=True)
@@ -218,10 +223,7 @@ def create_deepep_low_latency_buffer(
     num_experts: int,
     num_experts_per_rank: int,
 ):
-    # On a single 16-card node, rank count is still within local HIP IPC
-    # visibility. Only enable MNNVL/RDMA-style handles for true multi-node
-    # process groups, otherwise DeepEP can mix handle sizes during exchange.
-    allow_mnnvl = num_ranks > torch.cuda.device_count()
+    allow_mnnvl = dcu_peer_memory_fabric_enabled()
     rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
         num_max_tokens_per_rank,
         hidden,
