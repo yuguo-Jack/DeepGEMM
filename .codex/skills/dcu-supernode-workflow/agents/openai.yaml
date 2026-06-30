@@ -1,0 +1,4 @@
+interface:
+  display_name: "DCU Supernode Workflow"
+  short_description: "Operate TX32 and other DCU supernode environments safely."
+  default_prompt: "Use $dcu-supernode-workflow to inspect a DCU supernode environment, sync files to all nodes, and run a container-side compile or test."

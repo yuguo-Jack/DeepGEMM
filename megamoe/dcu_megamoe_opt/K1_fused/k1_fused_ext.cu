@@ -926,13 +926,13 @@ k1_symm_fused_l1_asm_impl(
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
     // The in-ASM route builder was tuned around the original EP8 fixed-local
     // layout. EP16/EP32 have fewer local experts and can fault in that path, so
-    // default those shapes to the HIP compact prebuild while keeping an explicit
-    // K1_PREBUILD_MODE=asm/asm_route escape hatch for ablation.
+    // those shapes are forced to the HIP compact prebuild. K1_PREBUILD_MODE is
+    // kept only for EP8/local ablations.
     const bool default_compact_prebuild =
         force_compact_prebuild || num_ranks > 8;
     bool use_compact_prebuild = default_compact_prebuild;
     bool force_asm_route = false;
-    if (!force_compact_prebuild) {
+    if (!force_compact_prebuild && num_ranks <= 8) {
         if (const char* mode = std::getenv("K1_PREBUILD_MODE")) {
             TORCH_CHECK(
                 std::strcmp(mode, "auto") == 0 ||

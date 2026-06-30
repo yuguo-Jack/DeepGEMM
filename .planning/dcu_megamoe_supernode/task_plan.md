@@ -14,13 +14,13 @@ Support the DCU MegaMoE V3 staged path on TX32 supernode EP sizes while keeping 
 
 Target shapes:
 - DSV4 Flash model shape: experts=256, topk=6, hidden=4096, intermediate=2048.
-- EP8 remains supported. On TX32/supernode nodes it must exercise the new supernode-aware hybrid symm buffer selection; legacy 8-DCU standalone environments keep the old IPC-only path.
+- EP8 remains supported. Peer-memory mode is independent from EP size: default is HIP IPC, and Fabric/RPC is enabled only with `MEGAMOE_DCU_PEER_MEMORY=rpc`.
 - EP16 and EP32 must be accepted for supernode runs, with local experts 16 and 8 respectively.
 
 Scope boundaries:
 - This branch only implements supernode support. Do not re-open LL_V2 or unrelated kernel experiments.
 - TX32 runtime validation is active; keep node-local and cross-node results separated because the two nodes do not share storage.
-- Preserve performance-first contracts: no extra hot-path kernels and no runtime weight transforms. In hybrid symm buffer mode, same-host peers use HIP IPC and only cross-host peers use Fabric/RPC.
+- Preserve performance-first contracts: no extra hot-path kernels and no runtime weight transforms. EP16/EP32 shape support must not implicitly switch peer-memory mode; `MEGAMOE_DCU_PEER_MEMORY=rpc` is the only Fabric/RPC selector.
 
 ## Phase 1: Read Examples And Current Assumptions
 Status: ✅ completed
@@ -44,8 +44,8 @@ Status: ✅ completed
 
 - ✅ Add a supernode-capable peer mapping path based on the example RPC/Fabric handle flow.
 - ✅ Keep legacy non-supernode EP8/local IPC behavior available.
-- ✅ Use the hybrid path when the runtime environment indicates a TX32/supernode node, including EP8 sanity runs on 16-DCU nodes.
-- ✅ In hybrid mode, use HIP IPC for same-host peers and Fabric/RPC only for cross-host peers.
+- ✅ Add explicit peer-memory selection: default `ipc`; `MEGAMOE_DCU_PEER_MEMORY=rpc` enables DeepEP-style Fabric/RPC handles.
+- 🚫 Abandoned the earlier hybrid same-host-IPC / cross-host-RPC design after re-reading DeepEP supernode normal path. DeepEP normal/MNNVL uses one Fabric-backed shared-memory mode instead of per-peer IPC/RPC mixing.
 - ✅ Ensure destroy/cleanup closes the matching handle type.
 - ✅ Build-review HSA include/link compatibility against the example code and link `hsa-runtime64`.
 
@@ -62,7 +62,7 @@ Status: [ ] active on TX32
 - ✅ Build the HIP wheel on the target DTK image for EP16 node22.
 - ✅ EP16 process-group smoke test: buffer allocation, pointer exchange, `set_mega_moe_peer_ptrs`, pre-dispatch, K1-only, K3 no-reduce, and default normal fused smoke.
 - ✅ EP16 correctness bring-up fixes: single-node IPC peer mode, K1 compact prebuild default for `num_ranks > 8`, and normal K3 ASM tail-reduce disabled for `num_ranks > 8`.
-- ✅ EP8 TX32 sanity uses `peer_mode=hybrid`: same-host peer handles are opened with HIP IPC, while the mode selection still validates the supernode-aware buffer path.
+- [ ] Re-run IPC default and `MEGAMOE_DCU_PEER_MEMORY=rpc` Fabric/RPC smoke once hardware is available; EP size should not affect peer-memory selection.
 - 🚫 Do not keep chasing the yuguo old-DeepGEMM baseline as the primary validator in the current TX32 torch runtime. It is ABI/storage-sensitive; use the current environment DeepGEMM with contiguous baseline weight layout for dcu_mega_v3/supernode A/B checks.
 - [ ] Build the HIP wheel on node69 once it is free, because TX32 nodes do not share compiled artifacts.
 - [ ] EP32 process-group smoke test: cross-node Fabric/RPC peer memory, buffer allocation, pointer exchange, `set_mega_moe_peer_ptrs`, and destroy cleanup.

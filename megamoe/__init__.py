@@ -1,5 +1,4 @@
 import os
-import socket
 from types import SimpleNamespace
 from typing import Any, Optional, Tuple
 
@@ -25,27 +24,15 @@ def _is_hip_backend() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
-def _physical_dcu_count_hint() -> int:
-    try:
-        return sum(
-            1
-            for name in os.listdir("/dev/dri")
-            if name.startswith("renderD")
-        )
-    except OSError:
-        return 0
-
-
-def _use_supernode_peer_memory(num_ranks: int, local_device_count: Optional[int] = None) -> bool:
-    if local_device_count is None:
-        local_device_count = torch.cuda.device_count()
-    # TX32 supernode nodes expose 16 local DCUs. Even EP8 sanity runs on those
-    # nodes should exercise the Fabric/RPC-backed symmetric buffer, while the
-    # original 8-DCU environment keeps the lower-overhead HIP IPC path.
-    return (
-        _physical_dcu_count_hint() > 8
-        or int(local_device_count) > 8
-        or int(num_ranks) > int(local_device_count)
+def _dcu_peer_memory_mode() -> str:
+    value = os.getenv("MEGAMOE_DCU_PEER_MEMORY", "ipc").strip().lower()
+    if value in ("", "0", "false", "off", "no", "ipc"):
+        return "ipc"
+    if value in ("1", "true", "on", "yes", "rpc", "fabric", "mnvl"):
+        return "fabric"
+    raise ValueError(
+        "MEGAMOE_DCU_PEER_MEMORY must be unset/ipc or one of "
+        "rpc/fabric/mnvl/1/true/on/yes"
     )
 
 
@@ -424,32 +411,21 @@ class SymmBuffer:
             activation,
         )
 
-        use_hybrid_peer_memory = _use_supernode_peer_memory(
-            group.size(), torch.cuda.device_count()
-        )
-        peer_memory_mode = "hybrid" if use_hybrid_peer_memory else "ipc"
+        peer_memory_mode = _dcu_peer_memory_mode()
+        use_fabric_peer_memory = peer_memory_mode == "fabric"
 
-        if use_hybrid_peer_memory:
-            self.buffer, buffer_ptr, local_ipc_handle, local_fabric_handle = (
-                _C.allocate_hip_hybrid_buffer(num_bytes)
+        if use_fabric_peer_memory:
+            self.buffer, buffer_ptr, local_fabric_handle = (
+                _C.allocate_hip_fabric_buffer(num_bytes)
             )
-            ipc_handles = [None] * group.size()
             fabric_handles = [None] * group.size()
-            dist.all_gather_object(ipc_handles, local_ipc_handle, group)
             dist.all_gather_object(fabric_handles, local_fabric_handle, group)
-            hostnames = [None] * group.size()
-            dist.all_gather_object(hostnames, socket.gethostname(), group)
-            local_hostname = hostnames[group.rank()]
-            local_peer_mask = [1 if host == local_hostname else 0 for host in hostnames]
-            buffer_ptrs, buffer_fabric_opened = _C.open_hip_hybrid_handles(
-                ipc_handles, fabric_handles, group.rank(), local_peer_mask
-            )
+            buffer_ptrs = _C.open_hip_fabric_handles(fabric_handles, group.rank())
         else:
             self.buffer, buffer_ptr, local_handle = _C.allocate_hip_ipc_buffer(num_bytes)
             ipc_handles = [None] * group.size()
             dist.all_gather_object(ipc_handles, local_handle, group)
             buffer_ptrs = _C.open_hip_ipc_handles(ipc_handles, group.rank())
-            buffer_fabric_opened = [0] * group.size()
 
         self.route_scratch = torch.empty(
             (route_scratch_num_bytes,),
@@ -461,26 +437,18 @@ class SymmBuffer:
         # EP8 keeps the historical signal layout. EP16/EP32 use dynamic slots
         # so tail/copy, barrier, and chunk-ready signals never overlap.
         signal_num_bytes = _align(_dcu_required_signal_slots(group.size()) * 4, 128)
-        if use_hybrid_peer_memory:
-            signal_ptr, signal_ipc_handle, signal_fabric_handle = (
-                _C.allocate_hip_hybrid_signal_buffer(signal_num_bytes)
+        if use_fabric_peer_memory:
+            signal_ptr, signal_fabric_handle = (
+                _C.allocate_hip_fabric_signal_buffer(signal_num_bytes)
             )
-            signal_ipc_handles = [None] * group.size()
             signal_fabric_handles = [None] * group.size()
-            dist.all_gather_object(signal_ipc_handles, signal_ipc_handle, group)
             dist.all_gather_object(signal_fabric_handles, signal_fabric_handle, group)
-            signal_ptrs, signal_fabric_opened = _C.open_hip_hybrid_handles(
-                signal_ipc_handles,
-                signal_fabric_handles,
-                group.rank(),
-                local_peer_mask,
-            )
+            signal_ptrs = _C.open_hip_fabric_handles(signal_fabric_handles, group.rank())
         else:
             signal_ptr, signal_handle = _C.allocate_hip_ipc_signal_buffer(signal_num_bytes)
             signal_handles = [None] * group.size()
             dist.all_gather_object(signal_handles, signal_handle, group)
             signal_ptrs = _C.open_hip_ipc_handles(signal_handles, group.rank())
-            signal_fabric_opened = [0] * group.size()
         signal_ptrs[group.rank()] = signal_ptr
         self.handle = SimpleNamespace(
             buffer_ptrs=buffer_ptrs,
@@ -488,8 +456,6 @@ class SymmBuffer:
             signal_ptrs=signal_ptrs,
             signal_buffer_ptr=signal_ptr,
             peer_memory_mode=peer_memory_mode,
-            buffer_fabric_opened=buffer_fabric_opened,
-            signal_fabric_opened=signal_fabric_opened,
         )
 
         self.buffer.zero_()
@@ -534,33 +500,6 @@ class SymmBuffer:
             if peer_memory_mode == "fabric":
                 _C.close_hip_fabric_handles(remote_ptrs)
                 _C.close_hip_fabric_handles(remote_signal_ptrs)
-            elif peer_memory_mode == "hybrid":
-                buffer_fabric_opened = getattr(
-                    self.handle, "buffer_fabric_opened", [0] * len(remote_ptrs)
-                )
-                signal_fabric_opened = getattr(
-                    self.handle, "signal_fabric_opened", [0] * len(remote_signal_ptrs)
-                )
-                buffer_ipc_ptrs = [
-                    0 if int(is_fabric) else ptr
-                    for ptr, is_fabric in zip(remote_ptrs, buffer_fabric_opened)
-                ]
-                buffer_fabric_ptrs = [
-                    ptr if int(is_fabric) else 0
-                    for ptr, is_fabric in zip(remote_ptrs, buffer_fabric_opened)
-                ]
-                signal_ipc_ptrs = [
-                    0 if int(is_fabric) else ptr
-                    for ptr, is_fabric in zip(remote_signal_ptrs, signal_fabric_opened)
-                ]
-                signal_fabric_ptrs = [
-                    ptr if int(is_fabric) else 0
-                    for ptr, is_fabric in zip(remote_signal_ptrs, signal_fabric_opened)
-                ]
-                _C.close_hip_ipc_handles(buffer_ipc_ptrs)
-                _C.close_hip_ipc_handles(signal_ipc_ptrs)
-                _C.close_hip_fabric_handles(buffer_fabric_ptrs)
-                _C.close_hip_fabric_handles(signal_fabric_ptrs)
             else:
                 _C.close_hip_ipc_handles(remote_ptrs)
                 _C.close_hip_ipc_handles(remote_signal_ptrs)

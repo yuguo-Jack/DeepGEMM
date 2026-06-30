@@ -256,3 +256,23 @@
   - Normal node: `/workspace/DeepGEMM/hygon_tmp/debug/rocblas_bench_20260630/`.
   - TX32 node22: `/home/yiqa/DeepGEMM/hygon_tmp/supernode_debug/rocblas_bench_20260630/`.
 - Current readout: raw rocBLAS BF16 GEMM is close between machines, and TX32 is not meaningfully slower on large square GEMM. The MegaMoE EP8 gap is therefore unlikely to be pure matrix-core throughput; it more likely comes from MegaMoE multi-kernel/peer-write/launch/clock behavior or the torch/runtime stack around those kernels.
+
+## 2026-06-30 - DeepEP-Style Fabric Peer Memory Cleanup
+- ✅ Re-read DeepEP-super_node normal/MNNVL memory flow: normal supernode shared memory uses one Fabric/RPC-backed mode rather than a per-peer same-host IPC / cross-host RPC hybrid table.
+- ✅ Updated MegaMoE supernode `SymmBuffer` selection to use `peer_mode=fabric` whenever `_use_supernode_peer_memory()` is true; legacy non-supernode EP8 still uses the original HIP IPC path.
+- ✅ Removed the Python hybrid peer mask flow from `megamoe/__init__.py`; kernels still receive the same flat peer pointer table and do not branch on peer type.
+- ✅ Removed unused hybrid C++ binding APIs from `python_api_hip.cpp` and kept only IPC and Fabric allocation/open/close APIs.
+- ✅ Changed Fabric signal buffer allocation to `hipDeviceMallocFinegrained`, matching the DeepEP-style exported shared-buffer approach and avoiding the earlier all-RPC signal attach risk seen with uncached signal memory.
+- [ ] Runtime validation is pending because TX32 nodes are no longer reachable / have been taken down.
+
+## 2026-06-30 - Explicit Peer-Memory Mode
+- ✅ Changed MegaMoE peer-memory selection to match the requested DeepEP-style opt-in behavior: default `ipc`, and `MEGAMOE_DCU_PEER_MEMORY=rpc` enables Fabric/RPC handles.
+- ✅ Decoupled EP16/EP32 shape support from IPC/RPC selection. Rank count, local expert count, scratch sizing, and signal slot layout are still shape concerns; peer memory is now controlled only by the environment variable.
+- [ ] Runtime validation is pending because TX32 nodes are unavailable.
+
+## 2026-06-30 - EP16/EP32 Normal Path Guardrails
+- ✅ Re-checked the staged normal path: `num_ranks > 8` forces K1 compact prebuild from `opt.py`, so EP16/EP32 do not use the in-ASM route builder.
+- ✅ Tightened the low-level K1 extension so `K1_PREBUILD_MODE=asm/asm_route` is only honored for `num_ranks <= 8`; direct EP16/EP32 low-level calls now stay on compact prebuild too.
+- ✅ Re-checked K3 normal eager/graph: `_tail_reduce_enabled_for_backend()` returns `False` for non-LL `num_ranks > 8`, so EP16/EP32 normal use K3 no-tail ASM plus the separate local combine reduce kernel.
+- ✅ Re-checked normal graph support: `graph=True, megamoe_backend="normal"` enters `_run_opt_3stage_graph`; K1 graph uses compact prebuild with `runtime_num_tokens`, K3 graph uses no-tail ASM with `active_tiles`, then `reduce_local_combine_graph`.
+- [ ] Runtime validation remains pending because TX32 nodes are unavailable.
