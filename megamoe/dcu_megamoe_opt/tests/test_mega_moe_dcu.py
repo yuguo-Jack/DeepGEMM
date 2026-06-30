@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -163,6 +164,10 @@ def create_deepep_low_latency_buffer(
     num_experts: int,
     num_experts_per_rank: int,
 ):
+    # On a single 16-card node, rank count is still within local HIP IPC
+    # visibility. Only enable MNNVL/RDMA-style handles for true multi-node
+    # process groups, otherwise DeepEP can mix handle sizes during exchange.
+    allow_mnnvl = num_ranks > torch.cuda.device_count()
     rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
         num_max_tokens_per_rank,
         hidden,
@@ -175,7 +180,7 @@ def create_deepep_low_latency_buffer(
             num_rdma_bytes=rdma_bytes,
             low_latency_mode=True,
             num_qps_per_rank=num_experts_per_rank,
-            allow_mnnvl=True,
+            allow_mnnvl=allow_mnnvl,
             explicitly_destroy=True,
         )
     except TypeError:
@@ -600,6 +605,10 @@ def safe_div(numerator: float, denominator: float) -> float:
     return float("nan") if denominator == 0 else numerator / denominator
 
 
+def json_finite_or_none(value: float) -> float | None:
+    return value if math.isfinite(float(value)) else None
+
+
 def nonfinite_count(tensor: torch.Tensor) -> int:
     return int((~torch.isfinite(tensor.float())).sum().item()) if tensor.numel() else 0
 
@@ -732,6 +741,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if ll_masked_baseline
         else "normal_contiguous_eager"
     )
+    if args.skip_baseline_bench and args.correctness_iters == 0:
+        baseline_execution = "skipped"
     ll_baseline_capacity_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
     if ll_masked_baseline and num_tokens > ll_baseline_capacity_tokens:
         raise ValueError(
@@ -739,11 +750,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             f"num_tokens={num_tokens} exceeds capacity={ll_baseline_capacity_tokens}"
         )
     if ll_masked_baseline:
-        needs_deepep_baseline = True
+        needs_deepep_baseline = (
+            args.correctness_iters > 0
+            or (not args.skip_bench and not args.skip_baseline_bench)
+        )
     else:
         needs_deepep_baseline = (
             args.correctness_iters > 0
-            or not args.skip_bench
+            or (not args.skip_bench and not args.skip_baseline_bench)
             or (
                 args.cuda_graph
                 and not args.cuda_graph_skip_baseline
@@ -789,8 +803,28 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l1_fp8), l1_scale)
         baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l2_fp8), l2_scale)
     else:
-        baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin(l1_fp8), l1_scale)
-        baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin(l2_fp8), l2_scale)
+        baseline_weight_layout = os.getenv("MEGAMOE_DCU_BASELINE_WEIGHT_LAYOUT", "auto").strip().lower()
+        if baseline_weight_layout == "auto":
+            deepgemm_file = str(getattr(deepgemm, "__file__", ""))
+            baseline_weight_layout = (
+                "old-marlin"
+                if "/yuguo/" in deepgemm_file or "deepgemm_old" in deepgemm_file
+                else "contiguous"
+            )
+        if baseline_weight_layout in ("old", "old-marlin", "marlin"):
+            baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin(l1_fp8), l1_scale)
+            baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin(l2_fp8), l2_scale)
+            baseline_weight_layout = "old-marlin"
+        elif baseline_weight_layout in ("contiguous", "contig"):
+            baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin_contiguous(l1_fp8), l1_scale)
+            baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin_contiguous(l2_fp8), l2_scale)
+            baseline_weight_layout = "contiguous"
+        else:
+            raise ValueError(
+                "MEGAMOE_DCU_BASELINE_WEIGHT_LAYOUT supports auto/old-marlin/contiguous, "
+                f"got {baseline_weight_layout!r}"
+            )
+        print_once(rank, f" > baseline normal DeepGEMM weight layout: {baseline_weight_layout}")
     if weight_layout == "normal":
         fused_l1_weights = {
             "normal": (megamoe.flatten_pack5_weight_asm_normal(l1_fp8), l1_scale),
@@ -1280,7 +1314,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     baseline_desc = baseline_kind_description(baseline_kind, args.prepost_backend)
     print_once(rank, f" > baseline={baseline_desc} (kind={baseline_kind}, requested={args.baseline_kind})")
     print_once(rank, " > router weights=CUDA MegaMoE compatible SwiGLU-pre-L2-quant")
-    print_once(rank, f" > sym_buffer={sym_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
+    print_once(
+        rank,
+        f" > sym_buffer={sym_buffer.buffer.nbytes / 2 ** 30:.3f} GiB "
+        f"peer_mode={sym_buffer.handle.peer_memory_mode}",
+    )
     print_once(rank, f" > route_scratch={sym_buffer.route_scratch.nbytes / 2 ** 30:.3f} GiB")
 
     if ll_masked_baseline and (args.correctness_iters > 0 or not args.skip_bench):
@@ -1365,7 +1403,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 out_path = Path(args.out)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        dist.barrier(group=group)
         sym_buffer.destroy()
+        if ep_buffer is not None:
+            dist.barrier(group=group)
         if ep_buffer is not None:
             ep_buffer.destroy()
         dist.barrier(group=group)
@@ -1383,12 +1424,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Benchmark
     fused_timing = bench_tilelang_ms(lambda: run_fused(reset_stats=False), args.warmup, args.repeat)
-    baseline_timing = bench_tilelang_ms(lambda: run_baseline(return_stats=False), args.warmup, args.repeat)
+    baseline_timing = (
+        None
+        if args.skip_baseline_bench
+        else bench_tilelang_ms(lambda: run_baseline(return_stats=False), args.warmup, args.repeat)
+    )
 
     fused_s = fused_timing["median_ms"] / 1e3
     fused_min_s = fused_timing["min_ms"] / 1e3
-    baseline_s = baseline_timing["median_ms"] / 1e3
-    baseline_min_s = baseline_timing["min_ms"] / 1e3
+    baseline_s = float("nan") if baseline_timing is None else baseline_timing["median_ms"] / 1e3
+    baseline_min_s = float("nan") if baseline_timing is None else baseline_timing["min_ms"] / 1e3
     matmul_flops = 2 * num_recv_tokens * (hidden * intermediate_hidden * 3)
     num_hbm_bytes = dcu_w8a8_effective_hbm_bytes(
         int(num_recv_tokens),
@@ -1460,8 +1505,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "num_touched_experts_avg_per_rank": avg_num_touched_experts,
             "fused_median_ms_avg_per_rank": avg_fused_s * 1e3,
             "fused_min_ms_avg_per_rank": avg_fused_min_s * 1e3,
-            "baseline_median_ms_avg_per_rank": avg_baseline_s * 1e3,
-            "baseline_min_ms_avg_per_rank": avg_baseline_min_s * 1e3,
+            "baseline_median_ms_avg_per_rank": json_finite_or_none(avg_baseline_s * 1e3),
+            "baseline_min_ms_avg_per_rank": json_finite_or_none(avg_baseline_min_s * 1e3),
             "baseline_kind": baseline_desc,
             "baseline_kind_resolved": baseline_kind,
             "baseline_kind_requested": args.baseline_kind,
@@ -1472,48 +1517,62 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "cuda_graph_requested": bool(args.cuda_graph),
             "graph_execution": graph_execution,
             "bench_backend": f"tilelang_{fused_timing['backend']}",
+            "baseline_bench_skipped": bool(args.skip_baseline_bench),
             "router_weight_stage": "swiglu_pre_l2_quant",
             "cuda_graph_timings": cuda_graph_timing_rows,
-            "speedup_vs_deepep_deepgemm_baseline": speedup,
+            "speedup_vs_deepep_deepgemm_baseline": json_finite_or_none(speedup),
             "dcu_reference_fp8_peak_tflops_per_card": DCU_REFERENCE_FP8_PEAK_TFLOPS_PER_CARD,
             "dcu_reference_hbm_gbps_per_card": DCU_REFERENCE_HBM_GBPS_PER_CARD,
             "dcu_reference_xhcl_gbps_per_card": DCU_REFERENCE_XHCL_GBPS_PER_CARD,
             "reference_note": "Raw effective per-card metrics averaged across ranks. HBM uses DCU W8A8 FP8 channelwise bytes: FP8 weights, FP32 input/weight/L2-act scales, FP8 activations, and BF16 output. Baseline bandwidth uses the same logical byte numerator as fused for apples-to-apples throughput comparison; split-kernel temporary traffic is not added.",
             "fused_tflops_median_avg_per_rank": avg_tflops,
-            "baseline_tflops_median_avg_per_rank": avg_baseline_tflops,
+            "baseline_tflops_median_avg_per_rank": json_finite_or_none(avg_baseline_tflops),
             "fused_compute_efficiency_pct": pct(avg_tflops, DCU_REFERENCE_FP8_PEAK_TFLOPS_PER_CARD),
-            "baseline_compute_efficiency_pct": pct(avg_baseline_tflops, DCU_REFERENCE_FP8_PEAK_TFLOPS_PER_CARD),
+            "baseline_compute_efficiency_pct": json_finite_or_none(pct(avg_baseline_tflops, DCU_REFERENCE_FP8_PEAK_TFLOPS_PER_CARD)),
             "dcu_w8a8_hbm_bytes_avg_per_rank": avg_num_hbm_bytes,
             "fused_dcu_w8a8_hbm_effective_gbps": avg_hbm_gbs,
             "fused_dcu_w8a8_hbm_efficiency_pct": pct(avg_hbm_gbs, DCU_REFERENCE_HBM_GBPS_PER_CARD),
-            "baseline_dcu_w8a8_hbm_effective_gbps": avg_baseline_hbm_gbs,
-            "baseline_dcu_w8a8_hbm_efficiency_pct": pct(avg_baseline_hbm_gbs, DCU_REFERENCE_HBM_GBPS_PER_CARD),
+            "baseline_dcu_w8a8_hbm_effective_gbps": json_finite_or_none(avg_baseline_hbm_gbs),
+            "baseline_dcu_w8a8_hbm_efficiency_pct": json_finite_or_none(pct(avg_baseline_hbm_gbs, DCU_REFERENCE_HBM_GBPS_PER_CARD)),
             "dcu_w8a8_xhcl_bytes_avg_per_rank": avg_num_xhcl_bytes,
             "fused_dcu_w8a8_xhcl_effective_gbps": avg_xhcl_gbs,
             "fused_dcu_w8a8_xhcl_efficiency_pct": pct(avg_xhcl_gbs, DCU_REFERENCE_XHCL_GBPS_PER_CARD),
-            "baseline_dcu_w8a8_xhcl_effective_gbps": avg_baseline_xhcl_gbs,
-            "baseline_dcu_w8a8_xhcl_efficiency_pct": pct(avg_baseline_xhcl_gbs, DCU_REFERENCE_XHCL_GBPS_PER_CARD),
+            "baseline_dcu_w8a8_xhcl_effective_gbps": json_finite_or_none(avg_baseline_xhcl_gbs),
+            "baseline_dcu_w8a8_xhcl_efficiency_pct": json_finite_or_none(pct(avg_baseline_xhcl_gbs, DCU_REFERENCE_XHCL_GBPS_PER_CARD)),
         }
         print("Performance:")
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
-        print(
-            f" > EP: {rank:2}/{num_ranks} | "
-            f"{avg_tflops:4.2f} TFLOPS, "
-            f"HBM {avg_hbm_gbs:4.2f} GB/s, "
-            f"xHCL {avg_xhcl_gbs:4.2f} GB/s | "
-            f"{avg_fused_s * 1e6:4.0f} us | "
-            f"{result['speedup_vs_deepep_deepgemm_baseline']:.2f}x baseline "
-            f"(baseline {avg_baseline_tflops:4.2f} TFLOPS, "
-            f"HBM {avg_baseline_hbm_gbs:4.2f} GB/s, "
-            f"xHCL {avg_baseline_xhcl_gbs:4.2f} GB/s)",
-            flush=True,
-        )
+        if args.skip_baseline_bench:
+            print(
+                f" > EP: {rank:2}/{num_ranks} | "
+                f"{avg_tflops:4.2f} TFLOPS, "
+                f"HBM {avg_hbm_gbs:4.2f} GB/s, "
+                f"xHCL {avg_xhcl_gbs:4.2f} GB/s | "
+                f"{avg_fused_s * 1e6:4.0f} us | baseline skipped",
+                flush=True,
+            )
+        else:
+            print(
+                f" > EP: {rank:2}/{num_ranks} | "
+                f"{avg_tflops:4.2f} TFLOPS, "
+                f"HBM {avg_hbm_gbs:4.2f} GB/s, "
+                f"xHCL {avg_xhcl_gbs:4.2f} GB/s | "
+                f"{avg_fused_s * 1e6:4.0f} us | "
+                f"{result['speedup_vs_deepep_deepgemm_baseline']:.2f}x baseline "
+                f"(baseline {avg_baseline_tflops:4.2f} TFLOPS, "
+                f"HBM {avg_baseline_hbm_gbs:4.2f} GB/s, "
+                f"xHCL {avg_baseline_xhcl_gbs:4.2f} GB/s)",
+                flush=True,
+            )
         if args.out:
             out_path = Path(args.out)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    dist.barrier(group=group)
     sym_buffer.destroy()
+    if ep_buffer is not None:
+        dist.barrier(group=group)
     if ep_buffer is not None:
         ep_buffer.destroy()
     dist.barrier(group=group)
@@ -1555,6 +1614,11 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--skip-bench", action="store_true")
+    parser.add_argument(
+        "--skip-baseline-bench",
+        action="store_true",
+        help="benchmark MegaMoE only; correctness still requires the selected baseline",
+    )
     parser.add_argument("--megamoe-backend", choices=("auto", "ll", "normal"),
                         default=os.getenv(BACKEND_ENV, V3_BACKEND_AUTO),
                         help=f"V3 backend selector used by this test; defaults to {BACKEND_ENV}=auto. "

@@ -198,6 +198,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "use_compact_prebuild ? 2u : 4u" not in k1_asm_ext
     assert "kK1AutoCompactMinLocalTileSaving" in k1_asm_ext
     assert "kK1AutoCompactHighTilesPerExpert" in k1_asm_ext
+    assert "force_compact_prebuild || num_ranks > 8" in k1_asm_ext
     assert "label_SymmRouteStoreAbsolutePtr" not in k1_asm_sources
     assert "label_SymmStageLoadAbsolutePtr" not in k1_asm_sources
     assert "absolute 64-bit" not in k1_asm_sources
@@ -245,6 +246,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "ll_split_tail: bool = False" in k3_py
     assert "def _tail_reduce_enabled_for_backend" in opt_py
     assert "if v3_backend == V3_BACKEND_LL:\n        return True" in opt_py
+    assert "if int(num_ranks) > 8:\n        return False" in opt_py
     assert "LL no-tail / tail-reduce-0 path has been retired" not in opt_py
     assert "DCU MegaMoE LL no-tail path has been retired" not in opt_py
     assert "MEGAMOE_DCU_LL_K3_SPLIT_TAIL_CHUNK_READY" not in opt_py
@@ -559,6 +561,6 @@ def test_v3_supernode_source_support():
     assert "kExperts, 4096, 2048" in k3_ext
     assert "open_hip_fabric_handles" in python_api_source
     assert "hsa_ext_rpc_memory_attach" in python_api_source
-    assert "MEGAMOE_DCU_SUPERNODE" in init_source
+    assert "return int(num_ranks) > int(local_device_count)" in init_source
     assert "build_libraries = ['hsa-runtime64']" in setup_source
     assert "addrs = [0] * (2 * int(num_ranks))" in k3_py

@@ -924,7 +924,13 @@ k1_symm_fused_l1_asm_impl(
                 route_capacity_headroom_rows(expected_per_expert));
     const int64_t fixed_capacity_tiles_per_expert =
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
-    bool use_compact_prebuild = force_compact_prebuild;
+    // The in-ASM route builder was tuned around the original EP8 fixed-local
+    // layout. EP16/EP32 have fewer local experts and can fault in that path, so
+    // default those shapes to the HIP compact prebuild while keeping an explicit
+    // K1_PREBUILD_MODE=asm/asm_route escape hatch for ablation.
+    const bool default_compact_prebuild =
+        force_compact_prebuild || num_ranks > 8;
+    bool use_compact_prebuild = default_compact_prebuild;
     bool force_asm_route = false;
     if (!force_compact_prebuild) {
         if (const char* mode = std::getenv("K1_PREBUILD_MODE")) {
@@ -935,7 +941,9 @@ k1_symm_fused_l1_asm_impl(
                     std::strcmp(mode, "compact") == 0,
                 "K1_PREBUILD_MODE supports only auto/asm/compact; fixed prebuild "
                 "is intentionally disabled for K1_fused");
-            use_compact_prebuild = std::strcmp(mode, "compact") == 0;
+            use_compact_prebuild = std::strcmp(mode, "auto") == 0
+                ? default_compact_prebuild
+                : std::strcmp(mode, "compact") == 0;
             force_asm_route =
                 std::strcmp(mode, "asm") == 0 ||
                 std::strcmp(mode, "asm_route") == 0;
@@ -948,11 +956,15 @@ k1_symm_fused_l1_asm_impl(
     }
     const int64_t fixed_capacity_tiles =
         local_experts * fixed_capacity_tiles_per_expert;
+    const bool force_fixed_compact_capacity =
+        use_compact_prebuild && num_ranks > 8;
     const int64_t capacity_tiles = use_compact_prebuild
-                                       ? compact_capacity_tiles(
-                                             capacity_total_tasks, num_experts,
-                                             local_experts,
-                                             fixed_capacity_tiles_per_expert)
+                                       ? (force_fixed_compact_capacity
+                                              ? fixed_capacity_tiles
+                                              : compact_capacity_tiles(
+                                              capacity_total_tasks, num_experts,
+                                              local_experts,
+                                              fixed_capacity_tiles_per_expert))
                                        : fixed_capacity_tiles;
     const int64_t capacity_rows = capacity_tiles * kK1RouteTileM;
     const int64_t route_workspace_bytes =
@@ -966,12 +978,14 @@ k1_symm_fused_l1_asm_impl(
         scratch_offset = offset + bytes;
         return offset;
     };
-    // Route header:
-    // counts[32], tile_bases[33], tile_experts[capacity_tiles].
-    // The asm-route candidate additionally uses expert_tile_to_compact
-    // [capacity_tiles] and per-row-tile stage flags [capacity_tiles * 16].
-    reserve_scratch((local_experts + local_experts + 1 + capacity_tiles +
-                     capacity_tiles + capacity_tiles * 16) *
+    // Route header: compact prebuild uses counts[32], tile_bases[32],
+    // active_tiles, tile_experts[capacity_tiles]. The asm-route candidate adds
+    // expert_tile_to_compact[capacity_tiles] and per-row-tile stage flags.
+    const int64_t compact_header_i32 = 65 + capacity_tiles;
+    const int64_t asm_route_header_i32 =
+        local_experts + local_experts + 1 + capacity_tiles +
+        capacity_tiles + capacity_tiles * 16;
+    reserve_scratch(std::max(compact_header_i32, asm_route_header_i32) *
                     static_cast<int64_t>(sizeof(int32_t)));
     const int64_t row_combine_ptrs_offset =
         reserve_scratch((capacity_rows + kK1RowPointerPadding) *

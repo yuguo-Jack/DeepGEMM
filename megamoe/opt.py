@@ -25,6 +25,7 @@ from .dcu_megamoe_opt.v3_config import V3_BACKEND_LL, normalize_v3_backend
 K_K1_ROUTE_TILE_M = 256
 K_K1_ALIGNMENT = 256
 K_K1_ROUTE_CAPACITY_SLACK = 64
+K_K1_ROUTE_CAPACITY_SLACK_DIVISOR = 10
 K_K1_LL_ROW_TILE = 64
 K_K1_LL_HEADROOM_EXPECTED_ROWS_THRESHOLD = 48
 K_K1_LL_HEADROOM_ROWS = 64
@@ -73,9 +74,11 @@ def k3_tail_reduce_enabled() -> bool:
     return value in {"1", "true", "yes", "on", "tail-reduce"}
 
 
-def _tail_reduce_enabled_for_backend(v3_backend: str) -> bool:
+def _tail_reduce_enabled_for_backend(v3_backend: str, num_ranks: int) -> bool:
     if v3_backend == V3_BACKEND_LL:
         return True
+    if int(num_ranks) > 8:
+        return False
     return k3_tail_reduce_enabled()
 
 
@@ -103,6 +106,13 @@ def _align(value: int, alignment: int) -> int:
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _k1_route_capacity_headroom_rows(expected_per_expert: int) -> int:
+    return max(
+        K_K1_ROUTE_CAPACITY_SLACK,
+        _ceil_div(expected_per_expert, K_K1_ROUTE_CAPACITY_SLACK_DIVISOR),
+    )
 
 
 def _dcu_tail_signal_slot_base(num_ranks: int) -> int:
@@ -162,7 +172,7 @@ def _v3_staged_capacity_rows(
     expected_per_expert = _ceil_div(total_tasks, num_experts)
     rows_per_expert_target = max(
         K_K1_ALIGNMENT,
-        expected_per_expert + K_K1_ROUTE_CAPACITY_SLACK,
+        expected_per_expert + _k1_route_capacity_headroom_rows(expected_per_expert),
     )
     fixed_capacity_tiles_per_expert = _ceil_div(
         rows_per_expert_target,
@@ -502,7 +512,7 @@ def fp8_mega_moe_opt_3stage(
 
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
-    use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend)
+    use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend, num_ranks)
     use_ll_split_tail = _ll_k3_split_tail_enabled_for_tokens(v3_backend, num_tokens)
     state = _state(
         sym_buffer,
@@ -538,7 +548,11 @@ def fp8_mega_moe_opt_3stage(
             verbose_build=verbose_build,
         )
 
-    force_safe_compact = num_tokens == 0 or route_capacity_num_tokens > num_tokens
+    force_safe_compact = (
+        num_tokens == 0
+        or route_capacity_num_tokens > num_tokens
+        or num_ranks > 8
+    )
     k1_launcher = k1_symm_fused_l1_v3
     k1_kwargs = dict(
         rank_idx=rank_idx,
@@ -710,7 +724,7 @@ def _run_opt_3stage_graph(
 
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
-    use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend)
+    use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend, num_ranks)
     use_ll_split_tail = _ll_k3_split_tail_enabled_for_tokens(
         v3_backend, graph_max_tokens
     )

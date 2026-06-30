@@ -11,6 +11,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "apis/mega_dcu.hpp"
@@ -130,11 +131,15 @@ static pybind11::bytes make_fabric_handle_bytes(void* ptr, const int64_t num_byt
         reinterpret_cast<const char*>(&handle), sizeof(hsa_ext_rpc_memory_t));
 }
 
+static pybind11::bytes make_hip_ipc_handle_bytes(void* ptr) {
+    hipIpcMemHandle_t handle{};
+    DG_HIP_CHECK(hipIpcGetMemHandle(&handle, ptr));
+    return pybind11::bytes(handle.reserved, HIP_IPC_HANDLE_SIZE);
+}
+
 static pybind11::bytes get_hip_ipc_handle(const torch::Tensor& tensor) {
     TORCH_CHECK(tensor.is_cuda(), "HIP IPC handle requires a CUDA/HIP tensor");
-    hipIpcMemHandle_t handle{};
-    DG_HIP_CHECK(hipIpcGetMemHandle(&handle, reinterpret_cast<void*>(tensor.data_ptr())));
-    return pybind11::bytes(handle.reserved, HIP_IPC_HANDLE_SIZE);
+    return make_hip_ipc_handle_bytes(reinterpret_cast<void*>(tensor.data_ptr()));
 }
 
 static pybind11::tuple allocate_hip_ipc_buffer(const int64_t& num_bytes) {
@@ -171,6 +176,23 @@ static pybind11::tuple allocate_hip_fabric_buffer(const int64_t& num_bytes) {
         make_fabric_handle_bytes(ptr, num_bytes));
 }
 
+static pybind11::tuple allocate_hip_hybrid_buffer(const int64_t& num_bytes) {
+    TORCH_CHECK(num_bytes > 0, "HIP hybrid buffer size must be positive");
+    void* ptr = nullptr;
+    DG_HIP_CHECK(hipExtMallocWithFlags(&ptr, static_cast<size_t>(num_bytes), hipDeviceMallocFinegrained));
+    DG_HIP_CHECK(hipMemset(ptr, 0, static_cast<size_t>(num_bytes)));
+
+    auto tensor = torch::from_blob(
+        ptr,
+        {num_bytes},
+        torch::TensorOptions().dtype(torch::kInt8).device(torch::kCUDA));
+    return pybind11::make_tuple(
+        tensor,
+        reinterpret_cast<int64_t>(ptr),
+        make_hip_ipc_handle_bytes(ptr),
+        make_fabric_handle_bytes(ptr, num_bytes));
+}
+
 static pybind11::tuple allocate_hip_fabric_signal_buffer(const int64_t& num_bytes) {
     TORCH_CHECK(num_bytes > 0, "HIP fabric signal buffer size must be positive");
     void* ptr = nullptr;
@@ -179,6 +201,18 @@ static pybind11::tuple allocate_hip_fabric_signal_buffer(const int64_t& num_byte
 
     return pybind11::make_tuple(
         reinterpret_cast<int64_t>(ptr),
+        make_fabric_handle_bytes(ptr, num_bytes));
+}
+
+static pybind11::tuple allocate_hip_hybrid_signal_buffer(const int64_t& num_bytes) {
+    TORCH_CHECK(num_bytes > 0, "HIP hybrid signal buffer size must be positive");
+    void* ptr = nullptr;
+    DG_HIP_CHECK(hipExtMallocWithFlags(&ptr, static_cast<size_t>(num_bytes), hipDeviceMallocUncached));
+    DG_HIP_CHECK(hipMemset(ptr, 0, static_cast<size_t>(num_bytes)));
+
+    return pybind11::make_tuple(
+        reinterpret_cast<int64_t>(ptr),
+        make_hip_ipc_handle_bytes(ptr),
         make_fabric_handle_bytes(ptr, num_bytes));
 }
 
@@ -193,6 +227,63 @@ static pybind11::tuple allocate_hip_ipc_signal_buffer(const int64_t& num_bytes) 
     return pybind11::make_tuple(
         reinterpret_cast<int64_t>(ptr),
         pybind11::bytes(handle.reserved, HIP_IPC_HANDLE_SIZE));
+}
+
+static std::pair<int64_t, int> open_one_hip_hybrid_handle(
+    const pybind11::bytes& ipc_handle_bytes,
+    const pybind11::bytes& fabric_handle_bytes,
+    const bool use_ipc,
+    const hsa_agent_t& agent) {
+    if (use_ipc) {
+        const std::string handle_str = ipc_handle_bytes;
+        TORCH_CHECK(handle_str.size() == HIP_IPC_HANDLE_SIZE, "invalid HIP IPC handle size");
+
+        hipIpcMemHandle_t handle{};
+        std::memcpy(handle.reserved, handle_str.data(), HIP_IPC_HANDLE_SIZE);
+
+        void* ptr = nullptr;
+        DG_HIP_CHECK(hipIpcOpenMemHandle(&ptr, handle, hipIpcMemLazyEnablePeerAccess));
+        return {reinterpret_cast<int64_t>(ptr), 0};
+    }
+
+    const std::string handle_str = fabric_handle_bytes;
+    TORCH_CHECK(handle_str.size() == sizeof(hsa_ext_rpc_memory_t),
+                "invalid HIP fabric handle size");
+
+    hsa_ext_rpc_memory_t handle{};
+    std::memcpy(&handle, handle_str.data(), sizeof(hsa_ext_rpc_memory_t));
+
+    void* ptr = nullptr;
+    DG_HSA_CHECK(hsa_ext_rpc_memory_attach(&handle, 1, &agent, &ptr));
+    return {reinterpret_cast<int64_t>(ptr), 1};
+}
+
+static pybind11::tuple open_hip_hybrid_handles(
+    const std::vector<pybind11::bytes>& ipc_handles,
+    const std::vector<pybind11::bytes>& fabric_handles,
+    const int& local_rank,
+    const std::vector<int>& local_peer_mask) {
+    const int num_handles = static_cast<int>(ipc_handles.size());
+    TORCH_CHECK(num_handles == static_cast<int>(fabric_handles.size()),
+                "hybrid IPC and fabric handle counts must match");
+    TORCH_CHECK(num_handles == static_cast<int>(local_peer_mask.size()),
+                "hybrid local_peer_mask size must match handle count");
+    TORCH_CHECK(local_rank >= 0 && local_rank < num_handles,
+                "local_rank is out of bounds for HIP hybrid handles");
+
+    const hsa_agent_t agent = get_current_device_agent();
+    std::vector<int64_t> ptrs(num_handles, 0);
+    std::vector<int> fabric_opened(num_handles, 0);
+    for (int i = 0; i < num_handles; ++i) {
+        if (i == local_rank)
+            continue;
+        const bool same_node = local_peer_mask[i] != 0;
+        auto opened = open_one_hip_hybrid_handle(
+            ipc_handles[i], fabric_handles[i], same_node, agent);
+        ptrs[i] = opened.first;
+        fabric_opened[i] = opened.second;
+    }
+    return pybind11::make_tuple(ptrs, fabric_opened);
 }
 
 static std::vector<int64_t> open_hip_fabric_handles(const std::vector<pybind11::bytes>& handles,
@@ -286,8 +377,11 @@ static void register_apis(pybind11::module_& m) {
     m.def("allocate_hip_ipc_signal_buffer", &allocate_hip_ipc_signal_buffer);
     m.def("allocate_hip_fabric_buffer", &allocate_hip_fabric_buffer);
     m.def("allocate_hip_fabric_signal_buffer", &allocate_hip_fabric_signal_buffer);
+    m.def("allocate_hip_hybrid_buffer", &allocate_hip_hybrid_buffer);
+    m.def("allocate_hip_hybrid_signal_buffer", &allocate_hip_hybrid_signal_buffer);
     m.def("open_hip_ipc_handles", &open_hip_ipc_handles);
     m.def("open_hip_fabric_handles", &open_hip_fabric_handles);
+    m.def("open_hip_hybrid_handles", &open_hip_hybrid_handles);
     m.def("close_hip_ipc_handles", &close_hip_ipc_handles);
     m.def("close_hip_fabric_handles", &close_hip_fabric_handles);
     m.def("free_hip_ipc_buffer", &free_hip_ipc_signal_buffer);

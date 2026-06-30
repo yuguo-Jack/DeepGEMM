@@ -1,0 +1,4 @@
+interface:
+  display_name: "TX32 Supernode Workflow"
+  short_description: "Operate the two-node 32-card TX supernode safely."
+  default_prompt: "Use $tx32-supernode-workflow to verify the TX32 supernode and run a container-side DeepGEMM task."

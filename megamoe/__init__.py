@@ -1,4 +1,5 @@
 import os
+import socket
 from types import SimpleNamespace
 from typing import Any, Optional, Tuple
 
@@ -20,17 +21,32 @@ def _align(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def _env_flag(name: str, default: str = "0") -> bool:
-    value = os.getenv(name, default).strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
 def _is_hip_backend() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
-def _use_supernode_peer_memory(num_ranks: int) -> bool:
-    return int(num_ranks) > 8 or _env_flag("MEGAMOE_DCU_SUPERNODE")
+def _physical_dcu_count_hint() -> int:
+    try:
+        return sum(
+            1
+            for name in os.listdir("/dev/dri")
+            if name.startswith("renderD")
+        )
+    except OSError:
+        return 0
+
+
+def _use_supernode_peer_memory(num_ranks: int, local_device_count: Optional[int] = None) -> bool:
+    if local_device_count is None:
+        local_device_count = torch.cuda.device_count()
+    # TX32 supernode nodes expose 16 local DCUs. Even EP8 sanity runs on those
+    # nodes should exercise the Fabric/RPC-backed symmetric buffer, while the
+    # original 8-DCU environment keeps the lower-overhead HIP IPC path.
+    return (
+        _physical_dcu_count_hint() > 8
+        or int(local_device_count) > 8
+        or int(num_ranks) > int(local_device_count)
+    )
 
 
 _DSV4_FLASH_SUPPORTED_EP_RANKS = (8, 16, 32)
@@ -252,6 +268,33 @@ def weight8bit_nt_kpack2_marlin(
     )
 
 
+def weight8bit_nt_kpack2_marlin_contiguous(
+    weight: torch.Tensor,
+    k_tile: int = 16,
+    k_tile_group: int = 4,
+    n_tile: int = 16,
+) -> torch.Tensor:
+    if weight.dim() != 3:
+        raise ValueError("contiguous DeepGEMM Marlin weight layout expects a 3D grouped weight tensor")
+    if k_tile != 16 or k_tile_group != 4 or n_tile != 16:
+        raise ValueError("DCU contiguous DeepGEMM currently supports only 16x4 by 16 tiles")
+    num_groups, rows, k = weight.shape
+    if rows % n_tile != 0 or k % (k_tile * k_tile_group) != 0:
+        raise ValueError("contiguous DeepGEMM Marlin weights require rows divisible by 16 and K divisible by 64")
+    return (
+        weight.reshape(
+            num_groups,
+            rows // n_tile,
+            n_tile,
+            k // (k_tile * k_tile_group),
+            k_tile_group,
+            k_tile,
+        )
+        .permute(0, 3, 1, 4, 2, 5)
+        .contiguous()
+    )
+
+
 def weight8bit_nt_kpack2_marlin_masked(
     weight: torch.Tensor,
     k_tile: int = 16,
@@ -381,42 +424,63 @@ class SymmBuffer:
             activation,
         )
 
-        use_supernode_peer_memory = _use_supernode_peer_memory(group.size())
-        alloc_buffer = (
-            _C.allocate_hip_fabric_buffer
-            if use_supernode_peer_memory
-            else _C.allocate_hip_ipc_buffer
+        use_hybrid_peer_memory = _use_supernode_peer_memory(
+            group.size(), torch.cuda.device_count()
         )
-        alloc_signal_buffer = (
-            _C.allocate_hip_fabric_signal_buffer
-            if use_supernode_peer_memory
-            else _C.allocate_hip_ipc_signal_buffer
-        )
-        open_handles = (
-            _C.open_hip_fabric_handles
-            if use_supernode_peer_memory
-            else _C.open_hip_ipc_handles
-        )
-        peer_memory_mode = "fabric" if use_supernode_peer_memory else "ipc"
+        peer_memory_mode = "hybrid" if use_hybrid_peer_memory else "ipc"
 
-        self.buffer, buffer_ptr, local_handle = alloc_buffer(num_bytes)
+        if use_hybrid_peer_memory:
+            self.buffer, buffer_ptr, local_ipc_handle, local_fabric_handle = (
+                _C.allocate_hip_hybrid_buffer(num_bytes)
+            )
+            ipc_handles = [None] * group.size()
+            fabric_handles = [None] * group.size()
+            dist.all_gather_object(ipc_handles, local_ipc_handle, group)
+            dist.all_gather_object(fabric_handles, local_fabric_handle, group)
+            hostnames = [None] * group.size()
+            dist.all_gather_object(hostnames, socket.gethostname(), group)
+            local_hostname = hostnames[group.rank()]
+            local_peer_mask = [1 if host == local_hostname else 0 for host in hostnames]
+            buffer_ptrs, buffer_fabric_opened = _C.open_hip_hybrid_handles(
+                ipc_handles, fabric_handles, group.rank(), local_peer_mask
+            )
+        else:
+            self.buffer, buffer_ptr, local_handle = _C.allocate_hip_ipc_buffer(num_bytes)
+            ipc_handles = [None] * group.size()
+            dist.all_gather_object(ipc_handles, local_handle, group)
+            buffer_ptrs = _C.open_hip_ipc_handles(ipc_handles, group.rank())
+            buffer_fabric_opened = [0] * group.size()
+
         self.route_scratch = torch.empty(
             (route_scratch_num_bytes,),
             dtype=torch.int8,
             device="cuda",
         )
-        ipc_handles = [None] * group.size()
-        dist.all_gather_object(ipc_handles, local_handle, group)
-        buffer_ptrs = open_handles(ipc_handles, group.rank())
         buffer_ptrs[group.rank()] = buffer_ptr
 
         # EP8 keeps the historical signal layout. EP16/EP32 use dynamic slots
         # so tail/copy, barrier, and chunk-ready signals never overlap.
         signal_num_bytes = _align(_dcu_required_signal_slots(group.size()) * 4, 128)
-        signal_ptr, signal_handle = alloc_signal_buffer(signal_num_bytes)
-        signal_handles = [None] * group.size()
-        dist.all_gather_object(signal_handles, signal_handle, group)
-        signal_ptrs = open_handles(signal_handles, group.rank())
+        if use_hybrid_peer_memory:
+            signal_ptr, signal_ipc_handle, signal_fabric_handle = (
+                _C.allocate_hip_hybrid_signal_buffer(signal_num_bytes)
+            )
+            signal_ipc_handles = [None] * group.size()
+            signal_fabric_handles = [None] * group.size()
+            dist.all_gather_object(signal_ipc_handles, signal_ipc_handle, group)
+            dist.all_gather_object(signal_fabric_handles, signal_fabric_handle, group)
+            signal_ptrs, signal_fabric_opened = _C.open_hip_hybrid_handles(
+                signal_ipc_handles,
+                signal_fabric_handles,
+                group.rank(),
+                local_peer_mask,
+            )
+        else:
+            signal_ptr, signal_handle = _C.allocate_hip_ipc_signal_buffer(signal_num_bytes)
+            signal_handles = [None] * group.size()
+            dist.all_gather_object(signal_handles, signal_handle, group)
+            signal_ptrs = _C.open_hip_ipc_handles(signal_handles, group.rank())
+            signal_fabric_opened = [0] * group.size()
         signal_ptrs[group.rank()] = signal_ptr
         self.handle = SimpleNamespace(
             buffer_ptrs=buffer_ptrs,
@@ -424,6 +488,8 @@ class SymmBuffer:
             signal_ptrs=signal_ptrs,
             signal_buffer_ptr=signal_ptr,
             peer_memory_mode=peer_memory_mode,
+            buffer_fabric_opened=buffer_fabric_opened,
+            signal_fabric_opened=signal_fabric_opened,
         )
 
         self.buffer.zero_()
@@ -464,9 +530,37 @@ class SymmBuffer:
                 ptr if rank != self.group.rank() else 0
                 for rank, ptr in enumerate(self.handle.signal_ptrs)
             ]
-            if getattr(self.handle, "peer_memory_mode", "ipc") == "fabric":
+            peer_memory_mode = getattr(self.handle, "peer_memory_mode", "ipc")
+            if peer_memory_mode == "fabric":
                 _C.close_hip_fabric_handles(remote_ptrs)
                 _C.close_hip_fabric_handles(remote_signal_ptrs)
+            elif peer_memory_mode == "hybrid":
+                buffer_fabric_opened = getattr(
+                    self.handle, "buffer_fabric_opened", [0] * len(remote_ptrs)
+                )
+                signal_fabric_opened = getattr(
+                    self.handle, "signal_fabric_opened", [0] * len(remote_signal_ptrs)
+                )
+                buffer_ipc_ptrs = [
+                    0 if int(is_fabric) else ptr
+                    for ptr, is_fabric in zip(remote_ptrs, buffer_fabric_opened)
+                ]
+                buffer_fabric_ptrs = [
+                    ptr if int(is_fabric) else 0
+                    for ptr, is_fabric in zip(remote_ptrs, buffer_fabric_opened)
+                ]
+                signal_ipc_ptrs = [
+                    0 if int(is_fabric) else ptr
+                    for ptr, is_fabric in zip(remote_signal_ptrs, signal_fabric_opened)
+                ]
+                signal_fabric_ptrs = [
+                    ptr if int(is_fabric) else 0
+                    for ptr, is_fabric in zip(remote_signal_ptrs, signal_fabric_opened)
+                ]
+                _C.close_hip_ipc_handles(buffer_ipc_ptrs)
+                _C.close_hip_ipc_handles(signal_ipc_ptrs)
+                _C.close_hip_fabric_handles(buffer_fabric_ptrs)
+                _C.close_hip_fabric_handles(signal_fabric_ptrs)
             else:
                 _C.close_hip_ipc_handles(remote_ptrs)
                 _C.close_hip_ipc_handles(remote_signal_ptrs)
@@ -732,6 +826,7 @@ __all__ = [
     "mega_moe_pre_dispatch",
     "cast_grouped_weight_to_fp8_channelwise",
     "weight8bit_nt_kpack2_marlin",
+    "weight8bit_nt_kpack2_marlin_contiguous",
     "weight8bit_nt_kpack2_marlin_masked",
     "get_mega_moe_hip_build_config",
     "get_symm_buffer_for_mega_moe",
