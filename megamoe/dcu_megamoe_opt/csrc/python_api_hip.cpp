@@ -53,6 +53,11 @@ static void ensure_hsa_initialized() {
     });
 }
 
+static int64_t align_fabric_bytes(const int64_t num_bytes) {
+    constexpr int64_t kFabricAlignmentBytes = 2 * 1024 * 1024;
+    return (num_bytes + kFabricAlignmentBytes - 1) & ~(kFabricAlignmentBytes - 1);
+}
+
 static bool bus_id_to_int64(const char* bus_id, int64_t* id) {
     char hex_str[17];
     int hex_offset = 0;
@@ -162,9 +167,10 @@ static pybind11::tuple allocate_hip_ipc_buffer(const int64_t& num_bytes) {
 
 static pybind11::tuple allocate_hip_fabric_buffer(const int64_t& num_bytes) {
     TORCH_CHECK(num_bytes > 0, "HIP fabric buffer size must be positive");
+    const int64_t alloc_bytes = align_fabric_bytes(num_bytes);
     void* ptr = nullptr;
-    DG_HIP_CHECK(hipExtMallocWithFlags(&ptr, static_cast<size_t>(num_bytes), hipDeviceMallocFinegrained));
-    DG_HIP_CHECK(hipMemset(ptr, 0, static_cast<size_t>(num_bytes)));
+    DG_HIP_CHECK(hipExtMallocWithFlags(&ptr, static_cast<size_t>(alloc_bytes), hipDeviceMallocFinegrained));
+    DG_HIP_CHECK(hipMemset(ptr, 0, static_cast<size_t>(alloc_bytes)));
 
     auto tensor = torch::from_blob(
         ptr,
@@ -173,18 +179,19 @@ static pybind11::tuple allocate_hip_fabric_buffer(const int64_t& num_bytes) {
     return pybind11::make_tuple(
         tensor,
         reinterpret_cast<int64_t>(ptr),
-        make_fabric_handle_bytes(ptr, num_bytes));
+        make_fabric_handle_bytes(ptr, alloc_bytes));
 }
 
 static pybind11::tuple allocate_hip_fabric_signal_buffer(const int64_t& num_bytes) {
     TORCH_CHECK(num_bytes > 0, "HIP fabric signal buffer size must be positive");
+    const int64_t alloc_bytes = align_fabric_bytes(num_bytes);
     void* ptr = nullptr;
-    DG_HIP_CHECK(hipExtMallocWithFlags(&ptr, static_cast<size_t>(num_bytes), hipDeviceMallocFinegrained));
-    DG_HIP_CHECK(hipMemset(ptr, 0, static_cast<size_t>(num_bytes)));
+    DG_HIP_CHECK(hipExtMallocWithFlags(&ptr, static_cast<size_t>(alloc_bytes), hipDeviceMallocFinegrained));
+    DG_HIP_CHECK(hipMemset(ptr, 0, static_cast<size_t>(alloc_bytes)));
 
     return pybind11::make_tuple(
         reinterpret_cast<int64_t>(ptr),
-        make_fabric_handle_bytes(ptr, num_bytes));
+        make_fabric_handle_bytes(ptr, alloc_bytes));
 }
 
 static pybind11::tuple allocate_hip_ipc_signal_buffer(const int64_t& num_bytes) {

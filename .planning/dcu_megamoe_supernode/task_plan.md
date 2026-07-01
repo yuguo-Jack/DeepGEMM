@@ -63,6 +63,13 @@ Status: [ ] active on TX32
 - ✅ EP16 process-group smoke test: buffer allocation, pointer exchange, `set_mega_moe_peer_ptrs`, pre-dispatch, K1-only, K3 no-reduce, and default normal fused smoke.
 - ✅ EP16 correctness bring-up fixes: single-node IPC peer mode, K1 compact prebuild default for `num_ranks > 8`, and normal K3 ASM tail-reduce disabled for `num_ranks > 8`.
 - [ ] Re-run IPC default and `MEGAMOE_DCU_PEER_MEMORY=rpc` Fabric/RPC smoke once hardware is available; EP size should not affect peer-memory selection.
+- ✅ 151.1 EP8 8-card RPC smoke on devices `0..7`: `LL graph`, `LL eager`, `normal eager`, `normal graph`, `LL graph uneven`, and `normal eager uneven` pass with `normal-contiguous` baseline after Fabric buffer export size was aligned to 2 MiB.
+- [ ] 151.1 true EP16 RPC validation is currently blocked by active `chl_sgl0512` card occupancy, not by a reproducible device15 failure. On 2026-07-01, device15 small torch allocation succeeds in both `chl_sgl0512` and restarted `sglang_megamoe`.
+- ✅ 151.1 EP8 RPC `normal eager 4096` passed after the node became idle: correct, MegaMoE `5.7636 ms`, baseline `10.0042 ms`.
+- ✅ 151.1 EP16 RPC `LL graph` capture512 passed for replay `8,32,64,128,256,512`: correct, graph replay medians `0.3749/0.4069/0.4769/0.5977/0.9869/1.9228 ms`.
+- ✅ 151.1 EP16 RPC `normal eager` matrix is complete through `5120`: `512/1024/1025/2048/2050/4096/4097/5120` are correct and faster than baseline.
+- ✅ 151.1 EP16 RPC `normal eager 8192` MegaMoE-only timing is collected (`12.6043 ms`); full baseline correctness passes, but baseline benchmark times out after 420s, so stable EP16 baseline timing is not available for this bucket.
+- ✅ Baseline comparison on 151.1 shows EP16 baseline is also mildly slower than EP8 at large tokens (`+3.4%` at 4096, `+6.9%` at 5120), suggesting the EP16 large-token gap is partly shared by the baseline communication path.
 - 🚫 Do not keep chasing the yuguo old-DeepGEMM baseline as the primary validator in the current TX32 torch runtime. It is ABI/storage-sensitive; use the current environment DeepGEMM with contiguous baseline weight layout for dcu_mega_v3/supernode A/B checks.
 - [ ] Build the HIP wheel on node69 once it is free, because TX32 nodes do not share compiled artifacts.
 - [ ] EP32 process-group smoke test: cross-node Fabric/RPC peer memory, buffer allocation, pointer exchange, `set_mega_moe_peer_ptrs`, and destroy cleanup.

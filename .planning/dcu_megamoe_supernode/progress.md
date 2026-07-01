@@ -282,3 +282,54 @@
 - ✅ Re-scanned the supernode deltas and found no remaining hostname/device-count based peer-memory selection. Rank-count checks that remain are shape/path guardrails only, such as forcing K1 compact prebuild for EP16/EP32.
 - ✅ Verified local syntax and whitespace checks: `python -m py_compile megamoe/__init__.py megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` and `git diff --check`.
 - [ ] Runtime validation remains pending because TX32 nodes are unavailable.
+
+## 2026-06-30 - 151.1 Single-Node 16-Card RPC Validation Bring-Up
+- [ ] Use node `10.17.151.1`, docker `sglang_megamoe`, repo `/root/yuguo/DeepGEMM`, and DTK `/root/yuguo/dtk-26.04.1/env.sh` for EP16 RPC validation.
+- ✅ Confirmed repo sync state: branch `supernode`, commit `f8f892c`.
+- ✅ Confirmed container mount `/root/yuguo -> /root/yuguo`, Ubuntu 22.04.5, DTK hipcc available.
+- ✅ Current card state changed from occupied to idle before testing; `hy-smi --showpids` still reports a tool-side process-directory error, so host `ps` is also used for occupancy checks.
+- ✅ Build MegaMoE inside the container with `MEGAMOE_DCU_PEER_MEMORY=rpc`.
+- [ ] Validate EP16 RPC `LL graph` and `normal eager` first.
+- [ ] If those pass, expand to `LL eager`, `normal graph`, and uneven coverage.
+- ✅ Built MegaMoE successfully on 151.1 with `/root/yuguo/dtk-26.04.1/env.sh`; wheel output under `/root/yuguo/DeepGEMM/build/whl/`.
+- [ ] EP16 RPC validation is currently blocked by device15/container runtime state: `LL graph` crashes before MoE kernels in `_C.allocate_hip_fabric_buffer`, and the reduced single-card smoke `torch.empty(..., device="cuda")` also segfaults with `HIP_VISIBLE_DEVICES=15`. Device14 Fabric alloc succeeds, so this is not yet a MegaMoE kernel failure.
+- ✅ Fixed the first RPC attach issue by matching DeepEP shared-memory allocation behavior: Fabric/RPC exported buffer sizes are now aligned to 2 MiB before `hsa_ext_rpc_memory_create`.
+- [ ] EP8 RPC 8-card smoke with `ll-masked` baseline now reaches DeepEP baseline init but fails inside DeepEP low-latency MNNVL/RDMA setup (`ROCSHMEM_HEAP_SIZE`/`deep_ep.cu:376 invalid argument`). Continue MegaMoE RPC validation with `normal-contiguous` baseline to isolate MegaMoE from DeepEP baseline environment setup.
+- ✅ EP8 RPC 8-card `LL graph` smoke passed with `normal-contiguous` baseline on devices `0..7`: correct, graph replay token 128/cap512 median `0.7549 ms`, eager main-call median `0.7369 ms`, peer mode `fabric`.
+- ✅ EP8 RPC 8-card `normal eager` smoke passed with `normal-contiguous` baseline on devices `0..7`: correct, token 512 median `1.8096 ms`, peer mode `fabric`.
+- ✅ Permission to clean stale SGLang/container state was granted; stale SGLang was killed and docker `sglang_megamoe` was restarted.
+- [ ] True EP16 validation is still blocked after cleanup: host shows no KFD PIDs and device14 torch allocation succeeds, but physical device15 still segfaults on ordinary `torch.empty(..., device="cuda")` and dmesg reports `libgalaxyhip.so.5` segfaults. This needs host-level device/driver reset or a healthy 16-card node before EP16 can be judged.
+- ✅ EP8 RPC 8-card `LL eager` smoke passed on devices `0..7`: correct, token 128/cap512 median `0.7376 ms`, baseline `1.4487 ms`, peer mode `fabric`.
+- ✅ EP8 RPC 8-card `normal graph` smoke passed on devices `0..7`: correct, token 512/cap512 graph replay median `1.6795 ms`, eager main-call median `1.9976 ms`, peer mode `fabric`.
+- ✅ EP8 RPC 8-card `LL graph uneven` smoke passed on devices `0..7` for local tokens `512,257,128,64,32,7,0,0`; graph replay medians for runtime `7/32/128/512` were `0.4939/0.6324/0.7277/0.9089 ms`.
+- ✅ EP8 RPC 8-card `normal eager uneven` smoke passed on devices `0..7` for local tokens `512,257,128,64,32,7,0,0`: correct, median `1.6304 ms`, baseline `1.7379 ms`.
+
+## 2026-07-01 - 151.1 Device15 Recheck While `chl_sgl0512` Is Running
+- ✅ Entered `chl_sgl0512` first because it was actively using the cards. It uses the same image as `sglang_megamoe`, sources `/opt/dtk/env.sh`, sees torch `2.10.0`, and `HIP_VISIBLE_DEVICES=15` small CUDA allocation plus synchronize succeeds.
+- ✅ Restarted existing `sglang_megamoe` container and reran the same device15 checks with `/root/yuguo/dtk-26.04.1/env.sh`; both inline torch allocation and the previous `torch_alloc_smoke.py` now succeed on device15.
+- ✅ Updated conclusion: the earlier device15 `libgalaxyhip.so.5` segfault was a transient container/runtime state, not a reproducible MegaMoE code failure and not a fixed physical-card failure.
+- [ ] `normal eager 4096 EP8` on 151.1 is currently not run because `chl_sgl0512` is actively occupying all 16 cards with large VRAM allocations. Wait for the node to become free or get explicit permission from the owner before killing/interrupting that workload.
+
+## 2026-07-01 - 151.1 RPC EP8/EP16 Performance Pass
+- ✅ Rechecked card state before the run: all 16 HCUs were idle with only 2 MiB VRAM used and no KFD PIDs.
+- ✅ EP8 RPC `normal eager 4096` on devices `0..7` passed: correct, route scratch `0.470 GiB`, MegaMoE median/min `5.7636/5.7153 ms`, normal-contiguous baseline median/min `10.0042/9.8233 ms`, speedup `1.736x`.
+- ✅ EP16 RPC `LL graph` capture512 passed on devices `0..15`: correct, graph replay medians for runtime `8/32/64/128/256/512` were `0.3749/0.4069/0.4769/0.5977/0.9869/1.9228 ms`.
+- ✅ EP16 RPC `normal eager` partial matrix completed before the node SSH became unresponsive:
+  - `512`: correct, MegaMoE `1.2940 ms`, baseline `2.1316 ms`, speedup `1.647x`.
+  - `1024`: correct, MegaMoE `2.0580 ms`, baseline `3.5208 ms`, speedup `1.711x`.
+  - `2050`: correct, MegaMoE `3.5886 ms`, baseline `5.7776 ms`, speedup `1.610x`.
+  - `4096`: correct, MegaMoE `6.5743 ms`, baseline `10.3451 ms`, speedup `1.574x`.
+- [ ] Need to collect the remote JSON/logs after 151.1 SSH recovers. The loop had progressed through at least `1025/2048` and started `4097`, but the terminal output was truncated and then the SSH connection closed during the `4097` run.
+- [ ] Need to resume remaining EP16 normal eager buckets after recovery: `4097,5120,8192` if they did not complete; collect exact `1025/2048` values from JSON.
+- ✅ 151.1 recovered and result JSONs were collected. Exact EP16 RPC `normal eager` values:
+  - `1025`: correct, MegaMoE `2.0536 ms`, baseline `3.4505 ms`, speedup `1.680x`.
+  - `2048`: correct, MegaMoE `3.6066 ms`, baseline `5.7382 ms`, speedup `1.591x`.
+  - `4097`: correct, MegaMoE `6.5976 ms`, baseline `10.3945 ms`, speedup `1.575x`.
+  - `5120`: correct, MegaMoE `8.1738 ms`, baseline `12.6119 ms`, speedup `1.543x`.
+  - `8192`: MegaMoE-only timing with `correctness-iters=0` passed, MegaMoE `12.6043 ms`; full-baseline rerun passed correctness (`max_abs=0.000488281`, `mean_abs=5.56393e-06`) but timed out in benchmark after 420s, so no stable EP16 baseline timing is recorded for this bucket.
+- ✅ EP8 RPC normal eager comparison points on the same 151.1 node:
+  - `4096`: MegaMoE `5.7636 ms`, baseline `10.0042 ms`.
+  - `5120`: MegaMoE `7.3197 ms`, baseline `11.7945 ms`.
+  - `8192`: MegaMoE `10.7700 ms`, baseline `19.0455 ms`.
+- ✅ Baseline observation: EP16 normal-contiguous baseline is slightly slower than EP8 at comparable big-token buckets on this node (`4096`: `10.3451` vs `10.0042 ms`, `+3.4%`; `5120`: `12.6119` vs `11.7945 ms`, `+6.9%`). This supports that part of the EP16 large-token slowdown is also present in the baseline/communication path, not only MegaMoE-specific. EP16 `8192` baseline timing remains unusable because the benchmark phase times out.
+- ✅ EP16 LL graph cap512 replay small-token effective bandwidth estimate from the recorded JSON: replay8 `0.3749 ms` -> estimated HBM `1077.6 GB/s`, xHCL `1.57 GB/s`; replay32 `0.4069 ms` -> estimated HBM `998.6 GB/s`, xHCL `5.80 GB/s`, assuming all 16 local experts are touched. The JSON stores replay latency, not per-bucket bandwidth fields, so these are reconstructed estimates.
