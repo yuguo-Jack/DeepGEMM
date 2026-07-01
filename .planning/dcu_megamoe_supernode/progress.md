@@ -333,3 +333,30 @@
   - `8192`: MegaMoE `10.7700 ms`, baseline `19.0455 ms`.
 - ✅ Baseline observation: EP16 normal-contiguous baseline is slightly slower than EP8 at comparable big-token buckets on this node (`4096`: `10.3451` vs `10.0042 ms`, `+3.4%`; `5120`: `12.6119` vs `11.7945 ms`, `+6.9%`). This supports that part of the EP16 large-token slowdown is also present in the baseline/communication path, not only MegaMoE-specific. EP16 `8192` baseline timing remains unusable because the benchmark phase times out.
 - ✅ EP16 LL graph cap512 replay small-token effective bandwidth estimate from the recorded JSON: replay8 `0.3749 ms` -> estimated HBM `1077.6 GB/s`, xHCL `1.57 GB/s`; replay32 `0.4069 ms` -> estimated HBM `998.6 GB/s`, xHCL `5.80 GB/s`, assuming all 16 local experts are touched. The JSON stores replay latency, not per-bucket bandwidth fields, so these are reconstructed estimates.
+
+## 2026-07-01 - EP16/EP32 Normal Tail-Reduce1 Signal Layout Fix
+- ✅ Root-caused the EP16/EP32 normal tail-reduce1 bug to the K3 ASM tail-reduce signal protocol: the old source only signaled ranks `0..7` and waited on fixed second-half offsets `64..120`, which is only correct for EP8.
+- ✅ Updated both K3 normal tail-reduce ASM sources to signal ranks up to 31 and to choose wait-base offsets from `asm_signal_num_ranks`: EP8 uses base `64`, EP16 uses base `128`, and EP32 uses base `256`.
+- ✅ Removed the Python normal-backend `num_ranks > 8` tail-reduce disable gate. K1 EP16/EP32 still uses compact prebuild; the restored behavior is only for K3 normal ASM tail-reduce.
+- ✅ Rebuilt MegaMoE on 151.1 before the node became unreachable; assembler accepted the expanded macros and the wheel was produced successfully.
+- ✅ EP16 normal tail-reduce1 smoke on 151.1 passed for `512` and `4096`:
+  - `512`: correct, MegaMoE `1.2804 ms`, baseline `2.1008 ms`.
+  - `4096`: correct, MegaMoE `6.8729 ms`, baseline `10.2744 ms`.
+- [ ] Full EP16 normal tail-reduce1 matrix (`512,1024,1025,2048,2050,4096,4097,5120,8192`) was started but 151.1 became unreachable. Resume only after confirming SSH/card state and using a single DTK environment, not mixed `/root/yuguo/dtk` plus `/opt/dtk` libraries.
+- [ ] EP32 tail-reduce1 runtime validation still needs a healthy 32-card environment.
+
+## 2026-07-01 - EP16/EP32 Eager Normal Active-Tile Patch
+- ✅ Found that normal eager K2/K3 did not pass `active_tiles`, unlike normal graph. With EP16/EP32 fixed compact capacity this can inflate K2/K3/tail-reduce work to capacity rows even when correctness is fine.
+- ✅ Patched the existing eager start `rank_barrier` path to write `graph_runtime_num_tokens` scratch from `graph_max_tokens` when no graph runtime tensor is provided.
+- ✅ Patched eager normal K2 to pass `active_tiles` and `active_tile_m=256`.
+- ✅ Patched eager normal K3 no-tail to pass `active_tiles`, and tail-reduce1 to pass `active_tiles`, the runtime-token offset, and the generation tensor so the ASM active-tile gate and reducer work sizing can match graph behavior.
+- ✅ Local checks passed: `python -m py_compile megamoe/opt.py megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` and `git diff --check`.
+- [ ] Remote build and EP16 normal eager retest are blocked because `10.17.151.1` currently times out at ping/SSH banner exchange.
+
+## 2026-07-01 - Active-Tile Attempt Superseded
+- 🚫 The EP16/EP32 eager normal active-tile patch was tested and reverted.
+- Validation on 151.1 passed correctness but did not show enough performance value:
+  - `4096`: correct, MegaMoE `6.6835 ms`, baseline `10.4333 ms`.
+  - `5120`: correct, MegaMoE `8.3056 ms`, baseline `12.8190 ms`.
+  - `8192`: MegaMoE-only `12.8188 ms`.
+- The previous "active-tile patch" note above should be treated as historical investigation, not an active work item.

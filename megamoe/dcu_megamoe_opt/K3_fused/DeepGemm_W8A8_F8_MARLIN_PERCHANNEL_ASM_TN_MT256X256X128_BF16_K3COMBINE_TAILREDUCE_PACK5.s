@@ -536,6 +536,105 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
    s_mov_b64 exec, s[66:67]
 .endm
 
+.macro K3_TAIL_SIGNAL_ONE idx:req
+   s_cmp_gt_u32 s61, \idx
+   s_cbranch_scc0 .L_k3_tail_rank\idx\()_done_\@
+   K3_TAIL_ATOMIC_SIGNAL (8 * \idx), s78
+.L_k3_tail_rank\idx\()_done_\@:
+.endm
+
+.macro K3_TAIL_SIGNAL_ALL_RANKS
+   K3_TAIL_SIGNAL_ONE 0
+   K3_TAIL_SIGNAL_ONE 1
+   K3_TAIL_SIGNAL_ONE 2
+   K3_TAIL_SIGNAL_ONE 3
+   K3_TAIL_SIGNAL_ONE 4
+   K3_TAIL_SIGNAL_ONE 5
+   K3_TAIL_SIGNAL_ONE 6
+   K3_TAIL_SIGNAL_ONE 7
+   K3_TAIL_SIGNAL_ONE 8
+   K3_TAIL_SIGNAL_ONE 9
+   K3_TAIL_SIGNAL_ONE 10
+   K3_TAIL_SIGNAL_ONE 11
+   K3_TAIL_SIGNAL_ONE 12
+   K3_TAIL_SIGNAL_ONE 13
+   K3_TAIL_SIGNAL_ONE 14
+   K3_TAIL_SIGNAL_ONE 15
+   K3_TAIL_SIGNAL_ONE 16
+   K3_TAIL_SIGNAL_ONE 17
+   K3_TAIL_SIGNAL_ONE 18
+   K3_TAIL_SIGNAL_ONE 19
+   K3_TAIL_SIGNAL_ONE 20
+   K3_TAIL_SIGNAL_ONE 21
+   K3_TAIL_SIGNAL_ONE 22
+   K3_TAIL_SIGNAL_ONE 23
+   K3_TAIL_SIGNAL_ONE 24
+   K3_TAIL_SIGNAL_ONE 25
+   K3_TAIL_SIGNAL_ONE 26
+   K3_TAIL_SIGNAL_ONE 27
+   K3_TAIL_SIGNAL_ONE 28
+   K3_TAIL_SIGNAL_ONE 29
+   K3_TAIL_SIGNAL_ONE 30
+   K3_TAIL_SIGNAL_ONE 31
+.endm
+
+.macro K3_TAIL_WAIT_ONE idx:req, base:req
+   s_cmp_gt_u32 s61, \idx
+   s_cbranch_scc0 .L_k3_tail_wait_rank\idx\()_done_\@
+   K3_TAIL_WAIT_SIGNAL (\base + 8 * \idx)
+.L_k3_tail_wait_rank\idx\()_done_\@:
+.endm
+
+.macro K3_TAIL_WAIT_ALL_RANKS_BASE base:req
+   K3_TAIL_WAIT_ONE 0, \base
+   K3_TAIL_WAIT_ONE 1, \base
+   K3_TAIL_WAIT_ONE 2, \base
+   K3_TAIL_WAIT_ONE 3, \base
+   K3_TAIL_WAIT_ONE 4, \base
+   K3_TAIL_WAIT_ONE 5, \base
+   K3_TAIL_WAIT_ONE 6, \base
+   K3_TAIL_WAIT_ONE 7, \base
+   K3_TAIL_WAIT_ONE 8, \base
+   K3_TAIL_WAIT_ONE 9, \base
+   K3_TAIL_WAIT_ONE 10, \base
+   K3_TAIL_WAIT_ONE 11, \base
+   K3_TAIL_WAIT_ONE 12, \base
+   K3_TAIL_WAIT_ONE 13, \base
+   K3_TAIL_WAIT_ONE 14, \base
+   K3_TAIL_WAIT_ONE 15, \base
+   K3_TAIL_WAIT_ONE 16, \base
+   K3_TAIL_WAIT_ONE 17, \base
+   K3_TAIL_WAIT_ONE 18, \base
+   K3_TAIL_WAIT_ONE 19, \base
+   K3_TAIL_WAIT_ONE 20, \base
+   K3_TAIL_WAIT_ONE 21, \base
+   K3_TAIL_WAIT_ONE 22, \base
+   K3_TAIL_WAIT_ONE 23, \base
+   K3_TAIL_WAIT_ONE 24, \base
+   K3_TAIL_WAIT_ONE 25, \base
+   K3_TAIL_WAIT_ONE 26, \base
+   K3_TAIL_WAIT_ONE 27, \base
+   K3_TAIL_WAIT_ONE 28, \base
+   K3_TAIL_WAIT_ONE 29, \base
+   K3_TAIL_WAIT_ONE 30, \base
+   K3_TAIL_WAIT_ONE 31, \base
+.endm
+
+.macro K3_TAIL_WAIT_ALL_RANKS
+   s_cmp_gt_u32 s61, 16
+   s_cbranch_scc1 .L_k3_tail_wait_ep32_\@
+   s_cmp_gt_u32 s61, 8
+   s_cbranch_scc1 .L_k3_tail_wait_ep16_\@
+   K3_TAIL_WAIT_ALL_RANKS_BASE 64
+   s_branch .L_k3_tail_wait_all_done_\@
+.L_k3_tail_wait_ep16_\@:
+   K3_TAIL_WAIT_ALL_RANKS_BASE 128
+   s_branch .L_k3_tail_wait_all_done_\@
+.L_k3_tail_wait_ep32_\@:
+   K3_TAIL_WAIT_ALL_RANKS_BASE 256
+.L_k3_tail_wait_all_done_\@:
+.endm
+
 .macro K3_TAIL_ADDR_FROM_BASE base_lo:req, base_hi:req
    v_lshlrev_b32 v153, 4, v250
    v_mov_b32 v154, 0
@@ -1921,38 +2020,7 @@ s_cbranch_scc1 .L_k3_extra_reduce_endpgm
 v_cmp_eq_u32 vcc, v[vgprSerial], 0
 s_and_saveexec_b64 s[64:65], vcc
 s_cbranch_execz .L_k3_extra_wait_done
-s_cmp_gt_u32 s61, 0
-s_cbranch_scc0 .L_k3_extra_wait_rank0_done
-K3_TAIL_WAIT_SIGNAL 64
-.L_k3_extra_wait_rank0_done:
-s_cmp_gt_u32 s61, 1
-s_cbranch_scc0 .L_k3_extra_wait_rank1_done
-K3_TAIL_WAIT_SIGNAL 72
-.L_k3_extra_wait_rank1_done:
-s_cmp_gt_u32 s61, 2
-s_cbranch_scc0 .L_k3_extra_wait_rank2_done
-K3_TAIL_WAIT_SIGNAL 80
-.L_k3_extra_wait_rank2_done:
-s_cmp_gt_u32 s61, 3
-s_cbranch_scc0 .L_k3_extra_wait_rank3_done
-K3_TAIL_WAIT_SIGNAL 88
-.L_k3_extra_wait_rank3_done:
-s_cmp_gt_u32 s61, 4
-s_cbranch_scc0 .L_k3_extra_wait_rank4_done
-K3_TAIL_WAIT_SIGNAL 96
-.L_k3_extra_wait_rank4_done:
-s_cmp_gt_u32 s61, 5
-s_cbranch_scc0 .L_k3_extra_wait_rank5_done
-K3_TAIL_WAIT_SIGNAL 104
-.L_k3_extra_wait_rank5_done:
-s_cmp_gt_u32 s61, 6
-s_cbranch_scc0 .L_k3_extra_wait_rank6_done
-K3_TAIL_WAIT_SIGNAL 112
-.L_k3_extra_wait_rank6_done:
-s_cmp_gt_u32 s61, 7
-s_cbranch_scc0 .L_k3_extra_wait_rank7_done
-K3_TAIL_WAIT_SIGNAL 120
-.L_k3_extra_wait_rank7_done:
+K3_TAIL_WAIT_ALL_RANKS
 .L_k3_extra_wait_done:
    s_mov_b64 exec, s[64:65]
    s_barrier
@@ -3330,38 +3398,7 @@ s_waitcnt vmcnt(0) lgkmcnt(0)
 buffer_wbinvl1_vol
 s_waitcnt vmcnt(0)
 
-s_cmp_gt_u32 s61, 0
-s_cbranch_scc0 .L_k3_tail_rank0_done
-K3_TAIL_ATOMIC_SIGNAL 0, s78
-.L_k3_tail_rank0_done:
-s_cmp_gt_u32 s61, 1
-s_cbranch_scc0 .L_k3_tail_rank1_done
-K3_TAIL_ATOMIC_SIGNAL 8, s78
-.L_k3_tail_rank1_done:
-s_cmp_gt_u32 s61, 2
-s_cbranch_scc0 .L_k3_tail_rank2_done
-K3_TAIL_ATOMIC_SIGNAL 16, s78
-.L_k3_tail_rank2_done:
-s_cmp_gt_u32 s61, 3
-s_cbranch_scc0 .L_k3_tail_rank3_done
-K3_TAIL_ATOMIC_SIGNAL 24, s78
-.L_k3_tail_rank3_done:
-s_cmp_gt_u32 s61, 4
-s_cbranch_scc0 .L_k3_tail_rank4_done
-K3_TAIL_ATOMIC_SIGNAL 32, s78
-.L_k3_tail_rank4_done:
-s_cmp_gt_u32 s61, 5
-s_cbranch_scc0 .L_k3_tail_rank5_done
-K3_TAIL_ATOMIC_SIGNAL 40, s78
-.L_k3_tail_rank5_done:
-s_cmp_gt_u32 s61, 6
-s_cbranch_scc0 .L_k3_tail_rank6_done
-K3_TAIL_ATOMIC_SIGNAL 48, s78
-.L_k3_tail_rank6_done:
-s_cmp_gt_u32 s61, 7
-s_cbranch_scc0 .L_k3_tail_rank7_done
-K3_TAIL_ATOMIC_SIGNAL 56, s78
-.L_k3_tail_rank7_done:
+K3_TAIL_SIGNAL_ALL_RANKS
 s_waitcnt vmcnt(0)
 s_cmp_gt_u32 s80, 0
 s_cbranch_scc1 .L_k3_tail_signal_done
@@ -3380,38 +3417,7 @@ s_cbranch_scc1 .L_k3_tail_signal_done
 v_cmp_eq_u32 vcc, v[vgprSerial], 0
 s_and_saveexec_b64 s[68:69], vcc
 s_cbranch_execz .L_k3_tail_wait_done
-s_cmp_gt_u32 s61, 0
-s_cbranch_scc0 .L_k3_tail_wait_rank0_done
-K3_TAIL_WAIT_SIGNAL 64
-.L_k3_tail_wait_rank0_done:
-s_cmp_gt_u32 s61, 1
-s_cbranch_scc0 .L_k3_tail_wait_rank1_done
-K3_TAIL_WAIT_SIGNAL 72
-.L_k3_tail_wait_rank1_done:
-s_cmp_gt_u32 s61, 2
-s_cbranch_scc0 .L_k3_tail_wait_rank2_done
-K3_TAIL_WAIT_SIGNAL 80
-.L_k3_tail_wait_rank2_done:
-s_cmp_gt_u32 s61, 3
-s_cbranch_scc0 .L_k3_tail_wait_rank3_done
-K3_TAIL_WAIT_SIGNAL 88
-.L_k3_tail_wait_rank3_done:
-s_cmp_gt_u32 s61, 4
-s_cbranch_scc0 .L_k3_tail_wait_rank4_done
-K3_TAIL_WAIT_SIGNAL 96
-.L_k3_tail_wait_rank4_done:
-s_cmp_gt_u32 s61, 5
-s_cbranch_scc0 .L_k3_tail_wait_rank5_done
-K3_TAIL_WAIT_SIGNAL 104
-.L_k3_tail_wait_rank5_done:
-s_cmp_gt_u32 s61, 6
-s_cbranch_scc0 .L_k3_tail_wait_rank6_done
-K3_TAIL_WAIT_SIGNAL 112
-.L_k3_tail_wait_rank6_done:
-s_cmp_gt_u32 s61, 7
-s_cbranch_scc0 .L_k3_tail_wait_rank7_done
-K3_TAIL_WAIT_SIGNAL 120
-.L_k3_tail_wait_rank7_done:
+K3_TAIL_WAIT_ALL_RANKS
 .L_k3_tail_wait_done:
    s_mov_b64 exec, s[68:69]
    s_waitcnt vmcnt(0) lgkmcnt(0)

@@ -61,7 +61,9 @@ Status: [ ] active on TX32
 
 - ✅ Build the HIP wheel on the target DTK image for EP16 node22.
 - ✅ EP16 process-group smoke test: buffer allocation, pointer exchange, `set_mega_moe_peer_ptrs`, pre-dispatch, K1-only, K3 no-reduce, and default normal fused smoke.
-- ✅ EP16 correctness bring-up fixes: single-node IPC peer mode, K1 compact prebuild default for `num_ranks > 8`, and normal K3 ASM tail-reduce disabled for `num_ranks > 8`.
+- ✅ EP16 correctness bring-up fixes: single-node IPC peer mode and K1 compact prebuild default for `num_ranks > 8`.
+- [ ] EP16/EP32 normal K3 ASM tail-reduce1 is being restored after fixing the old EP8-only signal layout; EP16 smoke passed, full matrix is pending while 151.1 is reachable and idle.
+- 馃毇 EP16/EP32 normal eager active-tile patch was tried and reverted. It passed correctness but did not improve large-token performance enough to justify extra eager plumbing.
 - [ ] Re-run IPC default and `MEGAMOE_DCU_PEER_MEMORY=rpc` Fabric/RPC smoke once hardware is available; EP size should not affect peer-memory selection.
 - ✅ 151.1 EP8 8-card RPC smoke on devices `0..7`: `LL graph`, `LL eager`, `normal eager`, `normal graph`, `LL graph uneven`, and `normal eager uneven` pass with `normal-contiguous` baseline after Fabric buffer export size was aligned to 2 MiB.
 - [ ] 151.1 true EP16 RPC validation is currently blocked by active `chl_sgl0512` card occupancy, not by a reproducible device15 failure. On 2026-07-01, device15 small torch allocation succeeds in both `chl_sgl0512` and restarted `sglang_megamoe`.
@@ -89,5 +91,5 @@ Status: [ ] active on TX32
 
 - Risk: Supernode fabric memory APIs may differ across DTK versions; code should prefer current HIP wrappers when available or use HSA extensions from the examples.
 - Risk: EP16/EP32 reduce local expert count and can change K1/K3 grid shape. Validators must not be the only change if kernels assume `local_experts == 32`.
-- Risk: Signal scratch slots currently include 16-entry assumptions in tail-reduce setup; EP32 may need larger signal-address storage.
+- Risk: Normal K3 ASM tail-reduce signal layout was originally EP8-only. The current fix expands signal/wait slots to 32 ranks, but EP32 still requires true 32-card validation.
 - Risk: The requested yuguo old DeepGEMM baseline needs an ABI shim in the active torch runtime and has layout/padding sensitivity; keep that baseline isolated from MegaMoE correctness diagnosis.

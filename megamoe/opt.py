@@ -77,8 +77,6 @@ def k3_tail_reduce_enabled() -> bool:
 def _tail_reduce_enabled_for_backend(v3_backend: str, num_ranks: int) -> bool:
     if v3_backend == V3_BACKEND_LL:
         return True
-    if int(num_ranks) > 8:
-        return False
     return k3_tail_reduce_enabled()
 
 

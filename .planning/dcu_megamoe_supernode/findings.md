@@ -40,6 +40,7 @@
 - EP16 on a single node must use HIP IPC peer memory. The supernode Fabric/RPC path should only be selected when the process-group rank count exceeds the local visible DCU count.
 - K1 normal EP16 uncovered an old ASM self-route assumption: the self-route path can VMFault with 16 local experts, while compact prebuild produces valid route metadata. The production default now switches to compact prebuild for `num_ranks > 8`.
 - Normal K3 ASM tail-reduce is not safe for EP16 yet. K1/K2/K3 main compute plus external post-K3 reduce passes, while ASM tail-reduce hangs. Normal backend now disables ASM tail-reduce for `num_ranks > 8`; LL backend is unchanged.
+- Superseded on 2026-07-01: the normal K3 ASM tail-reduce hang was traced to the old EP8-only signal layout. The current fix expands signal/wait handling to EP16/EP32 and removes the Python rank-count disable gate; EP16 smoke has passed, while EP32 still needs runtime validation.
 
 ## 2026-06-29 Hybrid Symm Buffer Finding
 
@@ -100,3 +101,36 @@
 - TX32 and normal-node environments differ materially: hardware SKU (`BW1301_LC` vs `BW1101`), torch version (`2.10.0` vs `2.9.0`), DeepGEMM package ABI/layout, DTK install path/package, and 16-card vs 8-card local visibility.
 - Local topology reports do not explain the gap: both systems report all-local HSW links and 1-hop peer access.
 - Until a TX32 runtime/clock/package normalization experiment proves otherwise, use TX32 EP8 `~7.1 ms` as the relevant same-machine baseline for EP16/EP32 supernode work, and keep the normal-node `~5.8 ms` as a cross-machine historical reference only.
+
+## 2026-07-01 - 151.1 Environment Usage Finding
+
+- Node `10.17.151.1` basic access and mount state:
+  - SSH key login as `root` works when the node is healthy.
+  - Docker container `sglang_megamoe` is the intended MegaMoE test container.
+  - Host `/root/yuguo` is mounted into the container as `/root/yuguo`; repo path is `/root/yuguo/DeepGEMM`.
+  - Container OS is Ubuntu 22.04.5; Python is 3.10.12; torch is 2.10.0 with HIP 6.3.26113.
+- Before every test on 151.1, check card occupancy first. A running SGLang service can occupy all 16 cards (`--tp-size 16 --ep-size 16 --dp-size 16`, port `10015`), with scheduler processes and a benchmark client. Do not run MegaMoE tests while those jobs own the cards.
+- `hy-smi --showpids` can fail with `Unable to open process directory` on this node. When that happens, use host-side `ps` to map the actual SGLang or benchmark processes before deciding whether the node is free.
+- Torch import can fail if `/opt/hyhal/lib/libamd_smi.so` wins library resolution and lacks `amdsmi_init`. Keep Python's amdsmi package library first:
+  - `export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:${LD_LIBRARY_PATH:-}`
+- DTK path must be selected deliberately per run and not mixed accidentally. For the current 151.1 MegaMoE validation flow, use the user-specified `/root/yuguo/dtk-26.04.1/env.sh` path when running from `/root/yuguo/DeepGEMM`; do not append `/opt/dtk` fallback libraries into the same test environment unless the user explicitly switches the run to `/opt/dtk`.
+- If SSH starts closing immediately, stop launching new tests and recheck node health later; do not assume the previous MegaMoE run is still valid or complete.
+
+## 2026-07-01 - Normal K3 Tail-Reduce1 EP16/EP32 Finding
+
+- The EP16/EP32 tail-reduce1 bug is in the K3 ASM tail-reduce signal protocol, not in the pure groupgemm path or the external local reduce path.
+- The original K3 tail-reduce source published completion for only 8 ranks and waited on fixed offsets that assume `num_ranks == 8`.
+- Correct signal addressing must scale with `asm_signal_num_ranks`:
+  - EP8 wait base: `8 * sizeof(int64_t) = 64`.
+  - EP16 wait base: `16 * sizeof(int64_t) = 128`.
+  - EP32 wait base: `32 * sizeof(int64_t) = 256`.
+- The code now expands signal and wait macros through rank 31. EP16 smoke confirms correctness for `512` and `4096`; EP32 validation remains pending because no healthy 32-card environment is currently available.
+
+## 2026-07-01 - EP16/EP32 Eager Normal Active-Tile Attempt
+
+- 🚫 Abandoned and reverted. The attempt passed active-tile metadata from eager normal K1 into K2/K3/tail-reduce to avoid capacity-row work after EP16/EP32 compact prebuild.
+- Validation on 151.1 showed only marginal recovery at 4096 and no improvement at larger buckets compared with the previous no-tail / external-reduce path:
+  - EP16 normal eager tail-reduce1 active-tile `4096`: correct, MegaMoE `6.6835 ms`, baseline `10.4333 ms`.
+  - EP16 normal eager tail-reduce1 active-tile `5120`: correct, MegaMoE `8.3056 ms`, baseline `12.8190 ms`.
+  - EP16 normal eager tail-reduce1 active-tile `8192`: MegaMoE-only `12.8188 ms`.
+- Conclusion: capacity-row inflation is not the dominant remaining EP16 big-token regression in this branch. Do not keep extra eager active-tile plumbing unless a later profiler shows a clearer K2/K3 padding bottleneck.
