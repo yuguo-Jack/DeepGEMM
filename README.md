@@ -64,8 +64,8 @@ The DCU path builds a standalone `megamoe` HIP extension for Hygon `gfx938`.
 It is separate from the CUDA `deep_gemm` JIT flow above and is specialized for
 the DSV4-Flash W8A8 FP8 channelwise MegaMoE shape:
 
-- EP size: 8 ranks
-- Experts: 256 total, 32 per rank
+- EP size: 8, 16, or 32 ranks on the V3 staged path
+- Experts: 256 total; 32/16/8 local experts per rank for EP8/EP16/EP32
 - Top-K: 6
 - Hidden size: 4096
 - Intermediate hidden size: 2048
@@ -116,6 +116,104 @@ MegaMoE fused extension:
 If any staged HIP or asm source changes, rebuild and reinstall the wheel.  The
 `hygon_tmp` directory is only used by test scripts for temporary reports or
 scratch files; it is not required for installed kernel binaries.
+
+### Supernode / EP16 / EP32
+
+The supernode branch keeps EP size and peer-memory transport as separate
+choices.  EP size controls the MegaMoE shape and local expert count.  Peer
+memory defaults to HIP IPC for non-supernode compatibility, but supernode runs
+should set `MEGAMOE_DCU_PEER_MEMORY=rpc` on every participating node so the
+runtime uses Fabric/RPC-backed symmetric buffers.  EP16 or EP32 does not
+automatically imply RPC, so keep the environment variable explicit.
+
+Build on every node that will execute compiled MegaMoE artifacts.  Keep the
+same repository path and command line on every participating node unless the
+launcher option explicitly differs, such as `--node-rank`.
+`MEGAMOE_DCU_PEER_MEMORY` is a runtime selection knob and is not required for
+the build command.
+
+Single-node 16-card build example:
+
+```bash
+source /path/to/dtk/env.sh
+cd /path/to/DeepGEMM
+bash ./megamoe/dcu_megamoe_opt/scripts/build_dcu_megamoe.sh
+```
+
+Single-node EP16 normal eager smoke:
+
+```bash
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export MEGAMOE_DCU_PEER_MEMORY=rpc
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
+  --num-processes 16 \
+  --num-max-tokens-per-rank 4096 \
+  --num-tokens 4096 \
+  --hidden 4096 --intermediate-hidden 2048 --num-experts 256 --num-topk 6 \
+  --megamoe-backend normal \
+  --baseline-kind normal-contiguous \
+  --warmup 5 --repeat 20
+```
+
+Single-node EP16 LL graph smoke:
+
+```bash
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export MEGAMOE_DCU_PEER_MEMORY=rpc
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
+  --num-processes 16 \
+  --num-max-tokens-per-rank 512 \
+  --num-tokens 512 \
+  --hidden 4096 --intermediate-hidden 2048 --num-experts 256 --num-topk 6 \
+  --megamoe-backend ll \
+  --baseline-kind ll-masked \
+  --cuda-graph --cuda-graph-bench \
+  --cuda-graph-test-tokens 8,32,64,128,256,512
+```
+
+Use uneven tests by adding an uneven token configuration such as
+`--num-max-removed-tokens 2048` to the same command family.  For LL masked
+baseline tests, also set the DeepEP/ROCSHMEM environment required by the test
+cluster.
+
+Two-node EP32 launch pattern for two 16-card nodes.  Run one launcher process
+per node; each launcher owns 16 local DCUs.  Keep the command and repository
+path identical on both nodes except for `--node-rank`.
+
+```bash
+# Node 0
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export MEGAMOE_DCU_PEER_MEMORY=rpc
+torchrun --nnodes=2 --nproc-per-node=1 --node-rank=0 \
+  --master-addr=<node0_ip> --master-port=<port> \
+  megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
+  --num-processes 16 \
+  --num-max-tokens-per-rank 4096 \
+  --num-tokens 4096 \
+  --hidden 4096 --intermediate-hidden 2048 --num-experts 256 --num-topk 6 \
+  --megamoe-backend normal --baseline-kind normal-contiguous
+
+# Node 1
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export MEGAMOE_DCU_PEER_MEMORY=rpc
+torchrun --nnodes=2 --nproc-per-node=1 --node-rank=1 \
+  --master-addr=<node0_ip> --master-port=<port> \
+  megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
+  --num-processes 16 \
+  --num-max-tokens-per-rank 4096 \
+  --num-tokens 4096 \
+  --hidden 4096 --intermediate-hidden 2048 --num-experts 256 --num-topk 6 \
+  --megamoe-backend normal --baseline-kind normal-contiguous
+```
+
+Current supernode defaults:
+
+- EP16/EP32 normal K1 use the compact prebuild path.
+- EP16/EP32 normal K3 default to tail-reduce disabled
+  (`K3_USE_ASM_TAIL_REDUCE=0` behavior) and use the external local reduce path.
+  EP8 normal keeps integrated ASM tail-reduce enabled by default.
+- LL K3 split-tail remains enabled by default for LL-capacity buckets up to 512
+  tokens per rank and is independent of the normal K3 tail-reduce flag.
 
 ### Runtime Routing
 
@@ -185,9 +283,8 @@ during initialization by creating tensor views into the same `route_scratch`
 storage; no extra device kernels, D2H synchronization, or duplicate activation
 buffers are introduced for the first timed call.
 
-By default K3 uses an integrated tail-reduce path for staged execution, so it
-avoids the separate `rank_barrier + reduce` tail that can show large latency
-swings.  For LL token buckets `<=512`, the default K3 path is split-tail:
+K3 tail handling is backend- and EP-size-dependent.  For LL token buckets
+`<=512`, the default K3 path is split-tail:
 the first kernel runs local K3 group GEMM without peer communication, and the
 second kernel performs peer combine plus local reduce with chunk-ready signals
 and a copy-done fallback for graph-capture sparse/padded rows.  Set
@@ -196,12 +293,13 @@ fallback/debug.  The split-tail gate is LL-only and still refuses token buckets
 larger than 512, so 4096-token prefill-style normal work should continue to use the
 normal backend selected by the framework.
 
-`K3_USE_ASM_TAIL_REDUCE=1` remains the default for the normal backend and uses
-the ASM integrated tail-reduce path.  `K3_USE_ASM_TAIL_REDUCE=0` is ignored for
-LL and only selects the older normal-backend barrier/reduce path.  For
-`num_max_tokens_per_rank <= 2048`, the normal tail reducer defaults to 64
-reducer workgroups; larger max-token buffers keep the previous 128-workgroup
-default.
+For the normal backend, EP8 defaults to the ASM integrated tail-reduce path.
+EP16/EP32 default to the no-tail ASM path plus the external local reduce kernel.
+Set `K3_USE_ASM_TAIL_REDUCE=1` to force normal ASM tail-reduce for ablation, or
+`K3_USE_ASM_TAIL_REDUCE=0` to disable it.  This flag is ignored for LL.  For
+normal tail-reduce-enabled runs with `num_max_tokens_per_rank <= 2048`, the
+tail reducer defaults to 64 reducer workgroups; larger max-token buffers keep
+the previous 128-workgroup default.
 
 The public `fast_math` argument is supported by both LL and normal staged
 paths.  It controls the K2 SwiGLU math choice, matching the CUDA MegaMoE
@@ -310,11 +408,13 @@ python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
 
 The staged graph bucket supports the same K3 modes as eager execution.  LL graph
 buckets `<=512` use split-tail by default unless
-`MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0`; larger LL graph buckets and normal graph
-buckets use their fused/integrated K3 tail path.  The captured K3 path consumes
-K1's device-side active-tile count plus the graph runtime token scalar where
-applicable, so replay skips inactive K3 row tiles and reduces only the valid
-token prefix.  Graph mode rejects
+`MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0`; larger LL graph buckets use the LL fused-tail
+fallback, and normal graph buckets use the normal backend's selected K3 tail
+policy.  By default that means integrated tail-reduce for EP8 and external
+local reduce for EP16/EP32.  The captured K3 path consumes K1's device-side
+active-tile count plus the graph runtime token scalar where applicable, so
+replay skips inactive K3 row tiles and reduces only the valid token prefix.
+Graph mode rejects
 `cumulative_local_expert_recv_stats`, because graph replay should not accumulate
 per-expert statistics across variable-token requests.
 

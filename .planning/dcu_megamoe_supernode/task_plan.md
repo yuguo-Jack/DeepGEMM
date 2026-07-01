@@ -62,7 +62,7 @@ Status: [ ] active on TX32
 - ✅ Build the HIP wheel on the target DTK image for EP16 node22.
 - ✅ EP16 process-group smoke test: buffer allocation, pointer exchange, `set_mega_moe_peer_ptrs`, pre-dispatch, K1-only, K3 no-reduce, and default normal fused smoke.
 - ✅ EP16 correctness bring-up fixes: single-node IPC peer mode and K1 compact prebuild default for `num_ranks > 8`.
-- [ ] EP16/EP32 normal K3 ASM tail-reduce1 is being restored after fixing the old EP8-only signal layout; EP16 smoke passed, full matrix is pending while 151.1 is reachable and idle.
+- 🚫 EP16/EP32 normal K3 ASM tail-reduce1 is no longer the default path. The signal-layout fix remains available for explicit ablation with `K3_USE_ASM_TAIL_REDUCE=1`, but EP16/EP32 normal defaults to tail-reduce0 / external local reduce.
 - 馃毇 EP16/EP32 normal eager active-tile patch was tried and reverted. It passed correctness but did not improve large-token performance enough to justify extra eager plumbing.
 - [ ] Re-run IPC default and `MEGAMOE_DCU_PEER_MEMORY=rpc` Fabric/RPC smoke once hardware is available; EP size should not affect peer-memory selection.
 - ✅ 151.1 EP8 8-card RPC smoke on devices `0..7`: `LL graph`, `LL eager`, `normal eager`, `normal graph`, `LL graph uneven`, and `normal eager uneven` pass with `normal-contiguous` baseline after Fabric buffer export size was aligned to 2 MiB.
@@ -83,7 +83,8 @@ Status: [ ] active on TX32
 - ✅ Sample EP16 normal eager `8192` MegaMoE-only performance with baseline timing explicitly skipped because the DeepEP normal baseline does not return cleanly at this bucket.
 - [ ] Investigate DeepEP normal baseline `8192` EP16 rank hang if a full baseline comparison at this bucket is still required.
 - ✅ Root-cause EP16 normal medium/large-token regression versus EP8 references (`1024+`, especially `4096/8192`): stage timing shows the pure K3 GEMM path is healthy, while K3 peer combine scatter/write dominates the extra EP16 cost.
-- [ ] Optimize normal K3 peer combine writes for EP16/EP32 without adding extra hot-path kernels; start from row pointer locality, destination-rank batching that preserves ASM-friendly row order, or a split local-output plus combine strategy only if profiling proves it wins.
+- 🚫 Optimize normal K3 peer combine writes for EP16/EP32 as a supernode-specific required task. Superseded by the 151.1 EP16 RPC data: EP8 `4096` recovered to `5.7636 ms`, EP16 normal eager and normal graph are correct and faster than baseline, so no extra hot-path K3 peer-combine rewrite is currently justified.
+- ✅ 151.1 EP16 RPC normal graph validation passed for uniform cap512/cap4096 and uneven cap512/cap1024/cap2048/cap4096. Keep the exact replay numbers in `progress.md` and `findings.md`.
 - [ ] EP32 LL eager/graph correctness and performance.
 - [ ] EP32 normal eager/graph correctness and performance, especially cross-node Fabric/RPC and signal handling.
 
@@ -91,5 +92,5 @@ Status: [ ] active on TX32
 
 - Risk: Supernode fabric memory APIs may differ across DTK versions; code should prefer current HIP wrappers when available or use HSA extensions from the examples.
 - Risk: EP16/EP32 reduce local expert count and can change K1/K3 grid shape. Validators must not be the only change if kernels assume `local_experts == 32`.
-- Risk: Normal K3 ASM tail-reduce signal layout was originally EP8-only. The current fix expands signal/wait slots to 32 ranks, but EP32 still requires true 32-card validation.
+- Risk: Normal K3 ASM tail-reduce signal layout was originally EP8-only. The current fix expands signal/wait slots to 32 ranks for explicit ablation, but EP16/EP32 normal defaults to tail-reduce0 and EP32 tail-reduce1 still requires true 32-card validation if re-enabled.
 - Risk: The requested yuguo old DeepGEMM baseline needs an ABI shim in the active torch runtime and has layout/padding sensitivity; keep that baseline isolated from MegaMoE correctness diagnosis.

@@ -250,7 +250,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
         "\n\n",
         1,
     )[0]
-    assert "num_ranks) > 8" not in tail_reduce_gate
+    assert "k3_tail_reduce_enabled(default=int(num_ranks) <= 8)" in tail_reduce_gate
     assert "LL no-tail / tail-reduce-0 path has been retired" not in opt_py
     assert "DCU MegaMoE LL no-tail path has been retired" not in opt_py
     assert "MEGAMOE_DCU_LL_K3_SPLIT_TAIL_CHUNK_READY" not in opt_py

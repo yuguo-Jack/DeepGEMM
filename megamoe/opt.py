@@ -69,15 +69,18 @@ class _OptState:
     asm_signal_generation: int = 0
 
 
-def k3_tail_reduce_enabled() -> bool:
-    value = os.getenv("K3_USE_ASM_TAIL_REDUCE", "1").strip().lower()
+def k3_tail_reduce_enabled(default: bool = True) -> bool:
+    value = os.getenv("K3_USE_ASM_TAIL_REDUCE")
+    if value is None:
+        return bool(default)
+    value = value.strip().lower()
     return value in {"1", "true", "yes", "on", "tail-reduce"}
 
 
 def _tail_reduce_enabled_for_backend(v3_backend: str, num_ranks: int) -> bool:
     if v3_backend == V3_BACKEND_LL:
         return True
-    return k3_tail_reduce_enabled()
+    return k3_tail_reduce_enabled(default=int(num_ranks) <= 8)
 
 
 def ll_k3_split_tail_enabled() -> bool:
@@ -432,7 +435,9 @@ def prepare_opt_3stage(sym_buffer, *, verbose_build: bool = False) -> None:
         num_topk=sym_buffer.num_topk,
         hidden=sym_buffer.hidden,
         intermediate_hidden=sym_buffer.intermediate_hidden,
-        init_tail_reduce=k3_tail_reduce_enabled(),
+        init_tail_reduce=k3_tail_reduce_enabled(
+            default=int(sym_buffer.group.size()) <= 8
+        ),
         verbose_build=verbose_build,
     )
 

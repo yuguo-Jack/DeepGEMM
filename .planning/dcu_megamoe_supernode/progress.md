@@ -333,6 +333,7 @@
   - `8192`: MegaMoE `10.7700 ms`, baseline `19.0455 ms`.
 - ✅ Baseline observation: EP16 normal-contiguous baseline is slightly slower than EP8 at comparable big-token buckets on this node (`4096`: `10.3451` vs `10.0042 ms`, `+3.4%`; `5120`: `12.6119` vs `11.7945 ms`, `+6.9%`). This supports that part of the EP16 large-token slowdown is also present in the baseline/communication path, not only MegaMoE-specific. EP16 `8192` baseline timing remains unusable because the benchmark phase times out.
 - ✅ EP16 LL graph cap512 replay small-token effective bandwidth estimate from the recorded JSON: replay8 `0.3749 ms` -> estimated HBM `1077.6 GB/s`, xHCL `1.57 GB/s`; replay32 `0.4069 ms` -> estimated HBM `998.6 GB/s`, xHCL `5.80 GB/s`, assuming all 16 local experts are touched. The JSON stores replay latency, not per-bucket bandwidth fields, so these are reconstructed estimates.
+- ✅ Follow-up conclusion after 151.1 EP8/EP16 RPC runs: the earlier "optimize normal K3 peer combine writes" item is no longer a required supernode task. EP8 `4096` on the same 151.1 environment recovered to `5.7636 ms`, EP16 normal eager/graph are correct and faster than baseline, and no extra K3 peer-combine rewrite is justified without new profiler evidence.
 
 ## 2026-07-01 - EP16/EP32 Normal Tail-Reduce1 Signal Layout Fix
 - ✅ Root-caused the EP16/EP32 normal tail-reduce1 bug to the K3 ASM tail-reduce signal protocol: the old source only signaled ranks `0..7` and waited on fixed second-half offsets `64..120`, which is only correct for EP8.
@@ -344,6 +345,7 @@
   - `4096`: correct, MegaMoE `6.8729 ms`, baseline `10.2744 ms`.
 - [ ] Full EP16 normal tail-reduce1 matrix (`512,1024,1025,2048,2050,4096,4097,5120,8192`) was started but 151.1 became unreachable. Resume only after confirming SSH/card state and using a single DTK environment, not mixed `/root/yuguo/dtk` plus `/opt/dtk` libraries.
 - [ ] EP32 tail-reduce1 runtime validation still needs a healthy 32-card environment.
+- ✅ Superseded policy update: EP16/EP32 normal now defaults back to tail-reduce0 / external local reduce. Tail-reduce1 code remains available only when explicitly forcing `K3_USE_ASM_TAIL_REDUCE=1`; LL behavior is unchanged.
 
 ## 2026-07-01 - EP16/EP32 Eager Normal Active-Tile Patch
 - ✅ Found that normal eager K2/K3 did not pass `active_tiles`, unlike normal graph. With EP16/EP32 fixed compact capacity this can inflate K2/K3/tail-reduce work to capacity rows even when correctness is fine.
@@ -360,3 +362,28 @@
   - `5120`: correct, MegaMoE `8.3056 ms`, baseline `12.8190 ms`.
   - `8192`: MegaMoE-only `12.8188 ms`.
 - The previous "active-tile patch" note above should be treated as historical investigation, not an active work item.
+
+## 2026-07-01 - 151.1 EP16 RPC Normal Graph Validation
+- ✅ Rechecked card state before testing on `10.17.151.1`: all 16 HCUs were idle and returned to 0% VRAM after the run.
+- ✅ Built and tested from `/root/yuguo/DeepGEMM` in docker `sglang_megamoe` with `/root/yuguo/dtk-26.04.1/env.sh`, `MEGAMOE_DCU_PEER_MEMORY=rpc`, `K3_USE_ASM_TAIL_REDUCE=1`, and normal graph replay enabled.
+- ✅ EP16 RPC `normal graph` uniform cap512 passed:
+  - eager main-call: MegaMoE `1.3027 ms`, baseline `1.7411 ms`.
+  - graph replay medians for runtime `128/256/512`: `0.9027/1.0053/1.2542 ms`.
+- ✅ EP16 RPC `normal graph` uneven cap512 passed:
+  - actual generated tokens `287`, rank0 replay locals `121/249/505`.
+  - eager main-call: MegaMoE `1.2027 ms`, baseline `1.5385 ms`.
+  - graph replay medians for runtime `128/256/512`: `0.8411/0.9076/1.1298 ms`.
+- ✅ EP16 RPC `normal graph` uniform cap4096 passed:
+  - eager main-call: MegaMoE `6.9082 ms`, baseline `9.9314 ms`.
+  - graph replay medians for runtime `1024/2048/4096`: `2.0467/3.3681/6.4547 ms`.
+- ✅ EP16 RPC `normal graph` uneven cap4096 passed:
+  - actual generated tokens `2291`, rank0 replay locals `1017/2041/4089`.
+  - eager main-call: MegaMoE `6.2936 ms`, baseline `7.9413 ms`.
+  - graph replay medians for runtime `1024/2048/4096`: `1.8613/3.3350/6.4743 ms`.
+- ✅ Additional uneven middle buckets passed:
+  - cap1024, actual tokens `573`, rank0 locals `505/1017`, graph replay medians `512/1024 -> 1.1037/1.7890 ms`, eager MegaMoE `1.8496 ms`, baseline `2.5275 ms`.
+  - cap2048, actual tokens `1146`, rank0 locals `1017/2041`, graph replay medians `1024/2048 -> 1.8058/3.2687 ms`, eager MegaMoE `3.3288 ms`, baseline `4.3669 ms`.
+- Note: DeepEP normal-contiguous baseline still emits `cached_notify_combine` launch-bound warnings. They do not block correctness or MegaMoE graph replay timing, but should not be mistaken for MegaMoE kernel warnings.
+- Logs:
+  - Primary run: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_ep16_normal_graph_20260701_155607/`.
+  - Extra uneven run: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_ep16_normal_graph_extra_20260701_161143/`.

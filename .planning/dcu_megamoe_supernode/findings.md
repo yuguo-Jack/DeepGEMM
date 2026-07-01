@@ -40,7 +40,7 @@
 - EP16 on a single node must use HIP IPC peer memory. The supernode Fabric/RPC path should only be selected when the process-group rank count exceeds the local visible DCU count.
 - K1 normal EP16 uncovered an old ASM self-route assumption: the self-route path can VMFault with 16 local experts, while compact prebuild produces valid route metadata. The production default now switches to compact prebuild for `num_ranks > 8`.
 - Normal K3 ASM tail-reduce is not safe for EP16 yet. K1/K2/K3 main compute plus external post-K3 reduce passes, while ASM tail-reduce hangs. Normal backend now disables ASM tail-reduce for `num_ranks > 8`; LL backend is unchanged.
-- Superseded on 2026-07-01: the normal K3 ASM tail-reduce hang was traced to the old EP8-only signal layout. The current fix expands signal/wait handling to EP16/EP32 and removes the Python rank-count disable gate; EP16 smoke has passed, while EP32 still needs runtime validation.
+- Superseded on 2026-07-01: the normal K3 ASM tail-reduce hang was traced to the old EP8-only signal layout. The current fix expands signal/wait handling to EP16/EP32 for explicit ablation, but EP16/EP32 normal defaults back to tail-reduce0 / external local reduce; EP32 tail-reduce1 still needs runtime validation if re-enabled.
 
 ## 2026-06-29 Hybrid Symm Buffer Finding
 
@@ -92,7 +92,8 @@
   - MegaMoE `7.1299 ms`;
   - baseline `9.8677 ms`;
   - speedup `1.384x`.
-- Current supernode branch EP8/4096 is in the same band (`~7.2 ms` formal run, stage breakdown also close), so there is no evidence that the supernode wrapper regressed EP8 4096. The EP16 normal large-token slowdown remains attributable to K3 peer combine scatter/write fanout rather than to pure GEMM, K1 capacity, or EP8 hybrid peer-memory selection.
+- Current supernode branch EP8/4096 is in the same band (`~7.2 ms` formal run, stage breakdown also close), so there is no evidence that the supernode wrapper regressed EP8 4096. Historical readout at that time attributed the EP16 normal large-token slowdown to K3 peer combine scatter/write fanout rather than to pure GEMM, K1 capacity, or EP8 hybrid peer-memory selection.
+- Superseded on 2026-07-01 by 151.1 EP8/EP16 RPC validation: EP8 `4096` recovered to `5.7636 ms`, and EP16 normal eager/graph are correct and faster than baseline. Treat K3 peer-combine rewrite as not currently required unless a future profiler run produces new evidence.
 
 ## 2026-06-30 - EP8 Baseline Mismatch Root Cause Narrowing
 
@@ -134,3 +135,17 @@
   - EP16 normal eager tail-reduce1 active-tile `5120`: correct, MegaMoE `8.3056 ms`, baseline `12.8190 ms`.
   - EP16 normal eager tail-reduce1 active-tile `8192`: MegaMoE-only `12.8188 ms`.
 - Conclusion: capacity-row inflation is not the dominant remaining EP16 big-token regression in this branch. Do not keep extra eager active-tile plumbing unless a later profiler shows a clearer K2/K3 padding bottleneck.
+
+## 2026-07-01 - EP16 Normal Graph Readout
+
+- EP16 RPC normal graph is functional on single-node 16-card `151.1` with `MEGAMOE_DCU_PEER_MEMORY=rpc` and `K3_USE_ASM_TAIL_REDUCE=1`.
+- Correctness passed for uniform cap512, uneven cap512, uniform cap4096, uneven cap4096, plus uneven cap1024 and cap2048.
+- Graph replay latency scales smoothly across tested buckets:
+  - uniform cap512: `128/256/512 -> 0.9027/1.0053/1.2542 ms`;
+  - uneven cap512: `128/256/512 -> 0.8411/0.9076/1.1298 ms`;
+  - uneven cap1024: `512/1024 -> 1.1037/1.7890 ms`;
+  - uneven cap2048: `1024/2048 -> 1.8058/3.2687 ms`;
+  - uniform cap4096: `1024/2048/4096 -> 2.0467/3.3681/6.4547 ms`;
+  - uneven cap4096: `1024/2048/4096 -> 1.8613/3.3350/6.4743 ms`.
+- Uneven graph cases are not showing a correctness-specific or signal-specific failure. The remaining large-token EP16 concern is still performance scaling versus EP8, not graph correctness.
+- The `cached_notify_combine` launch-bound warnings are emitted by the normal-contiguous DeepEP baseline path; they did not block MegaMoE normal graph replay validation.
