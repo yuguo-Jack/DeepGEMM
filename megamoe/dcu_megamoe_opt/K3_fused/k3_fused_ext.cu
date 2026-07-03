@@ -68,6 +68,7 @@ struct __attribute__((packed)) GpuProb {
     uint32_t graph_reserved_c4;
     int32_t* active_tiles;
     int32_t* asm_signal_generation_ptr;
+    uint32_t asm_reduce_hidden_vecs;
 };
 
 static_assert(offsetof(GpuProb, scaleA) == 0x70,
@@ -92,6 +93,10 @@ static_assert(offsetof(GpuProb, active_tiles) == 0xc8,
               "K3 graph asm expects active_tiles at GpuProb+0xc8");
 static_assert(offsetof(GpuProb, asm_signal_generation_ptr) == 0xd0,
               "K3 graph asm expects signal generation ptr at GpuProb+0xd0");
+static_assert(offsetof(GpuProb, asm_reduce_hidden_vecs) == 0xd8,
+              "K3 graph asm expects hidden vec count at GpuProb+0xd8");
+static_assert(sizeof(GpuProb) <= 256,
+              "K3 GpuProb must fit in the 256-byte prob storage");
 
 struct __attribute__((packed)) KernelArgs {
     uint32_t gemm_count;
@@ -215,8 +220,10 @@ void launch_l2_deepgemm_original_asm(
                 "m_indices length must cover total rows");
     TORCH_CHECK(total_rows > 0 && total_rows % 256 == 0,
                 "K3 asm expects rows padded to a 256-row tile");
-    TORCH_CHECK(hidden == 4096 && k == 2048,
-                "current K3 asm path is specialized for hidden=4096, intermediate=2048");
+    TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_k3_dims(hidden, k),
+                "current K3 asm path supports DeepSeek-V4-Flash "
+                "(hidden=4096, intermediate=2048) and DeepSeek-V4-Pro "
+                "(hidden=7168, intermediate=3072)");
     TORCH_CHECK(l2_scale.dim() == 2 &&
                     l2_scale.size(0) > 0 &&
                     l2_scale.size(1) == hidden,
@@ -278,9 +285,10 @@ void launch_l2_deepgemm_original_asm(
                     "asm_reduce_y must be BF16");
         TORCH_CHECK(sym_buffer->scalar_type() == torch::kInt8,
                     "sym_buffer must be int8");
-        TORCH_CHECK(reduce_hidden == hidden && reduce_hidden == 4096 &&
-                        reduce_num_topk == 6,
-                    "asm tail reduce currently supports hidden=4096, topk=6");
+        TORCH_CHECK(reduce_hidden == hidden &&
+                        deep_gemm::mega::dcu_supported_staged_k3_dims(hidden, k) &&
+                        reduce_num_topk == deep_gemm::mega::kDcuMegaMoeStagedTopk,
+                    "asm tail reduce currently supports Flash/Pro hidden sizes and topk=6");
         TORCH_CHECK(asm_reduce_y->dim() == 2 &&
                         asm_reduce_y->size(0) == reduce_num_tokens &&
                         asm_reduce_y->size(1) == reduce_hidden,
@@ -346,6 +354,7 @@ void launch_l2_deepgemm_original_asm(
             reduce_num_tokens * (reduce_hidden / 8));
         prob.asm_reduce_slot_stride_vec = static_cast<uint32_t>(
             reduce_num_max_tokens_per_rank * (reduce_hidden / 8));
+        prob.asm_reduce_hidden_vecs = static_cast<uint32_t>(reduce_hidden / 8);
         prob.asm_signal_generation = static_cast<uint32_t>(asm_signal_generation);
         prob.asm_tail_reduce = 1;
         prob.asm_reduce_blocks = static_cast<uint32_t>(default_reduce_blocks);
@@ -512,7 +521,8 @@ __device__ static inline int load_signal_system_acquire(const volatile int* ptr)
 constexpr int kDefaultStagedBarrierSignalSlotBase = 18;
 constexpr int kSplitTailChunkSignalSlots = 8;
 constexpr int kSplitTailCopyExpertDoneOffset = 48;
-constexpr int kSplitTailCopyExpertDoneCount = 32;
+constexpr int kSplitTailCopyExpertDoneCount =
+    deep_gemm::mega::kDcuMegaMoeTailCopyExpertDoneCount;
 
 __global__ void rank_barrier_kernel(
     uint8_t* local_sym_buffer,

@@ -4,7 +4,12 @@ from pathlib import Path
 
 import torch
 
-from ..v3_config import normalize_v3_backend
+from ..v3_config import (
+    STAGED_PACK5_SHAPE_CONTRACT,
+    SUPPORTED_STAGED_EP_RANKS,
+    normalize_v3_backend,
+    staged_pack5_k1_shape_supported,
+)
 from . import k1_fused_ext as _ext
 
 
@@ -19,16 +24,12 @@ FUSED_L1_ASM_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_PACK5_NAME}.co"
 FUSED_L1_ASM_UNIFIED_PACK5_NAME = f"{FUSED_L1_ASM_NAME}_UNIFIED_PACK5"
 FUSED_L1_ASM_UNIFIED_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_UNIFIED_PACK5_NAME}.co"
 
-K1_SUPPORTED_RANKS = (8, 16, 32)
-K1_SUPPORTED_EXPERTS = 256
-K1_SUPPORTED_TOPK = 6
-K1_SUPPORTED_HIDDEN = 4096
+K1_SUPPORTED_RANKS = SUPPORTED_STAGED_EP_RANKS
 K1_SUPPORTED_ALIGNMENT = 256
 K1_SHAPE_CONTRACT = (
-    "K1_fused dispatch-pull L1 asm currently supports DSV4 Flash ranks in "
-    "{8,16,32}, experts=256, local_experts<=32, topk=6, hidden=4096, "
-    "alignment=256, "
-    "and 0<=num_tokens_per_rank<=num_max_tokens_per_rank"
+    f"{STAGED_PACK5_SHAPE_CONTRACT}, K1 L1 output features must equal "
+    "2 * intermediate, alignment=256, and "
+    "0<=num_tokens_per_rank<=num_max_tokens_per_rank"
 )
 
 
@@ -40,13 +41,17 @@ def _check_fused_l1_shape(
     num_max_tokens_per_rank: int,
     num_topk: int,
     hidden: int,
+    l1_rows: int,
     alignment: int,
 ) -> None:
     if (
-        int(num_ranks) not in K1_SUPPORTED_RANKS
-        or int(num_experts) != K1_SUPPORTED_EXPERTS
-        or int(num_topk) != K1_SUPPORTED_TOPK
-        or int(hidden) != K1_SUPPORTED_HIDDEN
+        not staged_pack5_k1_shape_supported(
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_topk=num_topk,
+            hidden=hidden,
+            l1_rows=l1_rows,
+        )
         or int(alignment) != K1_SUPPORTED_ALIGNMENT
         or int(num_tokens) < 0
         or int(num_tokens) > int(num_max_tokens_per_rank)
@@ -173,6 +178,7 @@ def k1_symm_fused_l1_v3_asm_pack5(
     use_unified_weight_layout: bool = False,
     verbose_build: bool = False,
 ):
+    l1_weight_pack5, l1_scale = l1_weights
     _check_fused_l1_shape(
         num_ranks=num_ranks,
         num_experts=num_experts,
@@ -180,9 +186,9 @@ def k1_symm_fused_l1_v3_asm_pack5(
         num_max_tokens_per_rank=sym_buffer.num_max_tokens_per_rank,
         num_topk=num_topk,
         hidden=hidden,
+        l1_rows=int(l1_scale.size(1)),
         alignment=alignment,
     )
-    l1_weight_pack5, l1_scale = l1_weights
     ext = load_extension(verbose=verbose_build)
     code_object = ensure_fused_l1_asm_pack5_code_object(
         use_unified_weight_layout=use_unified_weight_layout
@@ -236,6 +242,7 @@ def k1_symm_fused_l1_v3_asm_pack5_graph(
     use_unified_weight_layout: bool = False,
     verbose_build: bool = False,
 ):
+    l1_weight_pack5, l1_scale = l1_weights
     _check_fused_l1_shape(
         num_ranks=num_ranks,
         num_experts=num_experts,
@@ -243,9 +250,9 @@ def k1_symm_fused_l1_v3_asm_pack5_graph(
         num_max_tokens_per_rank=sym_buffer.num_max_tokens_per_rank,
         num_topk=num_topk,
         hidden=hidden,
+        l1_rows=int(l1_scale.size(1)),
         alignment=alignment,
     )
-    l1_weight_pack5, l1_scale = l1_weights
     ext = load_extension(verbose=verbose_build)
     code_object = ensure_fused_l1_asm_pack5_code_object(
         use_unified_weight_layout=use_unified_weight_layout
@@ -308,6 +315,7 @@ def k1_symm_fused_l1_v3(
     verbose_build: bool = False,
 ):
     backend = normalize_v3_backend(backend)
+    l1_weight_pack5, l1_scale = l1_weights
     _check_fused_l1_shape(
         num_ranks=num_ranks,
         num_experts=num_experts,
@@ -315,6 +323,7 @@ def k1_symm_fused_l1_v3(
         num_max_tokens_per_rank=sym_buffer.num_max_tokens_per_rank,
         num_topk=num_topk,
         hidden=hidden,
+        l1_rows=int(l1_scale.size(1)),
         alignment=alignment,
     )
     ext = load_extension(verbose=verbose_build)
@@ -336,7 +345,6 @@ def k1_symm_fused_l1_v3(
             use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
-    l1_weight_pack5, l1_scale = l1_weights
     return ext.k1_symm_fused_l1_v3_pack5(
         sym_buffer.buffer,
         sym_buffer.route_scratch,
@@ -389,6 +397,7 @@ def k1_symm_fused_l1_v3_graph(
     verbose_build: bool = False,
 ):
     backend = normalize_v3_backend(backend)
+    l1_weight_pack5, l1_scale = l1_weights
     _check_fused_l1_shape(
         num_ranks=num_ranks,
         num_experts=num_experts,
@@ -396,6 +405,7 @@ def k1_symm_fused_l1_v3_graph(
         num_max_tokens_per_rank=sym_buffer.num_max_tokens_per_rank,
         num_topk=num_topk,
         hidden=hidden,
+        l1_rows=int(l1_scale.size(1)),
         alignment=alignment,
     )
     ext = load_extension(verbose=verbose_build)
@@ -415,7 +425,6 @@ def k1_symm_fused_l1_v3_graph(
             use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
-    l1_weight_pack5, l1_scale = l1_weights
     return ext.k1_symm_fused_l1_v3_pack5(
         sym_buffer.buffer,
         sym_buffer.route_scratch,

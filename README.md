@@ -62,13 +62,14 @@ Then, import `deep_gemm` in your Python project, and enjoy!
 
 The DCU path builds a standalone `megamoe` HIP extension for Hygon `gfx938`.
 It is separate from the CUDA `deep_gemm` JIT flow above and is specialized for
-the DSV4-Flash W8A8 FP8 channelwise MegaMoE shape:
+the DeepSeek-V4 staged W8A8 FP8 channelwise MegaMoE shapes:
 
 - EP size: 8, 16, or 32 ranks on the V3 staged path
-- Experts: 256 total; 32/16/8 local experts per rank for EP8/EP16/EP32
 - Top-K: 6
-- Hidden size: 4096
-- Intermediate hidden size: 2048
+- DeepSeek-V4-Flash: experts=256, hidden=4096, intermediate hidden=2048;
+  32/16/8 local experts per rank for EP8/EP16/EP32
+- DeepSeek-V4-Pro: experts=384, hidden=7168, intermediate hidden=3072;
+  48/24/12 local experts per rank for EP8/EP16/EP32
 - Maximum tokens per rank: set by `num_max_tokens_per_rank`
 
 ### Build
@@ -539,7 +540,7 @@ python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
 
 ### Validate
 
-Run the DSV4-Flash correctness and performance check:
+Run a DeepSeek-V4-Flash correctness and performance check:
 
 ```bash
 source /opt/dtk-26.04/env.sh
@@ -555,6 +556,26 @@ python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --warmup 3 \
   --repeat 8 \
   --out hygon_tmp/megamoe_dcu_dsv4_flash_512.json
+```
+
+For the DeepSeek-V4-Pro EP16 shape, use the same harness with:
+
+```bash
+source /opt/dtk-26.04/env.sh
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
+  --num-processes 16 \
+  --num-max-tokens-per-rank 2048 \
+  --num-tokens 512 \
+  --hidden 7168 \
+  --intermediate-hidden 3072 \
+  --num-experts 384 \
+  --num-topk 6 \
+  --correctness-iters 1 \
+  --warmup 3 \
+  --repeat 8 \
+  --megamoe-backend normal \
+  --baseline-kind normal-contiguous \
+  --out hygon_tmp/megamoe_dcu_dsv4_pro_ep16_512.json
 ```
 
 To exercise CUDA-compatible uneven per-rank local token counts, pass an exact

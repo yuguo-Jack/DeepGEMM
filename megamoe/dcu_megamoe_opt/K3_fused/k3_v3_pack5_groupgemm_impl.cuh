@@ -14,6 +14,7 @@
 
 #include <mega_moe_dcu/common.cuh>
 #include <mega_moe_dcu/comm.cuh>
+#include <mega_moe_dcu/layout.cuh>
 
 using int32x2_t = int __attribute__((ext_vector_type(2)));
 using int32x4_t = int32_t __attribute__((ext_vector_type(4)));
@@ -30,7 +31,8 @@ static constexpr int kV3K3TailChunkM = 64;
 static constexpr int kV3K3TailCopyDoneSignalSlotBase = 8;
 static constexpr int kV3K3TailCopyExpertDoneOffset =
     3 * kV3K3TailDoneCounterRingSlots;
-static constexpr int kV3K3TailCopyExpertDoneCount = 32;
+static constexpr int kV3K3TailCopyExpertDoneCount =
+    deep_gemm::mega::kDcuMegaMoeTailCopyExpertDoneCount;
 
 __device__ static inline void block_barrier_device();
 __device__ static inline void invalidate_l1_device();
@@ -1512,7 +1514,7 @@ V3_K3_LowLatencyMaskedGroupGemmKernel(
     const int32_t* signal_generation_ptr = nullptr,
     int done_target = 0,
     int reduce_blocks = 0) {
-    static_assert(kExperts <= 32, "readlane expert broadcast assumes <=32 experts");
+    static_assert(kExperts <= 64, "readlane expert broadcast assumes <=64 experts");
     static_assert(kBlockM == 16 || kBlockM == 32 || kBlockM == 48 ||
                       kBlockM == 64,
                   "this low-latency kernel uses M16/M32/M48/M64 tiles");

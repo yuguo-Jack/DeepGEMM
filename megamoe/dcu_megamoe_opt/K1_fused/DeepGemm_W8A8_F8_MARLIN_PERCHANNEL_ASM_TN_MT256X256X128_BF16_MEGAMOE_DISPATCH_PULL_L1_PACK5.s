@@ -963,7 +963,7 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1:
 
 /* Global Offset A */
 .macro GLOBAL_OFFSET_A vgprAddr:req vgprOffsetL:req vgprOffset0I:req vgprTmp:req
-   v_lshlrev_b32 v[\vgprTmp+0], 10, v[\vgprOffset0I] // no256 * (4096 / 4)
+   v_lshlrev_b32 v[\vgprTmp+0], 10, v[\vgprOffset0I] // pack5 ni16 * (4 * 256)
    _v_add_co_u32 v[\vgprAddr+0], vcc, v[vgprPack5OffsetBaseA], v[\vgprTmp+0]
    _v_add_u32 v[\vgprAddr+0], 0x10, v[\vgprAddr+0]    // add prepad for pointer shift
                                                       // offset *= bytes/element (multiplier is 1, do nothing)
@@ -1645,7 +1645,8 @@ _v_add_co_u32 v18, vcc, 64, v9                     // groBL_1 + LSCB
 /* global read addresses: final offsets a */
 
 v_lshrrev_b32 v[vgprPack5OffsetBaseA], 10, v8 // pack5 ko64
-v_lshlrev_b32 v[vgprPack5OffsetBaseA], 18, v[vgprPack5OffsetBaseA] // ko64 * (4096 * 64)
+v_lshlrev_b32 v[vgprPack5OffsetBaseA], 6, v[vgprPack5OffsetBaseA] // ko64 * 64
+v_mul_lo_u32 v[vgprPack5OffsetBaseA], s[sgprSizeI], v[vgprPack5OffsetBaseA] // ko64 * (N * 64)
 v_and_b32 v[vgprPack5OffsetTmpA], 0x300, v8 // ks16 * 256
 _v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
 v_and_b32 v[vgprPack5OffsetTmpA], 15, v[vgprSerial] // plain pack5 ni for normal ASM
@@ -1908,7 +1909,7 @@ v_readfirstlane_b32 s13, v236                     // uniform runtime num_tokens 
 s_mov_b32 s14, s91                                // preserve max tokens; s[90:91] is reused for exec masks below
 s_lshl_b32 s70, s70, 5                            // global expert base for rank
 s_add_u32 s74, s70, s[sgprScaleFlag]              // target global expert
-s_mul_i32 s71, s91, 0x1000
+s_mul_i32 s71, s91, s[sgprSizeL]
 s_add_u32 s71, s71, 0x90                          // x_sf offset
 s_lshl_b32 s72, s91, 2
 s_add_u32 s72, s71, s72                           // topk_idx offset
@@ -2210,7 +2211,10 @@ label_SymmRoutePrebuiltWait:
 s_mov_b64 s[52:53], s[92:93]
 s_mov_b32 s54, BufferLimit
 s_mov_b32 s55, Srd127_96
-v_mov_b32 v253, 64                                 // route_scratch total active compact tiles
+s_load_dword s61, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc4 // packed compact metadata
+s_waitcnt lgkmcnt(0)
+s_and_b32 s62, s61, 0xffff                         // route_scratch active_tiles i32 offset
+v_mov_b32 v253, s62
 v_lshlrev_b32 v253, 2, v253
 buffer_load_dword v252, v253, s[52:55], 0, offen, offset:0
 s_waitcnt vmcnt(0)
@@ -2220,21 +2224,22 @@ s_cbranch_scc0 label_SymmRoutePrebuiltActiveTile
 s_endpgm
 
 label_SymmRoutePrebuiltActiveTile:
-v_mov_b32 v253, s[sgprWorkGroup1]
-v_lshlrev_b32 v253, 10, v253                       // m_indices[compact tile * 256] byte offset
-s_mov_b64 s[76:77], s[98:99]
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-buffer_load_dword v252, v253, s[76:79], 0, offen, offset:0
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s[sgprScaleFlag], v252
-s_cmp_ge_u32 s[sgprScaleFlag], 32
+	s_and_b32 s62, s61, 0xffff                         // active_tiles offset
+	s_add_u32 s62, s62, 1                              // tile_experts offset
+	s_add_u32 s62, s62, s[sgprWorkGroup1]
+	v_mov_b32 v253, s62
+	v_lshlrev_b32 v253, 2, v253                        // route_scratch_i32[tile_experts + compact tile]
+	buffer_load_dword v252, v253, s[52:55], 0, offen, offset:0
+	s_waitcnt vmcnt(0)
+	v_readfirstlane_b32 s[sgprScaleFlag], v252
+	s_lshr_b32 s62, s61, 16                            // local_experts
+s_cmp_ge_u32 s[sgprScaleFlag], s62
 s_cmov_b32 s[sgprScaleFlag], 0
 s_branch label_SymmRouteMetaReady
 
 label_SymmRouteMetaReady:
 /* MegaMoE dispatch-pull stage:
- * The 16 N-tile CTAs for each row tile cooperatively pull one 256x4096 x tile.
+ * The N-tile CTAs for each row tile cooperatively pull one 256 x hidden x tile.
  * Each CTA copies a disjoint vector slice, atomically bumps one row-tile done
  * counter, then waits on that single counter before the original DeepGEMM B
  * addressing reads the shared staged_x.
@@ -2327,14 +2332,26 @@ s_cmp_lt_u32 s[sgprWorkGroup0], s58
 s_cbranch_scc0 label_SymmSliceDone
 s_mul_i32 s61, s[sgprWorkGroup0], 0x300           // slice start = wg0 * blockDim
 v_add_u32 v250, s61, v[vgprSerial]
-s_mov_b32 s60, 0x8000                             // 256 rows * 4096 bytes / 32
+s_lshl_b32 s60, s[sgprSizeL], 3                  // 256 rows * hidden bytes / 32
 s_mul_i32 s61, s58, 0x300                         // slice stride = producer CTAs * blockDim
 label_SymmStageLoop:
 v_cmp_lt_u32 vcc, v250, s60
 s_and_saveexec_b64 s[90:91], vcc
 s_cbranch_execz label_SymmSliceDone
-v_lshrrev_b32 v251, 7, v250                       // row in 256-row tile
-v_and_b32 v252, 127, v250                         // 32-byte vector index in row
+s_cmp_eq_u32 s[sgprSizeL], 4096
+s_cbranch_scc0 label_SymmStageProIndex
+v_lshrrev_b32 v251, 7, v250                       // Flash row in 256-row tile
+v_and_b32 v252, 127, v250                         // Flash 32-byte vector index in row
+s_branch label_SymmStageIndexDone
+label_SymmStageProIndex:
+v_lshrrev_b32 v251, 5, v250                       // Pro: divide vector index by 32
+s_mov_b32 s63, 9363                               // exact /7 for q <= 1791
+v_mul_lo_u32 v251, s63, v251
+v_lshrrev_b32 v251, 16, v251                      // row = vec / 224
+s_mov_b32 s63, 224                                // Pro row stride in 32-byte vectors
+v_mul_lo_u32 v252, s63, v251                      // row start vector
+v_sub_u32 v252, v250, v252                        // Pro 32-byte vector index in row
+label_SymmStageIndexDone:
 v_lshlrev_b32 v253, 3, v251
 ds_read_b64 v[253:254], v253, offset:0
 s_waitcnt lgkmcnt(0)
@@ -2352,14 +2369,29 @@ buffer_load_dwordx4 v[236:239], v253, s[68:71], 0, offen, offset:0
 s_branch label_SymmStageSourceLoadIssued
 
 label_SymmStageLoadRankLocalPtr:
+/* Pro rows are 224 x 32-byte chunks, so a wave can cover the tail of one
+ * staged row and the head of the next. The rows may come from different source
+ * ranks; do not scalarize v254 once for the whole wave. */
+s_mov_b64 s[78:79], exec
+label_SymmStageRankLocalLoop:
+s_cbranch_execz label_SymmStageRankLocalDone
 v_readfirstlane_b32 s63, v254
-s_lshl_b32 s63, s63, 3
-s_load_dwordx2 s[68:69], s[76:77], s63
+s_lshl_b32 s62, s63, 3
+s_load_dwordx2 s[68:69], s[76:77], s62
+v_cmp_eq_u32 vcc, v254, s63
+s_and_saveexec_b64 s[80:81], vcc
 s_waitcnt lgkmcnt(0)
 v_add_u32 v253, v253, v252
 buffer_load_dwordx4 v[232:235], v253, s[68:71], 0, offen, offset:0
 v_add_u32 v253, 16, v253
 buffer_load_dwordx4 v[236:239], v253, s[68:71], 0, offen, offset:0
+s_waitcnt vmcnt(0)
+s_mov_b64 exec, s[80:81]
+v_cmp_ne_u32 vcc, v254, s63
+s_and_b64 exec, exec, vcc
+s_branch label_SymmStageRankLocalLoop
+label_SymmStageRankLocalDone:
+s_mov_b64 exec, s[78:79]
 label_SymmStageSourceLoadIssued:
 s_waitcnt vmcnt(0)
 label_SymmStageSkipSourceLoad:
@@ -2376,7 +2408,13 @@ v_mov_b32 v239, 0
 label_SymmStageZeroFillDone:
 s_mov_b64 exec, s[54:55]
 v_add_u32 v251, s56, v251                         // global staged row
+s_cmp_eq_u32 s[sgprSizeL], 4096
+s_cbranch_scc0 label_SymmStageStoreDynamicStride
 v_lshlrev_b32 v251, 12, v251
+s_branch label_SymmStageStoreStrideDone
+label_SymmStageStoreDynamicStride:
+v_mul_lo_u32 v251, s[sgprSizeL], v251              // global staged row * hidden
+label_SymmStageStoreStrideDone:
 v_add_u32 v251, v251, v252
 buffer_store_dwordx4 v[232:235], v251, s[64:67], 0, offen, offset:0
 v_add_u32 v251, 16, v251
@@ -2451,6 +2489,9 @@ label_SymmRestoreStructSmallB:
 s_mov_b32 s[sgprStrideStructB], 1
 s_mov_b32 s[sgprOffsetStructB], 0
 label_SymmRestoreStructDoneB:
+/* The rank-local staging loop reuses s62 for source-rank pointer slots.  B
+ * reads from the staged_x plane, whose extra base offset is zero. */
+s_mov_b32 s62, 0
 s_add_u32 s[sgprAddressB+0], s[sgprAddressB+0], s62
 s_addc_u32 s[sgprAddressB+1], s[sgprAddressB+1], 0
 
@@ -2500,7 +2541,7 @@ s_mov_b64 s[sgprShadowLimitA_forTailLoop+0:sgprShadowLimitA_forTailLoop+1], s[sg
 s_lshr_b32 s[sgprLoopCounterL], s[sgprSizesSum+0], 7 //  s[sgprLoopCounterL] = s[sgprSizesSum+0] / 128
 
 ;s_mov_b32 s[sgprGlobalReadIncsA+0], DepthU*BpeA       // incrB (unrollIdx)    128
-s_mov_b32 s[sgprGlobalReadIncsA+0], 0x80000
+s_lshl_b32 s[sgprGlobalReadIncsA+0], s[sgprSizeI], 7
 s_mul_i32 s[sgprGlobalReadIncsA+0], s[sgprGlobalReadIncsA+0], s[sgprLoopCounterL]  
 
 s_add_u32 s[sgprSrdA_forTailLoop+0], s[sgprSrdA_forTailLoop+0], s[sgprGlobalReadIncsA+0] // 
@@ -2602,7 +2643,7 @@ s_or_b32 s[sgprSrdB+1], s[sgprSrdB+1], s[sgprStructNumB]  //
 
 /* global read addresses: increments a */
 ; s_mul_i32 s54, s[sgprGSU], DepthU*BpeAGR
-s_mov_b32 s[sgprGlobalReadIncsA+0], 0x80000          // V3 pack5 incrA, 128 K step
+s_lshl_b32 s[sgprGlobalReadIncsA+0], s[sgprSizeI], 7 // V3 pack5 incrA, 128 K step
 ; //s_mov_b32 s[sgprGlobalReadIncsA+0], DepthU*BpeA    // incrA (unrollIdx)
 
 

@@ -1254,12 +1254,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     if diff.numel()
                     else 0.0
                 )
-                graph_runtime_debug = (
+                graph_runtime_value = (
                     int(sym_buffer.cuda_graph_num_tokens.detach().cpu().item())
                     if hasattr(sym_buffer, "cuda_graph_num_tokens")
                     else -1
                 )
-                graph_active_tiles_debug = (
+                graph_active_tiles_value = (
                     int(sym_buffer.route_scratch.view(torch.int32)[64].detach().cpu().item())
                     if hasattr(sym_buffer, "route_scratch")
                     else -1
@@ -1269,8 +1269,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     f"max_abs={max_abs} exceeds --atol={args.atol}; "
                     f"argmax=({row_idx},{col_idx}) "
                     f"graph={graph_value} baseline={baseline_value}; "
-                    f"graph_runtime={graph_runtime_debug} "
-                    f"active_tiles={graph_active_tiles_debug}"
+                    f"graph_runtime={graph_runtime_value} "
+                    f"active_tiles={graph_active_tiles_value}"
                 )
             print_once(
                 rank,

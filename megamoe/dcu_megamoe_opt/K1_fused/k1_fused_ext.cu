@@ -38,6 +38,8 @@ void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
     int num_global_experts,
     int num_max_tokens_per_rank,
     int num_topk,
+    int hidden,
+    int l1_rows,
     int runtime_num_tokens,
     int rows_aligned_per_expert,
     int valid_rows_per_expert,
@@ -69,10 +71,6 @@ namespace {
 
 static constexpr const char* kFusedL1AsmKernelName =
     "DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1";
-static constexpr int kK1SupportedExperts = 256;
-static constexpr int kK1SupportedTopk = 6;
-static constexpr int kK1SupportedHidden = 4096;
-static constexpr int kK1SupportedL1Rows = 4096;
 static constexpr int kK1RouteTileM = 256;
 static constexpr int kK1SupportedAlignment = 256;
 static constexpr int kK1RouteCapacitySlack = 64;
@@ -83,17 +81,20 @@ static constexpr double kK1AutoCompactMinLocalTileSaving = 8.0;
 static constexpr int64_t kK1AutoCompactHighTilesPerExpert = 7;
 static constexpr double kK1CompactTightMarginMinSaving = 0.45;
 static constexpr const char* kK1ShapeContract =
-    "K1_fused dispatch-pull L1 asm is currently specialized for DSV4 Flash "
-    "ranks in {8,16,32}, experts=256, local_experts<=32, topk=6, hidden=4096, "
-    "L1 output features=4096 (intermediate=2048), route_tile_m=256, "
+    "K1_fused dispatch-pull L1 pack5 supports DeepSeek-V4-Flash "
+    "EP8/EP16/EP32 (experts=256, topk=6, hidden=4096, intermediate=2048) "
+    "and DeepSeek-V4-Pro EP8/EP16/EP32 (experts=384, topk=6, hidden=7168, "
+    "intermediate=3072), L1 output features=2*intermediate, route_tile_m=256, "
     "alignment=256, and 0<=num_tokens_per_rank<=num_max_tokens_per_rank";
 
-bool is_supported_dsv4_flash_rank_count(const int64_t num_ranks) {
-    return num_ranks == 8 || num_ranks == 16 || num_ranks == 32;
+bool is_supported_staged_rank_count(const int64_t num_ranks) {
+    return deep_gemm::mega::dcu_supported_staged_ep_rank_count(
+        static_cast<int>(num_ranks));
 }
 
-bool is_supported_dsv4_flash_local_experts(const int64_t local_experts) {
-    return local_experts == 8 || local_experts == 16 || local_experts == 32;
+bool is_supported_staged_local_experts(const int64_t local_experts) {
+    return deep_gemm::mega::dcu_supported_staged_local_experts(
+        static_cast<int>(local_experts));
 }
 
 int64_t ceil_div_i64(const int64_t a, const int64_t b) {
@@ -315,13 +316,14 @@ uint32_t next_fused_l1_flag_generation() {
 }
 
 __global__ void k1_init_compact_routes_kernel(
-    int32_t* route_scratch_i32) {
+    int32_t* route_scratch_i32,
+    const int local_experts) {
     const int tid = static_cast<int>(threadIdx.x);
-    for (int i = tid; i < 32; i += static_cast<int>(blockDim.x)) {
+    for (int i = tid; i < local_experts; i += static_cast<int>(blockDim.x)) {
         route_scratch_i32[i] = 0;
     }
     if (tid == 0) {
-        route_scratch_i32[64] = 0;
+        route_scratch_i32[2 * local_experts] = 0;
     }
 }
 
@@ -376,28 +378,30 @@ __global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
     int32_t* m_indices,
     uint16_t* padding_combine_sink,
     const int capacity_tiles,
+    const int local_experts,
     const int runtime_limited_init,
     const int hidden) {
-    constexpr int kLocalExperts = 32;
     constexpr int kTileM = kK1RouteTileM;
+    const int tile_bases_offset = local_experts;
+    const int active_tiles_offset = 2 * local_experts;
+    const int tile_experts_offset = active_tiles_offset + 1;
     __shared__ int active_tiles_shared;
     const int tid = static_cast<int>(threadIdx.x);
     if (tid == 0) {
         int total_tiles = 0;
-        for (int expert = 0; expert < kLocalExperts; ++expert) {
-            route_scratch_i32[32 + expert] = total_tiles;
+        for (int expert = 0; expert < local_experts; ++expert) {
+            route_scratch_i32[tile_bases_offset + expert] = total_tiles;
             int tiles = (route_scratch_i32[expert] + kTileM - 1) / kTileM;
             if (total_tiles + tiles > capacity_tiles) {
                 tiles = capacity_tiles > total_tiles ? capacity_tiles - total_tiles : 0;
             }
             for (int tile = 0; tile < tiles; ++tile) {
-                route_scratch_i32[65 + total_tiles + tile] = expert;
+                route_scratch_i32[tile_experts_offset + total_tiles + tile] = expert;
             }
             total_tiles += tiles;
             route_scratch_i32[expert] = 0;
         }
-        route_scratch_i32[32 + kLocalExperts] = total_tiles;
-        route_scratch_i32[64] = total_tiles;
+        route_scratch_i32[active_tiles_offset] = total_tiles;
         active_tiles_shared = total_tiles;
     }
     __syncthreads();
@@ -407,7 +411,7 @@ __global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
     for (int row = tid; row < init_rows; row += static_cast<int>(blockDim.x)) {
         const int tile_id = row / kTileM;
         const int expert =
-            row < active_rows ? route_scratch_i32[65 + tile_id] : 0;
+            row < active_rows ? route_scratch_i32[tile_experts_offset + tile_id] : 0;
         row_x_ptrs[row] = -1;
         row_x_scales[row] = 0.0f;
         route_weights[row] = 0.0f;
@@ -454,7 +458,9 @@ __global__ void k1_emit_compact_routes_kernel(
     const int local_experts = num_experts / num_ranks;
     const int first_expert = rank_idx * local_experts;
     const int last_expert = first_expert + local_experts;
-    const int active_tiles = route_scratch_i32[64];
+    const int tile_bases_offset = local_experts;
+    const int active_tiles_offset = 2 * local_experts;
+    const int active_tiles = route_scratch_i32[active_tiles_offset];
     const int capacity_rows = capacity_tiles * kTileM;
     uint8_t** sym_buffers =
         deep_gemm::mega::dcu_peer_sym_buffer_ptrs(local_sym_buffer);
@@ -492,7 +498,8 @@ __global__ void k1_emit_compact_routes_kernel(
         const int row_in_expert =
             atomicAdd(&route_scratch_i32[local_expert], 1);
         const int tile_id =
-            route_scratch_i32[32 + local_expert] + row_in_expert / kTileM;
+            route_scratch_i32[tile_bases_offset + local_expert] +
+            row_in_expert / kTileM;
         if (tile_id >= active_tiles || tile_id >= capacity_tiles) {
             continue;
         }
@@ -585,17 +592,18 @@ void launch_l1_deepgemm_fused_asm(
     const int hidden = static_cast<int>(l1_weight.size(2) / 16);
     const int n = static_cast<int>(output.size(1));
     const int local_experts = static_cast<int>(l1_weight.size(0));
-    TORCH_CHECK(hidden == kK1SupportedHidden && n == kK1SupportedL1Rows,
-                kK1ShapeContract);
-    TORCH_CHECK(is_supported_dsv4_flash_rank_count(num_ranks) &&
-                    num_experts == kK1SupportedExperts &&
-                    num_topk == kK1SupportedTopk,
+    TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_k1_shape(
+                    static_cast<int>(num_ranks),
+                    static_cast<int>(num_experts),
+                    static_cast<int>(num_topk),
+                    hidden,
+                    n),
                 kK1ShapeContract);
     TORCH_CHECK(num_tokens >= 0 && num_tokens <= num_max_tokens_per_rank,
                 kK1ShapeContract);
     TORCH_CHECK(total_rows > 0 && total_rows % kK1RouteTileM == 0,
                 "fused L1 asm expects total_rows padded to a 256-row tile");
-    TORCH_CHECK(is_supported_dsv4_flash_local_experts(local_experts),
+    TORCH_CHECK(is_supported_staged_local_experts(local_experts),
                 kK1ShapeContract);
     TORCH_CHECK(sym_buffer.is_cuda() && sym_buffer.scalar_type() == torch::kInt8 &&
                     sym_buffer.is_contiguous(),
@@ -677,7 +685,8 @@ void launch_l1_deepgemm_fused_asm(
                            4, ceil_div_i64(routes_per_rank, 768)))));
         dim3 route_grid(blocks_per_rank, static_cast<unsigned>(num_ranks), 1);
         k1_init_compact_routes_kernel<<<1, route_threads, 0, stream>>>(
-            reinterpret_cast<int32_t*>(route_scratch.data_ptr()));
+            reinterpret_cast<int32_t*>(route_scratch.data_ptr()),
+            local_experts);
         K1_HIP_CHECK(hipGetLastError());
         k1_count_compact_routes_kernel<<<route_grid, route_threads, 0, stream>>>(
             static_cast<uint8_t*>(sym_buffer.data_ptr()),
@@ -700,6 +709,7 @@ void launch_l1_deepgemm_fused_asm(
             m_indices.data_ptr<int32_t>(),
             reinterpret_cast<uint16_t*>(output.data_ptr()),
             capacity_tiles,
+            local_experts,
             runtime_num_tokens == nullptr ? 0 : 1,
             hidden);
         K1_HIP_CHECK(hipGetLastError());
@@ -772,7 +782,16 @@ void launch_l1_deepgemm_fused_asm(
     if (use_rank_local_x_ptrs) {
         prob.reserved_c0 |= 4u;
     }
-    prob.reserved_c4 = 0;
+    const uint32_t compact_active_tiles_offset =
+        static_cast<uint32_t>(2 * local_experts);
+    TORCH_CHECK(local_experts <= 0xffff &&
+                    compact_active_tiles_offset <= 0xffff,
+                "K1 compact metadata exceeds packed reserved_c4 range");
+    // reserved_c4 packs compact metadata needed by the prebuilt ASM path:
+    // low16 = active_tiles i32 offset, high16 = local_experts.
+    prob.reserved_c4 =
+        compact_active_tiles_offset |
+        (static_cast<uint32_t>(local_experts) << 16);
     prob.flag_generation = next_fused_l1_flag_generation();
     prob.expert_tiles_per_expert = expert_tiles_per_expert;
     prob.route_weights = route_weights.data_ptr<float>();
@@ -871,11 +890,7 @@ k1_symm_fused_l1_asm_impl(
                 "symm K1 tensors must be contiguous");
     TORCH_CHECK(!code_object_path.empty(),
                 "K1_fused requires the fused L1 asm code object");
-    TORCH_CHECK(is_supported_dsv4_flash_rank_count(num_ranks) &&
-                    num_experts == kK1SupportedExperts &&
-                    num_topk == kK1SupportedTopk &&
-                    hidden == kK1SupportedHidden,
-                kK1ShapeContract);
+    TORCH_CHECK(is_supported_staged_rank_count(num_ranks), kK1ShapeContract);
     TORCH_CHECK(rank_idx >= 0 && rank_idx < num_ranks, "invalid rank_idx");
     TORCH_CHECK(num_tokens >= 0 && num_tokens <= num_max_tokens_per_rank,
                 kK1ShapeContract);
@@ -893,7 +908,15 @@ k1_symm_fused_l1_asm_impl(
     TORCH_CHECK(l1_scale.dim() == 2, "l1_scale must be [expert,row]");
     const int64_t local_experts = num_experts / num_ranks;
     const int64_t l1_rows = l1_scale.size(1);
-    TORCH_CHECK(l1_rows == kK1SupportedL1Rows, kK1ShapeContract);
+    TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_k1_shape(
+                    static_cast<int>(num_ranks),
+                    static_cast<int>(num_experts),
+                    static_cast<int>(num_topk),
+                    static_cast<int>(hidden),
+                    static_cast<int>(l1_rows)),
+                kK1ShapeContract);
+    TORCH_CHECK(is_supported_staged_local_experts(local_experts),
+                kK1ShapeContract);
     TORCH_CHECK(l1_weight.size(0) == local_experts &&
                     l1_weight.size(1) == l1_rows / 16 &&
                     l1_weight.size(2) == hidden * 16,
@@ -924,15 +947,14 @@ k1_symm_fused_l1_asm_impl(
                 route_capacity_headroom_rows(expected_per_expert));
     const int64_t fixed_capacity_tiles_per_expert =
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
-    // The in-ASM route builder was tuned around the original EP8 fixed-local
-    // layout. EP16/EP32 have fewer local experts and can fault in that path, so
-    // those shapes are forced to the HIP compact prebuild. K1_PREBUILD_MODE is
-    // kept only for EP8/local ablations.
+    // The in-ASM route builder was tuned around the original Flash EP8 layout
+    // with 32 local experts. EP16/EP32 and Pro EP8 use the HIP compact
+    // prebuild, which has dynamic route-scratch metadata.
     const bool default_compact_prebuild =
-        force_compact_prebuild || num_ranks > 8;
+        force_compact_prebuild || num_ranks > 8 || local_experts > 32;
     bool use_compact_prebuild = default_compact_prebuild;
     bool force_asm_route = false;
-    if (!force_compact_prebuild && num_ranks <= 8) {
+    if (!force_compact_prebuild && num_ranks <= 8 && local_experts <= 32) {
         if (const char* mode = std::getenv("K1_PREBUILD_MODE")) {
             TORCH_CHECK(
                 std::strcmp(mode, "auto") == 0 ||
@@ -957,7 +979,7 @@ k1_symm_fused_l1_asm_impl(
     const int64_t fixed_capacity_tiles =
         local_experts * fixed_capacity_tiles_per_expert;
     const bool force_fixed_compact_capacity =
-        use_compact_prebuild && num_ranks > 8;
+        use_compact_prebuild && (num_ranks > 8 || local_experts > 32);
     const int64_t capacity_tiles = use_compact_prebuild
                                        ? (force_fixed_compact_capacity
                                               ? fixed_capacity_tiles
@@ -978,10 +1000,11 @@ k1_symm_fused_l1_asm_impl(
         scratch_offset = offset + bytes;
         return offset;
     };
-    // Route header: compact prebuild uses counts[32], tile_bases[32],
+    // Route header: compact prebuild uses counts[local_experts],
+    // tile_bases[local_experts],
     // active_tiles, tile_experts[capacity_tiles]. The asm-route candidate adds
     // expert_tile_to_compact[capacity_tiles] and per-row-tile stage flags.
-    const int64_t compact_header_i32 = 65 + capacity_tiles;
+    const int64_t compact_header_i32 = 2 * local_experts + 1 + capacity_tiles;
     const int64_t asm_route_header_i32 =
         local_experts + local_experts + 1 + capacity_tiles +
         capacity_tiles + capacity_tiles * 16;
@@ -1172,10 +1195,15 @@ k1_symm_fused_l1_v3_pack5(
     TORCH_CHECK(sym_buffer.is_contiguous() && route_scratch.is_contiguous() &&
                     l1_weight_pack5.is_contiguous() && l1_scale.is_contiguous(),
                 "V3 K1 tensors must be contiguous");
-    TORCH_CHECK(is_supported_dsv4_flash_rank_count(num_ranks) &&
-                    num_experts == kK1SupportedExperts &&
-                    num_topk == kK1SupportedTopk &&
-                    hidden == kK1SupportedHidden &&
+    TORCH_CHECK(l1_scale.dim() == 2, "V3 K1 l1_scale must be [local_experts, l1_rows]");
+    const int64_t local_experts = num_experts / num_ranks;
+    const int64_t l1_rows = l1_scale.size(1);
+    TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_k1_shape(
+                    static_cast<int>(num_ranks),
+                    static_cast<int>(num_experts),
+                    static_cast<int>(num_topk),
+                    static_cast<int>(hidden),
+                    static_cast<int>(l1_rows)) &&
                     alignment == kK1SupportedAlignment,
                 kK1ShapeContract);
     TORCH_CHECK(rank_idx >= 0 && rank_idx < num_ranks, "invalid rank_idx");
@@ -1184,19 +1212,16 @@ k1_symm_fused_l1_v3_pack5(
     TORCH_CHECK(backend == "ll",
                 "V3 K1 pack5 C entry is LL-only; normal uses ASM-pack5");
 
-    const int64_t local_experts = num_experts / num_ranks;
-    TORCH_CHECK(is_supported_dsv4_flash_local_experts(local_experts),
+    TORCH_CHECK(is_supported_staged_local_experts(local_experts),
                 kK1ShapeContract);
-    TORCH_CHECK(l1_scale.dim() == 2 &&
-                    l1_scale.size(0) == local_experts &&
-                    l1_scale.size(1) == kK1SupportedL1Rows,
-                "V3 K1 l1_scale must be [local_experts, 4096]");
+    TORCH_CHECK(l1_scale.size(0) == local_experts,
+                "V3 K1 l1_scale must be [local_experts, l1_rows]");
     TORCH_CHECK(l1_weight_pack5.dim() >= 2 &&
                     l1_weight_pack5.size(0) == local_experts &&
                     l1_weight_pack5.numel() >=
-                        local_experts * static_cast<int64_t>(kK1SupportedL1Rows) *
-                            kK1SupportedHidden,
-                "V3 K1 l1_weight_pack5 must cover [local_experts, 4096 * 4096]");
+                        local_experts * static_cast<int64_t>(l1_rows) *
+                            static_cast<int64_t>(hidden),
+                "V3 K1 l1_weight_pack5 must cover [local_experts, l1_rows * hidden]");
     if (runtime_num_tokens.has_value()) {
         const auto& runtime = runtime_num_tokens.value();
         TORCH_CHECK(runtime.is_cuda() && runtime.is_contiguous() &&
@@ -1209,9 +1234,9 @@ k1_symm_fused_l1_v3_pack5(
         const auto& counter = tail_done_counter.value();
         TORCH_CHECK(counter.is_cuda() && counter.is_contiguous() &&
                         counter.scalar_type() == torch::kInt &&
-                        counter.numel() >= 80,
+                        counter.numel() >= deep_gemm::mega::kDcuMegaMoeTailDoneCounterInts,
                     "tail_done_counter must be a contiguous CUDA int32 tensor "
-                    "with at least 80 elements");
+                    "with enough elements for LL tail/copy counters");
         tail_done_counter_tensor = &counter;
     }
     const torch::Tensor* graph_runtime_num_tokens_out_tensor = nullptr;
@@ -1429,11 +1454,11 @@ k1_symm_fused_l1_v3_pack5(
         TORCH_CHECK(workspace.scalar_type() == torch::kBFloat16,
                     "V3 K1 l1_out_workspace must be BF16");
         TORCH_CHECK(workspace.dim() == 2 && workspace.size(0) >= total_rows &&
-                        workspace.size(1) == kK1SupportedL1Rows,
-                    "V3 K1 l1_out_workspace must be [>=total_rows, 4096]");
+                        workspace.size(1) == l1_rows,
+                    "V3 K1 l1_out_workspace must be [>=total_rows, l1_rows]");
         l1_out = workspace.narrow(0, 0, total_rows);
     } else {
-        l1_out = torch::empty({total_rows, kK1SupportedL1Rows}, bf16_options);
+        l1_out = torch::empty({total_rows, l1_rows}, bf16_options);
     }
     const torch::Tensor* local_expert_stats = nullptr;
     if (cumulative_local_expert_recv_stats.has_value()) {
@@ -1467,6 +1492,8 @@ k1_symm_fused_l1_v3_pack5(
         static_cast<int>(num_experts),
         static_cast<int>(num_max_tokens_per_rank),
         static_cast<int>(num_topk),
+        static_cast<int>(hidden),
+        static_cast<int>(l1_rows),
         runtime_launch_num_tokens,
         static_cast<int>(rows_aligned_per_expert),
         static_cast<int>(valid_rows_per_expert),
@@ -1512,11 +1539,12 @@ k1_graph_flag_reset_layout(
     const int64_t hidden,
     const int64_t l1_rows,
     const int64_t alignment) {
-    TORCH_CHECK(is_supported_dsv4_flash_rank_count(num_ranks) &&
-                    num_experts == kK1SupportedExperts &&
-                    num_topk == kK1SupportedTopk &&
-                    hidden == kK1SupportedHidden &&
-                    l1_rows == kK1SupportedL1Rows &&
+    TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_k1_shape(
+                    static_cast<int>(num_ranks),
+                    static_cast<int>(num_experts),
+                    static_cast<int>(num_topk),
+                    static_cast<int>(hidden),
+                    static_cast<int>(l1_rows)) &&
                     alignment == kK1SupportedAlignment &&
                     num_tokens >= 0 && num_tokens <= num_max_tokens_per_rank,
                 kK1ShapeContract);
@@ -1533,8 +1561,11 @@ k1_graph_flag_reset_layout(
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
     const int64_t fixed_capacity_tiles =
         local_experts * fixed_capacity_tiles_per_expert;
-    const int64_t capacity_tiles = compact_capacity_tiles(
-        total_tasks, num_experts, local_experts, fixed_capacity_tiles_per_expert);
+    const int64_t capacity_tiles =
+        num_ranks > 8
+            ? fixed_capacity_tiles
+            : compact_capacity_tiles(total_tasks, num_experts, local_experts,
+                                     fixed_capacity_tiles_per_expert);
     const int64_t total_rows = capacity_tiles * kK1RouteTileM;
     const int64_t route_workspace_bytes =
         deep_gemm::mega::route_task_workspace_bytes(

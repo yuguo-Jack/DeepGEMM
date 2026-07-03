@@ -8,7 +8,7 @@
 
 #include "k3_v3_pack5_groupgemm_impl.cuh"
 
-template <int kExperts, int kBlockM>
+template <int kExperts, int kHidden, int kIntermediate, int kBlockM>
 static inline void launch_v3_k3_ll_rowptr(
     hip_bfloat16* output_workspace,
     const uint8_t* act_fp8,
@@ -36,7 +36,7 @@ static inline void launch_v3_k3_ll_rowptr(
     constexpr int kDoneTarget = 64;
     const dim3 grid(kCUs + reduce_blocks);
     V3_K3_LowLatencyMaskedGroupGemmKernel<
-        kExperts, 4096, 2048, kBlockM, 256, 64, 4, kCUs, true>
+        kExperts, kHidden, kIntermediate, kBlockM, 256, 64, 4, kCUs, true>
         <<<grid, block, 0, stream>>>(
             output_workspace,
             act_fp8,
@@ -62,7 +62,7 @@ static inline void launch_v3_k3_ll_rowptr(
             reduce_blocks);
 }
 
-template <int kExperts, int kBlockM>
+template <int kExperts, int kHidden, int kIntermediate, int kBlockM>
 static inline void launch_v3_k3_ll_local(
     hip_bfloat16* output_workspace,
     const uint8_t* act_fp8,
@@ -76,7 +76,7 @@ static inline void launch_v3_k3_ll_local(
     constexpr int kCUs = 64;
     const dim3 grid(kCUs);
     V3_K3_LowLatencyMaskedGroupGemmKernel<
-        kExperts, 4096, 2048, kBlockM, 256, 64, 4, kCUs, false>
+        kExperts, kHidden, kIntermediate, kBlockM, 256, 64, 4, kCUs, false>
         <<<grid, block, 0, stream>>>(
             output_workspace,
             act_fp8,
@@ -105,7 +105,7 @@ static inline void launch_v3_k3_ll_split_combine_reduce(
     int num_topk,
     int hidden,
     hipStream_t stream) {
-    if (hidden != 4096)
+    if (hidden != 4096 && hidden != 7168)
         return;
     constexpr int kCopyRows = 16;
     constexpr int kCopyHidden = 256;
@@ -120,23 +120,20 @@ static inline void launch_v3_k3_ll_split_combine_reduce(
     const int copy_blocks =
         local_experts * row_blocks_per_expert * hidden_tiles;
     const int reduce_blocks = kChunkSlots * hidden_tiles;
-    V3_K3_LowLatencyCombineReduceKernel<4096, kCopyRows, kCopyHidden>
-        <<<dim3(copy_blocks + reduce_blocks), dim3(256), 0, stream>>>(
-            output_workspace,
-            actual_m,
-            max_copy_rows_ptr,
-            rows_per_expert,
-            row_combine_ptrs,
-            sym_buffer,
-            done_counter,
-            reinterpret_cast<uint16_t*>(reduce_y),
-            rank_idx,
-            num_ranks,
-            num_experts,
-            num_max_tokens_per_rank,
-            num_tokens,
-            runtime_num_tokens,
-            num_topk);
+#define DCU_MEGAMOE_V3_LAUNCH_K3_LL_SPLIT_REDUCE(HIDDEN)                       \
+    V3_K3_LowLatencyCombineReduceKernel<HIDDEN, kCopyRows, kCopyHidden>         \
+        <<<dim3(copy_blocks + reduce_blocks), dim3(256), 0, stream>>>(          \
+            output_workspace, actual_m, max_copy_rows_ptr, rows_per_expert,     \
+            row_combine_ptrs, sym_buffer, done_counter,                         \
+            reinterpret_cast<uint16_t*>(reduce_y), rank_idx, num_ranks,         \
+            num_experts, num_max_tokens_per_rank, num_tokens,                   \
+            runtime_num_tokens, num_topk)
+    if (hidden == 4096) {
+        DCU_MEGAMOE_V3_LAUNCH_K3_LL_SPLIT_REDUCE(4096);
+    } else {
+        DCU_MEGAMOE_V3_LAUNCH_K3_LL_SPLIT_REDUCE(7168);
+    }
+#undef DCU_MEGAMOE_V3_LAUNCH_K3_LL_SPLIT_REDUCE
 }
 
 void dcu_megamoe_v3_launch_k3_ll_combine_pack5(
@@ -159,10 +156,11 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5(
     const int32_t* runtime_num_tokens,
     int num_topk,
     int hidden,
+    int intermediate,
     int ll_block_m,
     const int32_t* signal_generation_ptr,
     hipStream_t stream) {
-    if (hidden != 4096) {
+    if (!deep_gemm::mega::dcu_supported_staged_k3_dims(hidden, intermediate)) {
         (void)output_workspace;
         (void)act_fp8;
         (void)act_scale;
@@ -181,32 +179,47 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5(
     if (rows_per_expert <= 0 || total_rows % local_experts != 0)
         return;
     const int reduce_blocks = num_max_tokens_per_rank <= 2048 ? 64 : 128;
-#define DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, BLOCK_M)                             \
-    launch_v3_k3_ll_rowptr<(EXPERTS), (BLOCK_M)>(                              \
+#define DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, HIDDEN, INTERMEDIATE, BLOCK_M)        \
+    launch_v3_k3_ll_rowptr<(EXPERTS), (HIDDEN), (INTERMEDIATE), (BLOCK_M)>(     \
         output_workspace, act_fp8, act_scale, row_expert, weight_pack5,         \
         weight_scale,                                                           \
         row_combine_ptrs, rows_per_expert, sym_buffer, done_counter,            \
         signal_addrs, reduce_y, num_ranks, num_experts,                        \
         num_max_tokens_per_rank, num_tokens, runtime_num_tokens, num_topk,      \
         reduce_blocks, signal_generation_ptr, stream)
-#define DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(EXPERTS)                          \
+#define DCU_MEGAMOE_V3_LAUNCH_LL_FOR_SHAPE(EXPERTS, HIDDEN, INTERMEDIATE)       \
     do {                                                                        \
         if (ll_block_m == 64) {                                                  \
-            DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, 64);                              \
+            DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, HIDDEN, INTERMEDIATE, 64);        \
         } else if (ll_block_m == 48) {                                           \
-            DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, 48);                              \
+            DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, HIDDEN, INTERMEDIATE, 48);        \
         } else {                                                                 \
-            DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, 32);                              \
+            DCU_MEGAMOE_V3_LAUNCH_LL(EXPERTS, HIDDEN, INTERMEDIATE, 32);        \
+        }                                                                        \
+    } while (0)
+#define DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(EXPERTS)                          \
+    do {                                                                        \
+        if (hidden == 4096 && intermediate == 2048) {                            \
+            DCU_MEGAMOE_V3_LAUNCH_LL_FOR_SHAPE(EXPERTS, 4096, 2048);            \
+        } else if (hidden == 7168 && intermediate == 3072) {                     \
+            DCU_MEGAMOE_V3_LAUNCH_LL_FOR_SHAPE(EXPERTS, 7168, 3072);            \
         }                                                                        \
     } while (0)
     if (local_experts == 8) {
         DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(8);
+    } else if (local_experts == 12) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(12);
     } else if (local_experts == 16) {
         DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(16);
+    } else if (local_experts == 24) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(24);
     } else if (local_experts == 32) {
         DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(32);
+    } else if (local_experts == 48) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(48);
     }
 #undef DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS
+#undef DCU_MEGAMOE_V3_LAUNCH_LL_FOR_SHAPE
 #undef DCU_MEGAMOE_V3_LAUNCH_LL
     (void)sym_buffer;
     (void)done_counter;
@@ -240,10 +253,11 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5_split(
     const int32_t* runtime_num_tokens,
     int num_topk,
     int hidden,
+    int intermediate,
     const int32_t* max_copy_rows_ptr,
     int ll_block_m,
     hipStream_t stream) {
-    if (hidden != 4096) {
+    if (!deep_gemm::mega::dcu_supported_staged_k3_dims(hidden, intermediate)) {
         (void)output_workspace;
         (void)act_fp8;
         (void)act_scale;
@@ -266,28 +280,43 @@ void dcu_megamoe_v3_launch_k3_ll_combine_pack5_split(
         local_experts > 0 ? (total_rows / local_experts) : 0;
     if (rows_per_expert <= 0 || total_rows % local_experts != 0)
         return;
-#define DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, BLOCK_M)                       \
-    launch_v3_k3_ll_local<(EXPERTS), (BLOCK_M)>(                               \
+#define DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, HIDDEN, INTERMEDIATE, BLOCK_M)  \
+    launch_v3_k3_ll_local<(EXPERTS), (HIDDEN), (INTERMEDIATE), (BLOCK_M)>(      \
         output_workspace, act_fp8, act_scale, row_expert, weight_pack5,         \
         weight_scale, rows_per_expert, stream)
-#define DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(EXPERTS)                    \
+#define DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_SHAPE(EXPERTS, HIDDEN, INTERMEDIATE) \
     do {                                                                        \
         if (ll_block_m == 64) {                                                  \
-            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, 64);                        \
+            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, HIDDEN, INTERMEDIATE, 64);  \
         } else if (ll_block_m == 48) {                                           \
-            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, 48);                        \
+            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, HIDDEN, INTERMEDIATE, 48);  \
         } else {                                                                 \
-            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, 32);                        \
+            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL(EXPERTS, HIDDEN, INTERMEDIATE, 32);  \
+        }                                                                        \
+    } while (0)
+#define DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(EXPERTS)                    \
+    do {                                                                        \
+        if (hidden == 4096 && intermediate == 2048) {                            \
+            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_SHAPE(EXPERTS, 4096, 2048);      \
+        } else if (hidden == 7168 && intermediate == 3072) {                     \
+            DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_SHAPE(EXPERTS, 7168, 3072);      \
         }                                                                        \
     } while (0)
     if (local_experts == 8) {
         DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(8);
+    } else if (local_experts == 12) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(12);
     } else if (local_experts == 16) {
         DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(16);
+    } else if (local_experts == 24) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(24);
     } else if (local_experts == 32) {
         DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(32);
+    } else if (local_experts == 48) {
+        DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS(48);
     }
 #undef DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_EXPERTS
+#undef DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL_FOR_SHAPE
 #undef DCU_MEGAMOE_V3_LAUNCH_LL_LOCAL
     launch_v3_k3_ll_split_combine_reduce(
         output_workspace,
@@ -385,8 +414,10 @@ void k3_v3_ll_combine_tail(
                 "reduce_y shape mismatch");
     TORCH_CHECK(total_rows > 0 && total_rows % 64 == 0,
                 "V3 K3 LL pack5 expects rows padded to 64");
-    TORCH_CHECK(hidden == 4096 && intermediate == 2048,
-                "V3 K3 LL pack5 is specialized for hidden=4096, intermediate=2048");
+    TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_k3_dims(hidden, intermediate),
+                "V3 K3 LL pack5 supports DeepSeek-V4-Flash "
+                "(hidden=4096, intermediate=2048) and DeepSeek-V4-Pro "
+                "(hidden=7168, intermediate=3072)");
     TORCH_CHECK(ll_block_m == 32 || ll_block_m == 48 || ll_block_m == 64,
                 "V3 K3 LL pack5 expects ll_block_m in {32, 48, 64}");
     TORCH_CHECK(num_ranks > 0 && num_ranks <= 32,
@@ -398,7 +429,8 @@ void k3_v3_ll_combine_tail(
     TORCH_CHECK(num_max_tokens_per_rank >= num_tokens,
                 "num_max_tokens_per_rank must cover num_tokens");
     constexpr int64_t kTailDoneCounterRingSlots = 16;
-    constexpr int64_t kTailDoneCounterInts = 3 * kTailDoneCounterRingSlots;
+    constexpr int64_t kTailDoneCounterInts =
+        3 * kTailDoneCounterRingSlots + kV3K3TailCopyExpertDoneCount;
     TORCH_CHECK(done_counter.numel() >= kTailDoneCounterInts,
                 "done_counter must cover LL tail done and peer-ready rings");
     TORCH_CHECK(signal_addrs.numel() >= 2 * num_ranks,
@@ -422,8 +454,8 @@ void k3_v3_ll_combine_tail(
         runtime_num_tokens_ptr = runtime.data_ptr<int32_t>();
     }
     const int local_experts = num_ranks > 0 ? (num_experts / num_ranks) : 0;
-    TORCH_CHECK(local_experts == 8 || local_experts == 16 || local_experts == 32,
-                "V3 K3 LL pack5 supports local_experts in {8,16,32}");
+    TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_local_experts(local_experts),
+                "V3 K3 LL pack5 supports local_experts in {8,12,16,24,32,48}");
     TORCH_CHECK(m_indices.numel() >= local_experts,
                 "m_indices must carry one actual row count per local expert");
     TORCH_CHECK(row_combine_ptrs.numel() >= total_rows,
@@ -456,6 +488,7 @@ void k3_v3_ll_combine_tail(
         runtime_num_tokens_ptr,
         static_cast<int>(num_topk),
         hidden,
+        intermediate,
         static_cast<int>(ll_block_m),
         signal_generation_ptr,
         stream);
@@ -535,8 +568,10 @@ void k3_v3_ll_combine_tail_split(
                 "reduce_y shape mismatch");
     TORCH_CHECK(total_rows > 0 && total_rows % 64 == 0,
                 "V3 K3 LL pack5 expects rows padded to 64");
-    TORCH_CHECK(hidden == 4096 && intermediate == 2048,
-                "V3 K3 LL pack5 is specialized for hidden=4096, intermediate=2048");
+    TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_k3_dims(hidden, intermediate),
+                "V3 K3 LL pack5 supports DeepSeek-V4-Flash "
+                "(hidden=4096, intermediate=2048) and DeepSeek-V4-Pro "
+                "(hidden=7168, intermediate=3072)");
     TORCH_CHECK(ll_block_m == 32 || ll_block_m == 48 || ll_block_m == 64,
                 "V3 K3 LL pack5 expects ll_block_m in {32, 48, 64}");
     TORCH_CHECK(num_ranks > 0 && num_ranks <= 32,
@@ -576,8 +611,8 @@ void k3_v3_ll_combine_tail_split(
                     "V3 K3 LL split-tail eager path supports num_tokens <= 512");
     }
     const int local_experts = num_ranks > 0 ? (num_experts / num_ranks) : 0;
-    TORCH_CHECK(local_experts == 8 || local_experts == 16 || local_experts == 32,
-                "V3 K3 LL pack5 supports local_experts in {8,16,32}");
+    TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_local_experts(local_experts),
+                "V3 K3 LL pack5 supports local_experts in {8,12,16,24,32,48}");
     TORCH_CHECK(m_indices.numel() >= local_experts,
                 "m_indices must carry one actual row count per local expert");
     TORCH_CHECK(row_combine_ptrs.numel() >= total_rows,
@@ -614,6 +649,7 @@ void k3_v3_ll_combine_tail_split(
         runtime_num_tokens_ptr,
         static_cast<int>(num_topk),
         hidden,
+        intermediate,
         max_copy_rows_ptr,
         static_cast<int>(ll_block_m),
         stream);

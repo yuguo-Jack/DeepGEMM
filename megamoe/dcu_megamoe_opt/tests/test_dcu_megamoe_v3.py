@@ -67,6 +67,43 @@ def test_v3_backend_auto_policy(monkeypatch):
         config.select_v3_backend(8, "bogus")
 
 
+def test_v3_model_shape_registry_covers_flash_and_pro_ep_sizes():
+    config = load_module("dcu_megamoe_v3_config_shapes", V3_CONFIG_PATH)
+
+    for shape, local_experts_by_rank in (
+        ((256, 6, 4096, 2048), {8: 32, 16: 16, 32: 8}),
+        ((384, 6, 7168, 3072), {8: 48, 16: 24, 32: 12}),
+    ):
+        num_experts, num_topk, hidden, intermediate_hidden = shape
+        for num_ranks, expected_local_experts in local_experts_by_rank.items():
+            assert config.staged_pack5_shape_supported(
+                num_ranks=num_ranks,
+                num_experts=num_experts,
+                num_topk=num_topk,
+                hidden=hidden,
+                intermediate_hidden=intermediate_hidden,
+            )
+            assert (
+                config.staged_pack5_local_experts(
+                    num_ranks=num_ranks,
+                    num_experts=num_experts,
+                    num_topk=num_topk,
+                    hidden=hidden,
+                    intermediate_hidden=intermediate_hidden,
+                )
+                == expected_local_experts
+            )
+
+    assert not config.staged_pack5_shape_supported(
+        num_ranks=16,
+        num_experts=384,
+        num_topk=6,
+        hidden=4096,
+        intermediate_hidden=3072,
+    )
+    assert "DeepSeek-V4-Pro" in config.STAGED_PACK5_SHAPE_CONTRACT
+
+
 def reference_pack5_weight(weight: torch.Tensor) -> torch.Tensor:
     experts, n, k = weight.shape
     assert n % 256 == 0 and k % 64 == 0
@@ -164,6 +201,8 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
         for path in (
             K1_FUSED_DIR
             / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s",
+            K1_FUSED_DIR
+            / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.s",
         )
     )
     k1_ext = (K1_FUSED_DIR / "k1_v3_fused_ext.cu").read_text(encoding="utf-8")
@@ -174,6 +213,19 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     k2_ext = (K2_FUSED_DIR / "k2_fused_ext.cu").read_text(encoding="utf-8")
     k3_py = (K3_FUSED_DIR / "k3_fused.py").read_text(encoding="utf-8")
     k3_asm_ext = (K3_FUSED_DIR / "k3_fused_ext.cu").read_text(encoding="utf-8")
+    k3_asm_sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            K3_FUSED_DIR
+            / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.s",
+            K3_FUSED_DIR
+            / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_UNIFIED_PACK5.s",
+            K3_FUSED_DIR
+            / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.s",
+            K3_FUSED_DIR
+            / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_UNIFIED_PACK5.s",
+        )
+    )
     k3_ext = (K3_FUSED_DIR / "k3_v3_fused_ext.cu").read_text(encoding="utf-8")
     k3_header = (K3_FUSED_DIR / "k3_v3_pack5_groupgemm_impl.cuh").read_text(
         encoding="utf-8"
@@ -195,13 +247,60 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "k1_symm_fused_l1_asm_impl" in k1_asm_ext
     assert "use_absolute_x_ptrs" not in k1_asm_ext
     assert "prob.reserved_c0 |= 4u" in k1_asm_ext
+    assert "compact_active_tiles_offset" in k1_asm_ext
+    assert "static_cast<uint32_t>(2 * local_experts)" in k1_asm_ext
+    assert "(static_cast<uint32_t>(local_experts) << 16)" in k1_asm_ext
     assert "use_compact_prebuild ? 2u : 4u" not in k1_asm_ext
     assert "kK1AutoCompactMinLocalTileSaving" in k1_asm_ext
     assert "kK1AutoCompactHighTilesPerExpert" in k1_asm_ext
-    assert "force_compact_prebuild || num_ranks > 8" in k1_asm_ext
+    assert "force_compact_prebuild || num_ranks > 8 || local_experts > 32" in k1_asm_ext
+    assert "num_ranks <= 8 && local_experts <= 32" in k1_asm_ext
     assert "label_SymmRouteStoreAbsolutePtr" not in k1_asm_sources
     assert "label_SymmStageLoadAbsolutePtr" not in k1_asm_sources
     assert "absolute 64-bit" not in k1_asm_sources
+    assert "ko64 * (4096 * 64)" not in k1_asm_sources
+    assert "v_lshlrev_b32 v[vgprPack5OffsetBaseA], 18" not in k1_asm_sources
+    assert "s_mov_b32 s[sgprGlobalReadIncsA+0], 0x80000" not in k1_asm_sources
+    assert "s_mov_b32 s60, 0x8000" not in k1_asm_sources
+    assert "s_mul_i32 s71, s91, 0x1000" not in k1_asm_sources
+    assert "no256 * (4096 / 4)" not in k1_asm_sources
+    assert "SizeI / 4" not in k1_asm_sources
+    assert "v_mov_b32 v253, 64                                 // route_scratch total active compact tiles" not in k1_asm_sources
+    assert "s_cmp_ge_u32 s[sgprScaleFlag], 32" not in k1_asm_sources
+    assert k1_asm_sources.count("packed compact metadata") == 2
+    assert k1_asm_sources.count("route_scratch active_tiles i32 offset") == 2
+    assert "m_indices[compact tile * 256]" not in k1_asm_sources
+    assert k1_asm_sources.count("tile_experts offset") == 2
+    assert (
+        k1_asm_sources.count("route_scratch_i32[tile_experts + compact tile]")
+        == 2
+    )
+    assert "DEBUG_FORCE_EXPERT1" not in k1_asm_sources
+    assert "make HIP-built compact metadata visible" not in k1_asm_sources
+    assert k1_asm_sources.count("s_lshr_b32 s62, s61, 16") == 2
+    assert k1_asm_sources.count("pack5 ni16 * (4 * 256)") == 2
+    assert k1_asm_sources.count(
+        "v_mul_lo_u32 v[vgprPack5OffsetBaseA], s[sgprSizeI]"
+    ) == 2
+    assert k1_asm_sources.count(
+        "v_lshlrev_b32 v[\\vgprTmp+0], 10, v[\\vgprOffset0I]"
+    ) == 2
+    assert k1_asm_sources.count(
+        "s_lshl_b32 s[sgprGlobalReadIncsA+0], s[sgprSizeI], 7"
+    ) == 4
+    assert k1_asm_sources.count("s_mul_i32 s71, s91, s[sgprSizeL]") == 2
+    assert k1_asm_sources.count("s_lshl_b32 s60, s[sgprSizeL], 3") == 2
+    assert k1_asm_sources.count("label_SymmStageProIndex") == 4
+    assert "v_mul_lo_u32 v251, 9363, v251" not in k1_asm_sources
+    assert "v_mul_lo_u32 v252, 224, v251" not in k1_asm_sources
+    assert k1_asm_sources.count("s_mov_b32 s63, 9363") == 2
+    assert k1_asm_sources.count("v_mul_lo_u32 v251, s63, v251") == 2
+    assert k1_asm_sources.count("s_mov_b32 s63, 224") == 2
+    assert k1_asm_sources.count("v_mul_lo_u32 v252, s63, v251") == 2
+    assert k1_asm_sources.count("label_SymmStageStoreDynamicStride") == 4
+    assert k1_asm_sources.count("global staged row * hidden") == 2
+    assert k1_asm_sources.count("v_mul_lo_u32 v251, s[sgprSizeL], v251") == 2
+    assert k1_asm_sources.count("v_lshlrev_b32 v251, 12, v251") == 2
     assert "dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5" in k1_ext
     assert "V3_K1_LowLatencyMaskedGroupGemmKernel" in k1_header
     assert "tail_chunk_expected" not in k1_py
@@ -209,7 +308,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "v3_k1_publish_tail_chunk_expected_device" not in k1_header
     assert "kV3K1TailChunkSignalSlotBase" in k1_header
     assert "kV3K1TailCopyExpertDoneOffset" in k1_header
-    assert "counter.numel() >= 80" in k1_asm_ext
+    assert "kDcuMegaMoeTailDoneCounterInts" in k1_asm_ext
     assert "V3_K1_Fused_DeepGemm" not in k1_header
     assert "v3_k1_build_fixed_route_tile_device" not in k1_header
     assert "V3_K1_Pure" not in k1_header
@@ -224,6 +323,35 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "k3_l2_combine_asm_tail_reduce_out" not in k3_asm_ext
     assert "k3_l2_combine_asm_pack5_out" in k3_asm_ext
     assert "k3_l2_combine_asm_tail_reduce_pack5_out" in k3_asm_ext
+    assert "ko64 * (4096 * 64)" not in k3_asm_sources
+    assert "v_lshlrev_b32 v[vgprPack5OffsetBaseA], 18" not in k3_asm_sources
+    assert "s_mov_b32 s[sgprGlobalReadIncsA+0], 0x80000" not in k3_asm_sources
+    assert "v_lshlrev_b32 v153, 13, v152" not in k3_asm_sources
+    assert "no256 * (4096 / 4)" not in k3_asm_sources
+    assert "SizeI / 4" not in k3_asm_sources
+    assert k3_asm_sources.count("pack5 ni16 * (4 * 256)") == 4
+    assert k3_asm_sources.count(
+        "v_mul_lo_u32 v[vgprPack5OffsetBaseA], s[sgprSizeI]"
+    ) == 4
+    assert k3_asm_sources.count(
+        "v_lshlrev_b32 v[\\vgprTmp+0], 10, v[\\vgprOffset0I]"
+    ) == 4
+    assert k3_asm_sources.count(
+        "s_lshl_b32 s[sgprGlobalReadIncsA+0], s[sgprSizeI], 7"
+    ) == 8
+    assert k3_asm_sources.count("v_mov_b32 v149, s[sgprSizeI]") == 0
+    assert k3_asm_sources.count("v_mov_b32 v149, 4096") == 4
+    assert k3_asm_sources.count("v_mul_lo_u32 v153, s[sgprSizeI], v152") == 4
+    assert k3_asm_sources.count("v_lshlrev_b32 v153, 1, v153") == 4
+    assert "s_lshl_b32 s76, s76, 9" not in k3_asm_sources
+    assert "s_lshr_b32 s86, s[sgprSizeI], 3" not in k3_asm_sources
+    assert k3_asm_sources.count(
+        "s_load_dword s86, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xd8"
+    ) == 2
+    assert k3_asm_sources.count("s_mul_i32 s76, s76, s86") == 2
+    assert "asm_reduce_hidden_vecs" in k3_asm_ext
+    assert "offsetof(GpuProb, asm_reduce_hidden_vecs) == 0xd8" in k3_asm_ext
+    assert "sizeof(GpuProb) <= 256" in k3_asm_ext
     assert "debug_d" not in k3_asm_ext
     assert "row_combine_ptrs_i32" in k3_asm_ext
     assert "def k3_l2_fused_asm_to_combine(" not in k3_py
@@ -297,7 +425,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "hipEventRecord" not in k3_ext
     assert "hipStreamWaitEvent" not in k3_ext
     assert "3 * kTailDoneCounterRingSlots + 2 * 32" not in k3_ext
-    assert "constexpr int64_t kTailDoneCounterInts = 3 * kTailDoneCounterRingSlots" in k3_ext
+    assert "kV3K3TailCopyExpertDoneCount" in k3_ext
     assert "kSplitTailDoneCounterInts" in k3_ext
     assert "k3_v3_ll_reference" not in k3_ext
     assert "V3_K3_LowLatencyMaskedGroupGemmKernel" in k3_header
@@ -307,6 +435,9 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
 
 
 def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
+    test_harness_source = (
+        ROOT / "megamoe" / "dcu_megamoe_opt" / "tests" / "test_mega_moe_dcu.py"
+    ).read_text(encoding="utf-8")
     production_sources = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (
@@ -330,12 +461,27 @@ def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
         "MEGAMOE_DCU_V3_REDUCE_ACQUIRE",
         "MEGAMOE_DCU_V3_BARRIER_ACQUIRE",
         "MEGAMOE_DCU_V3_LL_K1_PARALLEL_STAGE_COPY",
+        "MEGAMOE_DCU_DEBUG_ROUTE",
+        "MEGAMOE_DCU_DEBUG_ROUTE_STAGE",
+        "MEGAMOE_DCU_DEBUG_CAPTURE_K1",
+        "MEGAMOE_DCU_DEBUG_STOP_AFTER_K1",
+        "MEGAMOE_DCU_DEBUG_COMPARE_SOURCE_X",
+        "MEGAMOE_DCU_DEBUG_K1_COMPARE",
+        "MEGAMOE_DCU_DEBUG_BACKEND_COMPARE",
+        "MEGAMOE_DCU_DEBUG_COMBINE",
+        "MEGAMOE_DCU_DEBUG_SLEEP_AFTER_K3",
+        "MEGAMOE_DCU_PRO_WEIGHT_LAYOUT",
+        "MEGAMOE_DCU_K2_GLC_SLC_LOAD",
+        "MEGAMOE_DCU_REDUCE_COMBINE_GLC_SLC_LOAD",
+        "--debug-combine-on-fail",
+        "--debug-compare-backends-on-fail",
         "system_fence_after_write",
         "invalidate_before_read",
         "acquire_after_wait",
         "V3 K3 LL no-tail signal path is not wired yet",
     ):
         assert retired not in production_sources
+        assert retired not in test_harness_source
 
     assert not (ROOT / "megamoe" / "dcu_megamoe_v2").exists()
 
@@ -473,16 +619,20 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "graph=True" in graph_call
     assert "dispatch_num_tokens=" not in graph_call
     assert "capacity_num_tokens=" not in graph_call
+    assert "pro_model_shape" not in test_source
+    assert "MEGAMOE_DCU_PRO_WEIGHT_LAYOUT" not in test_source
+    assert "UNIFIED_WEIGHT_LAYOUT_ENV" in test_source
+    assert '"normal" if v3_backend == "normal" else "unified"' in test_source
 
 
 def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
     opt_source = OPT_PATH.read_text(encoding="utf-8")
 
-    assert "staged_pack5_shape" in api_source
-    assert "(num_ranks == 8 || num_ranks == 16 || num_ranks == 32)" in api_source
-    assert "num_experts == 256 && num_topk == 6" in api_source
-    assert "hidden == 4096 && intermediate_hidden == 2048" in api_source
+    assert "dcu_supported_staged_pack5_shape" in api_source
+    assert "DeepSeek-V4-Flash" in api_source
+    assert "DeepSeek-V4-Pro" in api_source
+    assert "hidden=7168" in api_source
     assert "return legacy_route_scratch_bytes();" not in api_source
     assert "dcu_route_scratch_bytes(" not in api_source
     assert "MEGAMOE_DCU_NORMAL" not in api_source
@@ -499,7 +649,10 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     assert "normal_token_threshold()" not in opt_source
     assert "normal_backend_forced()" not in opt_source
     assert "K_K1_ASM_LAUNCH_ARGS_BYTES = 256" in opt_source
-    assert "capacity_rows * intermediate_hidden * 2" in opt_source
+    assert "l1_cols = intermediate_hidden * 2" in opt_source
+    assert "k3_out_offset" in opt_source
+    assert "k3_out = state.scratch.k3_out[:rows]" in opt_source
+    assert "capacity_rows * hidden * K_DTYPE_SIZES[torch.bfloat16]" in opt_source
 
     for py_name, cpp_name in (
         ("K_K1_ROUTE_TILE_M", "kK1RouteTileM"),
@@ -513,10 +666,15 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
         ("K_K1_LL_HEADROOM_ROWS", "kK1LlHeadroomRows"),
         ("K_K1_ASM_LAUNCH_ARGS_BYTES", "kK1AsmLaunchArgsBytes"),
         ("K_PROB_STORAGE_BYTES", "kProbStorageBytes"),
-        ("K_TAIL_DONE_COUNTER_RING_SLOTS", "kTailDoneCounterRingSlots"),
-        ("K_TAIL_DONE_COUNTER_INTS", "kTailDoneCounterInts"),
     ):
         assert source_int(opt_source, py_name) == source_int(api_source, cpp_name)
+    assert "K_TAIL_DONE_COUNTER_RING_SLOTS = 16" in opt_source
+    assert "kTailDoneCounterRingSlots = kDcuMegaMoeTailDoneCounterRingSlots" in api_source
+    assert (
+        "K_TAIL_DONE_COUNTER_INTS = 3 * K_TAIL_DONE_COUNTER_RING_SLOTS + 64"
+        in opt_source
+    )
+    assert "kDcuMegaMoeTailDoneCounterInts" in api_source
 
     for mirrored_name in (
         "ll_capacity_rows",
@@ -542,6 +700,7 @@ def test_v3_supernode_source_support():
         ROOT / "megamoe" / "dcu_megamoe_opt" / "include" / "mega_moe_dcu" / "layout.cuh"
     ).read_text(encoding="utf-8")
     k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
+    k1_asm_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
     k1_ext = (K1_FUSED_DIR / "k1_v3_fused_ext.cu").read_text(encoding="utf-8")
     k1_header = (K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh").read_text(
         encoding="utf-8"
@@ -552,17 +711,24 @@ def test_v3_supernode_source_support():
     )
     k3_py = (K3_FUSED_DIR / "k3_fused.py").read_text(encoding="utf-8")
 
-    assert "_DSV4_FLASH_SUPPORTED_EP_RANKS = (8, 16, 32)" in init_source
-    assert "K_DSV4_FLASH_SUPPORTED_EP_RANKS = (8, 16, 32)" in opt_source
-    assert "K1_SUPPORTED_RANKS = (8, 16, 32)" in k1_py
+    assert "staged_pack5_shape_supported" in init_source
+    assert "K_DSV4_SUPPORTED_EP_RANKS = SUPPORTED_STAGED_EP_RANKS" in opt_source
+    assert "K1_SUPPORTED_RANKS = SUPPORTED_STAGED_EP_RANKS" in k1_py
+    assert "counts[local_experts]" in k1_asm_ext
+    assert "num_ranks > 8 || local_experts > 32" in k1_asm_ext
+    assert "? fixed_capacity_tiles" in k1_asm_ext
     assert "dcu_required_signal_slots" in layout_source
     assert "dcu_split_tail_chunk_signal_slot_base(num_ranks)" in k1_header
     assert "dcu_split_tail_chunk_signal_slot_base(num_ranks)" in k3_header
     assert "signal_addrs[num_ranks + rank]" in k3_header
     assert "V3_K1_LowLatencyMaskedGroupGemmKernel<" in k1_ext
-    assert "EXPERTS, 4096, 4096" in k1_ext
+    assert "DCU_MEGAMOE_V3_LAUNCH_K1_LL_FOR_SHAPE(EXPERTS, 6144, 7168)" in k1_ext
+    assert "DCU_MEGAMOE_V3_LAUNCH_K1_LL_FOR_EXPERTS(48)" in k1_ext
+    assert "static_assert(kExperts <= 64" in k1_header
     assert "V3_K3_LowLatencyMaskedGroupGemmKernel<" in k3_ext
-    assert "kExperts, 4096, 2048" in k3_ext
+    assert "DCU_MEGAMOE_V3_LAUNCH_LL_FOR_SHAPE(EXPERTS, 7168, 3072)" in k3_ext
+    assert "DCU_MEGAMOE_V3_LAUNCH_LL_FOR_EXPERTS(48)" in k3_ext
+    assert "static_assert(kExperts <= 64" in k3_header
     assert "open_hip_fabric_handles" in python_api_source
     assert "hsa_ext_rpc_memory_attach" in python_api_source
     assert 'os.getenv("MEGAMOE_DCU_PEER_MEMORY", "ipc")' in init_source

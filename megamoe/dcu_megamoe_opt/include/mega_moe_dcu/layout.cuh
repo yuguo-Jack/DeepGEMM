@@ -7,9 +7,76 @@
 namespace deep_gemm::mega {
 
 static constexpr int kTokenAlignment = 384;
+static constexpr int kDcuMegaMoeStagedTopk = 6;
+static constexpr int kDcuMegaMoeFlashExperts = 256;
+static constexpr int kDcuMegaMoeFlashHidden = 4096;
+static constexpr int kDcuMegaMoeFlashIntermediate = 2048;
+static constexpr int kDcuMegaMoeProExperts = 384;
+static constexpr int kDcuMegaMoeProHidden = 7168;
+static constexpr int kDcuMegaMoeProIntermediate = 3072;
+static constexpr int kDcuMegaMoeTailDoneCounterRingSlots = 16;
+static constexpr int kDcuMegaMoeTailCopyExpertDoneCount = 64;
+static constexpr int kDcuMegaMoeTailDoneCounterInts =
+    3 * kDcuMegaMoeTailDoneCounterRingSlots + kDcuMegaMoeTailCopyExpertDoneCount;
 
 __host__ __device__ static inline int64_t align_i64(const int64_t value, const int64_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_ep_rank_count(const int num_ranks) {
+    return num_ranks == 8 || num_ranks == 16 || num_ranks == 32;
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_local_experts(
+    const int local_experts) {
+    return local_experts == 8 || local_experts == 12 || local_experts == 16 ||
+           local_experts == 24 || local_experts == 32 || local_experts == 48;
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_model_shape(
+    const int num_experts,
+    const int num_topk,
+    const int hidden,
+    const int intermediate_hidden) {
+    return num_topk == kDcuMegaMoeStagedTopk &&
+           ((num_experts == kDcuMegaMoeFlashExperts &&
+             hidden == kDcuMegaMoeFlashHidden &&
+             intermediate_hidden == kDcuMegaMoeFlashIntermediate) ||
+            (num_experts == kDcuMegaMoeProExperts &&
+             hidden == kDcuMegaMoeProHidden &&
+             intermediate_hidden == kDcuMegaMoeProIntermediate));
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_pack5_shape(
+    const int num_ranks,
+    const int num_experts,
+    const int num_topk,
+    const int hidden,
+    const int intermediate_hidden) {
+    return dcu_supported_staged_ep_rank_count(num_ranks) &&
+           num_experts % num_ranks == 0 &&
+           dcu_supported_staged_model_shape(
+               num_experts, num_topk, hidden, intermediate_hidden);
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_k1_shape(
+    const int num_ranks,
+    const int num_experts,
+    const int num_topk,
+    const int hidden,
+    const int l1_rows) {
+    return l1_rows % 2 == 0 &&
+           dcu_supported_staged_pack5_shape(
+               num_ranks, num_experts, num_topk, hidden, l1_rows / 2);
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_k3_dims(
+    const int hidden,
+    const int intermediate_hidden) {
+    return (hidden == kDcuMegaMoeFlashHidden &&
+            intermediate_hidden == kDcuMegaMoeFlashIntermediate) ||
+           (hidden == kDcuMegaMoeProHidden &&
+            intermediate_hidden == kDcuMegaMoeProIntermediate);
 }
 
 __host__ __device__ static inline int64_t dcu_sym_buffer_ptrs_offset() {

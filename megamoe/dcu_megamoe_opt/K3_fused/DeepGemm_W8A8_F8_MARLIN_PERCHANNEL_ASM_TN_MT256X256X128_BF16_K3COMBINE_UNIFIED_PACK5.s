@@ -442,6 +442,8 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
 .endm
 
 .macro K3_STORE_STAGED_HALF rowptr_offset:req, step:req
+   /* K3COMBINE: staged loop walks the 128 routed rows in this half tile.
+    * Keep this tile-local bound fixed; model hidden is handled by wg0. */
    v_mov_b32 v149, 4096
 .L_k3_staged_loop_\@:
    v_cmp_lt_u32 vcc, v150, v149
@@ -591,7 +593,8 @@ K3_Scatter_C_Tile_Loop:
    v_add_u32 v151, s59, v151
    v_add_u32 v152, s58, v149
 
-   v_lshlrev_b32 v153, 13, v152
+   v_mul_lo_u32 v153, s[sgprSizeI], v152
+   v_lshlrev_b32 v153, 1, v153
    v_add_u32 v153, v153, v151
    buffer_load_dwordx4 v[232:235], v153, s[52:55], 0, offen, offset:0
 
@@ -1348,7 +1351,7 @@ K3_Scatter_C_Tile_Done:
 
 /* Global Offset A */
 .macro GLOBAL_OFFSET_A vgprAddr:req vgprOffsetL:req vgprOffset0I:req vgprTmp:req
-   v_lshlrev_b32 v[\vgprTmp+0], 10, v[\vgprOffset0I] // no256 * (4096 / 4)
+   v_lshlrev_b32 v[\vgprTmp+0], 10, v[\vgprOffset0I] // pack5 ni16 * (4 * 256)
    _v_add_co_u32 v[\vgprAddr+0], vcc, v[vgprPack5OffsetBaseA], v[\vgprTmp+0]
    _v_add_u32 v[\vgprAddr+0], 0x10, v[\vgprAddr+0]    // keep original ASM prepad compensation
                                                       // offset *= bytes/element (multiplier is 1, do nothing)
@@ -2042,7 +2045,8 @@ _v_add_co_u32 v18, vcc, 64, v9                     // groBL_1 + LSCB
 /* global read addresses: final offsets a */
 
 v_lshrrev_b32 v[vgprPack5OffsetBaseA], 10, v8 // pack5 ko64
-v_lshlrev_b32 v[vgprPack5OffsetBaseA], 18, v[vgprPack5OffsetBaseA] // ko64 * (4096 * 64)
+v_lshlrev_b32 v[vgprPack5OffsetBaseA], 6, v[vgprPack5OffsetBaseA] // ko64 * 64
+v_mul_lo_u32 v[vgprPack5OffsetBaseA], s[sgprSizeI], v[vgprPack5OffsetBaseA] // ko64 * (N * 64)
 v_and_b32 v[vgprPack5OffsetTmpA], 0x300, v8 // ks16 * 256
 _v_add_u32 v[vgprPack5OffsetBaseA], v[vgprPack5OffsetBaseA], v[vgprPack5OffsetTmpA]
 v_and_b32 v[vgprPack5OffsetTmpA], 15, v[vgprSerial] // logical ni for ASM lanes
@@ -2136,7 +2140,7 @@ s_mov_b64 s[sgprShadowLimitA_forTailLoop+0:sgprShadowLimitA_forTailLoop+1], s[sg
 s_lshr_b32 s[sgprLoopCounterL], s[sgprSizesSum+0], 7 //  s[sgprLoopCounterL] = s[sgprSizesSum+0] / 128
 
 ;s_mov_b32 s[sgprGlobalReadIncsA+0], DepthU*BpeA       // incrB (unrollIdx)    128
-s_mov_b32 s[sgprGlobalReadIncsA+0], 0x80000
+s_lshl_b32 s[sgprGlobalReadIncsA+0], s[sgprSizeI], 7
 s_mul_i32 s[sgprGlobalReadIncsA+0], s[sgprGlobalReadIncsA+0], s[sgprLoopCounterL]  
 
 s_add_u32 s[sgprSrdA_forTailLoop+0], s[sgprSrdA_forTailLoop+0], s[sgprGlobalReadIncsA+0] // 
@@ -2234,7 +2238,7 @@ s_or_b32 s[sgprSrdB+1], s[sgprSrdB+1], s[sgprStructNumB]  //
 
 /* global read addresses: increments a */
 ; s_mul_i32 s54, s[sgprGSU], DepthU*BpeAGR
-s_mov_b32 s[sgprGlobalReadIncsA+0], 0x80000          // V3 pack5 incrA, 128 K step
+s_lshl_b32 s[sgprGlobalReadIncsA+0], s[sgprSizeI], 7 // V3 pack5 incrA, 128 K step
 ; //s_mov_b32 s[sgprGlobalReadIncsA+0], DepthU*BpeA    // incrA (unrollIdx)
 
 

@@ -7,8 +7,11 @@ import torch.distributed as dist
 
 from . import _C
 from .dcu_megamoe_opt.v3_config import (
+    STAGED_PACK5_SHAPE_CONTRACT,
     V3_BACKEND_NORMAL,
     normalize_v3_backend,
+    staged_pack5_model_shape_supported,
+    staged_pack5_shape_supported,
 )
 from .dcu_megamoe_opt.v3_layout import (
     flatten_pack5_weight,
@@ -34,9 +37,6 @@ def _dcu_peer_memory_mode() -> str:
         "MEGAMOE_DCU_PEER_MEMORY must be unset/ipc or one of "
         "rpc/fabric/mnvl/1/true/on/yes"
     )
-
-
-_DSV4_FLASH_SUPPORTED_EP_RANKS = (8, 16, 32)
 
 
 def _dcu_tail_signal_slot_base(num_ranks: int) -> int:
@@ -73,12 +73,12 @@ def _staged_pack5_shape_supported(
     hidden: int,
     intermediate_hidden: int,
 ) -> bool:
-    return (
-        int(num_ranks) in _DSV4_FLASH_SUPPORTED_EP_RANKS
-        and int(num_experts) == 256
-        and int(num_topk) == 6
-        and int(hidden) == 4096
-        and int(intermediate_hidden) == 2048
+    return staged_pack5_shape_supported(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
     )
 
 
@@ -98,9 +98,7 @@ def _check_staged_pack5_shape(
         intermediate_hidden=intermediate_hidden,
     ):
         raise ValueError(
-            "DCU MegaMoE staged LL/normal path currently supports only "
-            "DSV4 Flash EP8/EP16/EP32 experts=256 topk=6 hidden=4096 "
-            "intermediate=2048. "
+            f"{STAGED_PACK5_SHAPE_CONTRACT}. "
             "Add a shape-specific staged layout before enabling new model sizes."
         )
 
@@ -116,7 +114,12 @@ def _symm_warmup_alloc_enabled(
         return False
     if requested_num_max_tokens_per_rank < 512:
         return False
-    if (num_experts, num_topk, hidden, intermediate_hidden) != (256, 6, 4096, 2048):
+    if not staged_pack5_model_shape_supported(
+        num_experts=num_experts,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+    ):
         return False
     return True
 
@@ -359,9 +362,7 @@ def get_mega_moe_hip_build_config():
         "caller supplies megamoe_backend='ll' or 'normal'; "
         "auto selection belongs to the framework/test layer"
     )
-    config["supported_staged_shape"] = (
-        "DSV4 Flash EP8/EP16/EP32 experts=256 topk=6 hidden=4096 intermediate=2048"
-    )
+    config["supported_staged_shape"] = STAGED_PACK5_SHAPE_CONTRACT
     config["cuda_graph_max_tokens_source"] = "requested num_max_tokens_per_rank"
     config["cuda_graph_execution"] = "graph=True captures the selected v3_staged backend"
     return config

@@ -19,11 +19,18 @@ from .dcu_megamoe_opt.K3_fused.k3_fused import (
     reduce_local_combine,
     reduce_local_combine_graph,
 )
-from .dcu_megamoe_opt.v3_config import V3_BACKEND_LL, normalize_v3_backend
+from .dcu_megamoe_opt.v3_config import (
+    STAGED_PACK5_SHAPE_CONTRACT,
+    SUPPORTED_STAGED_EP_RANKS,
+    V3_BACKEND_LL,
+    normalize_v3_backend,
+    staged_pack5_shape_supported,
+)
 
 
 K_K1_ROUTE_TILE_M = 256
 K_K1_ALIGNMENT = 256
+K_K1_ROW_POINTER_PADDING = 512
 K_K1_ROUTE_CAPACITY_SLACK = 64
 K_K1_ROUTE_CAPACITY_SLACK_DIVISOR = 10
 K_K1_LL_ROW_TILE = 64
@@ -33,9 +40,9 @@ K_K1_ASM_LAUNCH_ARGS_BYTES = 256
 K_K2_GRAPH_ROW_BLOCKS = 8192
 K_PROB_STORAGE_BYTES = 256
 K_TAIL_DONE_COUNTER_RING_SLOTS = 16
-K_TAIL_DONE_COUNTER_INTS = 80
+K_TAIL_DONE_COUNTER_INTS = 3 * K_TAIL_DONE_COUNTER_RING_SLOTS + 64
 K_POST_K3_BARRIER_SIGNAL_SLOT_BASE = 20
-K_DSV4_FLASH_SUPPORTED_EP_RANKS = (8, 16, 32)
+K_DSV4_SUPPORTED_EP_RANKS = SUPPORTED_STAGED_EP_RANKS
 V3_LL_BLOCK_M = 32
 K_LL_SPLIT_TAIL_MAX_TOKENS = 512
 K_DTYPE_SIZES = {
@@ -52,6 +59,7 @@ K_DTYPE_SIZES = {
 class _RouteScratchViews:
     k1_active_tiles: torch.Tensor
     l1_out: torch.Tensor
+    k3_out: torch.Tensor
     act_fp8: torch.Tensor
     act_scale: torch.Tensor
     k3_prob_storage: torch.Tensor
@@ -67,7 +75,6 @@ class _OptState:
     empty_bf16: torch.Tensor
     asm_tail_signal_addrs_ready: bool = False
     asm_signal_generation: int = 0
-
 
 def k3_tail_reduce_enabled(default: bool = True) -> bool:
     value = os.getenv("K3_USE_ASM_TAIL_REDUCE")
@@ -193,7 +200,7 @@ def _route_tile_offsets(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int]:
     capacity_rows = _v3_staged_capacity_rows(
         num_ranks=num_ranks,
         num_experts=num_experts,
@@ -211,9 +218,15 @@ def _route_tile_offsets(
     offset = _align(offset, 16)
     offset += K_K1_ASM_LAUNCH_ARGS_BYTES
     offset = _align(offset, 16)
+    l1_cols = intermediate_hidden * 2
     act_bf16_offset = offset
-    offset += capacity_rows * intermediate_hidden * 2 * K_DTYPE_SIZES[torch.bfloat16]
+    offset += capacity_rows * l1_cols * K_DTYPE_SIZES[torch.bfloat16]
     offset = _align(offset, 16)
+    k3_out_offset = act_bf16_offset
+    if hidden > l1_cols:
+        k3_out_offset = offset
+        offset += capacity_rows * hidden * K_DTYPE_SIZES[torch.bfloat16]
+        offset = _align(offset, 16)
     act_fp8_offset = offset
     offset += capacity_rows * intermediate_hidden * K_DTYPE_SIZES[torch.float8_e4m3fn]
     offset = _align(offset, 16)
@@ -221,7 +234,14 @@ def _route_tile_offsets(
     offset += capacity_rows * K_DTYPE_SIZES[torch.float32]
     offset = _align(offset, 16)
     act_chunk_amax_offset = offset
-    return capacity_rows, act_bf16_offset, act_fp8_offset, act_scale_offset, act_chunk_amax_offset
+    return (
+        capacity_rows,
+        act_bf16_offset,
+        k3_out_offset,
+        act_fp8_offset,
+        act_scale_offset,
+        act_chunk_amax_offset,
+    )
 
 
 def _route_scratch_tensor(
@@ -259,13 +279,14 @@ def _route_scratch_views(
     if route_scratch.dtype != torch.int8 or not route_scratch.is_contiguous():
         raise RuntimeError("sym_buffer.route_scratch must be contiguous int8")
 
+    local_experts = int(num_experts) // int(num_ranks)
     num_max_tokens = int(sym_buffer.num_max_tokens_per_rank)
     route_base = _route_task_workspace_bytes(
         num_ranks=num_ranks,
         num_experts=num_experts,
         num_max_tokens=num_max_tokens,
     )
-    capacity_rows, act_bf16_offset, act_fp8_offset, act_scale_offset, act_chunk_amax_offset = (
+    capacity_rows, act_bf16_offset, k3_out_offset, act_fp8_offset, act_scale_offset, act_chunk_amax_offset = (
         _route_tile_offsets(
             num_ranks=num_ranks,
             num_experts=num_experts,
@@ -276,8 +297,8 @@ def _route_scratch_views(
         )
     )
     l1_cols = intermediate_hidden * 2
-    l1_capacity_bytes = act_fp8_offset - act_bf16_offset
-    l1_capacity_rows = l1_capacity_bytes // (l1_cols * K_DTYPE_SIZES[torch.bfloat16])
+    l1_capacity_bytes = capacity_rows * l1_cols * K_DTYPE_SIZES[torch.bfloat16]
+    k3_out_capacity_bytes = capacity_rows * hidden * K_DTYPE_SIZES[torch.bfloat16]
     act_fp8_capacity_bytes = act_scale_offset - act_fp8_offset
     act_scale_capacity_bytes = act_chunk_amax_offset - act_scale_offset
     prob_offset = route_base + act_chunk_amax_offset
@@ -291,7 +312,7 @@ def _route_scratch_views(
     return _RouteScratchViews(
         k1_active_tiles=_route_scratch_tensor(
             route_scratch,
-            byte_offset=64 * K_DTYPE_SIZES[torch.int32],
+            byte_offset=2 * local_experts * K_DTYPE_SIZES[torch.int32],
             byte_capacity=K_DTYPE_SIZES[torch.int32],
             dtype=torch.int32,
             shape=(1,),
@@ -301,7 +322,14 @@ def _route_scratch_views(
             byte_offset=route_base + act_bf16_offset,
             byte_capacity=l1_capacity_bytes,
             dtype=torch.bfloat16,
-            shape=(l1_capacity_rows, l1_cols),
+            shape=(capacity_rows, l1_cols),
+        ),
+        k3_out=_route_scratch_tensor(
+            route_scratch,
+            byte_offset=route_base + k3_out_offset,
+            byte_capacity=k3_out_capacity_bytes,
+            dtype=torch.bfloat16,
+            shape=(capacity_rows, hidden),
         ),
         act_fp8=_route_scratch_tensor(
             route_scratch,
@@ -453,18 +481,19 @@ def _check_shape(
     num_max_tokens_per_rank: int,
 ) -> None:
     if (
-        num_ranks not in K_DSV4_FLASH_SUPPORTED_EP_RANKS
-        or num_experts != 256
-        or num_topk != 6
-        or hidden != 4096
-        or intermediate_hidden != 2048
+        not staged_pack5_shape_supported(
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=intermediate_hidden,
+        )
         or num_tokens < 0
         or num_tokens > num_max_tokens_per_rank
     ):
         raise ValueError(
-            "DCU MegaMoE V3 staged path supports only DeepSeek-V4-Flash "
-            "EP8/EP16/EP32 shape: experts=256, topk=6, hidden=4096, intermediate=2048, "
-            "and 0<=num_tokens_per_rank<=num_max_tokens_per_rank"
+            f"{STAGED_PACK5_SHAPE_CONTRACT} and "
+            "0<=num_tokens_per_rank<=num_max_tokens_per_rank"
         )
 
 
@@ -550,11 +579,12 @@ def fp8_mega_moe_opt_3stage(
             barrier_signal_slot_base=_dcu_start_barrier_signal_slot_base(num_ranks),
             verbose_build=verbose_build,
         )
-
+    local_experts = int(num_experts) // int(num_ranks)
     force_safe_compact = (
         num_tokens == 0
         or route_capacity_num_tokens > num_tokens
         or num_ranks > 8
+        or local_experts > 32
     )
     k1_launcher = k1_symm_fused_l1_v3
     k1_kwargs = dict(
@@ -584,9 +614,9 @@ def fp8_mega_moe_opt_3stage(
         **k1_kwargs,
     )
     rows = int(l1_out.size(0))
-
     act_fp8 = state.scratch.act_fp8[:rows]
     act_scale = state.scratch.act_scale[:rows]
+    k3_out = state.scratch.k3_out[:rows]
     k2_actual_m = m_indices if v3_backend == V3_BACKEND_LL else None
     k2_m_per_expert = rows // (num_experts // num_ranks) if k2_actual_m is not None else 0
     swiglu_quant_channelwise_out(
@@ -608,7 +638,6 @@ def fp8_mega_moe_opt_3stage(
         fast_math=fast_math,
         verbose_build=verbose_build,
     )
-
     if use_tail_reduce:
         total_wgs = ((rows + 255) // 256) * ((hidden + 255) // 256)
         k3_launcher = k3_l2_fused_v3_to_combine
@@ -626,7 +655,7 @@ def fp8_mega_moe_opt_3stage(
             num_tokens=num_tokens,
             num_topk=num_topk,
             hidden=hidden,
-            output_workspace=l1_out,
+            output_workspace=k3_out,
             prob_storage=state.scratch.k3_prob_storage,
             ll_split_tail=use_ll_split_tail,
             use_unified_weight_layout=use_unified_weight_layout,
@@ -646,7 +675,7 @@ def fp8_mega_moe_opt_3stage(
     else:
         k3_launcher = k3_l2_fused_v3_to_combine
         k3_kwargs = dict(
-            output_workspace=l1_out,
+            output_workspace=k3_out,
             prob_storage=state.scratch.k3_prob_storage,
             use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
@@ -679,7 +708,6 @@ def fp8_mega_moe_opt_3stage(
             hidden=hidden,
             verbose_build=verbose_build,
         )
-
 
 def _run_opt_3stage_graph(
     y: torch.Tensor,
@@ -825,6 +853,7 @@ def _run_opt_3stage_graph(
 
     act_fp8 = state.scratch.act_fp8[:rows]
     act_scale = state.scratch.act_scale[:rows]
+    k3_out = state.scratch.k3_out[:rows]
     k2_actual_m = m_indices if v3_backend == V3_BACKEND_LL else None
     k2_m_per_expert = rows // (num_experts // num_ranks) if k2_actual_m is not None else 0
     k2_active_tiles = (
@@ -848,7 +877,6 @@ def _run_opt_3stage_graph(
         fast_math=fast_math,
         verbose_build=verbose_build,
     )
-
     if use_tail_reduce:
         total_wgs = ((rows + 255) // 256) * ((hidden + 255) // 256)
         graph_runtime_offset = (
@@ -871,7 +899,7 @@ def _run_opt_3stage_graph(
             num_tokens=graph_max_tokens,
             num_topk=num_topk,
             hidden=hidden,
-            output_workspace=l1_out,
+            output_workspace=k3_out,
             prob_storage=state.scratch.k3_prob_storage,
             active_tiles=state.scratch.k1_active_tiles,
             graph_runtime_offset_from_active_tiles=graph_runtime_offset,
@@ -898,7 +926,7 @@ def _run_opt_3stage_graph(
         )
         k3_launcher = k3_l2_fused_v3_to_combine
         k3_kwargs = dict(
-            output_workspace=l1_out,
+            output_workspace=k3_out,
             prob_storage=state.scratch.k3_prob_storage,
             active_tiles=state.scratch.k1_active_tiles,
             graph_runtime_offset_from_active_tiles=graph_runtime_offset,

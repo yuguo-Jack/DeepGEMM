@@ -238,14 +238,13 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
     TORCH_CHECK(hidden > 0 && intermediate_hidden > 0, "hidden sizes must be positive");
 
-    const bool staged_pack5_shape =
-        (num_ranks == 8 || num_ranks == 16 || num_ranks == 32) &&
-        num_experts == 256 && num_topk == 6 &&
-        hidden == 4096 && intermediate_hidden == 2048;
     TORCH_CHECK(
-        staged_pack5_shape,
+        dcu_supported_staged_pack5_shape(
+            num_ranks, num_experts, num_topk, hidden, intermediate_hidden),
         "DCU MegaMoE staged LL/normal route_scratch currently supports only "
-        "DSV4 Flash EP8/EP16/EP32 experts=256 topk=6 hidden=4096 intermediate=2048");
+        "DeepSeek-V4-Flash EP8/EP16/EP32 experts=256 topk=6 hidden=4096 "
+        "intermediate=2048 and DeepSeek-V4-Pro EP8/EP16/EP32 experts=384 "
+        "topk=6 hidden=7168 intermediate=3072");
 
     constexpr int64_t kK1RouteTileM = 256;
     constexpr int64_t kK1Alignment = 256;
@@ -307,8 +306,13 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     offset = align_i64(offset, 16);
     offset += kK1AsmLaunchArgsBytes;
     offset = align_i64(offset, 16);
-    offset += capacity_rows * static_cast<int64_t>(intermediate_hidden) * 2 *
-              static_cast<int64_t>(sizeof(uint16_t));
+    const int64_t l1_cols = static_cast<int64_t>(intermediate_hidden) * 2;
+    offset += capacity_rows * l1_cols * static_cast<int64_t>(sizeof(uint16_t));
+    offset = align_i64(offset, 16);
+    if (static_cast<int64_t>(hidden) > l1_cols) {
+        offset += capacity_rows * static_cast<int64_t>(hidden) *
+                  static_cast<int64_t>(sizeof(uint16_t));
+    }
     offset = align_i64(offset, 16);
     offset += capacity_rows * static_cast<int64_t>(intermediate_hidden);
     offset = align_i64(offset, 16);
@@ -316,9 +320,11 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     offset = align_i64(offset, 16);
 
     constexpr int64_t kProbStorageBytes = 256;
-    constexpr int64_t kTailDoneCounterRingSlots = 16;
-    constexpr int64_t kTailDoneCounterInts = 80;
-    static_assert(kTailDoneCounterInts == 3 * kTailDoneCounterRingSlots + 32,
+    constexpr int64_t kTailDoneCounterRingSlots = kDcuMegaMoeTailDoneCounterRingSlots;
+    constexpr int64_t kTailDoneCounterInts = kDcuMegaMoeTailDoneCounterInts;
+    static_assert(kTailDoneCounterInts ==
+                      3 * kTailDoneCounterRingSlots +
+                          kDcuMegaMoeTailCopyExpertDoneCount,
                   "tail done counter scratch layout changed");
     const int64_t kTailSignalAddrs = 2 * static_cast<int64_t>(num_ranks);
     const int64_t route_base =

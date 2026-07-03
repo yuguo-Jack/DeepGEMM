@@ -24,7 +24,8 @@ static constexpr int kV3K1TailChunkSignalSlotBase = 22;
 static constexpr int kV3K1TailChunkSignalSlots = 8;
 static constexpr int kV3K1TailCopyExpertDoneOffset =
     3 * kV3K1TailDoneCounterRingSlots;
-static constexpr int kV3K1TailCopyExpertDoneCount = 32;
+static constexpr int kV3K1TailCopyExpertDoneCount =
+    deep_gemm::mega::kDcuMegaMoeTailCopyExpertDoneCount;
 static constexpr int kV3K1StartSignalSlotBase = 18;
 static constexpr int kV3K1MaxSignalRanks = 32;
 
@@ -1032,7 +1033,7 @@ V3_K1_LowLatencyMaskedGroupGemmKernel(
     int32_t* graph_runtime_num_tokens_out = nullptr,
     int32_t* graph_tail_signal_generation_out = nullptr,
     int graph_max_tokens = -1) {
-    static_assert(kExperts <= 32, "readlane expert broadcast assumes <=32 experts");
+    static_assert(kExperts <= 64, "readlane expert broadcast assumes <=64 experts");
     static_assert(kBlockM == 16 || kBlockM == 32 || kBlockM == 48 ||
                       kBlockM == 64,
                   "this low-latency kernel uses M16/M32/M48/M64 tiles");
