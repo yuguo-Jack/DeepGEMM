@@ -253,6 +253,8 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     constexpr int64_t kK1LlRowTile = 64;
     constexpr int64_t kK1LlHeadroomExpectedRowsThreshold = 48;
     constexpr int64_t kK1LlHeadroomRows = 64;
+    constexpr int64_t kK1LlSkewGuardRows = 256;
+    constexpr int64_t kProEp8LlMaskedK1MinRowsPerExpert = 128;
     constexpr int64_t kK1AsmLaunchArgsBytes = 256;
     const auto ceil_div_i64 = [](const int64_t value, const int64_t divisor) {
         return (value + divisor - 1) / divisor;
@@ -278,6 +280,19 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     if (ll_rows_per_expert - ll_expected_rows_per_expert < min_slack) {
         ll_rows_per_expert = align_i64(
             ll_expected_rows_per_expert + min_slack, kK1LlRowTile);
+    }
+    const int64_t ll_skew_guard_rows = std::min<int64_t>(
+        kK1LlSkewGuardRows,
+        static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank);
+    ll_rows_per_expert = std::max<int64_t>(
+        ll_rows_per_expert,
+        align_i64(ll_skew_guard_rows, kK1LlRowTile));
+    const bool pro_ep8_ll_masked_k1 =
+        num_ranks == 8 && num_experts == 384 && num_topk == 6 &&
+        hidden == 7168 && intermediate_hidden == 3072;
+    if (pro_ep8_ll_masked_k1 &&
+        ll_rows_per_expert < kProEp8LlMaskedK1MinRowsPerExpert) {
+        ll_rows_per_expert = kProEp8LlMaskedK1MinRowsPerExpert;
     }
     const int64_t ll_capacity_rows = local_experts * ll_rows_per_expert;
     const int64_t total_tasks =

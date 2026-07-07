@@ -820,8 +820,10 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
             const int local_expert = static_cast<int>(expert) - first_expert;
             const int row_in_expert =
                 atomicAdd(symm_counts + local_expert, 1);
-            if (row_in_expert >= m_per_expert)
+            if (row_in_expert >= m_per_expert) {
+                atomicExch(symm_counts + kExperts + 1, 1);
                 continue;
+            }
             const int row = local_expert * m_per_expert + row_in_expert;
             symm_src_x_ptrs[row] =
                 static_cast<int64_t>(reinterpret_cast<uintptr_t>(
@@ -862,9 +864,7 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
 
     if (cumulative_local_expert_recv_stats != nullptr) {
         for (int expert = global_tid; expert < kExperts; expert += grid_threads) {
-            const int count = symm_counts[expert] > m_per_expert
-                                  ? m_per_expert
-                                  : symm_counts[expert];
+            const int count = symm_counts[expert] > 0 ? symm_counts[expert] : 0;
             atomicAdd(cumulative_local_expert_recv_stats + expert,
                       count);
         }
@@ -993,6 +993,54 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
 }
 
 template <int kExperts,
+          int kK,
+          int kBlockM,
+          bool kParallelStageCopy = false>
+__global__ __launch_bounds__(256, 1) void
+V3_K1_LowLatencyStageOnlyKernel(
+    const uint8_t* x,
+    const float* x_scale,
+    int m_per_expert,
+    uint8_t* local_sym_buffer,
+    int32_t* route_scratch_i32,
+    int32_t* grid_barrier,
+    int barrier_epoch,
+    int rank_idx,
+    int num_ranks,
+    int num_global_experts,
+    int num_max_tokens_per_rank,
+    int num_topk,
+    int runtime_num_tokens,
+    float* route_weights_out,
+    int32_t* row_expert_out,
+    int32_t* output_index,
+    int64_t* row_combine_ptrs_out,
+    uint8_t* local_topk_mask,
+    int32_t* tail_tokens,
+    int32_t* cumulative_local_expert_recv_stats,
+    bool enable_start_rank_barrier,
+    int32_t* tail_done_counter,
+    const int32_t* graph_runtime_num_tokens_for_barrier,
+    int32_t* graph_runtime_num_tokens_out,
+    int32_t* graph_tail_signal_generation_out,
+    int graph_max_tokens) {
+    static_assert(kExperts <= 64, "readlane expert broadcast assumes <=64 experts");
+    static_assert(kBlockM == 16 || kBlockM == 32 || kBlockM == 48 ||
+                      kBlockM == 64,
+                  "this low-latency stage kernel uses M16/M32/M48/M64 tiles");
+    static_assert(kK % 64 == 0, "this low-latency stage kernel uses K64 chunks");
+    (void)v3_k1_build_ll_stage_device<kExperts, kK, kBlockM, kParallelStageCopy>(
+        x, x_scale, local_sym_buffer, route_scratch_i32, grid_barrier,
+        barrier_epoch, rank_idx, num_ranks, num_global_experts,
+        num_max_tokens_per_rank, num_topk, runtime_num_tokens, m_per_expert,
+        route_weights_out, row_expert_out, output_index, row_combine_ptrs_out,
+        local_topk_mask, tail_tokens, cumulative_local_expert_recv_stats,
+        enable_start_rank_barrier, tail_done_counter,
+        graph_runtime_num_tokens_for_barrier, graph_runtime_num_tokens_out,
+        graph_tail_signal_generation_out, graph_max_tokens);
+}
+
+template <int kExperts,
           int kN,
           int kK,
           int kBlockM,
@@ -1002,7 +1050,7 @@ template <int kExperts,
           int kCUs,
           bool kMaskTinyStore = false,
           bool kParallelStageCopy = false>
-__global__ __launch_bounds__(256, 1) void
+__global__ __launch_bounds__(kNumWarps * 64, 1) void
 V3_K1_LowLatencyMaskedGroupGemmKernel(
     hip_bfloat16* out,
     const uint8_t* x,
@@ -1037,9 +1085,13 @@ V3_K1_LowLatencyMaskedGroupGemmKernel(
     static_assert(kBlockM == 16 || kBlockM == 32 || kBlockM == 48 ||
                       kBlockM == 64,
                   "this low-latency kernel uses M16/M32/M48/M64 tiles");
-    static_assert(kBlockN == 256, "this low-latency kernel uses N256 tiles");
+    static_assert(kBlockN == 64 || kBlockN == 128 || kBlockN == 256,
+                  "this low-latency kernel uses N64/N128/N256 tiles");
     static_assert(kBlockK == 64, "this low-latency kernel uses K64 iterations");
-    static_assert(kNumWarps == 4, "this low-latency kernel uses 4 waves");
+    static_assert(kNumWarps == 4 || kNumWarps == 8,
+                  "this low-latency kernel uses 4 or 8 waves");
+    static_assert(kBlockN % (kNumWarps * 16) == 0,
+                  "N tile must cover an integer number of per-wave N16 groups");
     constexpr int kNRepeats = kBlockN / (kNumWarps * 16);
     constexpr int kKIterations = kK / kBlockK;
     constexpr int kNTiles = kN / kBlockN;
@@ -1111,9 +1163,6 @@ V3_K1_LowLatencyMaskedGroupGemmKernel(
             const int tile_n = local_tile - tile_m * kNTiles;
             const uint8_t* x_tile =
                 expert_x + static_cast<int64_t>(tile_m) * kBlockM * kK;
-            const uint8_t* w_tile =
-                expert_w + static_cast<int64_t>(tile_n) * kLdElementsPerBlock +
-                warp_idx * kLdElementsPerWarp;
             float input_scale[kMRepeats];
 #pragma unroll
             for (int mr = 0; mr < kMRepeats; ++mr) {
@@ -1143,10 +1192,15 @@ V3_K1_LowLatencyMaskedGroupGemmKernel(
                 }
 #pragma unroll
                 for (int rep = 0; rep < kNRepeats; ++rep) {
-                    const int32x4_t* b_ptr = reinterpret_cast<const int32x4_t*>(
-                        w_tile + static_cast<int64_t>(k_iter) * kLdNIterKStride +
+                    const int64_t b_offset =
+                        static_cast<int64_t>(tile_n) * kLdElementsPerBlock +
+                        warp_idx * kLdElementsPerWarp +
+                        static_cast<int64_t>(k_iter) * kLdNIterKStride +
                         lane_offset_n +
-                        rep * kNumWarps * kLdElementsPerWarp);
+                        rep * kNumWarps * kLdElementsPerWarp;
+                    const int32x4_t* b_ptr =
+                        reinterpret_cast<const int32x4_t*>(
+                            expert_w + b_offset);
                     rB[k_iter & 1][rep].v4 = b_ptr[0];
                 }
             }
@@ -1164,10 +1218,15 @@ V3_K1_LowLatencyMaskedGroupGemmKernel(
                 }
 #pragma unroll
                 for (int rep = 0; rep < kNRepeats; ++rep) {
-                    const int32x4_t* b_ptr = reinterpret_cast<const int32x4_t*>(
-                        w_tile + static_cast<int64_t>(k_iter) * kLdNIterKStride +
+                    const int64_t b_offset =
+                        static_cast<int64_t>(tile_n) * kLdElementsPerBlock +
+                        warp_idx * kLdElementsPerWarp +
+                        static_cast<int64_t>(k_iter) * kLdNIterKStride +
                         lane_offset_n +
-                        rep * kNumWarps * kLdElementsPerWarp);
+                        rep * kNumWarps * kLdElementsPerWarp;
+                    const int32x4_t* b_ptr =
+                        reinterpret_cast<const int32x4_t*>(
+                            expert_w + b_offset);
                     rB[load_stage][rep].v4 = b_ptr[0];
                 }
                 __builtin_amdgcn_sched_barrier(0);

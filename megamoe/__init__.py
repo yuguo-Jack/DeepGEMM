@@ -8,6 +8,7 @@ import torch.distributed as dist
 from . import _C
 from .dcu_megamoe_opt.v3_config import (
     STAGED_PACK5_SHAPE_CONTRACT,
+    V3_BACKEND_LL,
     V3_BACKEND_NORMAL,
     normalize_v3_backend,
     staged_pack5_model_shape_supported,
@@ -597,18 +598,6 @@ def get_symm_buffer_for_mega_moe(
     )
 
 
-def transform_fp8_weights_for_mega_moe(
-    l1_weights: torch.Tensor,
-    l2_weights: torch.Tensor,
-) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    l1_fp8, l1_scale = cast_grouped_weight_to_fp8_channelwise(l1_weights)
-    l2_fp8, l2_scale = cast_grouped_weight_to_fp8_channelwise(l2_weights)
-    return (
-        (weight8bit_nt_kpack2_marlin(l1_fp8), l1_scale),
-        (weight8bit_nt_kpack2_marlin(l2_fp8), l2_scale),
-    )
-
-
 def transform_fp8_weights_for_masked_deepgemm(
     l1_weights: torch.Tensor,
     l2_weights: torch.Tensor,
@@ -621,16 +610,52 @@ def transform_fp8_weights_for_masked_deepgemm(
     )
 
 
+def transform_fp8_weights_for_mega_moe_pro_ll_masked_k1(
+    l1_weights: torch.Tensor,
+    l2_weights: torch.Tensor,
+):
+    l1_fp8, l1_scale = cast_grouped_weight_to_fp8_channelwise(l1_weights)
+    l2_fp8, l2_scale = cast_grouped_weight_to_fp8_channelwise(l2_weights)
+    return (
+        {"ll_pro_masked": (weight8bit_nt_kpack2_marlin_masked(l1_fp8), l1_scale)},
+        {"unified": (flatten_pack5_weight(l2_fp8), l2_scale)},
+    )
+
+
 def _select_v3_weight_layout(weights: Any, backend: str):
     if isinstance(weights, dict):
-        key = "unified" if "unified" in weights else backend
+        key = (
+            "ll_pro_masked"
+            if backend == V3_BACKEND_LL and "ll_pro_masked" in weights
+            else ("unified" if "unified" in weights else backend)
+        )
         if key not in weights:
             raise KeyError(
-                f"missing V3 weight layout {key!r}; provide keys 'll'/'normal' "
-                "or a single 'unified' layout"
+                f"missing V3 weight layout {key!r}; provide keys 'll'/'normal', "
+                "'ll_pro_masked' for the Pro LL masked-K1 path, or a single "
+                "'unified' layout"
             )
         return weights[key], key
     return weights, backend
+
+
+def _is_pro_ll_masked_k1_layout(
+    *,
+    v3_backend: str,
+    l1_layout: str,
+    l2_layout: str,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> bool:
+    return (
+        v3_backend == V3_BACKEND_LL
+        and l1_layout == "ll_pro_masked"
+        and l2_layout == "unified"
+        and (num_experts, num_topk, hidden, intermediate_hidden)
+        == (384, 6, 7168, 3072)
+    )
 
 
 def deepep_deepgemm_preprocess_channelwise(
@@ -687,17 +712,26 @@ def fp8_mega_moe(
     v3_backend = normalize_v3_backend(megamoe_backend)
     l1_weights, l1_layout = _select_v3_weight_layout(l1_weights, v3_backend)
     l2_weights, l2_layout = _select_v3_weight_layout(l2_weights, v3_backend)
-    if l1_layout != l2_layout:
+    intermediate_hidden = int(l1_weights[1].size(1) // 2)
+    use_pro_ll_masked_k1 = _is_pro_ll_masked_k1_layout(
+        v3_backend=v3_backend,
+        l1_layout=l1_layout,
+        l2_layout=l2_layout,
+        num_experts=sym_buffer.num_experts,
+        num_topk=sym_buffer.num_topk,
+        hidden=int(y.size(1)),
+        intermediate_hidden=intermediate_hidden,
+    )
+    if l1_layout != l2_layout and not use_pro_ll_masked_k1:
         raise ValueError(
             f"V3 L1/L2 weight layouts must match, got {l1_layout!r} and {l2_layout!r}"
         )
-    use_unified_weight_layout = l1_layout == "unified"
+    use_unified_weight_layout = l2_layout == "unified"
     if recipe != (1, 1, 32):
         raise ValueError("DCU W8A8 MegaMoE expects recipe=(1, 1, 32)")
     if activation != "swiglu":
         raise ValueError("DCU W8A8 MegaMoE supports swiglu only")
 
-    intermediate_hidden = int(l1_weights[1].size(1) // 2)
     staged_shape_supported = _staged_pack5_shape_supported(
         num_ranks=sym_buffer.group.size(),
         num_experts=sym_buffer.num_experts,
@@ -742,6 +776,7 @@ def fp8_mega_moe(
             fast_math=fast_math,
             v3_backend=v3_backend,
             use_unified_weight_layout=use_unified_weight_layout,
+            use_pro_ll_masked_k1=use_pro_ll_masked_k1,
         )
         return
     else:
@@ -768,6 +803,7 @@ def fp8_mega_moe(
             v3_backend=v3_backend,
             capacity_num_tokens=capacity_num_tokens,
             use_unified_weight_layout=use_unified_weight_layout,
+            use_pro_ll_masked_k1=use_pro_ll_masked_k1,
         )
         return
 
@@ -791,8 +827,8 @@ __all__ = [
     "weight8bit_nt_kpack2_marlin_masked",
     "get_mega_moe_hip_build_config",
     "get_symm_buffer_for_mega_moe",
-    "transform_fp8_weights_for_mega_moe",
     "transform_fp8_weights_for_masked_deepgemm",
+    "transform_fp8_weights_for_mega_moe_pro_ll_masked_k1",
     "flatten_pack5_weight",
     "flatten_pack5_weight_asm_normal",
     "deepep_deepgemm_preprocess_channelwise",

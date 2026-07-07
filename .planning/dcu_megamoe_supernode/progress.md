@@ -1277,3 +1277,770 @@
 - Post-build remote source pytest passed: `11 passed in 7.35s`.
 - Pro EP8 512 normal eager RPC smoke passed after the no-copy rebuild: correctness `max_abs=0.000976562`, fused median `4.8080 ms`, baseline bench skipped. Result path: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/no_copy_build_20260703_191544/pro_ep8_512_normal_eager_smoke.json`.
 - Next action per user request: commit the current git changes, then continue Pro EP8 broad data collection from `1024`.
+
+## 2026-07-03 19:41:00 +08:00 - Pro EP8 Normal Eager RPC Matrix
+- Committed the current Pro support/no-copy-build changes before broad Pro EP8 data collection: `bf7b3fa Support DeepSeek V4 Pro MegaMoE shapes`.
+- Ran Pro EP8 normal eager RPC matrix on 151.1 under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_normal_eager_rpc_current_20260703_193251`.
+- Shape and mode: `num_ranks=8`, Pro shape `experts=384`, `topk=6`, `hidden=7168`, `intermediate=3072`, `local_experts=48`, `MEGAMOE_DCU_PEER_MEMORY=rpc`, `K3_USE_ASM_TAIL_REDUCE=0`, baseline `normal-contiguous`, warmup `5`, repeat `10`.
+- All buckets passed correctness with `max_abs=0.000976562`.
+- Results `tokens -> fused ms / baseline ms / speedup`: `512 -> 4.7537 / 4.8026 / 1.010x`; `1024 -> 5.2085 / 7.5860 / 1.456x`; `1025 -> 5.2166 / 7.6248 / 1.462x`; `2048 -> 8.0569 / 13.1070 / 1.627x`; `2050 -> 8.0917 / 13.1054 / 1.620x`; `4096 -> 15.4011 / 24.6854 / 1.603x`; `4097 -> 15.3239 / 24.7344 / 1.614x`; `5120 -> 17.2820 / 30.5266 / 1.766x`; `8192 -> 27.6906 / 48.5922 / 1.755x`.
+- `hy-smi --showpids` was clear after each bucket.
+- Next action: reproduce and isolate the large graph cap8192 instability class, starting with Flash EP16 normal graph retest and then Pro EP16 graph cap8192 replay8192.
+
+## 2026-07-03 19:52:00 +08:00 - Graph8192 Instability Reproduced And Patch Hypothesis
+- Reproduced Flash EP16 normal graph cap8192 instability with explicit `K3_USE_ASM_TAIL_REDUCE=1`, replay `4096,5120,8192`, graph bench enabled, and eager bench skipped.
+- Eager correctness passed first (`max_abs=0.000488281`), then the run VMFaulted before printing the first graph bucket result. Log directory: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/graph8192_instability_flash_ep16_20260703_194417`.
+- VMFault diagnostics repeatedly showed `rank_barrier_kernel` and `MegaMoE HIP staged rank barrier timeout` at slot `32`, e.g. `generation=2`, `arrival=28`, `release=1`. For EP16 dynamic signal layout, slot `32` is the normal start barrier.
+- Interpretation: graph replay queues multiple replays back-to-back and only synchronizes after the replay loop. Normal tail-reduce graph had a start barrier but no end-of-replay rank barrier. A faster rank can enter the next replay start barrier and reset tail-reduce counters/signals while slower ranks are still finishing the previous replay's K3 tail-reduce, causing the generation-2 start barrier timeout and VMFault.
+- Started a `--cuda-graph-skip-baseline` replay-only check after the first VMFault, but 151.1 disconnected at the host SSH level immediately after printing graph execution. Subsequent ping/SSH checks fail or close, so the node is currently unavailable.
+- Local narrow patch prepared in `megamoe/opt.py`: for `normal` graph tail-reduce with `num_ranks > 8`, add a post-K3 rank barrier after K3 tail-reduce. This should serialize replay epochs before the next start barrier resets shared tail-reduce signals. The patch deliberately does not affect LL graph or EP8 normal graph.
+- Local checks after the patch passed: `python -m py_compile megamoe/opt.py` and `git diff --check`.
+- Pending validation when 151.1 recovers: sync `megamoe/opt.py`, rebuild with no-copy script, run source pytest, then rerun Flash EP16 graph cap8192 skip-baseline replay-only and full correctness+bench; finally rerun Pro EP16 graph cap8192 replay8192.
+- Added a source-level guard in `test_dcu_megamoe_v3.py` so the normal-tail-reduce graph post-K3 barrier condition is checked by static tests.
+- Rechecked 151.1 multiple times after the VMFault: ping gets 100% loss and SSH times out during banner exchange. No further remote validation has been run after the local patch.
+
+## 2026-07-03 20:47:00 +08:00 - Pro EP8 LL 512 Attempt
+- 151.1 recovered enough for SSH. The existing `sglang_megamoe` container was still exited with code 255 and was restarted.
+- Pre-run card check showed all 16 HCUs normal/idle and `hy-smi --showpids` reported no KFD PIDs.
+- Started Pro EP8 LL 512 on devices `0..7` with `MEGAMOE_DCU_PEER_MEMORY=rpc`, shape `experts=384`, `topk=6`, `hidden=7168`, `intermediate=3072`, backend `ll`, baseline `ll-masked`, warmup `5`, repeat `10`.
+- The process printed `fused execution=v3_ll_eager` and `cuda graph execution=disabled`, then the remote host closed the SSH connection. No result JSON was produced under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_512_20260703_204440`.
+- Immediate follow-up ping/SSH checks failed (`100%` ping loss and SSH banner timeout), so treat this as node/container-level interruption triggered during Pro EP8 LL bring-up, not as a recorded correctness mismatch.
+- Next isolation after 151.1 recovers: do not repeat the full timing command first. Run minimal Pro EP8 LL 512 fused-only (`correctness_iters=0`, `skip-bench`, `skip-baseline-bench`, small warmup/repeat or no timing) to determine whether the failure is in MegaMoE LL fused execution before baseline/bench.
+
+## 2026-07-03 21:35:00 +08:00 - Pro EP8 LL 512 Result
+- Rechecked 151.1 before rerun: `sglang_megamoe` was up and `hy-smi --showpids` reported no KFD PIDs.
+- Minimal fused-only isolation with `--baseline-kind normal-contiguous --correctness-iters 0 --skip-baseline-bench` passed. Result path: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_512_isolation_20260703_212455/pro_ep8_ll_512_fused_only_normalbaseline.json`. Pro EP8 LL fused eager median was `16.7910 ms`; baseline timing was intentionally skipped.
+- The first `ll-masked` correctness retry failed before comparison during DeepEP LL buffer init: `ROCSHMEM_HEAP_SIZE` was below the reported Pro requirement `11450456192` bytes.
+- Retried with node-actual 151.1 environment, no forced HCA/topology, and Pro-sized DeepEP LL heap: `ROCSHMEM_HEAP_SIZE=12884901888`, `DUSHMEM_HEAP_SIZE=12884901888`, plus the README low-latency context variables. Correctness-only passed against `ll-masked`: `max_abs=0.000976562`, `mean_abs=4.86086e-05`.
+- Full Pro EP8 LL 512 eager timing with `ll-masked` baseline passed. Result path: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_512_isolation_20260703_212455/pro_ep8_ll_512_llmasked_timing_heap12g.json`. Fused eager median `16.6829 ms`, `ll-masked` baseline median `5.6826 ms`, speedup `0.3406x`.
+- Pro EP8 LL graph cap512 replay512 also passed correctness. Result path: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_512_isolation_20260703_212455/pro_ep8_ll_graph512_llmasked_timing_heap12g.json`. Graph replay median `16.6293 ms`; `ll-masked` baseline graph median `5.7480 ms`.
+- `hy-smi --showpids` was clear after the LL runs.
+- Conclusion: Pro EP8 LL 512 is correct with `ll-masked` after increasing DeepEP LL heap, but fused LL is much slower than the `ll-masked` baseline. This is a Pro LL performance issue, not a correctness issue and not only launch overhead.
+
+## 2026-07-03 22:04:00 +08:00 - Pro LL Graph Performance Triage
+- Ran Pro EP16 LL graph cap512 on 151.1 with `--baseline-kind ll-masked`, replay `8,32,128,256,512`, Pro shape `experts=384`, `topk=6`, `hidden=7168`, `intermediate=3072`, `num_ranks=16`, and 12GiB ROCSHMEM/DUSHMEM heaps.
+- Result path: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_ll_graph512_masked_20260703_214635/result.json`.
+- Correctness passed for eager and all graph buckets. Fused graph vs `ll-masked` baseline graph:
+  - replay8: `3.2558 ms` vs `2.4204 ms`;
+  - replay32: `3.3209 ms` vs `2.4802 ms`;
+  - replay128: `5.1238 ms` vs `2.6445 ms`;
+  - replay256: `8.6320 ms` vs `3.3827 ms`;
+  - replay512: `15.2628 ms` vs `4.7778 ms`.
+- This confirms Pro EP16 LL graph has the same abnormal performance pattern as Pro EP8 LL 512: correctness is clean, but fused LL is slower than the `ll-masked` baseline.
+- Tested split-tail off for Pro EP8 LL graph512. Result: fused graph worsened from `16.6293 ms` to `17.1197 ms`, while baseline stayed about `5.7365 ms`. Split-tail is not the root cause.
+- Temporarily changed Python `V3_LL_BLOCK_M` for ablation only, without rebuilding because the compiled K1/K3 extensions already contain 32/48/64 variants:
+  - Pro EP16 replay512 default block32: `15.2628 ms`;
+  - block64: `13.7521 ms`;
+  - block48: `12.9954 ms`;
+  - `ll-masked` baseline stayed about `4.78 ms`.
+- Pro EP8 replay512 with block48 improved only modestly: fused graph `15.5261 ms` vs default `16.6293 ms`, baseline `5.7513 ms`.
+- Restored local and remote `V3_LL_BLOCK_M = 32` after the ablation. 151.1 source check shows the default is back, and `hy-smi --showpids` is clear.
+- Ran `hipprof --hip-trace --stats --show-pid --follow-fork` for Pro EP16 LL fused-only block48. Result path: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_ll_blockm48_hipprof_20260703_215257/`.
+- Profiling boundary: K1 dominates. Representative per-rank HIPOPS showed `V3_K1_LowLatencyMaskedGroupGemmKernel<24, 6144, 7168, ...>` around `11.5-11.8 ms` per call, while K3 LL group GEMM was about `0.8-0.9 ms`, K3 combine/reduce about `0.47-0.89 ms`, and K2 about `0.08 ms`.
+- Current conclusion: Pro LL performance issue is rooted in the Pro K1 LL kernel. Tuning `ll_block_m` helps slightly but does not close the gap. Normal backend is currently the performance-safe Pro path; fixing LL properly requires a Pro-optimized K1 LL path or routing Pro small-token auto selection away from LL.
+
+## 2026-07-03 22:16:00 +08:00 - Flash-vs-Pro K1 Profile Comparison
+- User pointed out that K1 slowness should be checked from the Pro-vs-Flash code path differences, not explained away by model size.
+- Checked 151.1 cards first; `hy-smi --showpids` was clear.
+- Ran Flash EP16 LL fused-only hipprof under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/flash_ep16_ll_block32_hipprof_20260703_215928`.
+- Flash EP16 token512 block32 result: fused eager median `1.8373 ms`; K1 median `1.3383 ms`, K3 GEMM median `0.3625 ms`, K3 combine median `0.6115 ms`, K2 median `0.0352 ms`.
+- Ran Pro EP16 LL default block32 fused-only hipprof under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_ll_block32_hipprof_20260703_220049`.
+- Pro EP16 token512 block32 result: fused eager median `15.7026 ms`; K1 median `13.9043 ms`, K3 GEMM median `1.0253 ms`, K3 combine median `1.2074 ms`, K2 median `0.0823 ms`.
+- K1 measured ratio is about `10.39x` versus the theoretical K1 work ratio `2.625x`, so Pro K1 has a real efficiency collapse.
+- Diff/source check: Pro LL K1 support only routes the existing HIP C++ K1 template from Flash `<4096,4096>` to Pro `<6144,7168>` and enables local experts `24/48`; no dedicated Pro-optimized LL K1 kernel exists.
+- Source check: K1 GEMM uses actual `cur_tokens` for `m_tiles`, so it is not doing full capacity rows; stage copy scales mainly with hidden and cannot explain the 10x K1 time.
+- Next ablation: test whether the fully unrolled Pro `kKIterations=112` loop is the main codegen/runtime issue.
+
+## 2026-07-03 22:23:00 +08:00 - K1 K-Loop Unroll Ablation
+- Applied a temporary K1 LL ablation changing the main K loop pragma from full `#pragma unroll` to `#pragma unroll 1`.
+- Synced the header to 151.1, rebuilt MegaMoE in-place, and source pytest passed (`11 passed`).
+- Pro EP16 LL fused-only token512 timing with the ablation was worse: fused median `17.3007 ms` versus the default block32 fused-only `15.7026 ms`.
+- Conclusion: simply disabling the Pro K-loop unroll is not the fix and does not explain the K1 efficiency collapse. The temporary local change was reverted after the measurement; remote source was also synced back to the default header for the next rebuild.
+
+## 2026-07-03 22:40:00 +08:00 - K1 Stage-Copy Ablation
+- Applied a temporary K1 LL launch ablation keeping blockM=32 but changing `kParallelStageCopy` from true to false for the block32 variants.
+- Synced `k1_v3_fused_ext.cu` to 151.1, rebuilt MegaMoE in-place, and source pytest passed (`11 passed`).
+- Pro EP16 LL fused-only token512 timing with stage-copy off was `15.8442 ms`, slightly worse than the default block32 `15.7026 ms`.
+- Conclusion: the Pro K1 gap is not caused by the parallel stage-copy strategy. The next ablation should target grid/CU count or K1 tiling/occupancy rather than copy scheduling.
+
+## 2026-07-03 23:58:00 +08:00 - K1 Dimension Ablation
+- Added temporary non-production shape gates and K1/K3 LL dispatch instances to isolate Pro LL K1 cost by dimension. These gates were for measurement only.
+- Mixed experts-only ablation passed on 151.1: `experts=384, hidden=4096, intermediate=2048, EP16 LL` under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/mixed_proexperts_flashdims_ep16_ll_20260703_231249`, fused `1.8772 ms`. This is essentially Flash-like, so `experts=384/local_experts=24` is not the cause.
+- K/N split ablations under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/k1_dim_ablation_runs_20260703_233714`:
+  - `hidden=7168, intermediate=2048`: correct, fused `10.6547 ms`.
+  - `hidden=4096, intermediate=3072`: correct, fused `2.5402 ms`.
+- Hipprof confirms the K-only case is still K1-dominated:
+  - K-only profile `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/k1_konly_hipprof_20260703_234023`: fused `10.6549 ms`, K1 `<24,4096,7168>` average about `9.1-9.7 ms`; K3 GEMM about `0.70 ms`, K3 combine about `0.85 ms`.
+  - N-only profile `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/k1_nonly_hipprof_20260703_234147`: fused `2.5350 ms`, K1 `<24,6144,4096>` average about `1.56-2.09 ms`; K3 GEMM about `0.55 ms`, K3 combine about `0.61 ms`.
+- Temporary-source caveat: source pytest failed while mixed-shape gates were open because `test_v3_model_shape_registry_covers_flash_and_pro_ep_sizes` intentionally asserts mixed shapes are unsupported. This was expected for the ablation.
+- Cleaned all temporary mixed-shape gates from local and remote source. Remote default rebuild passed under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/default_rebuild_after_k1_dim_ablation_20260703_234453`, source pytest `11 passed`, grep confirmed temp strings absent, and `hy-smi --showpids` was clear.
+- Conclusion: Pro LL K1 performance collapse is primarily triggered by `hidden/K=7168`; the Pro intermediate/N expansion is secondary, and expert count/local_experts is not the root cause.
+
+## 2026-07-04 00:30:00 +08:00 - K1 Partial-Unroll Ablation
+- Applied a temporary K1 LL codegen ablation changing only the main K loop from full `#pragma unroll` to `#pragma unroll 8`.
+- Rebuilt on 151.1 and ran Pro EP16 LL fused-only token512 under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_ll_kloop_unroll8_20260704_000153`.
+- Result: correctness passed, fused `15.7133 ms`, effectively unchanged from the default block32 fused-only `15.7026 ms`.
+- Interpretation: partial unroll 8 does not fix the Pro K1 `K=7168` collapse. Combined with the earlier `unroll 1` result (`17.3007 ms`), the issue is not solved by simple K-loop unroll-factor changes.
+- Reverted the temporary pragma locally and on 151.1. Remote default rebuild passed under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/default_rebuild_after_unroll8_ablation_20260704_001643`, source pytest `11 passed`, no `#pragma unroll 8` remained, and `hy-smi --showpids` was clear.
+
+## 2026-07-04 00:44:00 +08:00 - K1 Layout And Resource Check
+- Re-read the K1/K2/K3 LL source contract before trying a hybrid backend experiment.
+- LL K1 writes rows in per-local-expert contiguous layout (`row = local_expert * m_per_expert + row_in_expert`) and returns `ll_actual_m` as per-expert row counts plus a max-count slot. K2 and K3 both interpret `m_indices` as those per-expert counts.
+- Normal ASM K1 returns row-wise `m_indices` for compact/non-deterministic row order; the ASM source explicitly documents "Row order is intentionally nondeterministic". Therefore normal ASM K1 cannot be directly spliced into the LL K2/K3 path without a row-layout rewrite or an explicit reorder/count bridge.
+- Extracted the current 151.1 K1 extension fatbin and parsed gfx938 metadata through `llvm-readelf --notes`. For EP16 block32, Flash K1 `<24,4096,4096>` uses `vgpr=124`, `sgpr=100`, `sgpr_spill=6`, `private=0`; Pro K1 `<24,6144,7168>` uses `vgpr=132`, `sgpr=106`, `sgpr_spill=4`, `private=208`.
+- Resource metadata does not show a catastrophic VGPR spill or LDS increase, so the Pro K1 gap is unlikely to be explained by simple register exhaustion. Next temporary ablation should test Pro-only K1 tile granularity, starting with `blockN=128`, then cleanly revert if it is not useful.
+
+## 2026-07-04 01:04:00 +08:00 - Pro K1 Tile Granularity Ablation
+- Verified local and 151.1 source hashes match for `megamoe/opt.py`, `k1_v3_fused_ext.cu`, and `k1_v3_pack5_groupgemm_impl.cuh`. Remote source contains the candidate Pro K1 LL `K=7168 -> blockN=128` selector and Pro `ll_block_m=48`; Flash shape still maps to blockM32/blockN256.
+- Checked 151.1 before the run: `sglang_megamoe` is up, all 16 HCUs are Normal, and `hy-smi --showpids` reports no KFD PIDs.
+- Ran Pro EP16 LL graph cap512 against `ll-masked` baseline under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_ll_graph512_blockn128_blockm48_20260704_010417`.
+- Correctness passed for eager and graph buckets. Graph medians for fused vs `ll-masked` baseline:
+  - replay8: `1.3350 ms` vs `2.4166 ms`;
+  - replay32: `1.4698 ms` vs `2.4787 ms`;
+  - replay128: `1.6748 ms` vs `2.6485 ms`;
+  - replay256: `3.0813 ms` vs `3.3804 ms`;
+  - replay512: `5.0180 ms` vs `4.7777 ms`.
+- Compared with the prior Pro EP16 LL graph result, replay512 improved from `15.2628 ms` to `5.0180 ms`. This makes the K1 performance issue a tile-granularity/codegen problem for the Pro `K=7168` instantiation, not a baseline or graph-capture issue.
+
+## 2026-07-04 01:10:00 +08:00 - Flash And Pro EP8 LL Guardrails
+- Ran Flash EP16 LL graph cap512 guardrail under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/flash_ep16_ll_graph512_guard_blockn128_candidate_20260704_010641`.
+- Confirmed Flash still uses `_v3_ll_block_m(...Flash...) == 32`; Pro uses 48. Correctness passed. Flash graph medians replay `8/32/128/256/512` are `0.3774/0.4087/0.5981/0.9885/1.9169 ms`, matching the recent fair historical band (`0.3763/0.4113/0.5980/0.9915/1.9043 ms`).
+- Ran Pro EP8 LL graph cap512 under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_graph512_blockn128_blockm48_20260704_010823`.
+- Pro EP8 LL correctness passed. Eager fused is now `5.3814 ms` vs `ll-masked` baseline `5.7026 ms`; graph replay512 is now `5.3764 ms` vs baseline `5.7417 ms`.
+- Compared with the prior Pro EP8 LL graph replay512 result (`16.6293 ms`), the Pro K1 tile change removes the 16ms-level performance cliff and makes Pro EP8 LL performance competitive with the masked baseline.
+- Added static source tests for Pro/Flash LL blockM selection and K1 `K=7168 -> blockN=128`. Local `py_compile` passed; local pytest is unavailable because the local Python lacks pytest. Synced the test file to 151.1 and remote source pytest passed: `11 passed in 7.49s`.
+
+## 2026-07-04 01:15:00 +08:00 - Post-K3 Barrier Hypothesis Rejected
+- Tested the normal graph post-K3 barrier candidate on Flash EP16 normal graph cap8192 under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/flash_ep16_normal_graph8192_postk3barrier_probe_20260704_011221`.
+- The run passed eager correctness first (`max_abs=0.000488281`), then VMFaulted during graph replay. The failing kernel was still `rank_barrier_kernel`, slot32, with generation/release mismatch (`generation=2`, `release=1`), and the process aborted with `SIGABRT`.
+- This disproves the simple "add post-K3 barrier kernel" hypothesis. The extra barrier did not serialize the replay epoch safely and should not be kept.
+- Checked 151.1 after the failure: container stayed up, all 16 HCUs are Normal, and `hy-smi --showpids` reports no KFD PIDs.
+- Removed the failed tail-reduce graph post-K3 barrier branch and its static test assertions from local source, synced `opt.py` and the test file to 151.1, and reran remote source pytest: `11 passed in 7.51s`.
+
+## 2026-07-04 01:25:00 +08:00 - Pro LL K1 Next Optimization Plan
+- User requested continuing Pro LL K1 optimization by extracting a pure groupgemm skeleton, tuning it to the best achievable K1-only performance, and then folding proven structure back into the fused kernel.
+- Added a Pro LL K1 optimization sub-plan to `task_plan.md`. The plan is to separate K1 compute from routing/K2/K3/combine costs, benchmark several tile/block/CU variants, compare against fused LL and `ll-masked` baseline over multiple token buckets, then only backport measured improvements.
+- Initial acceptance criteria: keep Flash EP16 LL graph in the historical band, keep Pro correctness against `ll-masked`, and make Pro LL fused match or beat `ll-masked` on the tested small-token buckets.
+
+## 2026-07-04 08:05:00 +08:00 - Pro LL K1-only Harness Validation
+- Added a K1-only benchmark path to `test_mega_moe_dcu.py`: `--k1-only-bench` calls LL K1 directly using the fused route/stage contract and records K1-only median/min, rows per rank, max rows per expert, and effective LL blockM.
+- Added `--k1-only-ll-block-m {0,32,48,64}` so Pro LL K1 blockM can be ablated without changing production selector code. `0` records the effective production selector value.
+- Local checks passed: `python -m py_compile megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py megamoe/opt.py` and `git diff --check`.
+- Synced `opt.py`, K1 LL source/header, and the two test files to 151.1. Remote source checks passed in `sglang_megamoe`: `11 passed in 7.26s`.
+- 151.1 was idle before testing: `sglang_megamoe` up, all 16 HCUs normal, and `hy-smi --showpids` reported no KFD PIDs.
+- Started Pro EP16 K1-only blockM ablation under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_k1_only_blockm_ablation_20260704_075902`, beginning with blockM0/production selector. The command printed fused execution setup, then SSH was closed by the remote host before a JSON result was written.
+- Follow-up SSH probes currently fail with connection close or banner timeout. Treat this as a node interruption; do not count the blockM0 attempt as valid K1-only performance data.
+- Local safety follow-up: added a K1-only benchmark epoch guard. Each timed K1-only invocation now synchronizes the local DCU and enters a host `dist.barrier(group=group)` before the next warmup/repeat iteration. This protects the benchmark loop from re-entering the LL start barrier while a slower rank is still finishing the previous K1 GEMM. Local `py_compile` and `git diff --check` passed after the change.
+- Tightened the static source assertion to check the dedicated `run_k1_only_epoch` helper and the guarded timing scope string. Local checks still pass.
+- 151.1 remains unavailable after repeated probes (`Connection closed` or `banner timeout`), so the epoch-guarded harness has not yet been synced or remote-validated. First step after recovery: sync the two test files, rerun remote source pytest, then run one short Pro EP16 K1-only blockM0 smoke with low warmup/repeat before the full blockM matrix.
+
+## 2026-07-04 08:35:00 +08:00 - Pro LL K1 Internal Ablation Direction
+- User clarified that the intended ablation is to remove K1 internals such as kernel-side barriers or dispatch/stage work, not only sweep blockM.
+- 151.1 recovered briefly. Restarted the existing `sglang_megamoe` container, confirmed all 16 HCUs were idle, synced the guarded K1-only harness, and reran remote source pytest: `11 passed in 7.89s`.
+- Retried a short Pro EP16 K1-only full-mode smoke (`warmup=1`, `repeat=3`, production blockM selector). It again printed test setup and then SSH was closed by the remote host before any JSON result was written. Treat this as a reproduced full-K1-only instability, not a valid timing.
+- Local code now adds two internal ablation modes:
+  - `--k1-only-ablate-mode no-start-barrier`: uses a host rank barrier before launch and disables the K1 kernel start rank barrier.
+  - `--k1-only-ablate-mode pure-gemm`: after one initialization K1, launches a C++ pure groupgemm path that skips dispatch/route scan/stage copy and reads the existing `actual_m`, `staged_x`, and `staged_x_scale`.
+- Local checks after the ablation code passed: `python -m py_compile ...` and `git diff --check`.
+- Remote sync/build for the pure-gemm C++ changes is still pending because 151.1 returned to SSH close/banner-timeout after the reproduced full-mode failure.
+
+## 2026-07-04 11:20:00 +08:00 - Pro LL K1 Ablation Data And Current Blocker
+- Synced the pure-gemm C++ path to 151.1 after recovery, rebuilt in-place with `build_dcu_megamoe.sh`, verified imports resolve to `/root/yuguo/DeepGEMM`, and reran remote source pytest: `11 passed`.
+- Full K1-only mode with the in-kernel start rank barrier remains unsafe: the short Pro EP16 token512 run closed SSH before writing JSON. Do not use this mode for timing.
+- `no-start-barrier` Pro EP16 token512 smoke produced valid JSON under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_k1_ablate_no_start_20260704_110101/result.json`: median `4.7167 ms`, min `4.4850 ms`, rows/rank `3072`, max rows/expert average `149.375`.
+- Matrix run under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_k1_ablate_matrix_20260704_110224`:
+  - `no-start-barrier` medians for tokens `8/32/128/256/512`: `1.4832/1.6491/1.7492/2.9272/4.5657 ms`.
+  - `pure-gemm` medians for tokens `8/32/128/256/512`: `1.0704/1.1419/1.1690/2.1947/3.4260 ms`.
+- Interpretation: dispatch/route scan/stage copy/start-barrier overhead is about `0.41/0.51/0.58/0.73/1.14 ms` across the same buckets, while the 512-token pure GEMM core itself is still about `3.43 ms`.
+- BlockM core ablation started under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_k1_core_blockm_20260704_111154`. Valid results before interruption:
+  - pure-gemm token256 bm32 `2.1013 ms`, bm48 `2.5911 ms`, bm64 `10.1278 ms`.
+  - pure-gemm token512 bm32 `3.8352 ms`, bm48 `3.4162 ms`.
+- `ll_block_m=64` is rejected for Pro LL K1: it is already much slower at token256 and the token512 bm64 run interrupted SSH before writing JSON.
+- Current 151.1 status after the bm64 interruption: TCP/SSH to `10.17.151.1:22` times out or closes during banner exchange, so no card/container state can be read yet.
+- Next valid step after recovery: do not rerun bm64. Rerun bm32 vs bm48 for token256 and token512 with a larger repeat count, then decide whether another blockN/CU variant is justified.
+
+## 2026-07-04 11:45:00 +08:00 - Local Pure-GEMM BlockN Diagnostic Prep
+- While 151.1 remained unreachable by SSH banner timeout, added a local pure-gemm-only Pro K1 diagnostic knob: `--k1-only-ll-block-n {0,64,128,256}`.
+- The new knob is guarded to `--k1-only-ablate-mode pure-gemm`; production fused K1 still uses the existing selector (`K=7168 -> blockN=128`, Flash `K=4096 -> blockN=256`) when `ll_pure_block_n=0`.
+- C++ changes are limited to the pure groupgemm launcher and the shared kernel static assertion, adding Pro-only pure `blockN=64/128/256` instantiations. Non-Pro pure blockN override is rejected unless it is default/256.
+- Local checks passed: `python -m py_compile megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py megamoe/dcu_megamoe_opt/K1_fused/k1_fused.py` and `git diff --check`.
+- Local pytest is still unavailable (`No module named pytest`). Remote source pytest/build must be run after 151.1 recovers.
+
+## 2026-07-05 08:54:36 +08:00 - Pro K1 Pure GroupGEMM vs DeepGEMM Masked Baseline
+- Rechecked 151.1 before testing: `sglang_megamoe` was up, all 16 HCUs were idle, and `hy-smi --showpids` reported no KFD PIDs.
+- Ran a token512 smoke under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_k1_pure_vs_deepgemm_smoke_20260705_085305`. Result: pure K1 `3.7772 ms`, DeepGEMM masked `2.1582 ms`, ratio `1.750`, max_abs `0.00390625`.
+- Ran the full Pro EP16 pure K1 vs same-input DeepGEMM masked matrix under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_k1_pure_vs_deepgemm_matrix_20260705_085436`.
+- Matrix summary:
+  - tokens 8: pure `1.140250 ms`, DeepGEMM `0.891699 ms`, ratio `1.278738`, max_abs `0.00195312`.
+  - tokens 32: pure `1.249630 ms`, DeepGEMM `0.962710 ms`, ratio `1.298034`, max_abs `0.00195312`.
+  - tokens 128: pure `1.228529 ms`, DeepGEMM `0.967900 ms`, ratio `1.269273`, max_abs `0.00390625`.
+  - tokens 256: pure `2.293589 ms`, DeepGEMM `1.405310 ms`, ratio `1.632088`, max_abs `0.00390625`.
+  - tokens 512: pure `3.631959 ms`, DeepGEMM `2.162549 ms`, ratio `1.679481`, max_abs `0.00390625`.
+- Post-run `hy-smi --showpids` again reported no KFD PIDs.
+- Conclusion from user acceptance criterion: pure groupgemm is not达标. Continue by optimizing the pure K1 groupgemm core first; do not spend more time on dispatch/stage/fused overhead until the pure core is closer to same-shape DeepGEMM masked. If Flash's best kernel structure cannot be reused cleanly for Pro, split a Pro-only pure K1 kernel path.
+
+## 2026-07-05 09:18:00 +08:00 - Pro K1 Pure BlockM/BlockN Diagnostic
+- Ran Pro EP16 pure K1 same-input DeepGEMM masked comparisons for blockM `{32,48}` and blockN `{64,128,256}` at tokens `256` and `512` under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_k1_pure_bm_bn_deepgemm_20260705_090146`.
+- token256 results:
+  - bm32/bn64 pure `2.6990 ms`, DeepGEMM `1.4567 ms`, ratio `1.853`.
+  - bm32/bn128 pure `2.0946 ms`, DeepGEMM `1.4369 ms`, ratio `1.458`.
+  - bm32/bn256 pure `7.8040 ms`, DeepGEMM `1.4206 ms`, ratio `5.494`.
+  - bm48/bn64 pure `3.2130 ms`, DeepGEMM `1.4233 ms`, ratio `2.257`.
+  - bm48/bn128 pure `2.3095 ms`, DeepGEMM `1.4718 ms`, ratio `1.569`.
+  - bm48/bn256 pure `7.1367 ms`, DeepGEMM `1.4788 ms`, ratio `4.826`.
+- token512 results:
+  - bm32/bn64 pure `4.5758 ms`, DeepGEMM `2.1659 ms`, ratio `2.113`.
+  - bm32/bn128 pure `3.8220 ms`, DeepGEMM `2.1721 ms`, ratio `1.760`.
+  - bm32/bn256 pure `13.7912 ms`, DeepGEMM `2.1544 ms`, ratio `6.401`.
+  - bm48/bn64 pure `4.6950 ms`, DeepGEMM `2.1938 ms`, ratio `2.140`.
+  - bm48/bn128 pure `3.6236 ms`, DeepGEMM `2.1727 ms`, ratio `1.668`.
+  - bm48/bn256 pure `11.5711 ms`, DeepGEMM `2.1518 ms`, ratio `5.377`.
+- Conclusion: blockN128 remains the only viable width, but the best pure K1 ratio is still `1.46x-1.67x` slower than DeepGEMM. Parameter tuning is not enough; next step is source/profile-level optimization or a Pro-only kernel structure.
+
+## 2026-07-05 10:20:23 +08:00 - Pro K1 Reference Correction And MT256 Cleanup
+- User challenged the earlier assumption that DeepGEMM masked uses `MT256x256x128`; rechecked local references under `hygon_tmp/K1_groupgemm_fp8`.
+- Corrected finding: `ll-masked` should be compared against the masked small-token reference `deepgemm_groupgemm_masked_fp8_marlin_balanced_256x64x128_TN_BF16_WGM8.s` / `DEEPGEMM_FP8_FP8_BF16_PERCHANNEL_MARLIN_ASM_TN_MT256x64x128_WGM8_GROUPGEMM_MASKED`. The `MT256x256x128` reference is the normal/contiguous large-tile path.
+- The Pro MT256 pure diagnostic branch is not a valid primary optimization direction for LL masked comparison. It also caused a 151.1 SSH/host interruption before producing a result after the pack5 retry.
+- Cleaned local code so the unsafe `ll_block_m=256` / MT256 diagnostic path is no longer runnable and removed the unused MT256 Pro kernel/helper code from `k1_v3_pack5_groupgemm_impl.cuh`.
+- Local checks after cleanup passed: `python -m py_compile ...` and `git diff --check`. A grep confirms no runnable MT256 diagnostic entry remains; only static tests assert the `ll_block_m == 256` entry stays absent.
+- Next step after 151.1 recovers: rebuild, run source pytest, then continue Pro K1 pure optimization from the stable low-latency pure-gemm skeleton against the masked `256x64x128` reference.
+
+## 2026-07-05 11:15:00 +08:00 - DeepGEMM 6a53e9c Masked Kernel Reference Read
+- Cloned the requested DeepGEMM repo locally under `hygon_tmp/deepgemm_develop`, checked out `6a53e9c45c7d6b46395c3a85231d5f2322a36a2a`, matching the active installed `deepgemm` package build hash.
+- Read the wrapper and dispatch path: `deepgemm/m_group_gemm_nt_masked.py` selects `mode=1002` for Pro K1 masked comparisons, and `csrc/py_itfs_cu/m_grouped_fp8_gemm_nt_masked.cu` maps that to the ASM code object `deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co`.
+- Confirmed our test harness compares against `deepgemm.m_grouped_fp8_gemm_nt_masked` with marlin masked weights created only for the baseline. The fused/LL path still uses the existing pack5 layout, so the reference read does not justify another LL weight-layout change.
+- Used the 151.1 container only for offline tool inspection, not GPU workload. `llvm-readelf` and `/opt/dtk/aillvm/bin/llvm-objdump` confirmed the installed gfx938 `256x64x128` code object has a single `WGM8_GROUPGEMM_MASKED` kernel and uses the expected `v_mmac`, LDS read, global load, and BF16 store instruction families.
+- Current optimization direction: use DeepGEMM masked as a structural target for a Pro-only or Pro-specialized pure K1 GEMM core: 8 waves / 512 threads, row tile 64, N tile 256, and LDS-backed B-side pipeline. Keep Flash and the current LL weight layout stable while testing this.
+
+## 2026-07-05 11:34:40 +08:00 - Local Diagnostic Cleanup
+- Cleaned redundant local K1 diagnostic code before the next optimization pass. Removed the `--k1-only-ll-cus` CLI option/result field, the Python wrapper `ll_cus` override, and the unvalidated pure K1 128-CU / 8-wave instantiation.
+- Restored the shared LL K1 template launch contract to 4 waves / 256 threads in source assertions. The stable pure-gemm harness remains available for blockN comparisons against same-input DeepGEMM masked.
+- Kept production Pro fixes intact: Pro `K=7168 -> blockN=128`, Pro `ll_block_m=48`, no LL weight-layout change, and Flash `K=4096` remains on the original blockM32/blockN256 path.
+- Local verification passed after this cleanup: `python -m py_compile ...`, `git diff --check`, and source greps confirm the removed diagnostic controls do not remain in code.
+
+## 2026-07-05 12:12:45 +08:00 - Old C LL GroupGEMM vs Masked ASM Shape Check
+- User asked to pause optimization and first answer why the old `C fp8 groupgemm` LL groupgemm used to track the masked ASM, while Pro K1 now has a large gap.
+- Checked 151.1 before testing: `sglang_megamoe` was up, `hy-smi --showpids` reported no KFD PIDs, and all 16 HCUs were Normal/idle.
+- Ran the old scratch harness `hygon_tmp/K1_groupgemm_fp8` on device 0. Flash `E=32,N=4096,K=4096` directly supports both `--mode c-ll` and `--mode balanced`.
+- Flash paired results, using best-of-three within the run:
+  - tokens 8: balanced `0.3044 ms`, C-LL `0.2984 ms`, ratio `0.98x`.
+  - tokens 32: balanced `0.3044 ms`, C-LL `0.2986 ms`, ratio `0.98x`.
+  - tokens 128: balanced `0.3116 ms`, C-LL `0.3064 ms`, ratio `0.98x`.
+  - tokens 256: balanced `0.3214 ms`, C-LL `0.3193 ms`, ratio `0.99x`.
+  - tokens 512: balanced `0.4267 ms`, C-LL `0.4885 ms`, ratio `1.15x`.
+- Added scratch-only Pro template instantiations to the ignored `hygon_tmp/K1_groupgemm_fp8/k1_gemm.cpp` so the same old C-LL skeleton can be measured at Pro `E=24,N=6144,K=7168` with `blockN=256` and `blockN=128`. This does not touch tracked MegaMoE source.
+- Pro E24 same-harness results:
+  - tokens 8: balanced `0.5897 ms`, C-LL bm32/bn256 `2.7856 ms` (`4.72x`), C-LL bm48/bn128 `0.7932 ms` (`1.35x`).
+  - tokens 32: balanced `0.5952 ms`, C-LL bm32/bn256 `2.7859 ms` (`4.68x`), C-LL bm48/bn128 `0.8001 ms` (`1.34x`).
+  - tokens 128: balanced `0.6113 ms`, C-LL bm32/bn256 `2.7961 ms` (`4.57x`), C-LL bm48/bn128 `0.7977 ms` (`1.31x`).
+  - tokens 256: balanced `0.6938 ms`, C-LL bm32/bn256 `5.5740 ms` (`8.04x`), C-LL bm48/bn128 `1.6100 ms` (`2.32x`).
+  - tokens 512: balanced `1.1572 ms`, C-LL bm32/bn256 `11.1422 ms` (`9.63x`), C-LL bm48/bn128 `2.5276 ms` (`2.18x`).
+- Attempted a Pro E48 scratch sample, but commands did not reach timing output and a leftover script/process was killed. `hy-smi --showpids` was clear afterward. Do not use E48 scratch data.
+- Interpretation: the old C-LL path really was close for Flash, but it was never proven for Pro. The Pro gap is reproducible in the standalone old C harness without MegaMoE dispatch/K2/K3/fusion. The first cliff is `K=7168,N=6144` with old `blockN=256`; `blockN=128` removes most of the cliff but still leaves a meaningful pure GEMM core gap versus masked ASM.
+
+## 2026-07-05 12:42:25 +08:00 - Pro C-LL Scratch Candidate Sweep
+- User approved starting Pro pure groupgemm optimization while keeping LL weight layout stable.
+- Added scratch-only candidates in ignored `hygon_tmp/K1_groupgemm_fp8/k1_gemm.cpp`: Pro E24 `8 waves / 512 threads`, `CU128`, and `BM64/BN256` variants. These are not tracked MegaMoE source changes and do not alter weight layout.
+- 151.1 was idle before and after the run (`hy-smi --showpids` clear).
+- Candidate run directory: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/k1_pro_candidate_20260705_122805`.
+- Results versus masked ASM, best timing per command:
+  - tokens128: masked `0.6132 ms`; base `4w/CU64/BM48/BN128` `0.7963 ms`; `4w/CU128/BM48/BN128` `0.9969 ms`; `8w/CU128/BM48/BN128` `1.5777 ms`; `8w/CU128/BM48/BN256` `0.9337 ms`; `8w/CU128/BM64/BN256` `5.7192 ms`.
+  - tokens256: masked `0.6476 ms`; base `1.6008 ms`; `4w/CU128/BM48/BN128` `1.9821 ms`; `8w/CU128/BM48/BN128` `3.2499 ms`; `8w/CU128/BM48/BN256` `1.9314 ms`; `8w/CU128/BM64/BN256` `5.6905 ms`.
+  - tokens512: masked `1.1883 ms`; base `2.4943 ms`; `4w/CU128/BM48/BN128` `3.0151 ms`; `8w/CU128/BM48/BN128` `5.0821 ms`; `8w/CU128/BM48/BN256` `2.9876 ms`; `8w/CU128/BM64/BN256` `11.4877 ms`.
+- Conclusion: simply increasing CUs, using 8 waves, or copying the masked row/column tile shape into the direct-load C-LL skeleton is negative. The current `4w/CU64/BM48/BN128` remains the best measured direct-load skeleton. Stop sweeping these launch parameters; next step is profile/ISA comparison to explain the direct-load core gap versus masked ASM.
+
+## 2026-07-05 13:40:31 +08:00 - Pro K1 Pure LDS-backed Pack5 Skeleton
+- Profiled current Pro E24/N6144/K7168 pure direct C-LL versus masked ASM under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/k1_pro_profile_20260705_124725`.
+  - tokens512 direct C-LL `BM48/BN128`: hipprof kernel average `2.4815 ms`; harness `2.4788 ms`.
+  - tokens512 masked ASM: hipprof kernel average `1.1830 ms`; harness `1.1834 ms`.
+- ISA slice for the direct C-LL `E24,N6144,K7168,BM48,BN128` kernel shows the core is fully unrolled global-load plus `ds_bpermute`: 1344 static `v_mmac`, 566 `global_load`, 1344 `ds_bpermute`, and 1117 `s_waitcnt` in the slice. The masked ASM has 128 static `v_mmac`, LDS reads/writes, and a shorter WGM8 structure.
+- Tested two direct-core structural ablations under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/k1_pro_structural_ablation_20260705_125536`.
+  - `K1_LL_MAIN_UNROLL=8` was neutral (`2.4847 ms` vs default `2.4827 ms` at tokens512).
+  - Removing `__builtin_amdgcn_sched_barrier(0)` was faster (`2.2951 ms`) but failed correctness later with `max_abs=0.0610352`, so it is not valid.
+- Added scratch-only Pro parameterization for the existing LDS-backed pack5 C skeleton, without changing LL weight layout or tracked MegaMoE production code.
+  - Fixed `kProblemN/K` template params for Pro `6144/7168`.
+  - Fixed lowlat-pack expert stride to `N*K` and K-outer stride to `N*64`.
+  - Fixed a Flash-only stage ordering assumption: `stage_iter ^ 16` is valid for Flash K=4096 / 32 stages, but Pro K=7168 / 56 stages can map to out-of-range stages. Pro now uses linear stage order in the scratch LDS candidate.
+- Correctness/performance for the Pro LDS-backed pack5 `row256` candidate:
+  - Correctness passed against the ASM reference at tokens512: `max_abs=0`, `mean_abs=0`, bit/value mismatches `0`.
+  - Matrix run `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/k1_pro_lds_pack_stagefix_matrix_20260705_133237`:
+    - tokens128: masked `0.6142 ms`, direct C-LL `0.7964 ms`, LDS row256 `1.2018 ms`.
+    - tokens256: masked `0.6432 ms`, direct C-LL `1.5931 ms`, LDS row256 `1.3151 ms`.
+    - tokens512: masked `1.1948 ms`, direct C-LL `2.4797 ms`, LDS row256 `1.4948 ms`.
+- Current conclusion: LDS row256 is not good for small Pro buckets because it pads to 256 rows per expert, but it is the first correct Pro pack5 skeleton that materially improves the large-bucket pure K1 core. Next step is to port it as a shape-gated Pro candidate for larger buckets while preserving the direct path for small buckets and Flash.
+
+## 2026-07-05 15:05:00 +08:00 - Formal Pro K1 LDS Candidate Rejected Against LL Masked
+- Synced the formal Pro K1 LDS row256 candidate and K1-only diagnostic harness to 151.1, rebuilt MegaMoE in `sglang_megamoe`, and verified imports resolve to source-tree `.so` files.
+- Added a K1-only diagnostic compare that, only for `--k1-only-ll-block-n 512`, runs the LDS candidate and a direct blockN128 pure K1 on the same staged input/layout before comparing with DeepGEMM `ll-masked`.
+- Result after rebuild: LDS vs direct128 mismatch equals LDS vs DeepGEMM masked mismatch. Example failures:
+  - rank-local process 6 before rebuild: `max_abs=0.07421875`, argmax `(expert=0,row=5,col=5572)`, LDS `0.1689453125`, direct128/DeepGEMM `0.2431640625`.
+  - process 3 after rebuild: `max_abs=0.06640625`, argmax `(expert=1,row=5,col=1017)`, LDS `-0.193359375`, direct128/DeepGEMM `-0.259765625`.
+- Scratch `k1_gemm_lds_pro_stagefix` still passes against the normal MT256x256 ASM (`max_abs=0`) for Pro E24/N6144/K7168 token512, so the row256 skeleton is self-consistent with the normal/MT256 orientation, but it is not correct against the LL masked WGM8 baseline used by MegaMoE LL.
+- Conclusion: do not connect the row256 LDS candidate to fused LL. The next Pro K1 core work must preserve the LL/masked/direct orientation. Treat the current formal row256 path as a rejected diagnostic unless it is removed or fully rewritten.
+
+## 2026-07-05 15:07:59 +08:00 - Removed Rejected Row256 LDS Candidate From Formal Code
+- Removed the tracked `V3_K1_LdsPack5PureGroupGemmKernel` and its LDS store helpers from `k1_v3_pack5_groupgemm_impl.cuh`.
+- Removed the formal `block_n == 512` / `LDS256` launch branch and changed the K1 pure blockN control surface back to `{0,64,128,256}`.
+- Removed the temporary K1-only lds-vs-direct128 diagnostic branch that only existed to prove the row256 mismatch. The same-input K1 pure vs DeepGEMM masked comparison remains available.
+- Updated source static tests so `V3_K1_LdsPack5PureGroupGemmKernel` and `block_n == 512` are now rejected from production K1 code. Next checks: local py_compile, static pytest, diff check, then remote validation after checking card state.
+
+## 2026-07-05 15:27:54 +08:00 - Post-cleanup Build Verification
+- Local checks after removing the rejected LDS path passed: `python -m py_compile ...` and `git diff --check`.
+- Local pytest could not run because this Windows Python does not have `pytest`; reran the source test in the 151.1 container instead.
+- Synced the cleaned K1/Python/test files to 151.1. Container source pytest passed: `11 passed in 7.48s`.
+- Rebuilt MegaMoE inside `sglang_megamoe`; build verified fresh source-tree `.so/.co` artifacts and import paths for `megamoe`, `_C`, K1, K2, and K3 extensions.
+- Next runtime validation is the surviving K1 pure direct path (`blockN=128`) against same-input DeepGEMM `ll-masked`; do not rerun the removed `blockN=512` LDS path.
+
+## 2026-07-05 16:00:12 +08:00 - New Pro K1 Acceptance Target
+- User clarified that Pro LL K1 no longer needs to preserve the existing unified weight layout. A Pro-size independent layout/repack path is allowed as long as it is shape-gated and does not affect Flash or existing LL behavior.
+- Updated `task_plan.md` acceptance: pure Pro K1 groupgemm must be `<= 1.05x` DeepGEMM `ll-masked` on tested buckets, with correctness against same-input `ll-masked`; only after that should the path be connected to fused LL and validated e2e.
+- A just-started direct128 cleanup matrix was interrupted by the user. Checked 151.1, found the launched K1-only script still running, and stopped only that diagnostic process before proceeding. Do not treat the interrupted partial run as data.
+- Next source task: read DeepGEMM masked packing/dispatch and MegaMoE's weight-layout selection so the Pro-only layout can be added without touching Flash.
+
+## 2026-07-05 16:16:08 +08:00 - Preserve Pro Unified-Layout LL Path
+- User clarified that the existing Flash-friendly LL kernel should remain available for Pro. It already supports the Pro shape through the `blockN=128` and `blockM=48` tuning and is useful as a unified-layout fused compatibility/fallback path.
+- Planning implication: the new Pro masked-friendly K1 optimization must be introduced as an additional shape-gated layout/backend path, not by deleting or silently replacing the current Pro unified-layout LL fused route.
+
+## 2026-07-05 17:07:30 +08:00 - Pro LL Masked-K1 Layout Connected To Fused
+- Added a Pro-only `ll_pro_masked` L1 weight layout path. It uses MegaMoE K1 LL dispatch/stage-only to produce route metadata plus `staged_x/staged_x_scale`, then calls DeepGEMM masked FP8 groupgemm for L1; L2 remains the existing unified pack5 path. Flash and the existing Pro unified-layout LL fused path remain unchanged unless `MEGAMOE_DCU_PRO_LL_MASKED_K1=1` or the new public transform/dict key is used.
+- Added a stage-only K1 LL launcher restricted to Pro shape `(hidden=7168,l1_rows=6144)` with `ll_block_m=48,ll_cus=64`, covering Pro EP8/EP16/EP32 local experts `{48,24,12}` without instantiating Flash stage-only variants.
+- Verification completed so far:
+  - Local `python -m py_compile` and `git diff --check` passed.
+  - 151.1 source pytest passed: `12 passed`.
+  - 151.1 full MegaMoE build passed with fresh `.so/.co` artifact verification and source-tree import checks.
+  - Pro EP16 LL masked-layout correctness-only 512 passed against `ll-masked`: `max_abs=0.000976562`.
+- Performance bring-up:
+  - First e2e attempt was very slow (`61.2 ms`) because the fused helper called `deepgemm.m_grouped_fp8_gemm_nt_masked_impl(..., mode=1002)` directly. The same-input K1-only harness showed the wrapper path is fast (`DeepGEMM masked K1 2.16 ms` at 512), so the direct `_impl` call was replaced with the baseline wrapper `deepgemm.m_grouped_fp8_gemm_nt_masked(...)`.
+  - After this fix, Pro EP16 LL masked-layout eager 512 passed correctness and measured `3.877 ms`, versus existing Pro unified-layout LL fused `5.233 ms` and `ll-masked` baseline `4.877 ms` on the same 151.1 setup.
+- Next: validate graph/cap512 and additional Pro LL token buckets, then decide whether to make this Pro masked-K1 layout default or leave it explicit behind the layout key/env gate.
+
+## 2026-07-05 17:42:00 +08:00 - Pro LL Masked-K1 Graph Validation
+- Confirmed the "good pure groupgemm" path is connected to fused e2e as an additive Pro LL path, but not by merging it into the old monolithic K1 kernel. The active path is K1 LL stage-only route/stage packing, DeepGEMM masked K1 groupgemm on the staged input, then the existing K2/K3 fused flow.
+- Existing Pro LL unified-layout fused route remains available and unchanged. Same setup comparison at 512:
+  - Pro unified-layout LL fused eager: `5.233 ms`.
+  - Pro `ll_pro_masked` LL fused eager: `3.877 ms`.
+  - `ll-masked` baseline eager: `4.877 ms`.
+- Pro EP16 `ll_pro_masked` graph cap512 passed correctness for replay `8/32/128/256/512` with MegaMoE graph medians `1.014/1.126/1.370/2.239/3.872 ms`; `ll-masked` baseline graph medians were `2.420/2.483/2.646/3.378/4.780 ms`.
+- Correctness max_abs for graph replay buckets: `8/32 -> 0.000488281`, `128/256/512 -> 0.000976562`.
+- Current status: EP16 512/cap512 proves the independent-layout fused path is numerically correct and materially faster than both the old Pro unified LL path and the `ll-masked` e2e baseline. Still open: Pro EP8 masked-K1 validation, more token buckets if needed, and whether to make the new layout default for Pro LL or keep it opt-in behind layout/env selection.
+
+## 2026-07-05 17:18:00 +08:00 - Pro EP8 Masked-K1 And Unified EP16 A/B
+- Checked 151.1 before the run: all 16 HCUs were Normal/idle and `hy-smi --showpids` reported no KFD PIDs.
+- Pro EP8 `ll_pro_masked` eager 512 on devices `0..7` passed correctness against `ll-masked`: `max_abs=0.000976562`. Timing: fused `3.917 ms`, baseline `5.678 ms`, speedup `1.45x`.
+- Pro EP8 `ll_pro_masked` graph cap512/replay512 also passed: replay `3.929 ms`, baseline graph `5.734 ms`, correctness `max_abs=0.000976562`.
+- Pro EP8 unified-layout graph cap512/replay512 A/B, with `MEGAMOE_DCU_PRO_LL_MASKED_K1` unset, also passed correctness. Unified replay `5.314 ms`, baseline graph `5.735 ms`. Same-code EP8 512 comparison is therefore: old unified `5.314 ms`, new `ll_pro_masked` `3.929 ms`, baseline `5.734 ms`.
+- Pro EP8 `ll_pro_masked` full graph cap512 matrix also passed. Replay `8/32/128/256/512` medians: MegaMoE `1.435/1.902/2.100/2.424/3.936 ms`; `ll-masked` baseline `3.325/3.744/3.913/4.147/5.729 ms`. Correctness max_abs was `0.000488281` for `8/32` and `0.000976562` for `128/256/512`.
+- Current-code Pro EP16 unified-layout graph cap512 comparison, with `MEGAMOE_DCU_PRO_LL_MASKED_K1` unset, passed correctness. Unified graph replay `8/32/128/256/512` medians: `1.379/1.524/1.721/3.168/5.185 ms`; baseline graph medians: `2.415/2.478/2.643/3.380/4.790 ms`.
+- Same-code EP16 A/B at replay512: old unified layout `5.185 ms`, new `ll_pro_masked` path `3.872 ms`, baseline `4.780-4.790 ms`. The independent layout is the only currently measured Pro LL path that is both faster than baseline and clearly better at 512.
+- Added README usage notes for the Pro LL masked-K1 transform. The public example now shows `transform_fp8_weights_for_mega_moe_v3_pro_ll_masked_k1(...)` with `megamoe_backend="ll"` and explicitly documents that unified pack5 remains the Pro/Flash compatibility fallback.
+- Verification after the documentation/source sync: local `python -m py_compile` passed for touched Python files, local `git diff --check` passed, local pytest is unavailable (`No module named pytest`), and 151.1 container source pytest passed: `12 passed in 7.45s`.
+
+## 2026-07-05 17:58:00 +08:00 - K1-only Layout Diagnostic Cleanup
+- Removed the stale `ll_asm_compatible_layout` pybind/Python parameter and K1-only harness trigger that belonged to the rejected blockN512/LDS diagnostic direction. The production K1 path now keeps the normal LL row tile path directly and the K1-only harness remains limited to the supported pure blockN `{64,128,256}` diagnostics.
+- Added static coverage so `ll_asm_compatible_layout` is treated as a retired token in production/test harness sources, alongside the already rejected `block_n == 512` and `V3_K1_LdsPack5PureGroupGemmKernel` paths.
+- First rebuild attempt caught the missing `use_ll` local after parameter removal; fixed locally by retaining `use_ll=true` for the LL pack5 wrapper while removing only the obsolete layout switch.
+- Verification after cleanup:
+  - Local `python -m py_compile` passed for touched Python files.
+  - Local `git diff --check` passed.
+  - 151.1 source pytest passed after sync: `12 passed in 7.49s`; after rebuild/smoke, it passed again: `12 passed in 7.29s`.
+  - 151.1 rebuild completed and verified fresh source-tree `.so/.co` artifacts; the command's final exit was polluted only by a PowerShell/SSH Python here-doc delimiter issue after build completion, so a separate import check confirmed the rebuilt `k1_fused_ext` loads from the source tree.
+  - Pro EP16 `ll_pro_masked` 512 correctness-only smoke passed after rebuild: `max_abs=0.000976562`.
+  - Final `hy-smi --showpids` reported no KFD PIDs.
+
+## 2026-07-05 18:00:00 +08:00 - Flash EP16 Guardrail After Cleanup
+- Ran Flash EP16 LL graph cap512 after the K1 pybind cleanup/rebuild, with `MEGAMOE_DCU_PRO_LL_MASKED_K1` unset.
+- Correctness passed. Graph replay `8/32/128/256/512` medians were `0.378/0.410/0.602/1.003/1.925 ms`; `ll-masked` baseline medians were `0.929/0.942/1.020/1.387/2.037 ms`.
+- This matches the recent fair Flash EP16 cap512 band (`~1.904 ms` at replay512) within noise and confirms the Pro-only masked-K1 additions plus cleanup did not materially regress Flash LL graph.
+
+## 2026-07-05 18:12:00 +08:00 - Next Pro LL K1 Fusion Plan
+- User corrected the next-step scope: do not use old Pro unified fused K1 as a comparison target for the optimization loop. It remains only a compatibility fallback.
+- Current `ll_pro_masked` split path is the interim performance oracle/fallback: K1 stage-only plus DeepGEMM masked L1 GEMM, then MegaMoE K2/K3.
+- Next implementation work should target a Pro-specific C pure K1 groupgemm first, analogous to the Flash LL history where the C kernel reached copied masked-ASM performance before being fused.
+- Concrete todo list:
+  - Build a Pro-size C pure K1 groupgemm kernel for the masked-friendly layout and compare same-input output/timing against DeepGEMM `ll-masked`.
+  - Borrow structure from the real masked reference (`256x64x128 WGM8 GROUPGEMM_MASKED`, row tile 64, N tile 256, K tile 128, LDS-backed B-side pipeline), not from the rejected normal/MT256 row256 path.
+  - Keep the LL/masked output orientation and `actual_m` contract unchanged.
+  - Once pure C K1 is within 5% of DeepGEMM masked, fuse it like Flash LL K1: start barrier, route/stage, actual_m, scale staging, and L1 GEMM in one Pro shape-gated K1 kernel.
+  - Only after the fused C K1 candidate exists, run the unified final validation matrix. Until then, avoid spending cycles on more standalone validation beyond build/static sanity.
+
+## 2026-07-05 19:41:50 +08:00 - Direct Masked-Layout Pure K1 Rejected
+- Continued the Pro pure K1 effort from the new masked-friendly layout direction.
+- The direct masked-layout prototype had one real correctness bug: it decoded the masked DeepGEMM weight layout without applying the physical N16 lane mapping used by the pack5/marlin family. After adding `physical_n16 -> logical_n16`, the large same-input K1 mismatch disappeared and the remaining diff versus DeepGEMM masked is BF16-level (`max_abs=0.00390625`, mean about `4e-09`) on the Pro EP16 token128 check.
+- Performance is not close enough to keep this as the optimization path:
+  - Pro EP16 token128, `BM64/BN256/8wave/CU128`: pure K1 `6.6811 ms`, DeepGEMM masked `0.9063 ms`, ratio `7.37x`.
+  - Pro EP16 token128, `BM48/BN128/4wave/CU64`: pure K1 `5.3238 ms`, DeepGEMM masked `0.9129 ms`, ratio `5.83x`.
+- Conclusion: the direct global-load/shuffle masked-layout prototype is useful as a correctness probe, but it is rejected for the 5% target. The next implementation direction is a Pro masked-orientation LDS-backed K1 skeleton that preserves the `ll-masked` output/`actual_m` contract instead of reviving the rejected normal/MT256 row256 orientation.
+
+## 2026-07-05 20:20:00 +08:00 - Formal MegaMoE C K1 Backend Hook
+- User asked to stop keeping the experiment only in scratch and instead make a C groupgemm optionally replace the DeepGEMM ASM K1 call inside the MegaMoE Pro masked-K1 path.
+- Added an opt-in backend gate in `megamoe/opt.py`:
+  - `MEGAMOE_DCU_PRO_LL_MASKED_K1_C_GROUPGEMM=1` switches `ll_pro_masked` L1 from DeepGEMM masked K1 to the MegaMoE C pure groupgemm extension after stage-only route/stage.
+  - `MEGAMOE_DCU_PRO_LL_MASKED_K1_C_BLOCK_N={0,64,128,256}` controls the C pure K1 blockN diagnostic, defaulting to `128`.
+  - Default behavior remains DeepGEMM masked ASM; Flash and the existing Pro default/fallback paths are unchanged.
+- Local checks passed: `python -m py_compile megamoe/opt.py ...` and `git diff --check -- megamoe/opt.py`.
+- Synced `megamoe/opt.py` to 151.1. Remote source pytest passed: `12 passed in 7.30s`.
+- First formal e2e smoke with the C backend enabled passed correctness on 151.1:
+  - Command shape: Pro EP16 LL eager, `tokens=128`, `hidden=7168`, `intermediate=3072`, `experts=384`, `topk=6`, `baseline-kind=ll-masked`.
+  - Correctness: `max_abs=0.000488281`, `mean_abs=4.86055e-05`.
+  - Performance is poor: fused `5.8634 ms`, short-run baseline timing `1.5520 ms`, speedup `0.265x`.
+- Interpretation: the formal optional backend is now in place for iterative optimization, but the current C direct groupgemm is only a correctness-bearing scaffold. The next work is kernel optimization against the masked ASM structure, not more integration plumbing.
+
+## 2026-07-05 21:08:00 +08:00 - Pro C K1 Formal LDS Candidate A/B
+- Added a Pro-only masked-layout LDS C K1 candidate into the formal MegaMoE optional backend path. It is selected only when `MEGAMOE_DCU_PRO_LL_MASKED_K1_C_GROUPGEMM=1` and `MEGAMOE_DCU_PRO_LL_MASKED_K1_C_BLOCK_N=256`; the default Pro `ll_pro_masked` path still uses DeepGEMM masked ASM, and Flash paths are unchanged.
+- Local checks passed before remote validation: `python -m py_compile` for touched Python/test files and `git diff --check` for the touched K1/opt files.
+- 151.1 setup before the run: stale timed-out build process was stopped, process table was clean, and `hy-smi --showpids` reported no KFD PIDs.
+- Same-command Pro EP16 LL token128 A/B:
+  - Default `ll_pro_masked` path with DeepGEMM masked K1: correctness passed, fused `1.3832 ms`, `ll-masked` baseline `1.5496 ms`, speedup `1.12x`.
+  - C LDS backend (`C_GROUPGEMM=1`, `C_BLOCK_N=256`): correctness passed, fused `2.2897 ms`, `ll-masked` baseline `1.5562 ms`, speedup `0.68x`.
+- The LDS candidate improves materially over the earlier direct C formal backend (`5.86 ms` fused in the first token128 smoke), but it is still about `1.66x` slower than the default split path and about `1.47x` slower than the DeepGEMM masked timing in the same command.
+- Resource metadata for `V3_K1_ProMaskedLdsGroupGemmKernel<24>` shows `group_segment_fixed_size=65536`, `vgpr_count=211`, `sgpr_count=30`, no spills. That is much heavier than the old direct LL template variants around `~100-127` VGPR, and it uses a full 64 KiB LDS double buffer.
+- Local/remote source comparison shows the current formal LDS candidate is a 256-thread, 2-compute-wave + 2-loader-wave row64/N256 structure. The actual DeepGEMM masked Pro reference is `mode=1002`, `256x64x128`, 512-thread/WGM8. The next optimization should not be another blockN sweep; it should reduce the C kernel toward the masked ASM structure, likely by splitting the N256 work across more compute waves to reduce per-wave accumulator pressure while preserving the LL masked orientation.
+- Attempted a K1-only same-input compare for the C LDS backend with `--k1-only-ablate-mode pure-gemm --k1-only-ll-block-n 256 --k1-only-compare-deepgemm`. The command printed setup, then SSH to 151.1 was closed; subsequent `ssh` and ping/TCP probes timed out. Do not count this as a timing or correctness result. Treat 151.1 as unavailable until it recovers, then first check/clean node state before rerunning K1-only diagnostics.
+
+## 2026-07-05 21:07:07 +08:00 - Pro C K1 ASM-Guided Optimization Direction
+- User requested the next Pro C K1 optimization to stay close to the copied masked ASM and to use `--save-temps` for generated device `.s` comparison.
+- Adopted that as the next loop: generate the formal C LDS backend `.s`, compare against `hygon_tmp/K1_groupgemm_fp8/deepgemm_groupgemm_masked_fp8_marlin_balanced_256x64x128_TN_BF16_WGM8.s`, and only then change the C kernel.
+- Initial expected deltas to confirm in generated `.s`: C candidate is currently `256-thread`, `64 KiB` LDS, `211` VGPR, while the reference masked ASM is `512-thread/WGM8`, `32 KiB` LDS, `191` VGPR. Optimization should target launch/wave ownership, accumulator pressure, LDS B-side read schedule, wait/barrier placement, and `v_mmac` grouping rather than another blind blockN sweep.
+
+## 2026-07-05 23:25:00 +08:00 - Current C K1 Save-Temps Comparison
+- Synced the cleaned K1 files to 151.1 and generated the current formal Pro masked LDS C backend device assembly with `hipcc -save-temps=obj`.
+- Current C `<local_experts=24>` extracted assembly:
+  - run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_save_temps_m32_current_20260705_224241`;
+  - extracted file: `c_promasked24_m32_current.s`;
+  - resource/count summary: `64 KiB` LDS, `211` VGPR, `26` SGPR, `128` `v_mmac`, `32` `ds_read_b128`, `24` `ds_read_b32`, `35` global-to-LDS loads, `36` `buffer_load_dwordx4`, `256` buffer stores, `61` barriers, `379` waitcnts.
+- DeepGEMM masked object/source comparison confirms the main shape gap is not MMAC count. The reference has the same `128` `v_mmac`, but its WGM8 structure is much lighter around scheduling and epilogue: `32 KiB` LDS, `191` VGPR, 512-thread launch, compute waves `0..3`, loader waves `4..7`, wave id contributing to N offset (`NperWAVE=16`), and far fewer static barriers/waits/stores.
+- Tried a targeted single-LDS-stage experiment to match ASM's `32 KiB` LDS footprint. It compiled and resource metadata dropped to `32 KiB`, but K1-only same-input correctness failed badly: `max_abs=0.9892578125`, example `pure=0.86328125` vs DeepGEMM `-0.1259765625`.
+- Root cause of that failed experiment: the current C kernel's loader waves begin writing the next K-stage LDS buffer immediately after the stage barrier, while compute waves are still consuming the current stage. The double buffer is required unless the whole pipeline is rewritten like the ASM.
+- Reverted the single-stage change locally and synced the restored header to 151.1. Rebuilt the in-place extension in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_restore_m32_build_20260705_232513`.
+- Restoration K1-only smoke after rebuild returned to BF16-level agreement with DeepGEMM masked (`max_abs=0.00390625`, mean `4.3e-09`) but showed timing jitter: K1 median average `2.5683 ms`, min average `1.7723 ms`, DeepGEMM masked median `0.9598 ms`. Treat this as a restore/correctness check, not as a new performance baseline.
+- Next viable C candidate should not split rows like the earlier bad 512-thread/M16 experiment; it should preserve the LL/masked output contract while moving wave ownership toward the ASM's N-split WGM8 mapping.
+
+## 2026-07-05 23:50:00 +08:00 - Pro K1 Tune-Only Extraction Started
+- User requested avoiding full fused-extension rebuilds and optimizing the C kernel directly against the DeepGEMM masked `.s`.
+- Added a tune-only source file `megamoe/dcu_megamoe_opt/K1_fused/k1_pro_masked_lds_tune_ext.cu`. It exposes only `pro_masked_lds_groupgemm(out, staged_x, weight_masked, staged_x_scale, weight_scale, actual_m, rows_aligned_per_expert, local_experts)` and launches the current Pro masked LDS K1 kernel for local experts `12/24/48`.
+- Added `megamoe/dcu_megamoe_opt/scripts/build_k1_pro_masked_lds_tune_ext.sh` so 151.1 can build just this extension, optionally with `MEGAMOE_DCU_K1_TUNE_SAVE_TEMPS=1` for generated device assembly.
+- Added an env-gated K1-only harness path: `MEGAMOE_DCU_PRO_LL_MASKED_K1_TUNE_EXT=1` makes `--k1-only-ablate-mode pure-gemm --k1-only-compare-deepgemm` call the tune extension on the same staged inputs and compare against DeepGEMM masked.
+- Local static checks passed: `python -m py_compile megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py` and `git diff --check` for the touched tune/test files.
+
+## 2026-07-05 23:58:00 +08:00 - Tune-Only Build And Smoke Passed
+- Checked 151.1 before GPU work: `hy-smi --showpids` reported no KFD PIDs.
+- Synced `k1_pro_masked_lds_tune_ext.cu`, `build_k1_pro_masked_lds_tune_ext.sh`, and the updated K1-only test harness to 151.1.
+- Built only the tune extension with `MEGAMOE_DCU_K1_TUNE_SAVE_TEMPS=1`. Build run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_build_20260705_234136`; elapsed compile time was about `56s`, import path `/root/yuguo/DeepGEMM/megamoe/dcu_megamoe_opt/K1_fused/k1_pro_masked_lds_tune_ext.cpython-310-x86_64-linux-gnu.so`.
+- Generated C device assembly: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_build_20260705_234136/build/megamoe/dcu_megamoe_opt/K1_fused/k1_pro_masked_lds_tune_ext-hip-amdgcn-amd-amdhsa-gfx938.s`.
+- Pro EP16 token128 same-input smoke via the tune extension passed against DeepGEMM masked. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_smoke_t128_20260705_234317`.
+  - Tune C K1 median: `1.8035 ms`; DeepGEMM masked median: `0.9566 ms`; ratio `1.885x`.
+  - Diff: `max_abs=0.00390625`, `mean_abs=4.3035e-09`, rows aligned per expert `64`, expected_m `45`.
+- The warning after JSON output was the usual process-group TCPStore shutdown noise after all useful results were printed; final `hy-smi --showpids` again reported no KFD PIDs.
+
+## 2026-07-05 23:59:30 +08:00 - Scale-Order Precision Alignment
+- Read the DeepGEMM masked `.s` `SMQUANT` path. It computes scale products first (`scale_b * scale_a` with packed FP32 multiplies) and then multiplies those scale products into the accumulated C values before BF16 conversion.
+- Changed the Pro masked LDS C store helpers to compute `weight_scale * x_scale` first, then multiply by the accumulator. This is a narrow precision-alignment change for the opt-in C/tune kernel path.
+- Rebuilt the tune-only extension with save-temps in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_scaleorder_build_20260705_234901`; compile time was about `57s`.
+- Re-ran Pro EP16 token128 same-input K1-only smoke in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_scaleorder_smoke_t128_20260705_235025`.
+  - C tune K1 median `1.8105 ms`, DeepGEMM masked median `0.9660 ms`, ratio `1.874x`.
+  - Diff improved from BF16-level (`max_abs=0.00390625`) to bit-exact for the checked bucket: `max_abs=0`, `mean_abs=0`.
+- Generated `.s` structure is otherwise basically unchanged: for `<24>` it still has `128 v_mmac`, `32 ds_read_b128`, `24 ds_read_b32`, `36 buffer_load_dwordx4`, `256 buffer_store`, `61 s_barrier`, `377 s_waitcnt`, and `2 s_setprio`. This confirms the scale-order patch is precision-only; performance still requires WGM8/N-split ownership changes.
+
+## 2026-07-06 00:22:00 +08:00 - Pro K1 X-LDS WGM8 Candidate
+- Added tune-only C candidates selected by `MEGAMOE_DCU_K1_TUNE_VARIANT`:
+  - `wgm8`: 512-thread/N-split version that still stages weight in LDS.
+  - `xlds_wgm8`: 512-thread/N-split version that stages input `x` in LDS and direct-loads masked weights, matching the DeepGEMM masked asm dataflow more closely.
+- Results on Pro EP16 token128 same-input K1-only compare:
+  - Existing 256-thread weight-LDS after scale-order: `1.8105 ms` vs DeepGEMM `0.9660 ms`, ratio `1.874x`, bit-exact.
+  - `wgm8` weight-LDS: correct but slower, `2.3890 ms` vs `0.9759 ms`, ratio `2.448x`. Root cause: N-split compute waves duplicate global `x` loads because the dataflow is still weight-LDS.
+  - `xlds_wgm8` input-LDS, contiguous N ownership: correct, `1.4220 ms` vs `0.9808 ms`, ratio `1.450x`, bit-exact.
+  - `xlds_wgm8` plus masked-only small-token epilogue: correct, `1.4060 ms` vs `0.9746 ms`, ratio `1.443x`, bit-exact; generated `.s` for `<24>` has `16 KiB` LDS, `104` VGPR, `64 buffer_store`, and `155 s_waitcnt`.
+  - `xlds_wgm8` plus asm-style interleaved N16 ownership: correct, `1.2900 ms` vs `0.9800 ms`, ratio `1.316x`, bit-exact. This is the current best C pure K1 candidate.
+- Negative result: applying the asm row-based LDS swizzle directly to the current x-LDS layout failed correctness (`max_abs=1.67578125`), so that swizzle patch was reverted. Do not retry that exact swizzle without re-deriving the LDS layout.
+- 151.1 was checked after the failed swizzle run; `hy-smi --showpids` reported no KFD PIDs.
+
+## 2026-07-06 01:16:00 +08:00 - Pro K1 X-LDS Full-Tile Loader Optimization
+- Applied a narrow ASM-guided C change to `xlds_wgm8`: the x-LDS loader now removes redundant `linear < 512` checks and uses a branchless x prefetch path for full 64-row tiles, while preserving guarded loads for partial tiles.
+- Checked 151.1 before GPU work: `hy-smi --showpids` reported no KFD PIDs.
+- Synced the tune header/source/build script/test harness to 151.1 and rebuilt only the tune extension with save-temps. Build run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_fulltile_build_20260706_010516`.
+- Pro EP16 same-input K1-only matrix against DeepGEMM masked now passes bit-exact on all checked buckets:
+  - tokens `8/32/128/256/512`
+  - C tune K1 medians `1.0785/1.1309/1.1506/1.6135/2.5278 ms`
+  - DeepGEMM masked medians `0.8675/0.9616/0.9898/1.4401/2.1596 ms`
+  - ratios `1.243/1.176/1.162/1.120/1.170`
+  - `max_abs=0`, `mean_abs=0` for every bucket.
+- This improves the current-best C pure K1 substantially from the earlier xlds/preload/fullstore family, especially at token128 and token256, but it still misses the acceptance target of `<=1.05x` DeepGEMM masked. Do not fuse this C K1 yet.
+
+## 2026-07-06 02:07:00 +08:00 - Pro K1 ASM-Guided Scheduling Attempts
+- Continued from the tune-only `xlds_wgm8` C kernel and compared generated `.s` against the DeepGEMM masked `256x64x128 WGM8` ASM.
+- Rebuilt and tested several narrow candidates on 151.1, checking `hy-smi --showpids` before GPU runs; the node reported no KFD PIDs before the measured runs.
+- Rejected the "prefetch next half before phase4 wait" candidate. Generated `.s` showed the intended `buffer_load_dwordx4 -> s_waitcnt vmcnt(4) -> phase4` shape, but token128 same-input correctness failed with `max_abs=0.3076171875` and `pure=nan`, so the relaxed wait is unsafe under compiler/hardware load ordering.
+- Rejected `#pragma unroll 2` on the x-LDS compute loop. It produced ASM-like static shape (`128 v_mmac`, `16 ds_read_b128`, `VGPR=128`, `LDS=16 KiB`) and stayed bit-exact, but performance did not improve enough and token512 regressed:
+  - tokens `128/256/512`: C `1.1387/1.6079/2.6211 ms`, DeepGEMM `0.9598/1.4516/2.2052 ms`, ratios `1.186/1.108/1.189`.
+- Rejected the full-tile/partial-tile store-branch split. Static control improved (`s_waitcnt 217 -> 202`, `s_cbranch 131 -> 101`, `v_cmp 101 -> 89`, `VGPR 128 -> 123`), but runtime was neutral-to-worse:
+  - tokens `128/256/512`: C `1.1574/1.6076/2.4895 ms`, DeepGEMM `1.0184/1.4359/2.1494 ms`, ratios `1.136/1.120/1.158`.
+- Restored the current best split-prefetch baseline on 151.1 in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_best_build_20260706_020211`. Static count is back to `64 v_mmac`, `22 buffer_load_dwordx4`, `128 buffer_store`, `6 s_barrier`, `217 s_waitcnt`, `131 s_cbranch`, `101 v_cmp`.
+- Current retained best remains the split-prefetch x-LDS kernel from `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_wasm_splitpref_build_20260706_013607`: token `128/256/512` C medians `1.1491/1.5896/2.4878 ms`, all bit-exact, with full-tile matrix best record still `8/32/128/256/512 = 1.0785/1.1309/1.1506/1.6135/2.5278 ms` before the later scheduling refinements.
+
+## 2026-07-06 02:16:00 +08:00 - Pro K1 Current Baseline Small Buckets And Priority Scope
+- Filled in current split-prefetch baseline for small buckets after restoring the tune extension:
+  - run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_splitpref_small_matrix_20260706_020446`;
+  - token8: C `1.1040 ms`, DeepGEMM `0.8599 ms`, ratio `1.284`, bit-exact;
+  - token32: C `1.1511 ms`, DeepGEMM `0.9678 ms`, ratio `1.189`, bit-exact.
+- Tested a priority-scope candidate that moves `s_setprio 1` outside the K-stage loop and restores priority only after the loop. Static `.s` confirmed `s_setprio` at lines 10724 and 10988, but performance was worse despite bit-exact correctness:
+  - run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_prioscope_matrix_20260706_020903`;
+  - tokens `128/256/512`: C `1.1651/1.6854/2.5505 ms`, DeepGEMM `0.9780/1.4390/2.2085 ms`, ratios `1.191/1.171/1.155`.
+- Reverted priority-scope and restored the split-prefetch baseline on 151.1 in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_best2_build_20260706_021212`.
+
+## 2026-07-06 02:32:00 +08:00 - Pro K1 ASM-Guided Epilogue And LDS-Wait Attempts
+- Tested a packed-epilogue candidate copied from the reference C/ASM style: `v_pk_mul_f32` for scale-pair and output-pair multiplication.
+  - Build run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_pkmul_build_20260706_021846`.
+  - Static `.s` looked better (`v_pk_mul_f32=128`, `s_waitcnt=107`, `VGPR=123` for `<24>`), but runtime was not better.
+  - Pro EP16 same-input K1-only results: token128 `1.1573 ms` vs DeepGEMM `0.9863 ms`, token256 `1.6495 ms` vs `1.4520 ms`, token512 `2.5306 ms` vs `2.1868 ms`; all bit-exact.
+  - Rejected and reverted because it regressed versus the retained split-prefetch baseline at 128/256/512 despite nicer static instruction shape.
+- Tested an LDS-read overlap candidate: after four `ds_read_b128`, use `s_waitcnt lgkmcnt(2)` to compute the first two row groups before `lgkmcnt(0)` for the last two.
+  - Build run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_lgkm2_build_20260706_022738`.
+  - Generated `.s` matched the intended `ds_read -> lgkmcnt(2) -> half MMAC -> lgkmcnt(0) -> half MMAC` order.
+  - Pro EP16 same-input K1-only results: token128 `1.1465 ms` vs DeepGEMM `0.9546 ms`, token256 `1.6482 ms` vs `1.4012 ms`, token512 `2.5152 ms` vs `2.1777 ms`; all bit-exact.
+  - Rejected and reverted because only token128 improved marginally in absolute C time, while token256/token512 regressed and the ratio target remained far from `<=1.05x`.
+- Tested a four-load inline asm group for the masked weight loads to better match the hand ASM's B-side load grouping.
+  - First build `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_load4_build_20260706_023601` VMFaulted at token256 because the multi-output asm used normal `=v` constraints; generated `.s` allocated output `v[81:84]` on top of offset input `v81..v84`.
+  - Fixed the asm outputs to early-clobber `=&v` and rebuilt in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_load4ec_build_20260706_023949`.
+  - Corrected load4 results were bit-exact but not faster: token128 `1.1402 ms` vs DeepGEMM `0.9872 ms`, token256 `1.6133 ms` vs `1.4462 ms`, token512 `2.7117 ms` vs `2.1546 ms`.
+  - Rejected and reverted because token512 regressed heavily. Lesson: multi-instruction inline asm outputs must use early-clobber when outputs can be written before all input operands are consumed.
+- Tested removing the phase0/phase4 accumulator dependency `s_nop` block.
+  - Build run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_nosnop_build_20260706_024721`.
+  - Pro EP16 same-input K1-only results were bit-exact but mixed: token128 `1.1467 ms` vs DeepGEMM `0.9620 ms`, token256 `1.6651 ms` vs `1.4412 ms`, token512 `2.4719 ms` vs `2.1622 ms`.
+  - Rejected and reverted. The tiny token512 gain does not justify a bucket-specific path, and token256 regresses relative to the retained split-prefetch baseline.
+- Current retained source is back to the split-prefetch x-LDS baseline. Precision remains bit-exact (`max_abs=0`, `mean_abs=0`) on all checked candidates; remaining work is main-loop scheduling/ownership rather than epilogue precision.
+
+## 2026-07-06 03:13:00 +08:00 - Pro K1 VMFault Experiment Reverted
+- Re-read the active Pro C K1 optimization plan and restored the tune-only `xlds_wgm8` source after the aggressive `vmcnt(8)` double-buffer next-weight prefetch experiment VMFaulted.
+- Removed the temporary `pro_masked_lds_wait_vmem_le8_device()` helper and reverted the loop-carried `nw00..nw43` pending-load schedule back to the retained split-prefetch order.
+- Checked 151.1 before GPU work: `hy-smi --showpids` reported no KFD PIDs.
+- Synced the restored header to 151.1 and rebuilt only the tune extension with `MEGAMOE_DCU_K1_TUNE_SAVE_TEMPS=1`. Build run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_after_vmcnt8_revert_20260706_031100`.
+- Token128 same-input K1-only smoke passed after the revert:
+  - run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_after_vmcnt8_revert_smoke_t128_20260706_031218`;
+  - C tune K1 median `1.1661 ms`, DeepGEMM masked median `0.9573 ms`, ratio `1.218x`;
+  - correctness remains bit-exact (`max_abs=0`, `mean_abs=0`).
+- Interpretation: the restore is healthy. The next optimization loop should compare the regenerated C `.s` against the masked ASM and avoid loop-carried pending VMEM register schedules unless implemented with a stricter hand-asm block.
+
+## 2026-07-06 03:22:00 +08:00 - Pro K1 Store-Control Ablation Rejected
+- Compared the retained generated C `.s` with the actual DeepGEMM masked code object ISA. The reference object has `128 v_mmac`, `26 buffer_load_dwordx4`, `16 ds_read_b128`, `64 buffer_store_short`, `12 s_barrier`, `15 s_waitcnt`, and `8 s_setprio`; the retained C `<24>` x-LDS kernel has `64 v_mmac` in its loop body, `22 buffer_load_dwordx4`, `8 ds_read_b128`, `128 buffer_store_short`, `6 s_barrier`, `217 s_waitcnt`, `131 s_cbranch`, and `101 v_cmp`.
+- Tested an unconditional padding-row store ablation for the `xlds_wgm8` store macro. Static `.s` improved sharply: `buffer_store_short 128->64`, `s_waitcnt 217->77`, `s_cbranch 131->19`, `v_cmp 101->5`, with VGPR still `123`.
+- Pro EP16 same-input K1-only results for this ablation:
+  - token128: C `1.1507 ms`, DeepGEMM `0.9673 ms`, ratio `1.190`, `max_abs=0`;
+  - token256: C `1.6186 ms`, DeepGEMM `1.4465 ms`, ratio `1.119`, `max_abs=0`;
+  - token512: C `2.5129 ms`, DeepGEMM `2.1987 ms`, ratio `1.143`, `max_abs=0`;
+  - run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_unmasked_store_matrix_20260706_031722`.
+- Rejected the ablation and reverted local source to the masked partial-tile store path. Static control reduction alone is not enough; extra padding-row writes are neutral-to-worse versus the retained split-prefetch baseline.
+
+## 2026-07-06 03:48:00 +08:00 - Pro K1 Offset-Increment Rejected And Baseline Restored
+- Reverted the offset-increment experiment in `k1_v3_pro_masked_lds_impl.cuh`: removed `K1_XLDS_W_OFFSET`, `K1_XLDS_LOAD_W_OFFSET`, `kWeightStageStride`, and carried `w_off*` state, restoring direct `K1_XLDS_LOAD_W_AT` recomputation for each prefetch.
+- Previous offset-increment run was rejected: build `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_offsetinc_build_20260706_033232`, matrix `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_offsetinc_matrix_20260706_033350`, token `128/256/512` C medians `1.1564/1.6807/2.5308 ms` vs DeepGEMM `0.9736/1.4484/2.1583 ms`, all bit-exact but slower.
+- Checked 151.1 before GPU work; no KFD PIDs were active.
+- Synced the restored header and rebuilt only the tune extension with save-temps. Build run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_after_offsetinc_revert_20260706_034014`.
+- Token128 same-input K1-only smoke passed after restore: run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_after_offsetinc_revert_smoke_t128_20260706_034128`; C tune K1 `1.1435 ms`, DeepGEMM masked `0.9687 ms`, ratio `1.180x`, `max_abs=0`, `mean_abs=0`.
+- Generated `.s` for `<local_experts=24>` is back to retained split-prefetch shape: `64 v_mmac`, `8 ds_read_b128`, `22 buffer_load_dwordx4`, `128 buffer_store_short`, `6 s_barrier`, `217 s_waitcnt`, `2 s_setprio`, `131 s_cbranch`, `101 v_cmp`, `v_lshl=70`, `s_mul_i32=10`, and no `vmcnt(8)`.
+- Current conclusion: precision is already bit-exact on the checked restore path. To approach the hand ASM performance, next work should stop chasing cosmetic static-count edits and instead implement a larger ASM-guided main-loop schedule or re-derived LDS layout, then verify with save-temps and same-input DeepGEMM masked timing.
+
+## 2026-07-06 03:57:00 +08:00 - Pro K1 N64 C Retile Rejected
+- Built a tune-only `xlds_wgm8_n64` candidate to test whether matching the reference ASM's N64 tile direction helps when keeping the current M64 row ownership. This changed only the opt-in tune path and did not touch the default fused/Flash flow.
+- Build run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_n64_build_20260706_034902`.
+- Token128 same-input K1-only result: run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_n64_smoke_t128_20260706_035019`; C `1.8438 ms`, DeepGEMM masked `0.9524 ms`, ratio `1.936x`, `max_abs=0`, `mean_abs=0`.
+- Static count for `<local_experts=24>` improved per CTA (`16 v_mmac`, `8 ds_read_b128`, `10 buffer_load_dwordx4`, `32 buffer_store_short`, `62 s_waitcnt`, `46 s_cbranch`), but runtime became much worse. Conclusion: N64 alone increases CTA count by 4x and does not reproduce the reference's M256 ownership or hand-scheduled load/MMAC block.
+- Removed the N64 candidate and its launcher branch from local source, synced the cleaned files back to 151.1, and rebuilt tune-only baseline in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_after_n64_reject_20260706_035300`.
+- Restore smoke after cleanup passed: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_after_n64_reject_smoke_t128_20260706_035414`, repeat=1 C `1.1216 ms`, DeepGEMM `0.9719 ms`, ratio `1.154x`, `max_abs=0`. Treat this only as a restored `.so` sanity check.
+
+## 2026-07-06 04:05:00 +08:00 - Pro K1 Next4 Relaxed-Wait Rejected
+- Tried an ASM-guided phase retiming in the current `xlds_wgm8` C kernel: after phase0 MMAC, issue the next-stage phase0 weight loads with an early-clobber single-load helper, then use `s_waitcnt vmcnt(4)` before phase4. The intent was to reproduce the reference's pending-VMEM wait window without the previous load4 output/input aliasing issue.
+- Build run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_next4ec_build_20260706_035733`.
+- Generated `.s` partly matched the intended shape (`buffer_load_dwordx4` next4 followed by `s_waitcnt vmcnt(4)`), but compiler/control-flow lowering still inserted a later `s_waitcnt vmcnt(0)` before phase4 MMAC, so the wait window was not cleanly controlled.
+- Token128 same-input K1-only failed correctness with NaN: run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_next4ec_smoke_t128_20260706_0359*`; error `max_abs=0.40478515625`, `pure=nan`, `deepgemm=-0.040283203125`.
+- Reverted the early-clobber helper and relaxed-wait schedule locally, confirmed no residual `pack_ec`, `LOAD_W_AT_EC`, `xlds_wgm8_n64`, or `K1_XLDS64` symbols, then synced and rebuilt tune-only baseline in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_after_next4ec_reject_20260706_040059`.
+- Restore smoke passed: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_k1_tune_ext_xlds_restore_after_next4ec_reject_smoke_t128_20260706_040214`; repeat=1 C `1.1071 ms`, DeepGEMM `0.9871 ms`, ratio `1.122x`, `max_abs=0`.
+
+## 2026-07-06 08:52:10 +08:00 - Pro LL K1 Fused-C Path Implemented
+- Wired the retained Pro `xlds_wgm8` C groupgemm backbone into a Flash-style LL K1 fused path behind `MEGAMOE_DCU_PRO_LL_MASKED_K1_FUSED_C=1`.
+- New path is Pro-shape gated (`hidden=7168`, `l1_rows=6144`, `ll_block_m=48`, `ll_cus=64`) and leaves the current split `stage-only + DeepGEMM masked K1` path as the default fallback/oracle.
+- Added `V3_K1_ProMaskedXLdsWgm8FusedKernel` plus `pro_masked_xlds_wgm8_compute_tile_device`; the fused kernel runs the existing LL route/stage builder and then a persistent tile loop over the retained x-LDS/WGM8 compute tile.
+- Added one block barrier after the x-LDS tile compute helper so loader waves cannot enter the next persistent tile and overwrite LDS while compute waves are still finishing stores/scale reads.
+- Local checks passed: `python -m py_compile` for touched Python files and `git diff --check` for the touched source set. Local pytest is unavailable because the local Python environment lacks `pytest`.
+- Synced the touched source files to 151.1 and completed a full remote MegaMoE rebuild in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ll_k1_fused_c_build_20260706_082912`; fresh K1 artifacts were generated.
+- Remote pytest path handling was anomalous: container-side `find/stat` and `py_compile` saw the test file, but `python3 -m pytest -q ./megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` reported `file or directory not found`. Treat this as a test-runner/path issue until reproduced; it did not block the full compile.
+- Next action: check 151.1 HCU state, then run Pro EP16 LL eager 128/256/512 A/B with default split DeepGEMM masked K1 versus the fused-C env gate.
+
+## 2026-07-06 11:05:00 +08:00 - Pro LL K1 Fused-C Eager A/B
+- Ran Pro EP16 LL eager A/B on 151.1 with `MEGAMOE_DCU_PRO_LL_MASKED_K1=1`, `--baseline-kind ll-masked`, and ROCSHMEM/DUSHMEM heap set to `12884901888`.
+- Initial run without the larger heap failed before MegaMoE execution in DeepEP buffer initialization (`num_rdma_bytes=11450456192` exceeded the default heap). Re-ran with the previously used Pro LL heap setting.
+- Default split path (`stage-only + DeepGEMM masked K1`) passed correctness:
+  - token128: MegaMoE `1.3687 ms`, ll-masked baseline `2.6419 ms`, `max_abs=0.000488281`.
+  - token256: MegaMoE `2.2304 ms`, ll-masked baseline `3.5123 ms`, `max_abs=0.000976562`.
+  - token512: MegaMoE `3.8939 ms`, ll-masked baseline `4.8885 ms`, `max_abs=0.000976562`.
+- Fused-C path passed correctness but is slower than the default split path:
+  - token128: `1.6186 ms`, `max_abs=0.000488281`.
+  - token256: `2.5056 ms`, `max_abs=0.000976562`.
+  - token512: `4.2445 ms`, `max_abs=0.000976562`.
+- Tried a narrow fused-context barrier retiming: move the final persistent-tile block barrier from after output stores to after LDS scale reads but before stores, so next-tile prefetch can overlap the previous tile stores while still protecting LDS reuse. It stayed correct and gave only a small speedup:
+  - token128: `1.6108 ms`.
+  - token512: `4.2252 ms`.
+- Added a readlane-style fused tile dispatch tweak: load `actual_m` once per wave lane and broadcast with `__builtin_amdgcn_readlane`, passing `cur_tokens` into the x-LDS compute helper instead of reloading `actual_m` inside every tile. Remote full rebuild passed in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ll_k1_fused_c_readlane_build_20260706_102653`.
+- Runtime validation of the readlane tweak is pending because 151.1 was taken by an unrelated SGLang/prefix-cache benchmark after the rebuild.
+
+## 2026-07-06 11:38:00 +08:00 - Pro LL K1 Fused-C Readlane Validation Blocked
+- Rechecked 151.1 after the prefix-cache benchmark process exited. HCU utilization is idle, but the host `sglang.launch_server` process still holds about `97-98%` VRAM on all 16 cards.
+- Do not run Pro EP16 LL validation in this state because the test is expected to fail allocation or perturb another user's resident server. Runtime validation remains pending until the server releases the cards or explicit permission is given to stop/restart it.
+
+## 2026-07-06 13:55:00 +08:00 - Pro LL K1 Fused-C Readlane Eager A/B Complete
+- Rechecked 151.1 and found all 16 cards idle before testing.
+- Validated the readlane fused-C path with `MEGAMOE_DCU_PRO_LL_MASKED_K1=1`, `MEGAMOE_DCU_PRO_LL_MASKED_K1_FUSED_C=1`, `MEGAMOE_DCU_PEER_MEMORY=rpc`, `--baseline-kind ll-masked`, and ROCSHMEM/DUSHMEM heap `12884901888`.
+- Pro EP16 LL eager readlane fused-C correctness passed:
+  - token128: `1.6004 ms`, baseline `2.6409 ms`, `max_abs=0.000488281`, run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ll_k1_fused_c_readlane_t128_20260706_134745`.
+  - token256: `2.4841 ms`, baseline `3.5099 ms`, `max_abs=0.000976562`, run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ll_k1_fused_c_readlane_t256_20260706_135012`.
+  - token512: `4.2079 ms`, baseline `4.8629 ms`, `max_abs=0.000976562`, run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ll_k1_fused_c_readlane_t512_20260706_134901`.
+- Re-ran same-window default split DeepGEMM masked-K1 fallback with the fused-C env unset:
+  - token128: `1.3710 ms`, baseline `2.6405 ms`, `max_abs=0.000488281`, run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ll_k1_split_samewindow_t128_20260706_135153`.
+  - token256: `2.2329 ms`, baseline `3.5117 ms`, `max_abs=0.000976562`, run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ll_k1_split_samewindow_t256_20260706_135304`.
+  - token512: `3.9052 ms`, baseline `4.8821 ms`, `max_abs=0.000976562`, run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ll_k1_split_samewindow_t512_20260706_135415`.
+- Same-window conclusion: readlane fused-C is correct and slightly faster than the previous fused-C build, but still slower than the default split path by about `16.7%/11.2%/7.8%` at tokens `128/256/512`. Keep fused-C as an opt-in experiment; keep split DeepGEMM masked-K1 as the Pro LL default.
+
+## 2026-07-06 15:10:00 +08:00 - Pro LL Split Finalization Source Cleanup
+- User direction changed the final Pro LL plan: stop pursuing K1 fusion and keep only the high-performance split path.
+- Integrated the DeepGEMM masked FP8 group GEMM ASM source into `megamoe/dcu_megamoe_opt/K1_fused` and added setup/build rules for the packaged `.co`.
+- Added `k1_ll_masked_groupgemm_pack5` inside MegaMoE's K1 extension. `megamoe/opt.py` now runs Pro LL as `stage-only K1 + bundled masked ASM`, with no runtime `import deepgemm` or external `deepgemm.m_grouped_fp8_gemm_nt_masked` call in the MegaMoE execution path.
+- Removed rejected Pro fused-C/tune code paths: the fused-C pybind/launcher, tune-only LDS extension, tune build script, and the pack5 include of the tune header.
+- Updated test harness behavior: Pro shape with LL backend defaults to `ll_pro_masked`; only `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` forces the unified-layout compatibility path. Removed the old tune-extension runtime knob.
+- Updated README to describe the final split behavior and the unified-layout override. Remote rebuild/validation on 151.1 is still pending.
+
+## 2026-07-06 15:45:00 +08:00 - Pro LL Split Cleanup Continued
+- Removed the remaining pure-K1 groupgemm C++ launcher and its pybind/Python arguments (`ll_pure_groupgemm`, `ll_pure_block_n`, `ll_pure_masked_weight_layout`).
+- Removed the test harness `--k1-only-*` diagnostic surface and the staged-input/grouped-diff helpers that only supported pure-K1 same-input experiments.
+- Updated source static tests so they now assert the old pure/fused/K1-only controls do not return, while preserving the `ll-masked` baseline helper for correctness/performance comparisons.
+- Local checks passed: `python -m py_compile` on touched Python files and `git diff --check`. A source scan shows the retired Pro LL env knobs and pure-K1 symbols only appear in negative static-test assertions.
+- Synced the final source set to 151.1 `/root/yuguo/DeepGEMM`, removed stale remote tune files, and ran remote `py_compile` plus a lightweight source-contract script in `sglang_megamoe`; both passed.
+- Remote `python3 -m pytest` still reports `file or directory not found` for an existing test file, matching the earlier container pytest anomaly. Do not treat this as a source failure; use the lightweight contract script until the container pytest path issue is resolved.
+- 151.1 runtime build/Pro LL sanity is blocked by an active SGLang DeepSeek-V4-Pro service plus prefix-cache benchmark. `hy-smi` shows 98-99% VRAM across all 16 HCUs, and host processes include `python -m sglang.launch_server ... --port 10015` plus `prefix_cache_benchmark_with_e2e.py`. No MegaMoE workload was launched.
+- After two waiting polls, the same service and benchmark were still active, with several HCUs showing nonzero utilization. Leave full rebuild and Pro EP16 LL runtime validation pending until the node is released.
+- Removed the remaining `kSkipDispatch` and `kMaskedWeightLayout` template parameters from `V3_K1_LowLatencyMaskedGroupGemmKernel`. They were only needed by the deleted pure-K1 / masked-layout C experiments; the current production instantiation always runs dispatch/stage and uses the unified pack5 LL layout. Local `py_compile`/`git diff --check` passed, and the cleaned header/test were synced to 151.1 with a remote lightweight check.
+
+## 2026-07-06 15:12:27 +08:00 - Public Weight Transform API Cleanup
+- Removed the legacy top-level `transform_fp8_weights_for_mega_moe` helper from `megamoe/__init__.py` and from `__all__`.
+- Renamed the Pro LL masked-K1 helper from `transform_fp8_weights_for_mega_moe_v3_pro_ll_masked_k1` to `transform_fp8_weights_for_mega_moe_pro_ll_masked_k1`; updated README and source-contract assertions accordingly.
+- Cleaned `v3_layout.py` by deleting the unused `unpack_pack5_weight`, `_cast_weight_to_fp8`, `_pack_fp8_weight_and_scale*`, and `transform_fp8_weights_for_mega_moe_v3_pack5*` helper cluster.
+- Kept the remaining `v3_layout.py` helpers because they are either used by `flatten_pack5_weight*` or by static pack5 layout contract checks: `pack5_physical_to_logical_indices`, `pack5_logical_to_physical_ni`, `pack5_shape`, `pack5_flat_offset`, `pack5_weight`, `flatten_pack5_weight`, `pack5_weight_asm_normal`, and `flatten_pack5_weight_asm_normal`.
+- Local verification passed: `python -m py_compile megamoe/__init__.py megamoe/dcu_megamoe_opt/v3_layout.py megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py`, `git diff --check` on touched files, `rg` scan for retired helper names, and a lightweight Python source-contract script. Full local pytest is unavailable because this Python environment has no `pytest` module.
+
+## 2026-07-06 16:11:38 +08:00 - Planning Status Cleanup
+- Re-read `.planning/dcu_megamoe_supernode/task_plan.md`, `progress.md`, and `findings.md`, then updated stale `[]` entries to match the latest Pro LL split decision.
+- Marked the Pro LL pure-C/fused-C optimization branch as completed or abandoned where appropriate: same-input C K1 work, save-temps/ASM comparison, fused-C e2e A/B, and cleanup are no longer active tasks because split masked ASM is the chosen production path.
+- Kept true pending items as `[]`: final 151.1 rebuild/runtime sanity, Flash EP16 normal graph and large-cap graph instability retests, EP32 validation, Pod2 device exposure, and any future contingent debug branches.
+- Updated `findings.md` top-level status so it no longer says the whole EP16 benchmark matrix is pending; the remaining open part is EP32 plus large normal graph-bench stability.
+
+## 2026-07-06 16:18:00 +08:00 - Flash Regression Contingency Closed
+- Reclassified the Pro-only normal ASM split item: Flash guardrails collected so far do not show a material performance regression, so this is not a current unfinished task.
+- Keep it only as a future contingency if a fair Flash run later regresses.
+
+## 2026-07-06 20:57:00 +08:00 - Pro LL Split Final 151.1 Sanity Complete
+- Restarted `sglang_megamoe` on 151.1 after the container had exited; host/card check showed no KFD PIDs before running MegaMoE.
+- Fixed the bundled Pro LL masked K1 source artifact before the run: the earlier scratch `.s` copy was not from the active DeepGEMM package/develop checkout. The production package now bundles the active develop `.co` from commit `6a53e9c45c7d6b46395c3a85231d5f2322a36a2a`, hash `73184662ec644cf9f4e9cfacec720a15428e84c5f84ad06e6e9e57bfa06543b4`, and removes the wrong scratch `.s`.
+- Rebuilt on 151.1 and verified the prebuilt source `.co`, top-level source-tree `.co`, and build/lib `.co` all have hash `73184662ec644cf9f4e9cfacec720a15428e84c5f84ad06e6e9e57bfa06543b4`.
+- Pro EP16 LL default split path correctness/performance run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_ll_split_matrix_20260706_205021`.
+- Eager Pro EP16 LL against `ll-masked` baseline passed for tokens `8/32/64/128/256/512`. MegaMoE medians were `0.9780/1.0747/1.2800/1.4883/2.3585/4.0353 ms`; baseline medians were `2.4149/2.4804/2.7022/2.8068/3.7240/5.2574 ms`; speedups were `2.47x/2.31x/2.11x/1.89x/1.58x/1.30x`.
+- Graph cap512 Pro EP16 LL passed replay buckets `8/32/64/128/256/512`. MegaMoE graph medians were `1.1223/1.2266/1.3019/1.4499/2.3240/3.9464 ms`; `ll-masked` baseline graph medians were `2.5733/2.6482/2.6863/2.7920/3.6194/5.1602 ms`; speedups were `2.29x/2.16x/2.06x/1.93x/1.56x/1.31x`.
+- The runtime path reported `weight_layout=ll_pro_masked`, `fused_execution=v3_ll_eager`, and `graph_execution=v3_ll_cuda_graph_replay`, confirming Pro LL defaults to the high-performance split layout rather than the unified-layout compatibility path.
+
+## 2026-07-06 21:45:00 +08:00 - Pro EP8 LL Split Correctness Isolation
+- Pro EP8 LL split token256 is currently not clean on the latest source. Two short runs failed against `ll-masked` with valid route stats and small but real output mismatch (`max_abs` about `0.05-0.07`).
+- Added temporary assertion-side combine-slot readback. The latest failing token showed `combine_sum` matches fused output within BF16 rounding, so the final source-rank reduce is likely summing the visible slots correctly; the bad value is earlier, either per-route K1/K2/K3 output or split-tail copy into the per-slot combine buffer.
+- A no-split-tail ablation was attempted but invalidated by an active SGLang DeepSeek-V4-Pro service occupying all cards; it failed by allocation pressure, not by a trusted MegaMoE result.
+- Current node state blocks more DCU tests: host PIDs `79379..79394` plus parent `78899` hold about `86-89%` VRAM across all 16 HCUs. No new MegaMoE run should be launched until those cards are released.
+- Next clean-card sequence: rerun Pro EP8 LL token256 default, rerun the same command with `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0`, then enable route-slot diagnostics for the first bad `(token, slot, col)` only if the failure persists.
+
+## 2026-07-06 23:32:00 +08:00 - Pro LL Correctness Queue Restart
+- User priority reset: fix Pro EP8 LL uniform correctness first, prove token256, then token512, then `8/32/64/128` if needed; after that run Pro LL uneven with EP16 first, then EP8; finally collect split-vs-`ll-masked` eager/graph/uneven data and Flash guardrails.
+- Updated `task_plan.md` with the ordered queue and kept transient card-state checks out of the plan body.
+- 151.1 is currently usable after the stale SGLang service was terminated: latest check showed all 16 HCUs at `0%` VRAM/HCU and no KFD PIDs.
+- Immediate next action is root-cause reproduction, not a source patch: run Pro EP8 LL uniform token256 default against `ll-masked`, then split-tail-off on the same clean node if default fails.
+
+## 2026-07-06 23:46:00 +08:00 - Pro EP8 LL 256 Boundary Isolated To Masked K1 Size
+- Reproduced Pro EP8 LL token256 on clean 151.1 cards: default split path failed against `ll-masked` with valid stats and fused output matching the visible combine-slot sum.
+- Re-ran token256 with `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0`; it still failed, so K3 split-tail copy/publish is not the first boundary.
+- Route-slot diagnostics for the default failing point showed valid row metadata and nonzero staged scale, but some route rows had zero L1 output, default activation scale, and zero K3 output. This moves the first bad boundary to the Pro LL split K1 masked GEMM launch/input shape.
+- Ran current-source Pro EP8 LL token512 before patch: correctness passed against `ll-masked` (`max_abs=0.000976562`) in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_uniform512_check_20260706_234239`.
+- Prepared a narrow local fix: only Pro EP8 LL masked K1 is forced to use at least `128` rows/expert in Python scratch sizing, C API route_scratch sizing, and K1 stage-only launch sizing. Local `py_compile` and `git diff --check` passed.
+
+## 2026-07-07 00:10:00 +08:00 - Pro EP8 LL Min-Rows Fix Correctness Pass
+- Synced the Pro EP8 LL min-rows patch to 151.1 and rebuilt successfully in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_minrows_build_20260706_234708`; fresh source-tree artifacts were verified by the build script.
+- Pro EP8 LL token256 now passes against `ll-masked`: run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_uniform256_minrows_20260707_000131`, `max_abs=0.000976562`.
+- Pro EP8 LL uniform sweep after the patch passed tokens `512/8/32/64/128`: run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_uniform_sweep_minrows_20260707_000240`; max_abs values were `0.000976562/0.000488281/0.000488281/0.000976562/0.000976562`.
+- Pro EP16 LL uneven correctness passed with local token list `512,385,257,128,64,32,16,8,7,0,0,0,0,0,0,0`: run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_ll_uneven_minrows_20260707_000724`, `max_abs=0.000976562`.
+- Pro EP8 LL uneven correctness passed with local token list `512,257,128,64,32,7,0,0`: run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_uneven_minrows_20260707_000839`, `max_abs=0.000976562`.
+
+## 2026-07-07 00:25:00 +08:00 - Pro LL Performance And Flash Guardrail
+- Pro EP8 LL eager split-vs-`ll-masked` data collected in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_perf_minrows_20260707_001031`.
+  - tokens `8/32/64/128/256/512`
+  - MegaMoE medians `1.4607/1.9197/1.9813/2.0970/2.4093/3.9271 ms`
+  - `ll-masked` medians `1.4291/1.9572/2.1210/2.4853/3.1889/5.6766 ms`
+  - speedups `0.978x/1.020x/1.071x/1.185x/1.324x/1.445x`
+- Pro EP8 LL graph cap512 collected in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_graph_minrows_20260707_001535`.
+  - replay tokens `8/32/64/128/256/512`
+  - MegaMoE graph medians `1.4356/1.9034/1.9765/2.1167/2.4469/3.9259 ms`
+  - `ll-masked` graph medians `3.3337/3.7530/3.8005/3.9095/4.1563/5.7333 ms`
+- Pro LL uneven performance collected in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ll_uneven_perf_minrows_20260707_001644`.
+  - EP16 local token list `512,385,257,128,64,32,16,8,7,0,0,0,0,0,0,0`: MegaMoE `1.5895 ms`, `ll-masked` `3.0464 ms`, speedup `1.917x`, avg received tokens/rank `528.375`.
+  - EP8 local token list `512,257,128,64,32,7,0,0`: MegaMoE `2.3849 ms`, `ll-masked` `4.3379 ms`, speedup `1.819x`, avg received tokens/rank `750.0`.
+- Flash EP8 LL graph guardrail passed after the Pro EP8 min-rows patch in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/flash_ep8_ll_guard_minrows_20260707_001854`.
+  - replay tokens `8/32/128/256/512`
+  - MegaMoE graph medians `0.5302/0.6394/0.7418/1.0349/1.8153 ms`
+  - `ll-masked` graph medians `0.9908/1.1145/1.1942/1.2889/1.9799 ms`
+  - Flash replay512 remains in the same band as the earlier guardrail (`~1.814 ms`), so no Flash LL regression is observed.
+- Removed temporary Pro EP8 LL debug hooks from `opt.py` and the combine-slot assertion readback from `test_mega_moe_dcu.py`; synced the cleanup to 151.1. Post-cleanup Pro EP8 LL token256 smoke passed in `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_256_after_debug_cleanup_20260707_002226`.
+- Local checks after cleanup: `py_compile` and `git diff --check` passed. Local pytest remains unavailable because the Windows Python environment has no `pytest` module.
+
+## 2026-07-07 08:35:00 +08:00 - Runtime-Token-Aligned LL Baseline Fix
+- User flagged that `ll-masked` baseline graph must be measured as fairly as MegaMoE graph, using the runtime token bucket rather than graph allocation cap.
+- Confirmed the old `run_selected_baseline()` passed `ll_baseline_capacity_tokens` from `sym_buffer.cuda_graph_max_tokens_per_rank` into DeepEP `low_latency_dispatch()`. This made Pro EP8 graph cap512 small buckets dispatch with the larger allocation cap, inflating the baseline graph replay medians.
+- Patched `test_mega_moe_dcu.py` so `ll-masked` baseline dispatch capacity is `max(expected_tokens_per_rank, x_bf16_arg.size(0))` for each captured bucket. Added a static contract assertion in `test_dcu_megamoe_v3.py`.
+- Local checks passed: `python -m py_compile` for both touched tests and `git diff --check`. Local pytest remains unavailable because the Windows Python environment has no `pytest` module.
+- Synced the two test files to 151.1. Remote `py_compile` passed. Remote static pytest did not fully pass because other remote source files were not fully synced with local static-test expectations (`setup.py` prebuilt path and `_v3_ll_block_m` assertion), not because of the new runtime-token baseline assertion.
+- Re-ran Pro EP8 LL graph cap512 on 151.1 with `--baseline-kind ll-masked`, replay tokens `8/32/64/128/256/512`, run dir `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep8_ll_graph_runtime_baseline_20260707_082358`.
+  - MegaMoE graph medians: `1.4314/1.9004/1.9800/2.1053/2.4702/3.9245 ms`.
+  - Runtime-token-aligned `ll-masked` graph medians: `1.4417/1.9496/2.1295/2.4835/3.1822/5.7530 ms`.
+  - This supersedes the earlier unfair Pro EP8 graph baseline readout `3.3337/3.7530/3.8005/3.9095/4.1563/5.7333 ms` for small buckets.
+- Attempted a same-token eager sweep for confirmation, but token8 hit a VMFault during the benchmark loop after correctness. Host inspection showed the node was taken by an unrelated `sglang.launch_server` started at 08:24, with scheduler PIDs `196517..196532` holding 79-82% VRAM on all 16 HCUs. No MegaMoE cleanup/kill was performed.
+
+## 2026-07-07 08:45:00 +08:00 - LL Capacity Overflow Guard
+- Reviewed Flash LL, Pro LL, Flash normal, and Pro normal capacity behavior after the user asked about extreme skew. Normal Pro EP8 has stronger compact-prebuild fixed tile-pool protection because `local_experts > 32`; LL still uses fixed `m_per_expert` per expert and can overflow under adversarial routing.
+- Added a low-cost LL guard in the shared LL stage builder: when `row_in_expert >= m_per_expert`, set `symm_counts[kExperts + 1]` as a capacity-overflow flag before dropping that route row.
+- Changed LL cumulative local expert stats to use the raw route count instead of the clipped count. In correctness harnesses that compare stats, an LL capacity overflow should no longer look like a clean route-stat match.
+- Exposed the overflow flag by returning `m_indices` with `local_experts + 2` entries. K2/K3 still consume the original first `local_experts` counts plus the max slot, so normal no-overflow performance behavior should be unchanged.
+- This is not a full worst-case-skew compute fix. Fully computing a case such as one expert receiving all routes would require a much larger per-expert capacity or a fallback path, which would affect LL small-bucket performance.
+- Local verification passed: `python -m py_compile` for touched Python files and `git diff --check` for the touched K1/test files. Remote compile/runtime validation is pending because 151.1 is occupied by SGLang.
+
+## 2026-07-07 10:03:25 +08:00 - Unified LL Skew Guard Source Patch
+- User asked whether increasing `cap_per_expert` can be made safer by letting kernels skip invalid rows. Confirmed K1 unified LL already computes tile count from `actual_m`/`m_indices`, and K2/K3 also compact around `actual_m`, so increasing unified LL capacity mainly increases scratch/init/headroom rather than forcing full GEMM over every padded row.
+- Added a source-side unified LL skew guard: workspace sizing now reserves up to 256 rows/expert, bounded by `num_ranks * num_max_tokens`, and the actual K1 launch applies this 256-row guard only when `ll_stage_only` is false. This covers Flash LL and Pro unified-layout LL while keeping the Pro default split masked-K1 path on its existing 128-row EP8 guard.
+- Added static contract checks for the new guard in `test_dcu_megamoe_v3.py`.
+- Local verification passed: `python -m py_compile megamoe\opt.py megamoe\dcu_megamoe_opt\tests\test_dcu_megamoe_v3.py` and `git diff --check` on the touched source/test files. Local pytest remains unavailable because Windows Python has no `pytest` module.
+- Remote rebuild/runtime smoke is still pending; do not claim the Flash LL or Pro unified-layout guard is hardware-validated until 151.1 is free and rebuilt.
+
+## 2026-07-07 10:41:43 +08:00 - Pro LL Graph And Flash Guardrail Retest
+- Synced the current MegaMoE source/prebuilt subset to 151.1, rebuilt inside `sglang_megamoe`, and verified fresh import artifacts. Build log is under `hygon_tmp/supernode_debug/151_1_rpc/ll_guard_rebuild_*`.
+- Remote `py_compile` passed. Remote static pytest still has two pre-existing source-contract mismatches (`setup.py` prebuilt path assertion and `_v3_ll_block_m` assertion); runtime validation continued because compiled artifacts were fresh and imported from the source tree.
+- Runtime run root: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/ll_graph_flash_guard_20260707_103302`.
+- Pro EP8 LL graph cap512 passed replay `8/32/64/128/256/512` against runtime-token-aligned `ll-masked`; MegaMoE graph medians `1.4357/1.9045/1.9807/2.1098/2.4462/3.9351 ms`, baseline medians `1.4405/2.1707/2.2157/2.5796/3.1846/5.7378 ms`.
+- Pro EP16 LL graph cap512 passed replay `8/32/64/128/256/512` against `ll-masked`; MegaMoE graph medians `1.0103/1.1178/1.1885/1.3690/2.2363/3.8821 ms`, baseline medians `0.9977/1.1304/1.2654/1.5638/2.6578/4.7812 ms`.
+- Pro uneven smoke passed: EP16 list `512,385,257,128,64,32,16,8,7,0,0,0,0,0,0,0` measured MegaMoE `1.7253 ms`, baseline `3.0445 ms`, speedup `1.765x`; EP8 list `512,257,128,64,32,7,0,0` measured MegaMoE `2.3481 ms`, baseline `4.2974 ms`, speedup `1.830x`.
+- Flash guardrail passed after the unified LL skew guard. Flash EP8 LL graph cap512 replay `8/32/64/128/256/512` medians were `0.5483/0.6529/0.6983/0.7588/1.0272/1.8229 ms`; Flash EP16 LL graph medians were `0.3732/0.4078/0.4771/0.5932/0.9963/1.8817 ms`. Correctness max_abs stayed within `0.00055`.
+- Pro EP8 unified-layout LL graph smoke with `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` passed replay `8/32/128/256`; MegaMoE medians `1.6754/2.3483/2.5788/2.7217 ms`. This validates the non-performance compatibility path after the 256-row skew guard.
+- Final card check after runs showed no KFD PIDs and all 16 HCUs at 0% VRAM/HCU.
+
+## 2026-07-07 13:41:27 +08:00 - Flash EP8 LL Small-Cap Baseline Retest
+- User requested direct Flash EP8 LL graph comparisons for cap8/replay8 and cap32/replay32 rather than only cap512 replay buckets.
+- Ran on 151.1 devices `0..7` with node-actual LL env, `--megamoe-backend ll`, `--baseline-kind ll-masked`, runtime-token-aligned baseline dispatch, `--cuda-graph-bench`, `--cuda-graph-replays 20`.
+- Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/flash_ep8_ll_cap8_32_baseline_20260707_133854`.
+- cap8/replay8 passed correctness (`max_abs=0.000488281`; graph bucket `max_abs=0.000244141`): MegaMoE graph `0.5446 ms`, `ll-masked` graph `0.5452 ms`; eager-timing summary `0.5491 ms` vs baseline `0.5459 ms`.
+- cap32/replay32 passed correctness (`max_abs=0.000488281`; graph bucket `max_abs=0.000244141`): MegaMoE graph `0.6402 ms`, `ll-masked` graph `0.6545 ms`; eager-timing summary `0.6555 ms` vs baseline `0.6564 ms`.
+- Interpretation: at exact small capture caps, Flash EP8 LL is effectively tied with `ll-masked` at token8 and slightly faster at token32. This is consistent with the prior cap512 replay8/replay32 guardrail, not a regression.
+- Final card check showed no KFD PIDs and all 16 HCUs idle.
+
+## 2026-07-07 14:15:11 +08:00 - Redundant Debug Cleanup Pass
+- Reviewed the current source diff for leftover debug/probe/pure-K1/fused-C environment knobs and runnable branches. No active runtime entry remains for `MEGAMOE_DCU_PRO_LL_MASKED*`, `STAGE_STOP`, `--k1-only-*`, pure groupgemm, or fused-C Pro LL paths; the remaining matches are source-contract negative assertions in `test_dcu_megamoe_v3.py`.
+- Cleaned two non-functional residues: README Pro LL example now matches the actual `fp8_w8a8_mega_moe(...)` signature, and the Pro masked ASM argument struct no longer exposes a local `debugBuffer` member name. Also clarified the LL overflow slot comment as production overflow status rather than tests/debug.
+- Verified `prebuilt/` contains only the packaged `.co` code object and no temporary `.s`, logs, or object intermediates.
+- Local verification passed: `python -m py_compile` for touched Python sources and `git diff --check` on the touched runtime/test/docs files. Local `pytest` is unavailable in the Windows Python environment (`No module named pytest`).

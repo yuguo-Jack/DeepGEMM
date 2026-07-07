@@ -23,6 +23,13 @@ FUSED_L1_ASM_PACK5_NAME = f"{FUSED_L1_ASM_NAME}_PACK5"
 FUSED_L1_ASM_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_PACK5_NAME}.co"
 FUSED_L1_ASM_UNIFIED_PACK5_NAME = f"{FUSED_L1_ASM_NAME}_UNIFIED_PACK5"
 FUSED_L1_ASM_UNIFIED_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_UNIFIED_PACK5_NAME}.co"
+PRO_LL_MASKED_L1_ASM_NAME = (
+    "DEEPGEMM_FP8_FP8_BF16_PERCHANNEL_MARLIN_ASM_TN_"
+    "MT256x64x128_WGM8_GROUPGEMM_MASKED"
+)
+PRO_LL_MASKED_L1_ASM_CO = (
+    THIS_DIR / "deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co"
+)
 
 K1_SUPPORTED_RANKS = SUPPORTED_STAGED_EP_RANKS
 K1_SUPPORTED_ALIGNMENT = 256
@@ -73,6 +80,15 @@ def ensure_fused_l1_asm_pack5_code_object(
             "Rebuild and reinstall the megamoe wheel."
         )
     return co
+
+
+def ensure_pro_ll_masked_l1_asm_code_object() -> Path:
+    if not PRO_LL_MASKED_L1_ASM_CO.exists():
+        raise FileNotFoundError(
+            f"prebuilt Pro LL masked K1 asm code object not found: {PRO_LL_MASKED_L1_ASM_CO}. "
+            "Rebuild and reinstall the megamoe wheel."
+        )
+    return PRO_LL_MASKED_L1_ASM_CO
 
 
 def load_extension(verbose: bool = False):
@@ -289,6 +305,31 @@ def k1_symm_fused_l1_v3_asm_pack5_graph(
     )
 
 
+def k1_ll_masked_groupgemm(
+    input_fp8: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_masked: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m_per_group: int,
+    *,
+    verbose_build: bool = False,
+):
+    ext = load_extension(verbose=verbose_build)
+    code_object = ensure_pro_ll_masked_l1_asm_code_object()
+    return ext.k1_ll_masked_groupgemm_pack5(
+        input_fp8.contiguous(),
+        input_scale.contiguous(),
+        weight_masked.contiguous(),
+        weight_scale.contiguous(),
+        output,
+        masked_m.contiguous(),
+        int(expected_m_per_group),
+        str(code_object),
+    )
+
+
 def k1_symm_fused_l1_v3(
     sym_buffer,
     l1_weights: tuple[torch.Tensor, torch.Tensor],
@@ -307,11 +348,12 @@ def k1_symm_fused_l1_v3(
     capacity_num_tokens: int | None = None,
     use_unified_weight_layout: bool = False,
     ll_block_m: int = 32,
-    ll_asm_compatible_layout: bool = False,
     enable_start_rank_barrier: bool = False,
     tail_done_counter: torch.Tensor | None = None,
     graph_runtime_num_tokens_out: torch.Tensor | None = None,
     graph_tail_signal_generation_out: torch.Tensor | None = None,
+    ll_stage_only: bool = False,
+    ll_return_staged: bool = False,
     verbose_build: bool = False,
 ):
     backend = normalize_v3_backend(backend)
@@ -364,12 +406,13 @@ def k1_symm_fused_l1_v3(
         None,
         int(ll_block_m),
         64,
-        bool(ll_asm_compatible_layout),
         -1 if capacity_num_tokens is None else int(capacity_num_tokens),
         bool(enable_start_rank_barrier),
         tail_done_counter,
         graph_runtime_num_tokens_out,
         graph_tail_signal_generation_out,
+        bool(ll_stage_only),
+        bool(ll_return_staged),
     )
 
 
@@ -389,11 +432,12 @@ def k1_symm_fused_l1_v3_graph(
     l1_out_workspace: torch.Tensor | None = None,
     use_unified_weight_layout: bool = False,
     ll_block_m: int = 32,
-    ll_asm_compatible_layout: bool = False,
     enable_start_rank_barrier: bool = False,
     tail_done_counter: torch.Tensor | None = None,
     graph_runtime_num_tokens_out: torch.Tensor | None = None,
     graph_tail_signal_generation_out: torch.Tensor | None = None,
+    ll_stage_only: bool = False,
+    ll_return_staged: bool = False,
     verbose_build: bool = False,
 ):
     backend = normalize_v3_backend(backend)
@@ -444,10 +488,11 @@ def k1_symm_fused_l1_v3_graph(
         runtime_num_tokens.contiguous(),
         int(ll_block_m),
         64,
-        bool(ll_asm_compatible_layout),
         -1,
         bool(enable_start_rank_barrier),
         tail_done_counter,
         graph_runtime_num_tokens_out,
         graph_tail_signal_generation_out,
+        bool(ll_stage_only),
+        bool(ll_return_staged),
     )

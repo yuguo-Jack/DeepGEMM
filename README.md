@@ -266,6 +266,41 @@ layout dictionary, or the legacy tuple.  The unified mode loads `_UNIFIED_PACK5`
 ASM code objects and is intended as a compatibility path, not the default
 best-performance path.
 
+For the DeepSeek-V4-Pro LL performance path, L1 can use the Pro-only masked-K1
+layout while L2 stays on the existing unified pack5 layout:
+
+```python
+l1_weights, l2_weights = (
+    megamoe.transform_fp8_weights_for_mega_moe_pro_ll_masked_k1(
+        l1_bf16,
+        l2_bf16,
+    )
+)
+megamoe.fp8_w8a8_mega_moe(
+    y,
+    l1_weights,
+    l2_weights,
+    sym_buffer,
+    megamoe_backend="ll",
+)
+```
+
+This path is shape-gated to the Pro staged shape
+`experts=384, topk=6, hidden=7168, intermediate=3072`.  It preserves the
+Flash-friendly unified LL kernel as an explicit compatibility/fallback route:
+pass `{"unified": (megamoe.flatten_pack5_weight(...), scale)}` for both L1 and
+L2 if that layout is required.  The repository test harness selects the
+high-performance Pro LL masked-K1 layout by default when the Pro shape runs with
+`--megamoe-backend ll`; set `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` only when the
+unified-layout compatibility path is being tested.
+
+The Pro LL masked-K1 production path is split: MegaMoE K1 first performs the
+LL route/stage packing, then calls the bundled masked FP8 group-GEMM ASM code
+object `deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co`.
+This path does not import or call the external Python `deepgemm` package during
+MegaMoE execution.  `--baseline-kind ll-masked` still uses DeepEP plus
+DeepGEMM as the comparison oracle.
+
 For eager uneven-rank requests, pass the same EP-group maximum local token count
 as the optional host scalar `capacity_num_tokens`.  This value is not a backend
 selector, does not affect graph replay, and is not a runtime token tensor; it
@@ -505,9 +540,11 @@ DeepGEMM weights use the masked Marlin layout exported as
 interchangeable with the normal/contiguous
 `megamoe.weight8bit_nt_kpack2_marlin(...)` layout.
 
-The masked Marlin layout is sensitive to the installed DCU `deepgemm` package.
-The `ll-masked` baseline was validated on the following package fingerprint
-inside the `sglang_megamoe` container:
+The masked Marlin layout used by the `ll-masked` baseline is sensitive to the
+installed DCU `deepgemm` package.  MegaMoE's Pro LL split path uses the bundled
+masked ASM code object described above, but the baseline oracle should still be
+kept aligned with the active container.  The `ll-masked` baseline was validated
+on the following package fingerprint inside the `sglang_megamoe` container:
 
 - `deepgemm` metadata version: `2.1.0+das.dtk2604.cb50a46`
 - `deepgemm/version.py`: `version='2.1.0'`, `git_hash='cb50a46'`,
@@ -519,7 +556,8 @@ inside the `sglang_megamoe` container:
 
 If any of these change, rerun the standalone masked layout probe before trusting
 `--baseline-kind ll-masked`, because DCU DeepGEMM masked weight layouts have
-changed across internal builds.
+changed across internal builds.  This does not change MegaMoE's packaged Pro LL
+masked-K1 code object, but it can affect baseline comparisons.
 
 Example `ll-masked` baseline graph run:
 

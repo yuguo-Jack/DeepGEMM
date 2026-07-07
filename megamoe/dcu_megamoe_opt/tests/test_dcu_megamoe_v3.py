@@ -442,6 +442,8 @@ def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
         path.read_text(encoding="utf-8")
         for path in (
             OPT_PATH,
+            K1_FUSED_DIR / "k1_fused.py",
+            K1_FUSED_DIR / "k1_fused_ext.cu",
             K1_FUSED_DIR / "k1_v3_fused_ext.cu",
             K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh",
             K2_FUSED_DIR / "k2_fused.py",
@@ -470,13 +472,13 @@ def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
         "MEGAMOE_DCU_DEBUG_BACKEND_COMPARE",
         "MEGAMOE_DCU_DEBUG_COMBINE",
         "MEGAMOE_DCU_DEBUG_SLEEP_AFTER_K3",
-        "MEGAMOE_DCU_PRO_WEIGHT_LAYOUT",
         "MEGAMOE_DCU_K2_GLC_SLC_LOAD",
         "MEGAMOE_DCU_REDUCE_COMBINE_GLC_SLC_LOAD",
         "--debug-combine-on-fail",
         "--debug-compare-backends-on-fail",
         "system_fence_after_write",
         "invalidate_before_read",
+        "ll_asm_compatible_layout",
         "acquire_after_wait",
         "V3 K3 LL no-tail signal path is not wired yet",
     ):
@@ -488,11 +490,70 @@ def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
 
 def test_v3_ll_capacity_headroom_covers_256_and_512_exact_buckets():
     k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+    k1_header = (K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh").read_text(
+        encoding="utf-8"
+    )
+    api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
+    opt_source = OPT_PATH.read_text(encoding="utf-8")
 
     assert "kLlHeadroomExpectedRowsThreshold = 48" in k1_ext
     assert "kLlHeadroomRows = 64" in k1_ext
     assert "ll_expected_rows_per_expert >= kLlHeadroomExpectedRowsThreshold" in k1_ext
     assert "ll_expected_rows_per_expert >= 160 ? 64 : 0" not in k1_ext
+    assert "kLlSkewGuardRows = 256" in k1_ext
+    assert "if (!ll_stage_only)" in k1_ext
+    assert "route_capacity_tokens_per_rank * static_cast<int64_t>(num_ranks)" in k1_ext
+    assert "K_K1_LL_SKEW_GUARD_ROWS = 256" in opt_source
+    assert "kK1LlSkewGuardRows = 256" in api_source
+    assert "int(num_ranks) * int(num_max_tokens)" in opt_source
+    assert "static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank" in api_source
+    assert "kProEp8LlMaskedK1MinRowsPerExpert = 128" in k1_ext
+    assert "pro_ep8_ll_masked_k1" in k1_ext
+    assert "K_PRO_EP8_LL_MASKED_K1_MIN_ROWS_PER_EXPERT = 128" in opt_source
+    assert "kProEp8LlMaskedK1MinRowsPerExpert = 128" in api_source
+    assert "atomicExch(symm_counts + kExperts + 1, 1)" in k1_header
+    assert "capacity-overflow flag" in k1_ext
+    assert "make_i32_view(route_scratch_i32_offset, {local_experts + 2})" in k1_ext
+    assert "symm_counts[expert] > 0 ? symm_counts[expert] : 0" in k1_header
+
+
+def test_v3_pro_ll_masked_k1_stage_only_path_is_additive():
+    k1_header = (K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh").read_text(
+        encoding="utf-8"
+    )
+    k1_ext = (K1_FUSED_DIR / "k1_v3_fused_ext.cu").read_text(encoding="utf-8")
+    k1_pybind = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+    k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
+    opt_source = OPT_PATH.read_text(encoding="utf-8")
+    setup_source = (ROOT / "setup.py").read_text(encoding="utf-8")
+
+    assert "V3_K1_LowLatencyStageOnlyKernel" in k1_header
+    assert "dcu_megamoe_v3_launch_k1_ll_stage_only_pack5" in k1_ext
+    assert "ll_stage_only" in k1_pybind
+    assert "ll_return_staged" in k1_pybind
+    assert "DCU_MEGAMOE_V3_LAUNCH_K1_LL_PURE_FOR_PRO_SHAPE" not in k1_ext
+    assert "ll_pure_masked_weight_layout" not in k1_ext
+    assert "ll_pure_groupgemm" not in k1_pybind
+    assert "ll_pure_block_n" not in k1_pybind
+    assert "hidden == 7168 && l1_rows == 6144" in k1_pybind
+    assert (
+        "DCU_MEGAMOE_V3_LAUNCH_K1_LL(EXPERTS, N, K, 48, 64, false, false)"
+        in k1_ext
+    )
+    assert "PRO_LL_MASKED_L1_ASM_CO" in k1_py
+    assert "deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co" in k1_py
+    assert "PREBUILT_CODE_OBJECTS" in setup_source
+    assert "prebuilt/gfx938" in setup_source.replace("\\", "/")
+    assert "deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.s" not in setup_source
+    assert "k1_ll_masked_groupgemm_pack5" in k1_pybind
+    assert "kProLlMaskedL1AsmKernelName" in k1_pybind
+    assert "DEEPGEMM_FP8_FP8_BF16_PERCHANNEL_MARLIN_ASM_TN_" in k1_pybind
+    assert "MT256x64x128_WGM8_GROUPGEMM_MASKED" in k1_pybind
+    assert "k1_ll_masked_groupgemm(" in opt_source
+    assert "import deepgemm" not in opt_source
+    assert "m_grouped_fp8_gemm_nt_masked" not in opt_source
+    assert "ll_pro_masked_fused_groupgemm" not in k1_pybind
+    assert "ll_pro_masked_fused_groupgemm" not in k1_py
 
 
 def test_v3_normal_graph_runtime_work_is_limited_without_d2h():
@@ -538,10 +599,26 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "__builtin_hcu_cvt_f32_bf16" in c_kernel_source
     assert "lightop" not in api_source
     assert "weight8bit_nt_kpack2_marlin_masked" in api_source
+    assert "transform_fp8_weights_for_mega_moe_pro_ll_masked_k1" in api_source
+    old_pro_helper = (
+        "transform_fp8_weights_for_mega_moe_v3_" "pro_ll_masked_k1"
+    )
+    old_legacy_def = "def " "transform_fp8_weights_for_mega_moe("
+    old_legacy_export = '"transform_fp8_weights_for_mega_moe"' + ","
+    assert old_pro_helper not in api_source
+    assert old_legacy_def not in api_source
+    assert old_legacy_export not in api_source
+    assert '"ll_pro_masked"' in api_source
+    assert "l1_layout != l2_layout and not use_pro_ll_masked_k1" in api_source
+    assert 'use_unified_weight_layout = l2_layout == "unified"' in api_source
     assert "from megamoe.dcu_megamoe_opt import v3_layout" not in test_source
     assert "megamoe.flatten_pack5_weight_asm_normal" in test_source
     assert "megamoe.flatten_pack5_weight(l" in test_source
     assert "megamoe.weight8bit_nt_kpack2_marlin_masked" in test_source
+    assert "force_unified_layout = env_flag_enabled(UNIFIED_WEIGHT_LAYOUT_ENV)" in test_source
+    assert 'if v3_backend == "ll" and pro_shape:' in test_source
+    assert 'weight_layout = "unified" if force_unified_layout else "ll_pro_masked"' in test_source
+    assert '"ll_pro_masked"' in test_source
     assert 'BASELINE_AUTO = "auto"' in test_source
     assert 'default=BASELINE_AUTO' in test_source
     assert "fused_quantizes_input" not in test_source
@@ -575,6 +652,9 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert '"baseline_graph_kind": BASELINE_LL_MASKED' in test_source
     assert '"baseline_graph_kind": BASELINE_NORMAL_CONTIGUOUS' not in test_source
     assert "run_selected_baseline(\n                    graph_x_bf16[:local_token]" in test_source
+    assert "baseline graph is captured per runtime bucket" in test_source
+    assert "baseline_dispatch_tokens = max(" in test_source
+    assert "baseline_dispatch_tokens,\n                expected_tokens_per_rank," in test_source
     assert "use_layout_cache=False" in test_source
     assert "dispatch_num_tokens: Optional[int] = None" not in api_source
     assert "ll_cuda_graph" not in api_source
@@ -598,6 +678,27 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
 
     assert "--megamoe-backend" in test_source
     assert "--cuda-graph" in test_source
+    assert "--k1-only-bench" not in test_source
+    assert "--k1-only-ll-block-m" not in test_source
+    assert "--k1-only-ll-block-n" not in test_source
+    assert "--k1-only-compare-deepgemm" not in test_source
+    assert "--k1-only-ablate-mode" not in test_source
+    assert "def k1_ll_staged_input_views(" not in test_source
+    assert "deepgemm_masked_fp8_gemm(" in test_source
+    assert "k1_pure_vs_deepgemm_masked_median_ratio" not in test_source
+    assert "ll_pure_masked_weight_layout" not in test_source
+    assert "k1_only_effective_ll_block_n" not in test_source
+    assert "ll_stage_only" in opt_source
+    assert "_run_pro_ll_masked_k1_groupgemm" in opt_source
+    assert "def run_k1_only(" not in test_source
+    assert "def k1_only_ll_block_m(" not in test_source
+    assert "def k1_only_ll_block_n(" not in test_source
+    assert "def run_k1_only_epoch(" not in test_source
+    assert "k1_only_median_ms_avg_per_rank" not in test_source
+    assert "ll_k1_main_call_with_host_epoch_barrier" not in test_source
+    assert "ll_k1_pure_groupgemm_call_with_host_epoch_barrier" not in test_source
+    assert "dist.barrier(group=group)" in test_source
+    assert "_v3_ll_block_m(" in test_source
     assert "--opt-3stage" not in test_source
     assert "--ll-cuda-graph" not in test_source
     assert "--normal-cuda-graph" not in test_source
@@ -620,7 +721,6 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "dispatch_num_tokens=" not in graph_call
     assert "capacity_num_tokens=" not in graph_call
     assert "pro_model_shape" not in test_source
-    assert "MEGAMOE_DCU_PRO_WEIGHT_LAYOUT" not in test_source
     assert "UNIFIED_WEIGHT_LAYOUT_ENV" in test_source
     assert '"normal" if v3_backend == "normal" else "unified"' in test_source
 
@@ -713,6 +813,12 @@ def test_v3_supernode_source_support():
 
     assert "staged_pack5_shape_supported" in init_source
     assert "K_DSV4_SUPPORTED_EP_RANKS = SUPPORTED_STAGED_EP_RANKS" in opt_source
+    assert "V3_LL_DEFAULT_BLOCK_M = 32" in opt_source
+    assert "V3_LL_PRO_BLOCK_M = 48" in opt_source
+    assert "def _v3_ll_block_m(" in opt_source
+    assert ") == (384, 6, 7168, 3072):" in opt_source
+    assert "return V3_LL_PRO_BLOCK_M" in opt_source
+    assert "return V3_LL_DEFAULT_BLOCK_M" in opt_source
     assert "K1_SUPPORTED_RANKS = SUPPORTED_STAGED_EP_RANKS" in k1_py
     assert "counts[local_experts]" in k1_asm_ext
     assert "num_ranks > 8 || local_experts > 32" in k1_asm_ext
@@ -722,8 +828,21 @@ def test_v3_supernode_source_support():
     assert "dcu_split_tail_chunk_signal_slot_base(num_ranks)" in k3_header
     assert "signal_addrs[num_ranks + rank]" in k3_header
     assert "V3_K1_LowLatencyMaskedGroupGemmKernel<" in k1_ext
+    assert "ll_block_m == 256" not in k1_ext
+    assert "pure MT256" not in k1_asm_ext
+    assert "dcu_megamoe_v3_launch_k1_ll_pure_groupgemm_pack5" not in k1_ext
+    assert "DCU_MEGAMOE_V3_LAUNCH_K1_LL_PURE_FOR_PRO_SHAPE" not in k1_ext
+    assert "block_n == 512" not in k1_ext
+    assert "V3_K1_LdsPack5PureGroupGemmKernel" not in k1_header
     assert "DCU_MEGAMOE_V3_LAUNCH_K1_LL_FOR_SHAPE(EXPERTS, 6144, 7168)" in k1_ext
     assert "DCU_MEGAMOE_V3_LAUNCH_K1_LL_FOR_EXPERTS(48)" in k1_ext
+    assert "static_assert(kBlockN == 64 || kBlockN == 128 || kBlockN == 256" in k1_header
+    assert "static_assert(kNumWarps == 4 || kNumWarps == 8" in k1_header
+    assert "__launch_bounds__(kNumWarps * 64, 1)" in k1_header
+    assert "bool kSkipDispatch" not in k1_header
+    assert "bool kMaskedWeightLayout" not in k1_header
+    assert "if constexpr (!kSkipDispatch)" not in k1_header
+    assert "if constexpr (kMaskedWeightLayout)" not in k1_header
     assert "static_assert(kExperts <= 64" in k1_header
     assert "V3_K3_LowLatencyMaskedGroupGemmKernel<" in k3_ext
     assert "DCU_MEGAMOE_V3_LAUNCH_LL_FOR_SHAPE(EXPERTS, 7168, 3072)" in k3_ext

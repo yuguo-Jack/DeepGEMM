@@ -8,6 +8,7 @@ import torch
 
 from .dcu_megamoe_opt.K1_fused.k1_fused import (
     k1_graph_flag_reset_layout,
+    k1_ll_masked_groupgemm,
     k1_symm_fused_l1_v3,
     k1_symm_fused_l1_v3_graph,
 )
@@ -36,6 +37,8 @@ K_K1_ROUTE_CAPACITY_SLACK_DIVISOR = 10
 K_K1_LL_ROW_TILE = 64
 K_K1_LL_HEADROOM_EXPECTED_ROWS_THRESHOLD = 48
 K_K1_LL_HEADROOM_ROWS = 64
+K_K1_LL_SKEW_GUARD_ROWS = 256
+K_PRO_EP8_LL_MASKED_K1_MIN_ROWS_PER_EXPERT = 128
 K_K1_ASM_LAUNCH_ARGS_BYTES = 256
 K_K2_GRAPH_ROW_BLOCKS = 8192
 K_PROB_STORAGE_BYTES = 256
@@ -43,7 +46,8 @@ K_TAIL_DONE_COUNTER_RING_SLOTS = 16
 K_TAIL_DONE_COUNTER_INTS = 3 * K_TAIL_DONE_COUNTER_RING_SLOTS + 64
 K_POST_K3_BARRIER_SIGNAL_SLOT_BASE = 20
 K_DSV4_SUPPORTED_EP_RANKS = SUPPORTED_STAGED_EP_RANKS
-V3_LL_BLOCK_M = 32
+V3_LL_DEFAULT_BLOCK_M = 32
+V3_LL_PRO_BLOCK_M = 48
 K_LL_SPLIT_TAIL_MAX_TOKENS = 512
 K_DTYPE_SIZES = {
     torch.bfloat16: 2,
@@ -53,6 +57,49 @@ K_DTYPE_SIZES = {
     torch.int32: 4,
     torch.int64: 8,
 }
+
+
+def _v3_ll_block_m(
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> int:
+    if (
+        int(num_experts),
+        int(num_topk),
+        int(hidden),
+        int(intermediate_hidden),
+    ) == (384, 6, 7168, 3072):
+        return V3_LL_PRO_BLOCK_M
+    return V3_LL_DEFAULT_BLOCK_M
+
+
+def _run_pro_ll_masked_k1_groupgemm(
+    l1_out: torch.Tensor,
+    staged_x: torch.Tensor,
+    staged_x_scale: torch.Tensor,
+    l1_weight: torch.Tensor,
+    l1_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    *,
+    local_experts: int,
+    hidden: int,
+    expected_m_per_group: int,
+    verbose_build: bool = False,
+) -> None:
+    rows_per_expert = int(l1_out.size(0)) // int(local_experts)
+    l1_rows = int(l1_scale.size(1))
+    k1_ll_masked_groupgemm(
+        staged_x.view(local_experts, rows_per_expert, hidden),
+        staged_x_scale.view(local_experts, rows_per_expert).unsqueeze(-1),
+        l1_weight,
+        l1_scale.unsqueeze(-1),
+        l1_out.view(local_experts, rows_per_expert, l1_rows),
+        m_indices.narrow(0, 0, local_experts),
+        int(expected_m_per_group),
+        verbose_build=verbose_build,
+    )
 
 
 @dataclass
@@ -174,6 +221,19 @@ def _v3_staged_capacity_rows(
         ll_rows_per_expert = _align(
             ll_expected_rows_per_expert + min_slack,
             K_K1_LL_ROW_TILE,
+        )
+    ll_skew_guard_rows = min(
+        K_K1_LL_SKEW_GUARD_ROWS,
+        int(num_ranks) * int(num_max_tokens),
+    )
+    ll_rows_per_expert = max(
+        ll_rows_per_expert,
+        _align(ll_skew_guard_rows, K_K1_LL_ROW_TILE),
+    )
+    if int(num_experts) == 384 and int(num_ranks) == 8 and int(num_topk) == 6:
+        ll_rows_per_expert = max(
+            ll_rows_per_expert,
+            K_PRO_EP8_LL_MASKED_K1_MIN_ROWS_PER_EXPERT,
         )
     ll_capacity_rows = local_experts * ll_rows_per_expert
     total_tasks = num_ranks * num_max_tokens * num_topk
@@ -513,6 +573,7 @@ def fp8_mega_moe_opt_3stage(
     v3_backend: str,
     capacity_num_tokens: Optional[int] = None,
     use_unified_weight_layout: bool = False,
+    use_pro_ll_masked_k1: bool = False,
 ) -> None:
     l1_weight, l1_scale = l1_weights
     l2_weight, l2_scale = l2_weights
@@ -563,6 +624,8 @@ def fp8_mega_moe_opt_3stage(
         asm_signal_generation = state.asm_signal_generation
 
     inline_ll_start = v3_backend == V3_BACKEND_LL
+    if use_pro_ll_masked_k1 and not inline_ll_start:
+        raise ValueError("Pro LL masked-K1 layout is LL-backend only")
     if not inline_ll_start:
         # Make symmetric-buffer input copies visible to the dispatch stage.
         rank_barrier(
@@ -604,15 +667,50 @@ def fp8_mega_moe_opt_3stage(
     )
     k1_kwargs["backend"] = v3_backend
     if v3_backend == V3_BACKEND_LL:
-        k1_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+        ll_block_m = _v3_ll_block_m(
+            num_experts, num_topk, hidden, intermediate_hidden
+        )
+        k1_kwargs["ll_block_m"] = ll_block_m
         if inline_ll_start:
             k1_kwargs["enable_start_rank_barrier"] = True
             k1_kwargs["tail_done_counter"] = state.scratch.asm_tail_done_counter
-    l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_launcher(
+        if use_pro_ll_masked_k1:
+            k1_kwargs["ll_stage_only"] = True
+            k1_kwargs["ll_return_staged"] = True
+    k1_result = k1_launcher(
         sym_buffer,
         (l1_weight, l1_scale),
         **k1_kwargs,
     )
+    if use_pro_ll_masked_k1:
+        (
+            l1_out,
+            route_weights,
+            m_indices,
+            output_index,
+            row_combine_ptrs,
+            staged_x,
+            staged_x_scale,
+        ) = k1_result
+        expected_m_per_group = max(
+            1,
+            (num_tokens * num_ranks * num_topk + num_experts)
+            // num_experts,
+        )
+        _run_pro_ll_masked_k1_groupgemm(
+            l1_out,
+            staged_x,
+            staged_x_scale,
+            l1_weight,
+            l1_scale,
+            m_indices,
+            local_experts=local_experts,
+            hidden=hidden,
+            expected_m_per_group=expected_m_per_group,
+            verbose_build=verbose_build,
+        )
+    else:
+        l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_result
     rows = int(l1_out.size(0))
     act_fp8 = state.scratch.act_fp8[:rows]
     act_scale = state.scratch.act_scale[:rows]
@@ -663,7 +761,7 @@ def fp8_mega_moe_opt_3stage(
         )
         k3_kwargs["backend"] = v3_backend
         if v3_backend == V3_BACKEND_LL:
-            k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+            k3_kwargs["ll_block_m"] = ll_block_m
         k3_launcher(
             act_fp8,
             act_scale,
@@ -682,7 +780,7 @@ def fp8_mega_moe_opt_3stage(
         )
         k3_kwargs["backend"] = v3_backend
         if v3_backend == V3_BACKEND_LL:
-            k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+            k3_kwargs["ll_block_m"] = ll_block_m
         k3_launcher(
             act_fp8,
             act_scale,
@@ -725,6 +823,7 @@ def _run_opt_3stage_graph(
     graph_max_tokens: Optional[int] = None,
     v3_backend: str,
     use_unified_weight_layout: bool = False,
+    use_pro_ll_masked_k1: bool = False,
 ) -> None:
     if cumulative_local_expert_recv_stats is not None:
         raise ValueError("opt DCU MegaMoE graph path does not support stats")
@@ -792,6 +891,8 @@ def _run_opt_3stage_graph(
             meta_flags_numel,
         )
     inline_ll_start = v3_backend == V3_BACKEND_LL
+    if use_pro_ll_masked_k1 and not inline_ll_start:
+        raise ValueError("Pro LL masked-K1 layout is LL-backend only")
     if not inline_ll_start:
         rank_barrier(
             sym_buffer,
@@ -831,7 +932,10 @@ def _run_opt_3stage_graph(
     )
     k1_kwargs["backend"] = v3_backend
     if v3_backend == V3_BACKEND_LL:
-        k1_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+        ll_block_m = _v3_ll_block_m(
+            num_experts, num_topk, hidden, intermediate_hidden
+        )
+        k1_kwargs["ll_block_m"] = ll_block_m
         if inline_ll_start:
             k1_kwargs["enable_start_rank_barrier"] = True
             k1_kwargs["tail_done_counter"] = state.scratch.asm_tail_done_counter
@@ -842,13 +946,42 @@ def _run_opt_3stage_graph(
                 k1_kwargs["graph_tail_signal_generation_out"] = (
                     state.scratch.graph_tail_signal_generation
                 )
-    l1_out, route_weights, m_indices, output_index, row_combine_ptrs = (
-        k1_graph_launcher(
-            sym_buffer,
-            (l1_weight, l1_scale),
-            **k1_kwargs,
-        )
+        if use_pro_ll_masked_k1:
+            k1_kwargs["ll_stage_only"] = True
+            k1_kwargs["ll_return_staged"] = True
+    k1_result = k1_graph_launcher(
+        sym_buffer,
+        (l1_weight, l1_scale),
+        **k1_kwargs,
     )
+    if use_pro_ll_masked_k1:
+        (
+            l1_out,
+            route_weights,
+            m_indices,
+            output_index,
+            row_combine_ptrs,
+            staged_x,
+            staged_x_scale,
+        ) = k1_result
+        _run_pro_ll_masked_k1_groupgemm(
+            l1_out,
+            staged_x,
+            staged_x_scale,
+            l1_weight,
+            l1_scale,
+            m_indices,
+            local_experts=num_experts // num_ranks,
+            hidden=hidden,
+            expected_m_per_group=max(
+                1,
+                (graph_max_tokens * num_ranks * num_topk + num_experts)
+                // num_experts,
+            ),
+            verbose_build=verbose_build,
+        )
+    else:
+        l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_result
     rows = int(l1_out.size(0))
 
     act_fp8 = state.scratch.act_fp8[:rows]
@@ -909,7 +1042,7 @@ def _run_opt_3stage_graph(
         )
         k3_kwargs["backend"] = v3_backend
         if v3_backend == V3_BACKEND_LL:
-            k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+            k3_kwargs["ll_block_m"] = ll_block_m
             k3_kwargs["graph_runtime_num_tokens"] = state.scratch.graph_runtime_num_tokens
         k3_launcher(
             act_fp8,
@@ -935,7 +1068,7 @@ def _run_opt_3stage_graph(
         )
         k3_kwargs["backend"] = v3_backend
         if v3_backend == V3_BACKEND_LL:
-            k3_kwargs["ll_block_m"] = V3_LL_BLOCK_M
+            k3_kwargs["ll_block_m"] = ll_block_m
         k3_launcher(
             act_fp8,
             act_scale,

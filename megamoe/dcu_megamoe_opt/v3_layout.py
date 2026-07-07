@@ -8,8 +8,6 @@ pack5 layout. Callers select the runtime layout by passing either a single
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 
 
@@ -116,67 +114,3 @@ def pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
 def flatten_pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
     packed = pack5_weight_asm_normal(weight)
     return packed.reshape(weight.shape[0], weight.shape[1] * weight.shape[2])
-
-
-def unpack_pack5_weight(packed: torch.Tensor, *, n: int, k: int) -> torch.Tensor:
-    if packed.dim() != 7:
-        raise ValueError("unpack_pack5_weight expects the 7D pack5 tensor")
-    experts = packed.shape[0]
-    expected_shape = pack5_shape(experts, n, k)
-    if tuple(packed.shape) != expected_shape:
-        raise ValueError(f"invalid pack5 shape: got {tuple(packed.shape)}, expected {expected_shape}")
-
-    view = packed.permute(0, 2, 3, 5, 1, 4, 6).contiguous()
-    logical_to_physical = torch.empty(PACK5_N16, dtype=torch.long, device=packed.device)
-    logical_to_physical[pack5_physical_to_logical_indices(packed.device)] = torch.arange(
-        PACK5_N16,
-        dtype=torch.long,
-        device=packed.device,
-    )
-    view = view.index_select(3, logical_to_physical)
-    return view.reshape(experts, n, k).contiguous()
-
-
-def _cast_weight_to_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if weight.dim() != 3:
-        raise ValueError("V3 weight transform expects [expert, n, k]")
-    if not hasattr(torch, "float8_e4m3fn"):
-        raise RuntimeError("torch.float8_e4m3fn is required for V3 FP8 weight transform")
-    scale = weight.float().abs().amax(dim=2).clamp(min=1.0e-4) / 448.0
-    fp8 = (weight.float() / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-    return fp8.contiguous(), scale.contiguous()
-
-
-def _pack_fp8_weight_and_scale(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    fp8, scale = _cast_weight_to_fp8(weight)
-    return flatten_pack5_weight(fp8), scale
-
-
-def _pack_fp8_weight_and_scale_asm_normal(
-    weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    fp8, scale = _cast_weight_to_fp8(weight)
-    return flatten_pack5_weight_asm_normal(fp8), scale
-
-
-def transform_fp8_weights_for_mega_moe_v3_pack5(
-    l1_bf16: torch.Tensor,
-    l2_bf16: torch.Tensor,
-) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    """Transform BF16 L1/L2 weights into V3-owned FP8 pack5 layout.
-
-    This is an offline/test setup helper. Do not call it from the runtime or
-    benchmark execution path.
-    """
-    return _pack_fp8_weight_and_scale(l1_bf16), _pack_fp8_weight_and_scale(l2_bf16)
-
-
-def transform_fp8_weights_for_mega_moe_v3_pack5_asm_normal(
-    l1_bf16: torch.Tensor,
-    l2_bf16: torch.Tensor,
-) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    """Transform BF16 L1/L2 weights into normal-ASM plain pack5 layout."""
-    return (
-        _pack_fp8_weight_and_scale_asm_normal(l1_bf16),
-        _pack_fp8_weight_and_scale_asm_normal(l2_bf16),
-    )

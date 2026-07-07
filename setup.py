@@ -338,6 +338,26 @@ OPT_ASM_CODE_OBJECTS = [
 ]
 
 
+PREBUILT_CODE_OBJECTS = [
+    (
+        project_path(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K1_fused',
+            'prebuilt',
+            'gfx938',
+            'deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co',
+        ),
+        os.path.join(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K1_fused',
+            'deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co',
+        ),
+    ),
+]
+
+
 def _opt_asm_clang(env_name):
     clang = os.environ.get(env_name) or os.environ.get('MEGAMOE_DCU_AOT_CLANG')
     if clang:
@@ -387,11 +407,23 @@ def build_opt_asm_code_objects(output_root, temp_root):
         )
 
 
+def copy_prebuilt_code_objects(output_root):
+    if not (IS_HIP_EXTENSION and package_name == 'megamoe') or DG_SKIP_CUDA_BUILD:
+        return
+    for src, rel_dst in PREBUILT_CODE_OBJECTS:
+        if not os.path.exists(src):
+            raise FileNotFoundError(f'prebuilt code object not found: {src}')
+        dst = os.path.join(output_root, rel_dst)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+
+
 class CustomBuildExt(BuildExtension):
     def run(self):
         super().run()
         output_root = current_dir if self.inplace else self.build_lib
         build_opt_asm_code_objects(output_root, self.build_temp)
+        copy_prebuilt_code_objects(output_root)
 
 
 class CustomBuildPy(build_py):

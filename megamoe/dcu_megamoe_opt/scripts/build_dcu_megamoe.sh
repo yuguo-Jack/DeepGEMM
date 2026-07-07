@@ -15,7 +15,10 @@ build_epoch="$(date +%s)"
 
 rm -rf "$build_dir" dist ./*.egg-info
 rm -f megamoe/_C*.so deep_gemm/_C*.so
-find megamoe/dcu_megamoe_opt -type f \( -name '*_ext*.so' -o -name '*.co' -o -name '*.o' -o -name '*.hip' \) -delete 2>/dev/null || true
+find megamoe/dcu_megamoe_opt \
+    -path '*/prebuilt/*' -prune -o \
+    -type f \( -name '*_ext*.so' -o -name '*.co' -o -name '*.o' -o -name '*.hip' \) \
+    -delete 2>/dev/null || true
 mkdir -p "$wheel_dir"
 
 "$python_bin" setup.py \
@@ -59,6 +62,7 @@ verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/k3_fused_ext*.so"
 verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/k3_v3_fused_ext*.so"
 verify_fresh_artifact "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co"
 verify_fresh_artifact "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.co"
+verify_fresh_artifact "megamoe/dcu_megamoe_opt/K1_fused/deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co"
 verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co"
 verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_UNIFIED_PACK5.co"
 verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.co"

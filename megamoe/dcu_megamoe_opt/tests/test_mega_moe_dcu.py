@@ -768,11 +768,17 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             else args.baseline_kind
         )
     )
-    weight_layout = (
-        "unified"
-        if env_flag_enabled(UNIFIED_WEIGHT_LAYOUT_ENV)
-        else ("normal" if v3_backend == "normal" else "unified")
-    )
+    pro_shape = (
+        int(num_experts),
+        int(num_topk),
+        int(hidden),
+        int(intermediate_hidden),
+    ) == (384, 6, 7168, 3072)
+    force_unified_layout = env_flag_enabled(UNIFIED_WEIGHT_LAYOUT_ENV)
+    if v3_backend == "ll" and pro_shape:
+        weight_layout = "unified" if force_unified_layout else "ll_pro_masked"
+    else:
+        weight_layout = "normal" if v3_backend == "normal" else "unified"
     fused_execution = f"v3_{v3_backend}_eager"
     graph_execution = f"v3_{v3_backend}_cuda_graph_replay" if args.cuda_graph else "disabled"
     print_once(rank, "DCU MegaMoE channelwise W8A8 test:")
@@ -856,9 +862,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
     l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
     baseline_contiguous_weight_layout = None
+    masked_l1_weights = None
+    masked_l2_weights = None
+    if ll_masked_baseline or weight_layout == "ll_pro_masked":
+        masked_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l1_fp8), l1_scale)
+        masked_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l2_fp8), l2_scale)
     if ll_masked_baseline:
-        baseline_l1_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l1_fp8), l1_scale)
-        baseline_l2_weights = (megamoe.weight8bit_nt_kpack2_marlin_masked(l2_fp8), l2_scale)
+        baseline_l1_weights = masked_l1_weights
+        baseline_l2_weights = masked_l2_weights
     else:
         baseline_l1_packed, baseline_contiguous_weight_layout = pack_deepgemm_contiguous_weight(l1_fp8)
         baseline_l2_packed, l2_contiguous_weight_layout = pack_deepgemm_contiguous_weight(l2_fp8)
@@ -877,6 +888,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "normal": (megamoe.flatten_pack5_weight_asm_normal(l2_fp8), l2_scale),
         }
         layout_desc = "single normal ASM plain pack5"
+    elif weight_layout == "ll_pro_masked":
+        fused_l1_weights = {
+            "ll_pro_masked": masked_l1_weights,
+        }
+        fused_l2_weights = {
+            "unified": (megamoe.flatten_pack5_weight(l2_fp8), l2_scale),
+        }
+        layout_desc = "Pro LL masked-K1 L1 layout plus unified L2 pack5"
     else:
         fused_l1_weights = {
             "unified": (megamoe.flatten_pack5_weight(l1_fp8), l1_scale),
@@ -950,6 +969,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         use_layout_cache: bool = True,
     ):
         if baseline_kind == BASELINE_LL_MASKED:
+            # The DeepEP LL buffer is allocated for the graph maximum, but each
+            # baseline graph is captured per runtime bucket.  Keep dispatch
+            # capacity aligned with MegaMoE's runtime token bucket instead of
+            # the larger allocation cap, otherwise small replay buckets measure
+            # extra baseline-only padding work.
+            baseline_dispatch_tokens = max(
+                int(expected_tokens_per_rank),
+                int(x_bf16_arg.size(0)),
+            )
             return run_deepep_ll_deepgemm_masked_baseline(
                 ep_buffer,
                 x_bf16_arg,
@@ -957,7 +985,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 topk_weights_arg,
                 baseline_l1_weights,
                 baseline_l2_weights,
-                ll_baseline_capacity_tokens,
+                baseline_dispatch_tokens,
                 expected_tokens_per_rank,
                 num_ranks,
                 num_experts,

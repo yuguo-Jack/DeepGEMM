@@ -4,7 +4,7 @@
 
 - ✅ EP8/EP16/EP32 shape gates, scratch sizing, signal-slot helpers, and peer-memory path are implemented on the supernode branch.
 - ✅ EP16 single-node runtime bring-up now builds and passes staged smoke on node22.
-- [ ] EP16 benchmark matrix and EP32 multi-node validation are still pending.
+- [ ] EP32 multi-node validation is still pending; EP16 has broad normal/LL coverage, with large normal graph-bench instability tracked separately in `task_plan.md`.
 - 🧭 Future tuning should start from profiler data on real supernode hardware, not from EP8 assumptions.
 
 ## Supernode Examples
@@ -592,3 +592,251 @@ Clean-source update:
 - The build script is now the source of truth for remote MegaMoE runtime artifacts: it deletes stale source-tree `.so/.co` files, runs `build_ext --inplace`, verifies fresh source-tree artifacts, and imports `megamoe._C` plus K1/K2/K3 extension modules from `/root/yuguo/DeepGEMM`.
 - This removes the manual `build/lib... -> source tree` copy step from the normal remote validation loop. If a future run imports from `build/`, site-packages, or another repo path, the build script should fail before GPU testing starts.
 - Verification on 151.1 after this change: rebuild passed, source pytest passed (`11 passed`), and Pro EP8 512 normal eager RPC smoke passed with `max_abs=0.000976562`.
+
+## 2026-07-03 - Pro EP8 Normal Eager Finding
+
+- Pro EP8 normal eager is no longer blocked at K1 after forcing compact prebuild for `local_experts > 32`.
+- The full RPC normal eager matrix `512,1024,1025,2048,2050,4096,4097,5120,8192` passed correctness against `normal-contiguous`; every bucket produced baseline timing and cleared KFD PIDs after exit.
+- Performance scales from near-baseline at 512 (`4.7537 ms` fused vs `4.8026 ms` baseline) to about `1.75x` faster at 8192 (`27.6906 ms` fused vs `48.5922 ms` baseline).
+
+## 2026-07-03 - Pro EP8 LL 512 Finding
+
+- Pro EP8 LL 512 needs a larger DeepEP LL heap than the README Flash-sized example. DeepEP reported `num_rdma_bytes(11450456192)`, so the successful 151.1 `ll-masked` runs used `ROCSHMEM_HEAP_SIZE=12884901888` and `DUSHMEM_HEAP_SIZE=12884901888`.
+- Do not force stale HCA/topology variables on 151.1 while `/sys/class/infiniband` is empty. The successful Pro EP8 LL baseline runs used node-actual settings plus the generic DeepEP LL context variables.
+- Correctness is not the blocker: Pro EP8 LL 512 passed against `ll-masked` with `max_abs=0.000976562`, and graph replay512 also passed.
+- Performance is the blocker: Pro EP8 LL fused is about `16.63-16.68 ms` for replay/eager 512, while the `ll-masked` baseline is about `5.68-5.75 ms`. The same timing in graph mode shows the gap is inside the fused LL path, not just launch overhead.
+
+## 2026-07-03 - Pro LL Graph Performance Finding
+
+- Pro EP16 LL graph cap512 has now been compared directly against `ll-masked`; it is also abnormal. Fused graph replay medians for `8/32/128/256/512` are `3.2558/3.3209/5.1238/8.6320/15.2628 ms`, while `ll-masked` baseline graph medians are `2.4204/2.4802/2.6445/3.3827/4.7778 ms`.
+- This separates Pro behavior from Flash EP16: Flash EP16 LL graph is faster than `ll-masked`, but Pro EP16/EP8 LL graph is slower.
+- Split-tail is not the root cause: disabling `MEGAMOE_DCU_LL_K3_SPLIT_TAIL` made Pro EP8 LL graph512 slightly slower.
+- `ll_block_m` is only a secondary tuning parameter. For Pro EP16 replay512, block64 improved `15.2628 -> 13.7521 ms`, and block48 improved to `12.9954 ms`, but both remain far behind the `4.78 ms` baseline.
+- Kernel profiling isolates the dominant cost to K1 LL. In a Pro EP16 block48 fused-only run, `V3_K1_LowLatencyMaskedGroupGemmKernel<24, 6144, 7168, ...>` took about `11.5-11.8 ms` per call; K2 and K3 were much smaller.
+- Root-cause direction: the current LL K1 kernel is a C++ low-latency grouped GEMM path tuned enough for Flash but not competitive for the Pro K1 shape (`N=6144`, `K=7168`). A simple size-support patch is insufficient for Pro LL performance.
+- Practical path: keep Pro small-token auto selection on the normal backend unless/until a Pro-optimized LL K1 path is implemented. A proper Pro LL fix likely needs a dedicated/DeepGEMM-derived K1 LL kernel rather than another launch-policy tweak.
+- This validates the Pro EP8 local-experts=48 route for eager normal. It does not yet validate Pro EP8 graph, LL, or uneven buckets.
+
+Update after Flash-vs-Pro K1 profile:
+- The abnormal Pro LL cost is not explained by the Pro K1 arithmetic size alone. Under the same EP16, token512, block32, fused-only profile, Flash K1 median is `1.3383 ms` and Pro K1 median is `13.9043 ms`.
+- The theoretical K1 work ratio at the same token/topk is `(6144 * 7168) / (4096 * 4096) = 2.625x`, while measured K1 ratio is about `10.39x`; per unit work Pro is roughly `3.96x` slower.
+- The Pro support diff for LL K1 did not add a Pro-specific optimized kernel. It generalized the old Flash template launch from `<4096,4096>` to `<6144,7168>` and enabled local experts `24/48`.
+- Source inspection shows LL K1 does not compute empty capacity rows in the GEMM loop; it uses `cur_tokens` to derive `m_tiles`. Stage-copy traffic scales mainly with hidden (`7168/4096 = 1.75x`), also too small to explain the observed K1 ratio.
+- Current working hypothesis: the Pro `<6144,7168>` instantiation exposes a template/codegen problem in the HIP C++ LL K1, especially the fully unrolled `kKIterations = 112` outer loop. Next ablation should test K-loop unroll behavior before any production fix.
+
+Update after K/N dimension ablation:
+- The fully unrolled K-loop hypothesis was tested and rejected: `#pragma unroll 1` made Pro EP16 LL fused-only worse (`17.3007 ms`), and disabling block32 parallel stage-copy was also slightly worse (`15.8442 ms`).
+- Expert-count/local-expert effects are ruled out for the main gap. A temporary `experts=384, hidden=4096, intermediate=2048` EP16 LL run stayed Flash-like at `1.8772 ms`.
+- The dominant trigger is `K=hidden=7168`. With `experts=384`, `hidden=7168, intermediate=2048` already costs `10.6547 ms`, and hipprof shows K1 `<24,4096,7168>` averaging about `9.1-9.7 ms`. In contrast, `hidden=4096, intermediate=3072` costs only `2.5402 ms`, with K1 `<24,6144,4096>` about `1.56-2.09 ms`.
+- Therefore the current HIP C++ LL K1 path has a K-dimension/codegen or memory-pipeline scaling failure around `kKIterations=112`, not a route-scratch/local-expert issue and not primarily the N/output width. Another small launch-policy tweak is unlikely to close the `ll-masked` baseline gap.
+- All temporary mixed-shape gates were removed after measurement, and the remote default source was rebuilt with source pytest `11 passed`.
+- A partial-unroll ablation also failed to improve Pro K1: changing the main K loop to `#pragma unroll 8` produced fused `15.7133 ms`, equivalent to default `15.7026 ms`; `unroll 1` was worse at `17.3007 ms`. This narrows the remaining path away from simple unroll-factor tuning and toward a different K1 implementation/tile pipeline for `K=7168`.
+
+Update after layout/resource check:
+- Do not splice normal ASM K1 directly into the LL path as a shortcut. The LL path relies on per-expert contiguous rows and `m_indices` as per-expert `actual_m`; normal ASM K1 produces compact/nondeterministic row order and row-wise metadata. A correct hybrid would need a bridge that rebuilds per-expert row layout and counts, which is no longer a narrow K1 performance ablation.
+- Current gfx938 resource metadata for EP16 block32 does not show catastrophic resource growth: Flash `<24,4096,4096>` is `vgpr=124, sgpr=100, private=0`, while Pro `<24,6144,7168>` is `vgpr=132, sgpr=106, private=208`, with no VGPR spill. This makes a pure occupancy/register-spill explanation weak.
+- The next useful local ablation is Pro-only K1 tile granularity: try `blockN=128` for the Pro K1 LL template to see whether more N tiles with fewer accumulators improves the `K=7168` path. Keep it temporary unless correctness and timing justify production work.
+
+Update after Pro K1 tile-granularity ablation:
+- Pro-only K1 LL `blockN=128` plus Pro `ll_block_m=48` is a strong positive ablation. Pro EP16 LL graph cap512 replay512 improved from `15.2628 ms` to `5.0180 ms`, while `ll-masked` baseline stayed `4.7777 ms`.
+- Small replay buckets also improved enough to beat the masked baseline: replay8/32/128/256 fused medians were `1.3350/1.4698/1.6748/3.0813 ms` versus baseline `2.4166/2.4787/2.6485/3.3804 ms`.
+- Current root-cause statement: the old Pro `K=7168,N=6144,blockN=256` instantiation carried too much per-tile accumulator/codegen pressure for the LL K1 kernel. Splitting N to 128 removes that collapse without changing Flash's `K=4096` path.
+- Keep the finding conditional until guardrails pass: Flash EP16 LL graph must remain in its historical band, and Pro EP8 LL 512 must show the same improvement.
+
+Guardrail update:
+- Flash EP16 LL graph cap512 remains effectively unchanged with the candidate: replay512 `1.9169 ms` versus recent fair history `1.9043 ms`, with the same blockM32 path.
+- Pro EP8 LL 512 confirms the fix generalizes across EP sizes: graph replay512 improved from `16.6293 ms` to `5.3764 ms`, and is now faster than `ll-masked` baseline `5.7417 ms`.
+- This is enough evidence to keep the narrow Pro LL K1 tile selector instead of immediately creating a separate Pro-only kernel family. The change is still shape-gated by `K=7168`, so Flash `K=4096` stays on the previous blockN256 instantiation.
+
+Next optimization direction:
+- The current Pro LL K1 fix is a successful tile granularity fix, not proof that K1 is near optimal. The right next step is to extract or emulate a K1-only groupgemm benchmark with the same LL layout contract, tune the GEMM core in isolation, then backport only the winning structure to the fused K1 path.
+- The benchmark must keep the LL output contract intact: per-local-expert contiguous output rows and `actual_m` counts. A normal-ASM K1 shortcut remains invalid unless it rebuilds that layout.
+- K1-only benchmark harness is now available in `test_mega_moe_dcu.py` through `--k1-only-bench`; blockM can be ablated with `--k1-only-ll-block-m`.
+- The first 151.1 Pro EP16 blockM ablation attempt was interrupted by host SSH closure before any result JSON, so it provides no performance conclusion. Resume by checking node health, then rerun a short single blockM smoke before the full matrix.
+- After adding a host epoch guard, full K1-only still reproduced the SSH-closure failure before writing JSON. This points away from the Python warmup/repeat loop alone and makes component ablation necessary.
+- The next useful split is:
+  - `no-start-barrier` to test whether the K1 kernel-side rank barrier is the trigger;
+  - `pure-gemm` to test the groupgemm core after dispatch/route scan/stage copy has been initialized once.
+- A local pure-gemm path has been prepared, but it requires remote rebuild before it can produce data.
+
+Update after pure-gemm/no-start ablation:
+- The K1-only diagnostic split is now producing useful data. Full mode with the in-kernel start barrier remains unsafe and can close SSH before a result JSON, so it should not be used for performance attribution.
+- `no-start-barrier` versus `pure-gemm` isolates non-GEMM K1 overhead. For Pro EP16 token buckets `8/32/128/256/512`, no-start medians are `1.4832/1.6491/1.7492/2.9272/4.5657 ms`, while pure-gemm medians are `1.0704/1.1419/1.1690/2.1947/3.4260 ms`.
+- Dispatch/route scan/stage copy plus barrier setup therefore costs roughly `0.41/0.51/0.58/0.73/1.14 ms`. This is measurable, but the 512-token GEMM core itself still accounts for about `3.43 ms`, so core GEMM tuning remains the main optimization target.
+- `ll_block_m=64` is a negative result for Pro LL K1. It measured about `10.13 ms` at token256 and then interrupted SSH at token512. Do not spend more time on bm64 unless a later code change materially changes the kernel structure.
+- bm32 and bm48 have a real token-size tradeoff: bm32 was faster in the noisy token256 sample, while bm48 stayed better at token512. This needs a stable rerun before changing the production selector.
+- The next useful core-GEMM axis is blockN, not another bm64 retry. A pure-gemm-only `blockN` diagnostic is prepared so Pro K1 can compare 64/128/256 on the same staged inputs while keeping production fused behavior unchanged until measurements justify a change.
+
+## 2026-07-03 - Normal Tail-Reduce Graph Replay Finding
+
+- Flash EP16 normal graph cap8192 with explicit tail-reduce1 reproduced the large graph instability after eager correctness passed. The failure happens inside graph replay, before the first bucket result is printed.
+- The strongest signal is the rank barrier timeout at EP16 start-barrier slot `32` with `generation=2` and `release=1`. That indicates some ranks entered the next replay's start barrier while others did not finish the previous replay epoch.
+- Earlier hypothesis: normal tail-reduce graph may need a post-K3 rank barrier so back-to-back graph replay cannot reuse/reset tail-reduce counters before all ranks finish K3.
+- This hypothesis was later tested and rejected on 151.1; see the validation update below. It is retained here only as diagnostic history.
+
+Update after validation:
+- The post-K3 rank-barrier hypothesis is rejected. Flash EP16 normal graph cap8192 still VMFaulted in `rank_barrier_kernel` slot32 after eager correctness passed, and the extra barrier was removed.
+- Do not treat "add another kernel after K3" as the fix path. The next investigation should isolate the graph replay state transition itself: which captured operation first observes stale/reset tail-reduce or compact-route state, and whether tail-reduce graph should be disabled for large EP16/Pro caps until a no-extra-kernel fix exists.
+
+## 2026-07-05 - Pro K1 Pure GroupGEMM Baseline Finding
+
+- The Pro EP16 pure K1 groupgemm core is still slower than same-shape DeepGEMM masked grouped GEMM on the same staged inputs and `actual_m`.
+- Matrix result under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_k1_pure_vs_deepgemm_matrix_20260705_085436`: tokens `8/32/128/256/512`, pure K1 medians `1.1403/1.2496/1.2285/2.2936/3.6320 ms`, DeepGEMM masked medians `0.8917/0.9627/0.9679/1.4053/2.1625 ms`, ratios `1.279/1.298/1.269/1.632/1.679`.
+- Numerical diff between pure K1 and DeepGEMM masked is small but not bit-identical: max_abs is `0.001953` for 8/32 and `0.003906` for 128/256/512, while mean_abs stays around `4e-09`. Treat this as BF16-level accumulation/order difference unless a later correctness check ties it to an end-to-end failure.
+- Current acceptance gate is stricter than "fused is close": the pure Pro K1 groupgemm itself should not be this far behind DeepGEMM masked. Optimize the pure skeleton first, then reconnect dispatch/stage/copy/fused path only after the core is close.
+- BlockM/blockN diagnostic under `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_rpc/pro_ep16_k1_pure_bm_bn_deepgemm_20260705_090146` shows parameter tuning alone is insufficient:
+  - token256 best: bm32/bn128, pure K1 `2.0946 ms`, DeepGEMM `1.4369 ms`, ratio `1.458`.
+  - token512 best: bm48/bn128, pure K1 `3.6236 ms`, DeepGEMM `2.1727 ms`, ratio `1.668`.
+  - bn64 is slower than bn128 at both token sizes; bn256 is unusable for Pro (`4.83x-6.40x` slower than DeepGEMM).
+- Current optimization axis: inspect/profile the pure groupgemm skeleton against DeepGEMM masked. If the Flash-tuned LL K1 structure cannot match DeepGEMM for `K=7168,N=6144`, create a Pro-only pure K1 kernel family rather than compromising the Flash path.
+
+Correction after re-checking the local DeepGEMM references:
+- The DeepGEMM masked baseline should not be described as the `MT256x256x128` path. The matching local reference is `hygon_tmp/K1_groupgemm_fp8/deepgemm_groupgemm_masked_fp8_marlin_balanced_256x64x128_TN_BF16_WGM8.s`, symbol `DEEPGEMM_FP8_FP8_BF16_PERCHANNEL_MARLIN_ASM_TN_MT256x64x128_WGM8_GROUPGEMM_MASKED`.
+- `MT256x256x128` is the normal/contiguous large-tile reference in the same scratch workspace, not the masked low-latency reference used for LL baseline comparison.
+- The attempted Pro MT256 pure diagnostic branch is therefore not the right primary optimization direction for `ll-masked`; it was also unstable on 151.1 and has been removed from the runnable code path.
+- Continue Pro K1 pure optimization from the stable low-latency pure-gemm skeleton and compare/borrow only from the masked `256x64x128` reference unless new package-symbol evidence proves a different masked dispatch.
+
+DeepGEMM package-commit reference check:
+- Local reference repo was cloned from `http://42.228.13.241:10068/dcutoolkit/deeplearing/deepgemm.git` on `develop`, then checked out to the environment package commit `6a53e9c45c7d6b46395c3a85231d5f2322a36a2a`.
+- The current environment package reports `deepgemm` version `2.1.0+das.opt1.dtk2604.torch2100.2606152155.g6a53e9`, so this checkout matches the active baseline rather than newer develop HEAD.
+- For `m_grouped_fp8_gemm_nt_masked`, `deepgemm_masked_config_i8fp8()` maps `EXPECTED_M16/32/64` to `mode=1002`, and values beyond configured keys also fall back to `1002`. Python config names this rows `block_m=64`, cols `block_n=256`.
+- In C++ dispatch, `mode=1002` launches `_m_grouped_marlin_fp8_gemm_nt_masked_asm_impl<256, 64, 128, scalar_t, 512>`, which maps to code object `deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co`.
+- Offline `llvm-readelf`/`llvm-objdump` on the installed gfx938 `.co` confirmed one kernel symbol, `DEEPGEMM_FP8_FP8_BF16_PERCHANNEL_MARLIN_ASM_TN_MT256x64x128_WGM8_GROUPGEMM_MASKED`, with a 512-thread/WGM8 style kernel. The disassembly has 128 `v_mmac_f32_16x16x32_fp8_fp8` instructions, B-side LDS reads (`ds_read_b128`), direct global `buffer_load_dwordx4`, and scalar `s_waitcnt`/`s_barrier` scheduling.
+- Optimization implication: do not change LL weight layout to chase this baseline. The actionable structure to borrow is the Pro masked GEMM pipeline shape: 8 waves / 512 threads, 128 persistent workgroups, row tile 64, column tile 256, and an LDS-backed B-side pipeline. The current MegaMoE pure LL K1 skeleton is direct-load/shuffle and 4-wave on the production path, so the remaining gap is likely the GEMM core pipeline, not dispatch or layout.
+
+Local diagnostic cleanup finding:
+- Keep `--k1-only-ll-block-n` because it is still useful for the stable pure-gemm core comparison, but do not keep `--k1-only-ll-cus` or the 128-CU/8-wave instantiation as a casual diagnostic knob.
+- Reason: DeepGEMM masked's 512-thread/WGM8 structure is a kernel-design reference, not proof that the existing direct-load LL K1 template can be safely widened by only changing `CUS/WARPS`. A future 8-wave path should be introduced as an intentional Pro-only kernel family with correctness and performance data, not hidden behind the current harness.
+
+Old C LL vs masked ASM shape finding:
+- The user's suspicion is valid: the old `C fp8 groupgemm` LL path was designed and measured against Flash `E32,N4096,K4096`, and in that shape it still tracks the copied masked ASM closely on 151.1: C-LL is slightly faster through tokens 256 and only about `1.15x` slower at token512.
+- The same old C-LL skeleton does not generalize cleanly to Pro `E24,N6144,K7168`. In the scratch harness, Pro `blockN=256` is `4.6x-9.6x` slower than the masked ASM, while Pro `blockN=128` is much better but still `1.3x-2.3x` slower.
+- This means the current Pro pure-K1 gap is not primarily caused by MegaMoE dispatch, stage copy, K2/K3, or graph mechanics. The old direct-load/shuffle C-LL GEMM core has a shape cliff at Pro K/N. Any next optimization should first explain/profile this standalone gap against the masked `256x64x128` ASM structure.
+- Scratch candidate sweep shows launch widening is not enough: `CU128`, `8 waves`, and `BM64/BN256` are all slower than the current `4w/CU64/BM48/BN128` direct-load skeleton for Pro E24. This strengthens the hypothesis that the gap is the memory/compute pipeline structure, not merely persistent block count or wave count.
+
+Pro LDS-backed pack5 skeleton finding:
+- Direct Pro C-LL profiling and ISA inspection show a clean core gap: tokens512 direct C-LL averages about `2.48 ms`, while masked ASM averages about `1.18 ms`. The direct slice is dominated by fully unrolled global loads plus `ds_bpermute`; the masked reference uses a compact LDS-backed WGM8 `256x64x128` structure.
+- Removing the direct kernel's scheduler barrier is not valid even though it is faster. The no-sched variant improves tokens512 to about `2.30 ms` but fails correctness with `max_abs=0.0610352`, so that dependency must be respected for the direct-load/shuffle path.
+- A scratch-only Pro parameterization of the existing LDS-backed pack5 C skeleton is correct after three Pro-specific fixes:
+  - template `kProblemN/K` must be `6144/7168`, not fixed `4096/4096`;
+  - lowlat-pack expert stride must be `N*K`, and K-outer stride must be `N*64`;
+  - Flash's `stage_iter ^ 16` ordering is invalid for Pro because K=7168 has 56 K-stages; Pro uses linear K-stage order in the scratch candidate.
+- The corrected LDS row256 candidate is exact against the ASM reference at tokens512 (`max_abs=0`, no bit mismatches), and improves large-bucket Pro pure K1 materially:
+  - tokens128: masked `0.6142 ms`, direct C-LL `0.7964 ms`, LDS row256 `1.2018 ms`;
+  - tokens256: masked `0.6432 ms`, direct C-LL `1.5931 ms`, LDS row256 `1.3151 ms`;
+  - tokens512: masked `1.1948 ms`, direct C-LL `2.4797 ms`, LDS row256 `1.4948 ms`.
+- The row256 path should not replace the direct path globally: it over-computes small buckets and loses at tokens128. Treat it as a Pro large-bucket kernel candidate, while preserving Flash and Pro small-bucket behavior.
+
+Formal row256 port recheck:
+- The formal MegaMoE K1-only check showed the row256 LDS candidate is not correct for the current LL contract. On the same staged input/layout, LDS row256 differed from both direct128 LL and DeepGEMM `ll-masked` by the same amount (`max_abs` about `0.066-0.074`).
+- The scratch pass was against the normal/MT256x256 reference path, while MegaMoE LL compares against the masked WGM8/direct orientation. This is a reference-orientation mismatch, not a stale-build problem.
+- Do not connect the current row256 LDS skeleton to fused LL. Any future Pro K1 pure kernel must preserve the existing LL weight layout and the LL masked/direct output orientation, or prove a full rewrite against `ll-masked` before entering production code.
+
+Pro masked-K1 fused path finding:
+- The fastest currently verified Pro LL K1 route is an independent-layout path, not the old unified-layout C-LL pure kernel. It uses MegaMoE LL K1 only for deterministic route/stage packing, then calls the same DeepGEMM masked grouped GEMM wrapper as the `ll-masked` baseline for L1.
+- This is intentionally additive: the old Flash-friendly Pro unified-layout LL path with `blockN=128` and `blockM=48` remains present as a compatibility/fallback path, and Flash does not select `ll_pro_masked`.
+- On Pro EP16 512, the new fused path is faster than both the old unified-layout fused path and the end-to-end baseline because K1 uses DeepGEMM masked while K2/K3 still use MegaMoE fused execution: `3.877 ms` vs old unified `5.233 ms` vs baseline `4.877 ms`.
+- Graph cap512 replay `8/32/128/256/512` passed correctness and measured `1.014/1.126/1.370/2.239/3.872 ms`, all faster than the `ll-masked` baseline `2.420/2.483/2.646/3.378/4.780 ms`.
+- Pro EP8 also validates the same shape-gated path with `local_experts=48`: eager 512 `3.917 ms` vs baseline `5.678 ms`, and graph cap512 replay `8/32/128/256/512` `1.435/1.902/2.100/2.424/3.936 ms` vs baseline `3.325/3.744/3.913/4.147/5.729 ms`. Correctness max_abs stays at `0.000488281` or `0.000976562`. The same-code unified-layout fallback graph replay512 is `5.314 ms`, so the new path is about `1.35x` faster than unified for Pro EP8 512.
+- A fresh Pro EP16 unified-layout graph A/B on the same current code gives replay512 `5.185 ms`, which is slower than both the new independent-layout path and the baseline. This keeps the unified path useful as a compatibility/fallback route, but it should not be the preferred Pro LL performance path if the remaining guardrails pass.
+- User-adjusted next direction: do not keep comparing against old Pro unified fused K1 during optimization. The meaningful ladder is DeepGEMM masked ASM -> Pro C pure K1 -> Pro Flash-style fused K1.
+- The current `ll_pro_masked` split path is therefore best viewed as an interim high-performance fallback and oracle. It proves the independent layout is viable and gives an e2e target, but it does not answer whether K1 can be fused back into MegaMoE without losing the masked-ASM-level GEMM core.
+- Next kernel finding to prove: a Pro C pure K1 kernel can match the `256x64x128 WGM8 GROUPGEMM_MASKED` reference while preserving LL/masked orientation and `actual_m`. Only after that proof should route/stage/start-barrier fusion be attempted.
+
+Direct masked-layout prototype finding:
+- The masked DeepGEMM L1 layout is not just a linear `[N16,K16]` order. The Pro C prototype must apply the same physical N16 mapping used by the pack5/marlin family inside each 16-wide N group. Missing this mapping caused the large same-input K1 diff; adding it reduced the difference to one BF16 quantum (`max_abs=0.00390625`, mean about `4e-09`) in the Pro EP16 token128 same-input check.
+- Correctness alone is not enough: direct masked-layout loads are much slower than the DeepGEMM masked ASM at Pro size. The measured token128 ratios were `7.37x` for the widened `BM64/BN256/8wave` prototype and `5.83x` for the current direct `BM48/BN128/4wave` skeleton.
+- Treat the direct masked-layout C path as a diagnostic/orientation oracle only. The next viable pure K1 candidate needs an LDS-backed masked-orientation pipeline that borrows the `256x64x128 WGM8 GROUPGEMM_MASKED` structure without returning to the rejected normal/MT256 row256 contract.
+
+Formal C backend hook finding:
+- The Pro masked-K1 path now has a formal MegaMoE C groupgemm backend gate. With `MEGAMOE_DCU_PRO_LL_MASKED_K1_C_GROUPGEMM=1`, `ll_pro_masked` still uses K1 stage-only route/stage packing, but L1 GEMM is produced by the MegaMoE C pure groupgemm extension instead of the DeepGEMM masked wrapper.
+- This validates integration shape and correctness in the real e2e path: Pro EP16 token128 eager passed against `ll-masked` with `max_abs=0.000488281`.
+- It also quantifies the current gap in the real path: the C backend smoke measured about `5.86 ms`, far slower than the masked baseline timing in that short run. Therefore the C backend is now a formal optimization target/scaffold, not a performance solution.
+
+Formal LDS C backend finding:
+- The first formal masked-orientation LDS C candidate is correct but still not fast enough. On Pro EP16 LL token128, the default split path with DeepGEMM masked K1 measures `1.383 ms` fused, while the C LDS backend measures `2.290 ms` fused on the same command. This proves the remaining gap is in the C K1 core, not in the surrounding Pro `ll_pro_masked` e2e flow.
+- Resource metadata explains part of the gap: `V3_K1_ProMaskedLdsGroupGemmKernel<24>` uses `64 KiB` LDS and `211` VGPR/thread with no spill. The kernel maps one wave over a full N256 slice, so each compute wave carries 32 `float32x4` accumulators. That is structurally different from the masked `256x64x128` WGM8 reference, whose useful clue is 512 threads / 8 waves with an LDS-backed pipeline and much more compact static MMAC structure.
+- The current 256-thread LDS candidate is useful as a correctness-bearing formal scaffold and is much faster than the direct C scaffold, but it should not be treated as the final pure K1 design. Next optimization should intentionally build a WGM8-like Pro C K1 family that splits the N256 tile across more compute waves to reduce accumulator pressure, rather than simply changing `blockN` or widening the old direct-load template.
+- 151.1 became unreachable during a K1-only same-input compare of this candidate. Until the node recovers, do not infer a kernel correctness failure from that run; first verify host/container/HCU state, clear any stale distributed processes, then rerun a short K1-only smoke.
+
+ASM-guided current C finding:
+- Current C save-temps and object-level extraction show the first formal Pro masked LDS backend is still structurally far from DeepGEMM masked ASM even though the math core has the same `128` `v_mmac` static count.
+- The C `<24>` kernel uses `64 KiB` LDS and keeps two compute waves over M halves; DeepGEMM masked uses a 512-thread WGM8 layout with compute waves `0..3` and loader waves `4..7`.
+- The ASM line `s_mul_i32 s[sgprTemp0], s[sgprWaveiD], NperWAVE` with `NperWAVE=16` is the key mapping clue: wave id shifts N ownership, while row ownership is derived from lane group plus store row offsets. The earlier 512-thread/M16 C experiment was wrong because it split physical rows by wave id instead of splitting N.
+- A naive single-LDS-stage C attempt is invalid. It reduces LDS metadata from `64 KiB` to `32 KiB`, but it lets loader waves overwrite the same LDS buffer for the next K stage while compute waves still read the current stage. Correctness failed with `max_abs~0.99`.
+- Optimization implication: keep the current DeepGEMM masked split path as the fallback/oracle. The next real C optimization must rewrite wave ownership and scheduling closer to WGM8 while preserving the LL masked layout/output contract; do not spend more time on single-buffer or blind blockN sweeps.
+
+Tune-loop extraction finding:
+- Full `k1_fused_ext.cu + k1_v3_fused_ext.cu` rebuilds are too slow for ASM-guided iteration. The practical loop is now a tune-only extension that compiles only the Pro masked LDS pure K1 launch and the current C kernel header.
+- This keeps the same-input contract intact: staged input/scales and masked L1 weights come from the real K1 stage-only path, while timing/diff compares directly with DeepGEMM masked on those tensors.
+- Optimization target remains strict: generated C `.s` should converge toward the installed DeepGEMM masked `256x64x128 WGM8 GROUPGEMM_MASKED` structure, and the C pure K1 should approach ASM performance while reducing the residual BF16-level diff where possible.
+- First tune-only `.s` comparison confirms the current gap. Per instantiated C kernel (`local_experts=12/24/48`), static counts are `128 v_mmac`, `32 ds_read_b128`, `24 ds_read_b32`, `36 buffer_load_dwordx4`, `256 buffer_store`, `61 s_barrier`, `379 s_waitcnt`, `2 s_setprio`. The DeepGEMM masked source reference has the same `128 v_mmac` but far fewer scheduling/epilogue instructions in the source count: `26 buffer_load_dwordx4`, `29 buffer_store`, `16 s_barrier`, `21 s_waitcnt`, `8 s_setprio`.
+- Immediate optimization target is therefore not arithmetic coverage but C schedule/ownership: reduce store fanout, reduce wait/barrier count, and move toward the ASM WGM8 wave ownership where wave id splits N (`NperWAVE=16`) instead of the current two-compute-wave row split. Precision work should follow the same alignment: match ASM accumulation/store/scale order to see whether the current one-BF16-quantum max diff can be reduced.
+- Matching the ASM scale order is useful for precision: computing `weight_scale * x_scale` first and then multiplying by the accumulator made the Pro EP16 token128 tune-ext K1 output bit-exact versus DeepGEMM masked (`max_abs=0`, `mean_abs=0`) without materially changing timing or generated instruction structure. Keep this precision alignment unless a later WGM8 rewrite naturally supersedes it.
+- The first 512-thread WGM8 rewrite proved that N-split alone is not sufficient. A weight-LDS WGM8 variant lowered VGPR/static store count but slowed token128 to `2.3890 ms` because each N-split compute wave still reloaded the same `x` rows from global memory.
+- The useful WGM8 dataflow is input-LDS plus direct masked-weight loads, matching the DeepGEMM masked asm direction. The current best tune-only C candidate stages `x` in LDS, direct-loads masked weights, uses masked-only stores for small partial tiles, and maps wave id to interleaved N16 groups (`n16 = R * 4 + wave_id`). On Pro EP16 token128 it is bit-exact versus DeepGEMM masked and improves C K1 to `1.2900 ms` versus DeepGEMM `0.9800 ms` (`1.316x`).
+- The asm row-based LDS swizzle cannot be copied mechanically into the current x-LDS layout. The direct `k_vec ^ (row & 7)` write/read attempt failed correctness with `max_abs=1.67578125`; any future swizzle work must re-derive the exact layout rather than reusing that patch.
+
+Full-tile x-LDS loader finding:
+- Removing redundant loader bounds and adding a branchless full-tile x prefetch path is a valid C approximation of the ASM's branch-light prefetch style. It keeps partial tiles guarded and preserves bit-exact output versus DeepGEMM masked.
+- The current best Pro EP16 pure C K1 matrix is now tokens `8/32/128/256/512`: C `1.0785/1.1309/1.1506/1.6135/2.5278 ms`, DeepGEMM masked `0.8675/0.9616/0.9898/1.4401/2.1596 ms`, ratios `1.243/1.176/1.162/1.120/1.170`, with `max_abs=0` and `mean_abs=0` for every bucket.
+- The remaining gap is no longer a gross layout or precision problem. The likely gap is compiler scheduling around direct masked-weight loads and store/control lowering: generated C still cannot reproduce the ASM's coarse `s_waitcnt vmcnt(8)` grouping, and compiler-emitted waits/control remain heavier than the hand-written `.s`.
+- Next high-value options should therefore be source-backed and `.s`-checked: either use a bounded buffer-resource probe to replace partial-tile row branches safely, or introduce a very small inline-asm load/MMAC scheduling block for the weight side so C can hold more outstanding weight loads like the ASM. Do not spend more time on blind blockN/blockM sweeps.
+
+ASM-guided scheduling rejection finding:
+- Relaxing the phase4 wait by issuing the next-stage first four weight loads before `s_waitcnt vmcnt(4)` is unsafe in the generated C kernel. Even though the local `.s` window looked closer to hand ASM, token128 produced NaNs and `max_abs=0.3076171875`, which means the compiler/hardware queue ordering does not give the same guarantee as the hand-written ASM schedule.
+- Two source-level simplifications were also measured and rejected. `#pragma unroll 2` made static shape more ASM-like but slowed token512; splitting full-tile and partial-tile store epilogues reduced static control but did not improve runtime. The retained kernel is therefore the previous split-prefetch x-LDS baseline.
+- Moving `s_setprio` outside the K-stage loop is also a negative result. Keeping high MMAC priority across the entire loop worsened all checked buckets, so the per-stage high/normal priority toggles should remain in the current C schedule.
+- Precision is currently not the limiting factor for the checked pure-K1 buckets: all retained and most rejected correct candidates are bit-exact versus DeepGEMM masked (`max_abs=0`, `mean_abs=0`). The remaining work is pipeline/scheduling latency, not numerical accuracy.
+- The reference C/ASM-style packed epilogue (`v_pk_mul_f32`) is not a win in this generated C x-LDS kernel. It reduced static wait count and VGPRs, but Pro EP16 token `128/256/512` C times were `1.1573/1.6495/2.5306 ms`, worse than the retained split-prefetch baseline at the important 256/512 buckets. Keep the scalar epilogue unless a larger rewrite changes register scheduling.
+- Splitting LDS consumption with `lgkmcnt(2)` is correct but not beneficial in the current phase shape. The `.s` formed the intended partial-wait schedule and stayed bit-exact, but token `128/256/512` C times were `1.1465/1.6482/2.5152 ms`; only 128 marginally improved while 256/512 regressed. Do not retry this exact 4-read/2+2 split without changing the surrounding MMAC/load grouping.
+- Grouping four masked-weight `buffer_load_dwordx4` instructions into one inline asm block is also not a win. The first form was invalid because outputs used `=v` instead of early-clobber and clobbered offset VGPRs inside the asm block, causing a token256 VMFault. The corrected `=&v` form stayed bit-exact but measured token `128/256/512` C times `1.1402/1.6133/2.7117 ms`; token512 regressed badly, so the retained per-load helper remains better.
+- Removing the phase0/phase4 accumulator `s_nop` dependency block is not a clean win. It remains bit-exact and slightly improves token512 absolute C time in one run (`2.4719 ms`), but token256 regresses (`1.6651 ms`), so keep the dependency block in the retained baseline.
+- A phase-priority retiming variant is also rejected. It stayed bit-exact but did not improve the important buckets (`128/256/512` measured `1.1655/1.5922/2.4961 ms`), so the retained per-stage priority placement remains the better baseline.
+- A `vmcnt(8)` double-buffered next-weight prefetch variant is unsafe in generated C. It increased VGPR pressure substantially and VMFaulted in `V3_K1_ProMaskedXLdsWgm8GroupGemmKernel<24>` during token128/tune testing. After reverting it, token128 smoke returned to `1.1661 ms` vs DeepGEMM `0.9573 ms`, ratio `1.218x`, with `max_abs=0`. Do not retry loop-carried pending VMEM registers without a tighter inline-asm/control proof.
+- The actual DeepGEMM masked code object, not just the macro source `.s`, has `128 v_mmac`, `26 buffer_load_dwordx4`, `16 ds_read_b128`, `64 buffer_store_short`, `12 s_barrier`, `15 s_waitcnt`, and `8 s_setprio`. This confirms the reference really is slimmer than the retained C x-LDS kernel in wait/control and uses 64 stores, not an artifact of macro-source counting.
+- Unconditional padding-row stores are rejected despite making the C `.s` statically closer to the reference. The variant reduced `<24>` static control to `64 buffer_store_short`, `77 s_waitcnt`, `19 s_cbranch`, and `5 v_cmp`, and stayed bit-exact, but token `128/256/512` measured `1.1507/1.6186/2.5129 ms`. Extra padding writes outweigh the branch reduction on the checked buckets, so keep the masked partial-tile store path.
+- Offset-increment weight addressing is also rejected. It looked like a reasonable C simplification for `K1_XLDS_LOAD_W_AT` by carrying `w_off*` across K stages, but the generated kernel raised VGPR pressure (`123 -> 127`) and regressed token `128/256/512` to `1.1564/1.6807/2.5308 ms` while remaining bit-exact. The retained direct address expression is better because the compiler can schedule/recompute it without carrying eight extra loop-state VGPRs.
+- After reverting offset-increment, the restored generated C `.s` for `<24>` matches the retained split-prefetch static shape: `64 v_mmac`, `22 buffer_load_dwordx4`, `8 ds_read_b128`, `128 buffer_store_short`, `6 s_barrier`, `217 s_waitcnt`, `2 s_setprio`, `131 s_cbranch`, `101 v_cmp`, and no `vmcnt(8)`. Token128 smoke is again bit-exact versus DeepGEMM masked (`1.1435 ms` vs `0.9687 ms`, ratio `1.180x`).
+- The `MT256x64x128` reference shape should not be copied as a plain C N64 retile while keeping M64. A tune-only `xlds_wgm8_n64` candidate stayed bit-exact and had much lighter per-CTA static counts (`16 v_mmac`, `10 buffer_load_dwordx4`, `32 buffer_store_short`, `62 s_waitcnt`), but token128 slowed to `1.8438 ms` vs DeepGEMM `0.9524 ms`. The reason is likely that N64 increases CTA count by 4x without reproducing the reference's M256 row ownership and hand-scheduled main loop.
+- The next4 relaxed-wait idea is rejected even with early-clobber single-load outputs. The generated `.s` did contain `buffer_load_dwordx4` for the next-stage phase0 weights followed by `s_waitcnt vmcnt(4)`, but the compiler/control-flow lowering still emitted a later `s_waitcnt vmcnt(0)` before phase4 MMAC, and runtime produced NaNs (`max_abs=0.40478515625`). This confirms that pending-VMEM retiming cannot be safely expressed with the current C variables and small inline helpers; it needs a larger hand-controlled block if pursued.
+- The current evidence says precision is already at the practical target for the checked pure K1 buckets (`max_abs=0`). Further "precision improvement" should come naturally from preserving the ASM scale/order and avoiding unsafe wait changes; the main remaining gap is load/wait/MMAC scheduling. Small C edits that only improve static counts have repeatedly failed, so the next candidate should be a larger ASM-guided C/inline-asm block or a re-derived LDS layout that changes the actual main-loop schedule.
+
+Pro fused-C K1 implementation finding:
+- The first fused-C Pro LL K1 implementation deliberately copies the successful Flash-style structure rather than inventing a new driver flow: route/stage/start-rank-barrier is produced inside the K1 kernel, then the retained `xlds_wgm8` C groupgemm consumes the staged tensors and `actual_m` metadata in a persistent tile loop.
+- The path is opt-in and shape-gated by `MEGAMOE_DCU_PRO_LL_MASKED_K1_FUSED_C=1`, `hidden=7168`, `l1_rows=6144`, `ll_block_m=48`, and `ll_cus=64`; Flash and the default Pro split DeepGEMM masked fallback should not select it.
+- The fused helper needs an extra block-level barrier after the tile store path because the old pure groupgemm kernel returned after one tile, while the fused kernel keeps the same CTA alive for the next persistent tile. Without that barrier, loader waves for the next tile can overwrite x-LDS while compute waves from the previous tile are still finishing scale reads/stores.
+- Runtime proof now shows the fused-C path is correct but not yet faster than the default split DeepGEMM masked-K1 path. On Pro EP16 LL eager, split measures `1.3687/2.2304/3.8939 ms` at tokens `128/256/512`; fused-C measures `1.6186/2.5056/4.2445 ms` before barrier retiming, and `1.6108/4.2252 ms` for checked `128/512` after moving the persistent-tile barrier before stores.
+- The readlane broadcast tweak for `actual_m` is now measured. It improves fused-C slightly but does not change the decision: readlane fused-C measures `1.6004/2.4841/4.2079 ms` at tokens `128/256/512`, while the same-window default split path measures `1.3710/2.2329/3.9052 ms`.
+- Interpretation: the fusion mechanics are viable and correct, but simply embedding the current C x-LDS backbone does not beat the DeepGEMM masked ASM split call. Keep fused-C as an opt-in experiment and keep split DeepGEMM masked-K1 as the Pro LL default. Further work should only proceed if the C backbone/main-loop schedule changes materially; do not change the LL weight layout or default fallback to chase this result.
+
+Pro LL split finalization finding:
+- Final user decision is to stop pursuing Pro LL K1 fusion for this branch and keep the split path as the production route.
+- Production Pro LL split should mean: K1 stage-only route/stage packing inside MegaMoE, followed by a MegaMoE-packaged launch of the masked FP8 group GEMM ASM code object. It must not import/call the external Python `deepgemm` package in the MegaMoE execution path.
+- The external `deepgemm` package remains acceptable for test baselines such as `--baseline-kind ll-masked`, because those are oracle/comparison paths rather than MegaMoE fused execution.
+- Pro LL tests should default to `ll_pro_masked` for the Pro shape. `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` is the only Pro LL test-harness override that should force the old unified-layout compatibility kernel.
+- The remaining pure-K1/C-fusion scaffolding is not part of the final branch contract. The source should not expose `ll_pure_*`, `--k1-only-*`, Pro LL fused-C env knobs, or tune-only extension paths; future K1 experiments should be reintroduced on a separate branch if needed.
+- The first bundled masked K1 integration attempt used an untracked scratch `.s`, not the active DeepGEMM package's masked kernel. The active environment is DeepGEMM commit `6a53e9c45c7d6b46395c3a85231d5f2322a36a2a`, and its installed/develop masked Pro LL kernel is the prebuilt code object `deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co` with hash `73184662ec644cf9f4e9cfacec720a15428e84c5f84ad06e6e9e57bfa06543b4`.
+- Correct integration should copy that `.co` as a prebuilt package artifact and never recompile the unrelated scratch `.s`. After switching to the develop `.co`, the MegaMoE default Pro LL split path passed Pro EP16 LL eager and graph cap512 against `ll-masked`, with graph replay512 `3.9464 ms` versus baseline `5.1602 ms`.
+
+Pro EP8 LL split correctness isolation finding:
+- Pro EP16 LL split is validated, but Pro EP8 LL token256 needs a clean-card rerun. The first failures have valid route stats and final fused output equal to the sum of visible combine slots for the failing column, which points away from the final local reduce and toward per-route slot production or the split-tail slot copy.
+- Because the latest no-split-tail ablation overlapped with a resident SGLang service and hit allocation pressure, it is not usable evidence. The decisive next test is the same input on clean cards with split-tail enabled versus disabled.
+- If split-tail-off passes, inspect `k3_v3_ll_combine_tail_split` slot copy/signaling. If it fails the same way, inspect the route owner's staged row through K1 masked GEMM, K2 activation, and K3 `output_workspace` before combine.
+- The current capacity-overflow hypothesis is testable and must not be assumed as fact. Pro EP8 LL token256 is the most sensitive bucket because expected rows per local expert are `256 * 6 / 48 = 32`, aligned capacity is `64`, and the current LL headroom threshold does not add slack below expected `48`. If a failing run shows every `actual_m <= 64` and valid `row_combine_ptrs`, the capacity hypothesis should be dropped in favor of K3 split-tail copy/publish or per-route K1/K2/K3 value tracing.
+- Clean-card token256 evidence now rules out split-tail as the first boundary: the default and `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` runs both fail, and the fused output matches the visible combine-slot sum. Route-slot diagnostics for the default failing point show valid `row_combine_ptrs`, `row_in_expert < actual_m`, and nonzero staged scales, but some route rows have zero L1 output, default/min activation scale, and zero K3 output.
+- Current-source token512 passes with the same Pro EP8 LL split path. The 256/512 contrast aligns with the masked K1 launch size: token256 uses `rows_per_expert=64` (`num_MBlocks=1`), while token512 uses `rows_per_expert=128` (`num_MBlocks=2`). The current minimal fix is to force only Pro EP8 LL masked K1 to at least `128` rows/expert across K1 launch and route-scratch sizing; this is a launch-shape guard, not a weight-layout change.
+- The Pro EP8 LL min-rows fix is validated. Uniform tokens `8/32/64/128/256/512`, uneven EP8, and uneven EP16 all pass against `ll-masked`. Performance after the fix is acceptable for the split path: Pro EP8 eager is faster than `ll-masked` from token32 upward and graph is faster on every checked replay bucket. Flash EP8 LL graph cap512 still matches the prior `~1.814 ms` replay512 guardrail, so the Pro-shape guard did not produce a Flash LL regression.
+
+LL baseline fairness finding:
+- `ll-masked` baseline graph and eager paths both use CUDA graph replay internally, but they were not necessarily doing the same amount of work. The old test harness passed the graph allocation capacity (`sym_buffer.cuda_graph_max_tokens_per_rank`, e.g. Pro EP8 cap512 allocating/printing `512/768`) into DeepEP `low_latency_dispatch()` as `num_max_tokens_per_rank`.
+- MegaMoE graph already uses the runtime token bucket for its active work. For a fair `ll-masked` baseline, the DeepEP LL dispatch cap must also be aligned to the current bucket (`expected_tokens_per_rank`, bounded by the actual local input rows), while the larger graph allocation cap remains only a buffer allocation property.
+- The corrected Pro EP8 LL graph cap512 baseline medians are `1.4417/1.9496/2.1295/2.4835/3.1822/5.7530 ms` for replay tokens `8/32/64/128/256/512`, versus MegaMoE `1.4314/1.9004/1.9800/2.1053/2.4702/3.9245 ms`. This supersedes the earlier unfair small-bucket graph baseline values around `3.33-4.16 ms`.
+- Do not cite old Pro EP8 graph `ll-masked` baseline data collected before this harness fix as fair performance comparison data. Re-run eager/graph/uneven summaries with the runtime-token-aligned harness if they are needed for final reporting.
+
+Unified LL capacity finding:
+- The unified LL K1/K2/K3 path is already closer to a masked design than a pure fixed-M design: K1 computes per-expert tile counts from `actual_m`, K2 scans or reads the max actual M, and K3 reads `actual_m` before iterating rows. Therefore a moderate `m_per_expert` guard can reduce skew overflow risk without forcing every later stage to process all padded rows.
+- The remaining non-free costs of a larger guard are scratch size, K1 row initialization/staging metadata, and tail-tile/padding stores. This is materially cheaper than making the Pro split DeepGEMM masked ASM always use a larger `size_m`, so the 256-row skew guard is limited to Flash LL and Pro unified-layout LL (`ll_stage_only == false`).
+- Pro default LL split remains governed by the separate Pro EP8 128-row masked-K1 launch-shape guard. Raising that path to 256 by default would change the DeepGEMM masked ASM `size_m`/`num_MBlocks` and is not currently justified by measured correctness data.
+- 151.1 runtime smoke supports this split: Pro default LL split EP8/EP16 graph remains correct and performant, Pro `MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1` graph smoke is correct, and Flash EP8/EP16 LL graph guardrails remain in the historical band. The unified 256-row guard did not produce an observed Flash precision or performance regression in the checked cap512 graph buckets.
+- Direct Flash EP8 LL small-cap retest also supports the same conclusion: cap8/replay8 measured `0.5446 ms` vs `ll-masked` `0.5452 ms`, and cap32/replay32 measured `0.6402 ms` vs `ll-masked` `0.6545 ms`, both with graph correctness passing.

@@ -60,6 +60,39 @@ void dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
     int graph_max_tokens,
     hipStream_t stream);
 
+void dcu_megamoe_v3_launch_k1_ll_stage_only_pack5(
+    const uint8_t* staged_x,
+    const float* staged_x_scale,
+    uint8_t* sym_buffer,
+    int32_t* route_scratch_i32,
+    int32_t* grid_barrier,
+    int barrier_epoch,
+    int rank_idx,
+    int num_ranks,
+    int num_global_experts,
+    int num_max_tokens_per_rank,
+    int num_topk,
+    int hidden,
+    int l1_rows,
+    int runtime_num_tokens,
+    int rows_aligned_per_expert,
+    int ll_block_m,
+    int ll_cus,
+    float* route_weights,
+    int32_t* row_expert_out,
+    int32_t* output_index,
+    int64_t* row_combine_ptrs,
+    uint8_t* local_topk_mask,
+    int32_t* tail_tokens,
+    int32_t* cumulative_local_expert_recv_stats,
+    bool enable_start_rank_barrier,
+    int32_t* tail_done_counter,
+    const int32_t* graph_runtime_num_tokens_for_barrier,
+    int32_t* graph_runtime_num_tokens_out,
+    int32_t* graph_tail_signal_generation_out,
+    int graph_max_tokens,
+    hipStream_t stream);
+
 #define K1_HIP_CHECK(expr)                                                       \
     do {                                                                        \
         const hipError_t _status = (expr);                                       \
@@ -71,6 +104,9 @@ namespace {
 
 static constexpr const char* kFusedL1AsmKernelName =
     "DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1";
+static constexpr const char* kProLlMaskedL1AsmKernelName =
+    "DEEPGEMM_FP8_FP8_BF16_PERCHANNEL_MARLIN_ASM_TN_"
+    "MT256x64x128_WGM8_GROUPGEMM_MASKED";
 static constexpr int kK1RouteTileM = 256;
 static constexpr int kK1SupportedAlignment = 256;
 static constexpr int kK1RouteCapacitySlack = 64;
@@ -275,6 +311,33 @@ struct LoadedAsmKernel {
     std::string kernel_name;
     hipModule_t module = nullptr;
     hipFunction_t function = nullptr;
+};
+
+template <typename T>
+struct ProLlMaskedGroupGemmArgs {
+    uint32_t num_MBlocks;
+    uint32_t num_NBlocks;
+    T* ptr_C;
+    const char* ptr_A;
+    const char* ptr_B;
+    float* ptr_A_scale;
+    float* ptr_B_scale;
+    const int32_t* masked_m;
+    uint32_t experts_num;
+    uint32_t size_m;
+    uint32_t size_n;
+    uint32_t size_k;
+    uint32_t stride_ase;
+    uint32_t stride_asm;
+    uint32_t stride_ask;
+    uint32_t stride_bse;
+    uint32_t stride_bsn;
+    uint32_t stride_bsk;
+    uint32_t numFullBlocks;
+    uint32_t wgmRemainder1;
+    uint32_t magicNumberWgmRemainder1;
+    void* reserved_buffer;
+    const int32_t* signal;
 };
 
 LoadedAsmKernel& asm_kernel_cache() {
@@ -850,7 +913,145 @@ void launch_l1_deepgemm_fused_asm(
                 hipGetErrorString(post_launch_status));
 }
 
+void launch_pro_ll_masked_groupgemm_asm(
+    const torch::Tensor& input,
+    const torch::Tensor& input_scale,
+    const torch::Tensor& weight_masked,
+    const torch::Tensor& weight_scale,
+    const torch::Tensor& output,
+    const torch::Tensor& masked_m,
+    const int64_t expected_m_per_group,
+    const std::string& code_object_path) {
+    const c10::OptionalDeviceGuard device_guard(at::device_of(input));
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous() &&
+                    input.scalar_type() == torch::kFloat8_e4m3fn,
+                "Pro LL masked K1 input must be contiguous CUDA FP8");
+    TORCH_CHECK(input_scale.is_cuda() && input_scale.is_contiguous() &&
+                    input_scale.scalar_type() == torch::kFloat32,
+                "Pro LL masked K1 input_scale must be contiguous CUDA FP32");
+    TORCH_CHECK(weight_masked.is_cuda() && weight_masked.is_contiguous() &&
+                    weight_masked.scalar_type() == torch::kFloat8_e4m3fn,
+                "Pro LL masked K1 weight must be contiguous CUDA FP8");
+    TORCH_CHECK(weight_scale.is_cuda() && weight_scale.is_contiguous() &&
+                    weight_scale.scalar_type() == torch::kFloat32,
+                "Pro LL masked K1 weight_scale must be contiguous CUDA FP32");
+    TORCH_CHECK(output.is_cuda() && output.is_contiguous() &&
+                    output.scalar_type() == torch::kBFloat16,
+                "Pro LL masked K1 output must be contiguous CUDA BF16");
+    TORCH_CHECK(masked_m.is_cuda() && masked_m.is_contiguous() &&
+                    masked_m.scalar_type() == torch::kInt,
+                "Pro LL masked K1 masked_m must be contiguous CUDA int32");
+    TORCH_CHECK(input.dim() == 3 && input_scale.dim() == 3 &&
+                    weight_scale.dim() == 3 && output.dim() == 3,
+                "Pro LL masked K1 expects input [E,M,K], input_scale [E,M,1], "
+                "weight_scale [E,N,1], and output [E,M,N]");
+    const int64_t experts = input.size(0);
+    const int64_t size_m = input.size(1);
+    const int64_t size_k = input.size(2);
+    const int64_t size_n = weight_scale.size(1);
+    TORCH_CHECK(experts == output.size(0) && experts == input_scale.size(0) &&
+                    experts == weight_scale.size(0),
+                "Pro LL masked K1 tensor expert dimensions must match");
+    TORCH_CHECK(output.size(1) == size_m && output.size(2) == size_n,
+                "Pro LL masked K1 output must be [E,M,N]");
+    TORCH_CHECK(input_scale.size(1) == size_m && input_scale.size(2) == 1,
+                "Pro LL masked K1 input_scale must be [E,M,1]");
+    TORCH_CHECK(weight_scale.size(2) == 1,
+                "Pro LL masked K1 weight_scale must be [E,N,1]");
+    TORCH_CHECK(masked_m.numel() >= experts,
+                "Pro LL masked K1 masked_m must cover all local experts");
+    TORCH_CHECK(expected_m_per_group > 0,
+                "Pro LL masked K1 expected_m_per_group must be positive");
+    TORCH_CHECK(size_k == 7168 && size_n == 6144 &&
+                    (experts == 12 || experts == 24 || experts == 48),
+                "Pro LL masked K1 internal ASM supports Pro local experts "
+                "{12,24,48}, K=7168, N=6144");
+    TORCH_CHECK(weight_masked.size(0) == experts &&
+                    weight_masked.numel() >= experts * size_n * size_k,
+                "Pro LL masked K1 weight must cover the masked Marlin "
+                "[E,N,K] storage");
+
+    ProLlMaskedGroupGemmArgs<hip_bfloat16> args{};
+    args.num_MBlocks = static_cast<uint32_t>(ceil_div_i64(size_m, 64));
+    args.num_NBlocks = static_cast<uint32_t>(ceil_div_i64(size_n, 256));
+    args.ptr_C = reinterpret_cast<hip_bfloat16*>(output.data_ptr());
+    args.ptr_A = reinterpret_cast<const char*>(weight_masked.data_ptr());
+    args.ptr_B = reinterpret_cast<const char*>(input.data_ptr());
+    args.ptr_A_scale = weight_scale.data_ptr<float>();
+    args.ptr_B_scale = input_scale.data_ptr<float>();
+    args.masked_m = masked_m.data_ptr<int32_t>();
+    args.experts_num = static_cast<uint32_t>(experts);
+    args.size_m = static_cast<uint32_t>(size_m);
+    args.size_n = static_cast<uint32_t>(size_n);
+    args.size_k = static_cast<uint32_t>(size_k);
+    args.stride_ase = static_cast<uint32_t>(weight_scale.stride(0));
+    args.stride_asm = static_cast<uint32_t>(weight_scale.stride(1));
+    args.stride_ask = static_cast<uint32_t>(weight_scale.stride(2));
+    args.stride_bse = static_cast<uint32_t>(input_scale.stride(0));
+    args.stride_bsn = static_cast<uint32_t>(input_scale.stride(1));
+    args.stride_bsk = static_cast<uint32_t>(input_scale.stride(2));
+    constexpr uint32_t kWorkgroupMapping = 8;
+    constexpr uint32_t kProblemNumGroupTiles1 = 1;
+    constexpr uint32_t kSmallNumMagicShift = 31;
+    uint32_t wgm_remainder = kProblemNumGroupTiles1 % kWorkgroupMapping;
+    if (wgm_remainder == 0) {
+        wgm_remainder = kWorkgroupMapping;
+    }
+    args.numFullBlocks = kProblemNumGroupTiles1 / kWorkgroupMapping;
+    args.wgmRemainder1 = wgm_remainder;
+    args.magicNumberWgmRemainder1 =
+        static_cast<uint32_t>((1ULL << kSmallNumMagicShift) / wgm_remainder + 1);
+    args.reserved_buffer = nullptr;
+    args.signal = nullptr;
+
+    hipFunction_t function =
+        get_asm_function(code_object_path, kProLlMaskedL1AsmKernelName);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    size_t arg_size = sizeof(args);
+    void* config[] = {
+        HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+        HIP_LAUNCH_PARAM_BUFFER_SIZE, &arg_size,
+        HIP_LAUNCH_PARAM_END};
+    constexpr size_t kLocalWorkSize = 512;
+    constexpr size_t kGlobalWorkGroups = 128;
+    const hipError_t launch_status = hipExtModuleLaunchKernel(
+        function,
+        kGlobalWorkGroups * kLocalWorkSize, 1, 1,
+        kLocalWorkSize, 1, 1,
+        0, stream, nullptr, reinterpret_cast<void**>(&config),
+        nullptr, 0, 0);
+    const hipError_t post_launch_status = hipGetLastError();
+    TORCH_CHECK(launch_status == hipSuccess,
+                "hipExtModuleLaunchKernel(Pro LL masked K1 asm) failed: ",
+                hipGetErrorString(launch_status));
+    TORCH_CHECK(post_launch_status == hipSuccess,
+                "hipGetLastError after Pro LL masked K1 asm launch failed: ",
+                hipGetErrorString(post_launch_status));
+}
+
 } // namespace
+
+void k1_ll_masked_groupgemm_pack5(
+    const torch::Tensor& input,
+    const torch::Tensor& input_scale,
+    const torch::Tensor& weight_masked,
+    const torch::Tensor& weight_scale,
+    const torch::Tensor& output,
+    const torch::Tensor& masked_m,
+    const int64_t expected_m_per_group,
+    const std::string& code_object_path) {
+    TORCH_CHECK(!code_object_path.empty(),
+                "Pro LL masked K1 asm code_object_path must not be empty");
+    launch_pro_ll_masked_groupgemm_asm(
+        input,
+        input_scale,
+        weight_masked,
+        weight_scale,
+        output,
+        masked_m,
+        expected_m_per_group,
+        code_object_path);
+}
 
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 k1_symm_fused_l1_asm_impl(
@@ -1155,7 +1356,7 @@ k1_symm_fused_l1_v3_asm_pack5(
         runtime_num_tokens, force_compact_prebuild, capacity_num_tokens);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+pybind11::tuple
 k1_symm_fused_l1_v3_pack5(
     const torch::Tensor& sym_buffer,
     const torch::Tensor& route_scratch,
@@ -1175,12 +1376,13 @@ k1_symm_fused_l1_v3_pack5(
     const std::optional<torch::Tensor>& runtime_num_tokens,
     const int64_t ll_block_m,
     const int64_t ll_cus,
-    const bool ll_asm_compatible_layout,
     const int64_t capacity_num_tokens,
     const bool enable_start_rank_barrier,
     const std::optional<torch::Tensor>& tail_done_counter,
     const std::optional<torch::Tensor>& graph_runtime_num_tokens_out,
-    const std::optional<torch::Tensor>& graph_tail_signal_generation_out) {
+    const std::optional<torch::Tensor>& graph_tail_signal_generation_out,
+    const bool ll_stage_only,
+    const bool ll_return_staged) {
     TORCH_CHECK(sym_buffer.is_cuda() && route_scratch.is_cuda() &&
                     l1_weight_pack5.is_cuda() && l1_scale.is_cuda(),
                 "V3 K1 tensors must be CUDA/HIP tensors");
@@ -1264,11 +1466,16 @@ k1_symm_fused_l1_v3_pack5(
     TORCH_CHECK(!graph_runtime_num_tokens_out.has_value() ||
                     runtime_num_tokens.has_value(),
                 "graph_runtime_num_tokens_out requires runtime_num_tokens");
+    TORCH_CHECK(!ll_return_staged || ll_stage_only,
+                "ll_return_staged requires ll_stage_only");
+    TORCH_CHECK(!ll_stage_only ||
+                    (hidden == 7168 && l1_rows == 6144 &&
+                     ll_block_m == 48 && ll_cus == 64),
+                "ll_stage_only is only enabled for the Pro LL masked-K1 path "
+                "(hidden=7168, l1_rows=6144, ll_block_m=48, ll_cus=64)");
 
     const bool use_ll = true;
-    const int64_t ll_row_tile =
-        ll_asm_compatible_layout ? kK1RouteTileM : 64;
-    const int64_t row_tile = use_ll ? ll_row_tile : kK1RouteTileM;
+    const int64_t row_tile = 64;
     const int64_t route_capacity_tokens_per_rank =
         capacity_num_tokens >= 0 ? capacity_num_tokens : num_tokens;
     TORCH_CHECK(route_capacity_tokens_per_rank >= num_tokens &&
@@ -1312,6 +1519,8 @@ k1_symm_fused_l1_v3_pack5(
     constexpr int64_t kLlHighHeadroomExpectedRowsThreshold = 512;
     constexpr int64_t kLlHeadroomRows = 64;
     constexpr int64_t kLlHighHeadroomRows = 128;
+    constexpr int64_t kLlSkewGuardRows = 256;
+    constexpr int64_t kProEp8LlMaskedK1MinRowsPerExpert = 128;
     // Preserve tiny LL buckets exactly, but reserve enough per-expert headroom
     // for high-token buckets: random routing can exceed the mean per-expert count.
     const int64_t ll_min_slack =
@@ -1320,12 +1529,27 @@ k1_symm_fused_l1_v3_pack5(
             : (ll_expected_rows_per_expert >= kLlHeadroomExpectedRowsThreshold
                    ? kLlHeadroomRows
                    : 0);
-    const int64_t ll_rows_per_expert =
+    int64_t ll_rows_per_expert =
         ll_base_rows_per_expert - ll_expected_rows_per_expert < ll_min_slack
             ? deep_gemm::mega::align_i64(
                   ll_expected_rows_per_expert + ll_min_slack,
                   row_tile)
             : ll_base_rows_per_expert;
+    if (!ll_stage_only) {
+        const int64_t ll_skew_guard_rows = std::min<int64_t>(
+            kLlSkewGuardRows,
+            route_capacity_tokens_per_rank * static_cast<int64_t>(num_ranks));
+        ll_rows_per_expert = std::max<int64_t>(
+            ll_rows_per_expert,
+            deep_gemm::mega::align_i64(ll_skew_guard_rows, row_tile));
+    }
+    const bool pro_ep8_ll_masked_k1 =
+        num_ranks == 8 && num_experts == 384 && num_topk == 6 &&
+        hidden == 7168 && l1_rows == 6144 && ll_stage_only;
+    if (pro_ep8_ll_masked_k1 &&
+        ll_rows_per_expert < kProEp8LlMaskedK1MinRowsPerExpert) {
+        ll_rows_per_expert = kProEp8LlMaskedK1MinRowsPerExpert;
+    }
     const int64_t capacity_tiles_i64 =
         use_ll
             ? local_experts * ceil_div_i64(ll_rows_per_expert, kK1RouteTileM)
@@ -1420,10 +1644,11 @@ k1_symm_fused_l1_v3_pack5(
     auto route_scratch_i32 =
         make_i32_view(route_scratch_i32_offset, {route_scratch_i32_ints});
     // K1 LL writes per-local-expert row counts at the head of route_scratch_i32.
-    // The extra slot carries max(actual_m) for K2; K3 only consumes the first
-    // local_experts entries.
+    // The first extra slot carries max(actual_m) for K2; the second extra slot
+    // carries the LL capacity-overflow status. K2/K3 only consume the first
+    // local_experts entries and the max slot.
     auto ll_actual_m =
-        make_i32_view(route_scratch_i32_offset, {local_experts + 1});
+        make_i32_view(route_scratch_i32_offset, {local_experts + 2});
     auto grid_barrier = make_i32_view(grid_barrier_offset, {grid_barrier_ints});
     auto local_topk_mask =
         torch::from_blob(
@@ -1474,58 +1699,109 @@ k1_symm_fused_l1_v3_pack5(
         runtime_num_tokens.has_value() ? -1 : static_cast<int>(num_tokens);
     TORCH_CHECK((ll_block_m == 32 || ll_block_m == 48 || ll_block_m == 64) &&
                     ll_cus == 64,
-                "V3 K1 ll supports ll_block_m in {32,48,64} with ll_cus=64");
+                "V3 K1 ll supports ll_block_m in {32,48,64}; production "
+                "uses ll_cus=64");
     const int epoch = static_cast<int>(next_fused_l1_flag_generation());
-    dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
-        reinterpret_cast<hip_bfloat16*>(l1_out.data_ptr()),
-        reinterpret_cast<const uint8_t*>(staged_x.data_ptr()),
-        reinterpret_cast<const uint8_t*>(l1_weight_pack5.data_ptr()),
-        staged_x_scale.data_ptr<float>(),
-        l1_scale.data_ptr<float>(),
-        route_scratch_i32.data_ptr<int32_t>(),
-        reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
-        route_scratch_i32.data_ptr<int32_t>(),
-        grid_barrier.data_ptr<int32_t>(),
-        epoch,
-        static_cast<int>(rank_idx),
-        static_cast<int>(num_ranks),
-        static_cast<int>(num_experts),
-        static_cast<int>(num_max_tokens_per_rank),
-        static_cast<int>(num_topk),
-        static_cast<int>(hidden),
-        static_cast<int>(l1_rows),
-        runtime_launch_num_tokens,
-        static_cast<int>(rows_aligned_per_expert),
-        static_cast<int>(valid_rows_per_expert),
-        static_cast<int>(ll_block_m),
-        static_cast<int>(ll_cus),
-        route_weights.data_ptr<float>(),
-        m_indices.data_ptr<int32_t>(),
-        output_index.data_ptr<int32_t>(),
-        row_combine_ptrs.data_ptr<int64_t>(),
-        nullptr,
-        nullptr,
-        local_expert_stats == nullptr
-            ? nullptr
-            : local_expert_stats->data_ptr<int32_t>(),
-        enable_start_rank_barrier,
-        tail_done_counter_tensor == nullptr
-            ? nullptr
-            : tail_done_counter_tensor->data_ptr<int32_t>(),
-        runtime_num_tokens.has_value()
-            ? runtime_num_tokens.value().data_ptr<int32_t>()
-            : nullptr,
-        graph_runtime_num_tokens_out_tensor == nullptr
-            ? nullptr
-            : graph_runtime_num_tokens_out_tensor->data_ptr<int32_t>(),
-        graph_tail_signal_generation_out_tensor == nullptr
-            ? nullptr
-            : graph_tail_signal_generation_out_tensor->data_ptr<int32_t>(),
-        enable_start_rank_barrier ? static_cast<int>(num_tokens) : -1,
-        stream);
+    if (ll_stage_only) {
+        dcu_megamoe_v3_launch_k1_ll_stage_only_pack5(
+            reinterpret_cast<const uint8_t*>(staged_x.data_ptr()),
+            staged_x_scale.data_ptr<float>(),
+            reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
+            route_scratch_i32.data_ptr<int32_t>(),
+            grid_barrier.data_ptr<int32_t>(),
+            epoch,
+            static_cast<int>(rank_idx),
+            static_cast<int>(num_ranks),
+            static_cast<int>(num_experts),
+            static_cast<int>(num_max_tokens_per_rank),
+            static_cast<int>(num_topk),
+            static_cast<int>(hidden),
+            static_cast<int>(l1_rows),
+            runtime_launch_num_tokens,
+            static_cast<int>(rows_aligned_per_expert),
+            static_cast<int>(ll_block_m),
+            static_cast<int>(ll_cus),
+            route_weights.data_ptr<float>(),
+            m_indices.data_ptr<int32_t>(),
+            output_index.data_ptr<int32_t>(),
+            row_combine_ptrs.data_ptr<int64_t>(),
+            nullptr,
+            nullptr,
+            local_expert_stats == nullptr
+                ? nullptr
+                : local_expert_stats->data_ptr<int32_t>(),
+            enable_start_rank_barrier,
+            tail_done_counter_tensor == nullptr
+                ? nullptr
+                : tail_done_counter_tensor->data_ptr<int32_t>(),
+            runtime_num_tokens.has_value()
+                ? runtime_num_tokens.value().data_ptr<int32_t>()
+                : nullptr,
+            graph_runtime_num_tokens_out_tensor == nullptr
+                ? nullptr
+                : graph_runtime_num_tokens_out_tensor->data_ptr<int32_t>(),
+            graph_tail_signal_generation_out_tensor == nullptr
+                ? nullptr
+                : graph_tail_signal_generation_out_tensor->data_ptr<int32_t>(),
+            enable_start_rank_barrier ? static_cast<int>(num_tokens) : -1,
+            stream);
+    } else {
+        dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5(
+            reinterpret_cast<hip_bfloat16*>(l1_out.data_ptr()),
+            reinterpret_cast<const uint8_t*>(staged_x.data_ptr()),
+            reinterpret_cast<const uint8_t*>(l1_weight_pack5.data_ptr()),
+            staged_x_scale.data_ptr<float>(),
+            l1_scale.data_ptr<float>(),
+            route_scratch_i32.data_ptr<int32_t>(),
+            reinterpret_cast<uint8_t*>(sym_buffer.data_ptr<int8_t>()),
+            route_scratch_i32.data_ptr<int32_t>(),
+            grid_barrier.data_ptr<int32_t>(),
+            epoch,
+            static_cast<int>(rank_idx),
+            static_cast<int>(num_ranks),
+            static_cast<int>(num_experts),
+            static_cast<int>(num_max_tokens_per_rank),
+            static_cast<int>(num_topk),
+            static_cast<int>(hidden),
+            static_cast<int>(l1_rows),
+            runtime_launch_num_tokens,
+            static_cast<int>(rows_aligned_per_expert),
+            static_cast<int>(valid_rows_per_expert),
+            static_cast<int>(ll_block_m),
+            static_cast<int>(ll_cus),
+            route_weights.data_ptr<float>(),
+            m_indices.data_ptr<int32_t>(),
+            output_index.data_ptr<int32_t>(),
+            row_combine_ptrs.data_ptr<int64_t>(),
+            nullptr,
+            nullptr,
+            local_expert_stats == nullptr
+                ? nullptr
+                : local_expert_stats->data_ptr<int32_t>(),
+            enable_start_rank_barrier,
+            tail_done_counter_tensor == nullptr
+                ? nullptr
+                : tail_done_counter_tensor->data_ptr<int32_t>(),
+            runtime_num_tokens.has_value()
+                ? runtime_num_tokens.value().data_ptr<int32_t>()
+                : nullptr,
+            graph_runtime_num_tokens_out_tensor == nullptr
+                ? nullptr
+                : graph_runtime_num_tokens_out_tensor->data_ptr<int32_t>(),
+            graph_tail_signal_generation_out_tensor == nullptr
+                ? nullptr
+                : graph_tail_signal_generation_out_tensor->data_ptr<int32_t>(),
+            enable_start_rank_barrier ? static_cast<int>(num_tokens) : -1,
+            stream);
+    }
     K1_HIP_CHECK(hipGetLastError());
 
-    return std::make_tuple(
+    if (ll_return_staged) {
+        return pybind11::make_tuple(
+            l1_out, route_weights, ll_actual_m, output_index, row_combine_ptrs,
+            staged_x, staged_x_scale);
+    }
+    return pybind11::make_tuple(
         l1_out, route_weights, ll_actual_m, output_index, row_combine_ptrs);
 }
 
@@ -1644,12 +1920,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("runtime_num_tokens") = std::nullopt,
           pybind11::arg("ll_block_m") = 32,
           pybind11::arg("ll_cus") = 64,
-          pybind11::arg("ll_asm_compatible_layout") = false,
           pybind11::arg("capacity_num_tokens") = -1,
           pybind11::arg("enable_start_rank_barrier") = false,
           pybind11::arg("tail_done_counter") = std::nullopt,
           pybind11::arg("graph_runtime_num_tokens_out") = std::nullopt,
-          pybind11::arg("graph_tail_signal_generation_out") = std::nullopt);
+          pybind11::arg("graph_tail_signal_generation_out") = std::nullopt,
+          pybind11::arg("ll_stage_only") = false,
+          pybind11::arg("ll_return_staged") = false);
+    m.def("k1_ll_masked_groupgemm_pack5", &k1_ll_masked_groupgemm_pack5,
+          pybind11::arg("input"),
+          pybind11::arg("input_scale"),
+          pybind11::arg("weight_masked"),
+          pybind11::arg("weight_scale"),
+          pybind11::arg("output"),
+          pybind11::arg("masked_m"),
+          pybind11::arg("expected_m_per_group"),
+          pybind11::arg("code_object_path"));
     m.def("k1_graph_flag_reset_layout", &k1_graph_flag_reset_layout,
           pybind11::arg("num_ranks"),
           pybind11::arg("num_experts"),
