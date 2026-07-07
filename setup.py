@@ -358,6 +358,55 @@ PREBUILT_CODE_OBJECTS = [
 ]
 
 
+def _existing_paths(paths):
+    return [path for path in paths if os.path.exists(path)]
+
+
+def _glob_project_paths(*parts):
+    import glob
+    return glob.glob(project_path(*parts))
+
+
+def _megamoe_extension_header_dependencies(ext_name):
+    if not (IS_HIP_EXTENSION and package_name == 'megamoe'):
+        return []
+    shared_headers = _glob_project_paths('megamoe', 'dcu_megamoe_opt', 'include', 'mega_moe_dcu', '*.cuh')
+    api_headers = _glob_project_paths('megamoe', 'dcu_megamoe_opt', 'csrc', 'apis', '*.hpp')
+    k1_headers = _glob_project_paths('megamoe', 'dcu_megamoe_opt', 'K1_fused', '*.cuh')
+    k3_headers = _glob_project_paths('megamoe', 'dcu_megamoe_opt', 'K3_fused', '*.cuh')
+    if ext_name == 'megamoe._C':
+        return _existing_paths(shared_headers + api_headers)
+    if ext_name == 'megamoe.dcu_megamoe_opt.K1_fused.k1_fused_ext':
+        return _existing_paths(shared_headers + k1_headers)
+    if ext_name in (
+        'megamoe.dcu_megamoe_opt.K3_fused.k3_fused_ext',
+        'megamoe.dcu_megamoe_opt.K3_fused.k3_v3_fused_ext',
+    ):
+        return _existing_paths(shared_headers + k3_headers)
+    return []
+
+
+def _object_path_for_source(build_temp, source):
+    rel_source = os.path.relpath(source, current_dir)
+    rel_object = os.path.splitext(rel_source)[0] + '.o'
+    return os.path.join(build_temp, rel_object)
+
+
+def _remove_objects_stale_against_headers(build_temp, extensions):
+    if not (IS_HIP_EXTENSION and package_name == 'megamoe') or DG_SKIP_CUDA_BUILD:
+        return
+    for ext in extensions:
+        header_deps = _megamoe_extension_header_dependencies(ext.name)
+        if not header_deps:
+            continue
+        newest_header_mtime = max(os.path.getmtime(path) for path in header_deps)
+        for source in ext.sources:
+            obj = _object_path_for_source(build_temp, source)
+            if os.path.exists(obj) and os.path.getmtime(obj) < newest_header_mtime:
+                print(f'Removing stale object after header update: {obj}')
+                os.remove(obj)
+
+
 def _opt_asm_clang(env_name):
     clang = os.environ.get(env_name) or os.environ.get('MEGAMOE_DCU_AOT_CLANG')
     if clang:
@@ -367,44 +416,67 @@ def _opt_asm_clang(env_name):
     return candidate if candidate and os.path.exists(candidate) else 'clang'
 
 
+def _generated_file_current(path, dependency):
+    return (
+        os.path.exists(path) and
+        os.path.getsize(path) > 0 and
+        os.path.getmtime(path) >= os.path.getmtime(dependency)
+    )
+
+
+def _copy_file_if_needed(src, dst):
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return
+    if _generated_file_current(dst, src):
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
+
+
 def build_opt_asm_code_objects(output_root, temp_root):
     if not (IS_HIP_EXTENSION and package_name == 'megamoe') or DG_SKIP_CUDA_BUILD:
         return
     for src, rel_dst, clang_env in OPT_ASM_CODE_OBJECTS:
         if not os.path.exists(src):
             raise FileNotFoundError(f'opt asm source not found: {src}')
+        cached_dst = project_path(rel_dst)
         dst = os.path.join(output_root, rel_dst)
         obj = os.path.join(temp_root, 'opt_asm', os.path.basename(rel_dst) + '.o')
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        os.makedirs(os.path.dirname(obj), exist_ok=True)
-        clang = _opt_asm_clang(clang_env)
-        subprocess.run(
-            [
-                clang,
-                '-x',
-                'assembler',
-                '-target',
-                'amdgcn-amd-amdhsa',
-                '-mcode-object-version=4',
-                '-mcpu=gfx938',
-                '-c',
-                '-o',
-                obj,
-                src,
-            ],
-            check=True,
-        )
-        subprocess.run(
-            [
-                clang,
-                '-target',
-                'amdgcn-amd-amdhsa',
-                obj,
-                '-o',
-                dst,
-            ],
-            check=True,
-        )
+        if not _generated_file_current(cached_dst, src):
+            os.makedirs(os.path.dirname(cached_dst), exist_ok=True)
+            os.makedirs(os.path.dirname(obj), exist_ok=True)
+            clang = _opt_asm_clang(clang_env)
+            print(f'Building opt asm code object: {cached_dst}')
+            subprocess.run(
+                [
+                    clang,
+                    '-x',
+                    'assembler',
+                    '-target',
+                    'amdgcn-amd-amdhsa',
+                    '-mcode-object-version=4',
+                    '-mcpu=gfx938',
+                    '-c',
+                    '-o',
+                    obj,
+                    src,
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    clang,
+                    '-target',
+                    'amdgcn-amd-amdhsa',
+                    obj,
+                    '-o',
+                    cached_dst,
+                ],
+                check=True,
+            )
+        else:
+            print(f'Skipping up-to-date opt asm code object: {cached_dst}')
+        _copy_file_if_needed(cached_dst, dst)
 
 
 def copy_prebuilt_code_objects(output_root):
@@ -414,11 +486,14 @@ def copy_prebuilt_code_objects(output_root):
         if not os.path.exists(src):
             raise FileNotFoundError(f'prebuilt code object not found: {src}')
         dst = os.path.join(output_root, rel_dst)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copyfile(src, dst)
+        _copy_file_if_needed(src, dst)
 
 
 class CustomBuildExt(BuildExtension):
+    def build_extensions(self):
+        _remove_objects_stale_against_headers(self.build_temp, self.extensions)
+        super().build_extensions()
+
     def run(self):
         super().run()
         output_root = current_dir if self.inplace else self.build_lib

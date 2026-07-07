@@ -11,25 +11,43 @@ fi
 
 build_dir="$repo_dir/build"
 wheel_dir="$build_dir/whl"
-build_epoch="$(date +%s)"
 
-rm -rf "$build_dir" dist ./*.egg-info
-rm -f megamoe/_C*.so deep_gemm/_C*.so
-find megamoe/dcu_megamoe_opt \
-    -path '*/prebuilt/*' -prune -o \
-    -type f \( -name '*_ext*.so' -o -name '*.co' -o -name '*.o' -o -name '*.hip' \) \
-    -delete 2>/dev/null || true
+rm -rf dist ./*.egg-info "$build_dir/bdist"
 mkdir -p "$wheel_dir"
+rm -f "$wheel_dir"/*.whl
 
 "$python_bin" setup.py \
     egg_info --egg-base "$build_dir" \
-    build --build-base "$build_dir" \
-    build_ext --build-temp "$build_dir/temp" --build-lib "$build_dir/lib" --inplace \
-    bdist_wheel --bdist-dir "$build_dir/bdist" --dist-dir "$wheel_dir"
+    build --build-base "$build_dir" --build-lib "$build_dir/lib" \
+    bdist_wheel --skip-build --bdist-dir "$build_dir/bdist" --dist-dir "$wheel_dir"
 
 rm -rf dist ./*.egg-info
 
-verify_fresh_artifact() {
+sync_built_shared_objects() {
+    local artifact rel_path target
+    shopt -s nullglob
+    for artifact in \
+        "$build_dir"/lib/megamoe/_C*.so \
+        "$build_dir"/lib/megamoe/dcu_megamoe_opt/K1_fused/k1_fused_ext*.so \
+        "$build_dir"/lib/megamoe/dcu_megamoe_opt/K2_fused/k2_fused_ext*.so \
+        "$build_dir"/lib/megamoe/dcu_megamoe_opt/K3_fused/k3_fused_ext*.so \
+        "$build_dir"/lib/megamoe/dcu_megamoe_opt/K3_fused/k3_v3_fused_ext*.so; do
+        rel_path="${artifact#"$build_dir"/lib/}"
+        target="$repo_dir/$rel_path"
+        mkdir -p "$(dirname "$target")"
+        if [ ! -e "$target" ] || [ "$artifact" -nt "$target" ]; then
+            cp -p "$artifact" "$target"
+            echo "synced shared object: $target"
+        else
+            echo "kept current shared object: $target"
+        fi
+    done
+    shopt -u nullglob
+}
+
+sync_built_shared_objects
+
+verify_shared_object() {
     local pattern="$1"
     local matches=()
     shopt -s nullglob
@@ -45,28 +63,47 @@ verify_fresh_artifact() {
             echo "empty in-place build artifact: $artifact" >&2
             exit 1
         fi
-        local mtime
-        mtime="$(stat -c '%Y' "$artifact")"
-        if [ "$mtime" -lt "$build_epoch" ]; then
-            echo "stale in-place build artifact: $artifact" >&2
-            exit 1
-        fi
-        echo "verified fresh artifact: $artifact"
+        echo "verified shared object: $artifact"
     done
 }
 
-verify_fresh_artifact "megamoe/_C*.so"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K1_fused/k1_fused_ext*.so"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K2_fused/k2_fused_ext*.so"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/k3_fused_ext*.so"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/k3_v3_fused_ext*.so"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.co"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K1_fused/deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_UNIFIED_PACK5.co"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.co"
-verify_fresh_artifact "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_UNIFIED_PACK5.co"
+verify_code_object() {
+    local pattern="$1"
+    local matches=()
+    shopt -s nullglob
+    matches=( $pattern )
+    shopt -u nullglob
+    if [ "${#matches[@]}" -eq 0 ]; then
+        echo "missing code object: $pattern" >&2
+        exit 1
+    fi
+    local artifact
+    for artifact in "${matches[@]}"; do
+        if [ ! -s "$artifact" ]; then
+            echo "empty code object: $artifact" >&2
+            exit 1
+        fi
+        local asm_source="${artifact%.co}.s"
+        if [ -f "$asm_source" ] && [ "$artifact" -ot "$asm_source" ]; then
+            echo "stale code object: $artifact is older than $asm_source" >&2
+            exit 1
+        fi
+        echo "verified code object: $artifact"
+    done
+}
+
+verify_shared_object "megamoe/_C*.so"
+verify_shared_object "megamoe/dcu_megamoe_opt/K1_fused/k1_fused_ext*.so"
+verify_shared_object "megamoe/dcu_megamoe_opt/K2_fused/k2_fused_ext*.so"
+verify_shared_object "megamoe/dcu_megamoe_opt/K3_fused/k3_fused_ext*.so"
+verify_shared_object "megamoe/dcu_megamoe_opt/K3_fused/k3_v3_fused_ext*.so"
+verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co"
+verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.co"
+verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co"
+verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co"
+verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_UNIFIED_PACK5.co"
+verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.co"
+verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_UNIFIED_PACK5.co"
 
 "$python_bin" - <<'PY'
 import importlib

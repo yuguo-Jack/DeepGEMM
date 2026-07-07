@@ -13,6 +13,9 @@ V3_CONFIG_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "v3_config.py"
 V3_LAYOUT_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "v3_layout.py"
 OPT_PATH = ROOT / "megamoe" / "opt.py"
 SETUP_PATH = ROOT / "setup.py"
+BUILD_SCRIPT_PATH = (
+    ROOT / "megamoe" / "dcu_megamoe_opt" / "scripts" / "build_dcu_megamoe.sh"
+)
 MEGA_DCU_API_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "csrc" / "apis" / "mega_dcu.hpp"
 MEGA_DCU_KERNEL_PATH = (
     ROOT / "megamoe" / "dcu_megamoe_opt" / "csrc" / "kernels" / "mega_moe_baseline_hip.cu"
@@ -554,6 +557,33 @@ def test_v3_pro_ll_masked_k1_stage_only_path_is_additive():
     assert "m_grouped_fp8_gemm_nt_masked" not in opt_source
     assert "ll_pro_masked_fused_groupgemm" not in k1_pybind
     assert "ll_pro_masked_fused_groupgemm" not in k1_py
+
+
+def test_dcu_megamoe_build_is_incremental_by_default():
+    setup_source = SETUP_PATH.read_text(encoding="utf-8")
+    build_script = BUILD_SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert "def _generated_file_current(" in setup_source
+    assert "cached_dst = project_path(rel_dst)" in setup_source
+    assert "Skipping up-to-date opt asm code object" in setup_source
+    assert "_copy_file_if_needed(cached_dst, dst)" in setup_source
+    assert "def _remove_objects_stale_against_headers(" in setup_source
+    assert "Removing stale object after header update" in setup_source
+    assert "def build_extensions(self):" in setup_source
+    assert "_remove_objects_stale_against_headers(self.build_temp, self.extensions)" in setup_source
+    assert 'rm -rf "$build_dir"' not in build_script
+    assert "-delete" not in build_script
+    assert "-name '*.co'" not in build_script
+    assert "-name '*.o'" not in build_script
+    assert "-name '*.hip'" not in build_script
+    assert 'rm -f megamoe/_C*.so' not in build_script
+    assert "verify_fresh_artifact" not in build_script
+    assert "build_epoch" not in build_script
+    assert "sync_built_shared_objects" in build_script
+    assert "bdist_wheel --skip-build" in build_script
+    assert "--inplace" not in build_script
+    assert "verify_shared_object" in build_script
+    assert "verify_code_object" in build_script
 
 
 def test_v3_normal_graph_runtime_work_is_limited_without_d2h():

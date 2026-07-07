@@ -81,9 +81,13 @@ source /opt/dtk-26.04/env.sh
 ./megamoe/dcu_megamoe_opt/scripts/build_dcu_megamoe.sh
 ```
 
-The build script keeps intermediate files under `build/` and writes the wheel to
-`build/whl/`.  It also builds the extension in place, so the local checkout can
-run the tests directly.
+The build script keeps intermediate files under `build/`, writes the wheel to
+`build/whl/`, and syncs the built shared objects back into the checkout so local
+tests import the current extensions directly.  Repeated builds are incremental:
+C/HIP extension objects, generated `.hip` files, and staged asm `.co` files are
+retained by default, so ordinary source edits should only rebuild the affected
+translation units and their dependent extension.  If an `.s` file is newer than
+its `.co`, or the `.co` is missing, the build recompiles only that code object.
 
 If you do not install the wheel but want to import `megamoe` from another
 directory, either set `PYTHONPATH` to this repository root or install the source
