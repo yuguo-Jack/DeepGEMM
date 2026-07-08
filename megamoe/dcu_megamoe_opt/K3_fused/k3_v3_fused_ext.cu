@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdint>
 
@@ -117,12 +118,21 @@ static inline void launch_v3_k3_ll_split_combine_reduce(
     const int hidden_tiles = hidden / kCopyHidden;
     const int row_blocks_per_expert =
         (rows_per_expert + kCopyRows - 1) / kCopyRows;
-    const int copy_blocks =
+    const int full_copy_blocks =
         local_experts * row_blocks_per_expert * hidden_tiles;
+    const int copy_launch_rows_per_expert = hidden == 7168 ? 128 : 256;
+    const int copy_launch_row_blocks_per_expert =
+        (std::min(rows_per_expert, copy_launch_rows_per_expert) +
+         kCopyRows - 1) /
+        kCopyRows;
+    const int copy_blocks =
+        std::max(1, local_experts * copy_launch_row_blocks_per_expert *
+                        hidden_tiles);
     const int reduce_blocks = kChunkSlots * hidden_tiles;
 #define DCU_MEGAMOE_V3_LAUNCH_K3_LL_SPLIT_REDUCE(HIDDEN)                       \
     V3_K3_LowLatencyCombineReduceKernel<HIDDEN, kCopyRows, kCopyHidden>         \
-        <<<dim3(copy_blocks + reduce_blocks), dim3(256), 0, stream>>>(          \
+        <<<dim3(std::min(full_copy_blocks, copy_blocks) + reduce_blocks),       \
+           dim3(256), 0, stream>>>(                                             \
             output_workspace, actual_m, max_copy_rows_ptr, rows_per_expert,     \
             row_combine_ptrs, sym_buffer, done_counter,                         \
             reinterpret_cast<uint16_t*>(reduce_y), rank_idx, num_ranks,         \

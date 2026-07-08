@@ -330,6 +330,37 @@ def k1_ll_masked_groupgemm(
     )
 
 
+def k1_ll_masked_prepare_compact_active(
+    staged_x: torch.Tensor,
+    staged_x_scale: torch.Tensor,
+    route_weights: torch.Tensor,
+    row_combine_ptrs: torch.Tensor,
+    actual_m: torch.Tensor,
+    compact_staged_x: torch.Tensor,
+    compact_staged_x_scale: torch.Tensor,
+    compact_route_weights: torch.Tensor,
+    compact_row_combine_ptrs: torch.Tensor,
+    compact_m: torch.Tensor,
+    rows_per_expert: int,
+    *,
+    verbose_build: bool = False,
+):
+    ext = load_extension(verbose=verbose_build)
+    return ext.k1_ll_masked_prepare_compact_active_pack5(
+        staged_x.contiguous(),
+        staged_x_scale.contiguous(),
+        route_weights.contiguous(),
+        row_combine_ptrs.contiguous(),
+        actual_m.contiguous(),
+        compact_staged_x,
+        compact_staged_x_scale,
+        compact_route_weights,
+        compact_row_combine_ptrs,
+        compact_m,
+        int(rows_per_expert),
+    )
+
+
 def k1_symm_fused_l1_v3(
     sym_buffer,
     l1_weights: tuple[torch.Tensor, torch.Tensor],
@@ -428,6 +459,7 @@ def k1_symm_fused_l1_v3_graph(
     hidden: int,
     runtime_num_tokens: torch.Tensor,
     backend: str,
+    capacity_num_tokens: int | None = None,
     alignment: int = 256,
     l1_out_workspace: torch.Tensor | None = None,
     use_unified_weight_layout: bool = False,
@@ -488,7 +520,7 @@ def k1_symm_fused_l1_v3_graph(
         runtime_num_tokens.contiguous(),
         int(ll_block_m),
         64,
-        -1,
+        -1 if capacity_num_tokens is None else int(capacity_num_tokens),
         bool(enable_start_rank_barrier),
         tail_done_counter,
         graph_runtime_num_tokens_out,

@@ -397,24 +397,25 @@ V3_K3_LowLatencyCombineReduceKernel(
     const int local_experts = num_experts / num_ranks;
     const int row_blocks_per_expert =
         (m_per_expert + kCopyRows - 1) / kCopyRows;
-    const int copy_blocks =
-        local_experts * row_blocks_per_expert * kHiddenTiles;
     constexpr int kReduceBlocks =
         kV3K3TailChunkSignalSlots * kHiddenTiles;
     const int tid = static_cast<int>(threadIdx.x);
     int copy_row_blocks_per_expert = row_blocks_per_expert;
-    if (runtime_num_tokens != nullptr && max_copy_rows_ptr != nullptr) {
+    if (max_copy_rows_ptr != nullptr) {
         int max_copy_rows = *max_copy_rows_ptr;
         if (max_copy_rows < 0)
             max_copy_rows = 0;
         if (max_copy_rows > m_per_expert)
             max_copy_rows = m_per_expert;
-        if (max_copy_rows <= kCopyRows)
-            copy_row_blocks_per_expert =
-                (max_copy_rows + kCopyRows - 1) / kCopyRows;
+        copy_row_blocks_per_expert =
+            (max_copy_rows + kCopyRows - 1) / kCopyRows;
     }
     const int active_copy_blocks =
         local_experts * copy_row_blocks_per_expert * kHiddenTiles;
+    const int launched_copy_blocks =
+        static_cast<int>(gridDim.x) > kReduceBlocks
+            ? static_cast<int>(gridDim.x) - kReduceBlocks
+            : 0;
 
     if (blockIdx.x == 0 && tid == 0) {
         const int max_peer_runtime_tokens =
@@ -430,8 +431,10 @@ V3_K3_LowLatencyCombineReduceKernel(
         }
     }
 
-    if (static_cast<int>(blockIdx.x) < active_copy_blocks) {
-        const int copy_idx = static_cast<int>(blockIdx.x);
+    if (static_cast<int>(blockIdx.x) < launched_copy_blocks) {
+        for (int copy_idx = static_cast<int>(blockIdx.x);
+             copy_idx < active_copy_blocks;
+             copy_idx += launched_copy_blocks) {
         const int hidden_tile = copy_idx % kHiddenTiles;
         const int row_block =
             (copy_idx / kHiddenTiles) % copy_row_blocks_per_expert;
@@ -447,7 +450,7 @@ V3_K3_LowLatencyCombineReduceKernel(
             v3_k3_split_finish_copy_block_device(
                 done_counter, active_copy_blocks, sym_buffer, rank_idx,
                 num_ranks);
-            return;
+            continue;
         }
         int row_end = row_start + kCopyRows;
         if (row_end > cur_tokens)
@@ -614,10 +617,11 @@ V3_K3_LowLatencyCombineReduceKernel(
         __threadfence_system();
         v3_k3_split_finish_copy_block_device(
             done_counter, active_copy_blocks, sym_buffer, rank_idx, num_ranks);
+        }
         return;
     }
 
-    const int reduce_idx = static_cast<int>(blockIdx.x) - copy_blocks;
+    const int reduce_idx = static_cast<int>(blockIdx.x) - launched_copy_blocks;
     if (reduce_idx < 0 || reduce_idx >= kReduceBlocks)
         return;
 

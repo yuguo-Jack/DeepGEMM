@@ -224,6 +224,33 @@ int64_t compact_capacity_tiles(
     return std::min<int64_t>(fixed_capacity_tiles, capacity_tiles);
 }
 
+int64_t skew_safe_compact_capacity_tiles(
+    const int64_t num_ranks,
+    const int64_t route_capacity_tokens_per_rank,
+    const int64_t num_topk,
+    const int64_t local_experts) {
+    const int64_t total_routes =
+        num_ranks * route_capacity_tokens_per_rank * num_topk;
+    if (total_routes <= 0 || local_experts <= 0) {
+        return std::max<int64_t>(1, local_experts);
+    }
+    // Top-k routing does not repeat an expert for a token, so a single local
+    // expert's worst case is one row per token from every rank. Compact routing
+    // also needs one partial tile per touched expert for fragmentation.
+    const int64_t max_routes_per_expert =
+        num_ranks * route_capacity_tokens_per_rank;
+    const int64_t max_tiles_per_expert =
+        ceil_div_i64(max_routes_per_expert, kK1RouteTileM);
+    const int64_t max_tiles = local_experts * max_tiles_per_expert;
+    const int64_t active_experts = std::min<int64_t>(local_experts, total_routes);
+    int64_t fragmented_tiles = active_experts;
+    if (total_routes > active_experts) {
+        fragmented_tiles += (total_routes - active_experts) / kK1RouteTileM;
+    }
+    return std::max<int64_t>(
+        local_experts, std::min<int64_t>(max_tiles, fragmented_tiles));
+}
+
 struct __attribute__((packed)) GpuProb {
     uint32_t m;
     uint32_t n;
@@ -339,6 +366,88 @@ struct ProLlMaskedGroupGemmArgs {
     void* reserved_buffer;
     const int32_t* signal;
 };
+
+using UInt32x4 = uint32_t __attribute__((ext_vector_type(4)));
+static constexpr float kDefaultLlStagedScale = 1.0e-4f / 448.0f;
+
+__global__ void pro_ll_masked_compact_counts_kernel(
+    const int32_t* __restrict__ actual_m,
+    int32_t* __restrict__ compact_m,
+    int local_experts,
+    int rows_per_expert,
+    int compact_rows_per_expert) {
+    int max_compact = 0;
+    for (int expert = 0; expert < local_experts; ++expert) {
+        int count = actual_m[expert];
+        if (count < 0)
+            count = 0;
+        if (count > rows_per_expert)
+            count = rows_per_expert;
+        const int compact = count < compact_rows_per_expert
+                                ? count
+                                : compact_rows_per_expert;
+        compact_m[expert] = compact;
+        max_compact = compact > max_compact ? compact : max_compact;
+    }
+    compact_m[local_experts] = max_compact;
+    compact_m[local_experts + 1] = 0;
+}
+
+__global__ void pro_ll_masked_compact_stage_active_kernel(
+    const uint8_t* __restrict__ staged_x,
+    const float* __restrict__ staged_x_scale,
+    const float* __restrict__ route_weights,
+    const int64_t* __restrict__ row_combine_ptrs,
+    const int32_t* __restrict__ actual_m,
+    uint8_t* __restrict__ compact_x,
+    float* __restrict__ compact_x_scale,
+    float* __restrict__ compact_route_weights,
+    int64_t* __restrict__ compact_row_combine_ptrs,
+    int local_experts,
+    int rows_per_expert,
+    int compact_rows_per_expert,
+    int hidden) {
+    const int vecs_per_row = hidden / 16;
+    const int64_t total_vecs =
+        static_cast<int64_t>(local_experts) * compact_rows_per_expert *
+        vecs_per_row;
+    const int64_t grid_threads =
+        static_cast<int64_t>(gridDim.x) * blockDim.x;
+    int64_t linear =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const UInt32x4 zero{0, 0, 0, 0};
+    auto* compact_vec = reinterpret_cast<UInt32x4*>(compact_x);
+    const auto* staged_vec = reinterpret_cast<const UInt32x4*>(staged_x);
+    for (; linear < total_vecs; linear += grid_threads) {
+        const int vec_col = static_cast<int>(linear % vecs_per_row);
+        const int compact_row = static_cast<int>(linear / vecs_per_row);
+        const int expert = compact_row / compact_rows_per_expert;
+        const int row_in_expert =
+            compact_row - expert * compact_rows_per_expert;
+        int count = actual_m[expert];
+        if (count < 0)
+            count = 0;
+        if (count > rows_per_expert)
+            count = rows_per_expert;
+        const bool active = row_in_expert < count;
+        const int source_row = expert * rows_per_expert + row_in_expert;
+        UInt32x4 value = zero;
+        if (active) {
+            value = staged_vec[static_cast<int64_t>(source_row) *
+                                   vecs_per_row +
+                               vec_col];
+        }
+        compact_vec[linear] = value;
+        if (vec_col == 0) {
+            compact_x_scale[compact_row] =
+                active ? staged_x_scale[source_row] : kDefaultLlStagedScale;
+            compact_route_weights[compact_row] =
+                active ? route_weights[source_row] : 0.0f;
+            compact_row_combine_ptrs[compact_row] =
+                active ? row_combine_ptrs[source_row] : 0;
+        }
+    }
+}
 
 LoadedAsmKernel& asm_kernel_cache() {
     static LoadedAsmKernel cache;
@@ -704,6 +813,7 @@ void launch_l1_deepgemm_fused_asm(
     const int wg_m = (n + 255) / 256;
     const int wg_n = (total_rows + 255) / 256;
     const int capacity_tiles = wg_n;
+    int launch_wg_n = wg_n;
     TORCH_CHECK(staged_x.is_cuda() && staged_x.scalar_type() == torch::kFloat8_e4m3fn &&
                     staged_x.is_contiguous() &&
                     staged_x.numel() >= static_cast<int64_t>(total_rows) * hidden,
@@ -776,6 +886,30 @@ void launch_l1_deepgemm_fused_asm(
             runtime_num_tokens == nullptr ? 0 : 1,
             hidden);
         K1_HIP_CHECK(hipGetLastError());
+        // Eager compact routing has already computed the exact active tile
+        // count. Copying this single int lets the ASM launch stay proportional
+        // to active compact rows while the backing buffers still keep the full
+        // skew-safe worst-case capacity. Graph capture cannot synchronize here,
+        // so graph keeps the conservative capacity launch.
+        if (runtime_num_tokens == nullptr && capacity_tiles > 128) {
+            int active_tiles_host = capacity_tiles;
+            const int active_tiles_offset = 2 * local_experts;
+            K1_HIP_CHECK(hipMemcpyAsync(
+                &active_tiles_host,
+                reinterpret_cast<int32_t*>(route_scratch.data_ptr()) +
+                    active_tiles_offset,
+                sizeof(int),
+                hipMemcpyDeviceToHost,
+                stream));
+            K1_HIP_CHECK(hipStreamSynchronize(stream));
+            if (active_tiles_host < 0) {
+                active_tiles_host = 0;
+            }
+            if (active_tiles_host > capacity_tiles) {
+                active_tiles_host = capacity_tiles;
+            }
+            launch_wg_n = std::max(1, active_tiles_host);
+        }
         k1_emit_compact_routes_kernel<<<route_grid, route_threads, 0, stream>>>(
             static_cast<uint8_t*>(sym_buffer.data_ptr()),
             reinterpret_cast<int32_t*>(route_scratch.data_ptr()),
@@ -801,9 +935,10 @@ void launch_l1_deepgemm_fused_asm(
             use_rank_local_x_ptrs ? 1 : 0);
         K1_HIP_CHECK(hipGetLastError());
     }
+    const int launch_rows = launch_wg_n * 256;
     GpuProb prob{};
     prob.m = static_cast<uint32_t>(n);
-    prob.n = static_cast<uint32_t>(total_rows);
+    prob.n = static_cast<uint32_t>(launch_rows);
     prob.batch = 1;
     prob.k = static_cast<uint32_t>(hidden);
     prob.d = output.data_ptr();
@@ -889,7 +1024,7 @@ void launch_l1_deepgemm_fused_asm(
 
     const int local_work_size = 768;
     const size_t global_work_items =
-        static_cast<size_t>(local_work_size) * wg_m * wg_n;
+        static_cast<size_t>(local_work_size) * wg_m * launch_wg_n;
 
     hipFunction_t function =
         get_asm_function(code_object_path, kFusedL1AsmKernelName);
@@ -1053,6 +1188,117 @@ void k1_ll_masked_groupgemm_pack5(
         code_object_path);
 }
 
+void k1_ll_masked_prepare_compact_active_pack5(
+    const torch::Tensor& staged_x,
+    const torch::Tensor& staged_x_scale,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& row_combine_ptrs,
+    const torch::Tensor& actual_m,
+    const torch::Tensor& compact_staged_x,
+    const torch::Tensor& compact_staged_x_scale,
+    const torch::Tensor& compact_route_weights,
+    const torch::Tensor& compact_row_combine_ptrs,
+    const torch::Tensor& compact_m,
+    const int64_t rows_per_expert) {
+    const c10::OptionalDeviceGuard device_guard(at::device_of(staged_x));
+    TORCH_CHECK(staged_x.is_cuda() && staged_x.is_contiguous() &&
+                    staged_x.scalar_type() == torch::kFloat8_e4m3fn,
+                "compact active staged_x must be contiguous CUDA FP8");
+    TORCH_CHECK(staged_x_scale.is_cuda() && staged_x_scale.is_contiguous() &&
+                    staged_x_scale.scalar_type() == torch::kFloat32,
+                "compact active staged_x_scale must be contiguous CUDA FP32");
+    TORCH_CHECK(route_weights.is_cuda() && route_weights.is_contiguous() &&
+                    route_weights.scalar_type() == torch::kFloat32,
+                "compact active route_weights must be contiguous CUDA FP32");
+    TORCH_CHECK(row_combine_ptrs.is_cuda() &&
+                    row_combine_ptrs.is_contiguous() &&
+                    row_combine_ptrs.scalar_type() == torch::kInt64,
+                "compact active row_combine_ptrs must be contiguous CUDA int64");
+    TORCH_CHECK(actual_m.is_cuda() && actual_m.is_contiguous() &&
+                    actual_m.scalar_type() == torch::kInt,
+                "compact active actual_m must be contiguous CUDA int32");
+    TORCH_CHECK(compact_staged_x.is_cuda() && compact_staged_x.is_contiguous() &&
+                    compact_staged_x.scalar_type() == torch::kFloat8_e4m3fn,
+                "compact active destination staged_x must be contiguous CUDA FP8");
+    TORCH_CHECK(compact_staged_x_scale.is_cuda() &&
+                    compact_staged_x_scale.is_contiguous() &&
+                    compact_staged_x_scale.scalar_type() == torch::kFloat32,
+                "compact active destination scale must be contiguous CUDA FP32");
+    TORCH_CHECK(compact_route_weights.is_cuda() &&
+                    compact_route_weights.is_contiguous() &&
+                    compact_route_weights.scalar_type() == torch::kFloat32,
+                "compact active destination route_weights must be CUDA FP32");
+    TORCH_CHECK(compact_row_combine_ptrs.is_cuda() &&
+                    compact_row_combine_ptrs.is_contiguous() &&
+                    compact_row_combine_ptrs.scalar_type() == torch::kInt64,
+                "compact active destination row_combine_ptrs must be CUDA int64");
+    TORCH_CHECK(compact_m.is_cuda() && compact_m.is_contiguous() &&
+                    compact_m.scalar_type() == torch::kInt,
+                "compact active counts must be contiguous CUDA int32");
+    TORCH_CHECK(staged_x.dim() == 2 && compact_staged_x.dim() == 2,
+                "compact active staged tensors must be [rows, hidden]");
+    const int64_t hidden = staged_x.size(1);
+    TORCH_CHECK(hidden == compact_staged_x.size(1) && hidden % 16 == 0,
+                "compact active hidden must match and be 16-byte aligned");
+    const int64_t local_experts = actual_m.numel() - 2;
+    TORCH_CHECK(local_experts > 0 &&
+                    compact_m.numel() >= local_experts + 2,
+                "compact active counts must include local experts plus max/status");
+    TORCH_CHECK(rows_per_expert > 0 &&
+                    staged_x.size(0) >= local_experts * rows_per_expert &&
+                    staged_x_scale.numel() >= local_experts * rows_per_expert &&
+                    route_weights.numel() >= local_experts * rows_per_expert &&
+                    row_combine_ptrs.numel() >= local_experts * rows_per_expert,
+                "compact active source must cover [local_experts, rows_per_expert]");
+    TORCH_CHECK(compact_staged_x.size(0) % local_experts == 0,
+                "compact active rows must be divisible by local experts");
+    const int64_t compact_rows_per_expert =
+        compact_staged_x.size(0) / local_experts;
+    TORCH_CHECK(compact_rows_per_expert > 0 &&
+                    compact_staged_x_scale.numel() >= compact_staged_x.size(0) &&
+                    compact_route_weights.numel() >= compact_staged_x.size(0) &&
+                    compact_row_combine_ptrs.numel() >= compact_staged_x.size(0),
+                "compact active destination metadata is too small");
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    hipLaunchKernelGGL(
+        pro_ll_masked_compact_counts_kernel,
+        dim3(1),
+        dim3(1),
+        0,
+        stream,
+        actual_m.data_ptr<int32_t>(),
+        compact_m.data_ptr<int32_t>(),
+        static_cast<int>(local_experts),
+        static_cast<int>(rows_per_expert),
+        static_cast<int>(compact_rows_per_expert));
+    const int64_t vecs =
+        compact_staged_x.numel() / static_cast<int64_t>(16);
+    const int blocks =
+        static_cast<int>(std::min<int64_t>((vecs + 255) / 256, 4096));
+    if (blocks > 0) {
+        hipLaunchKernelGGL(
+            pro_ll_masked_compact_stage_active_kernel,
+            dim3(blocks),
+            dim3(256),
+            0,
+            stream,
+            reinterpret_cast<const uint8_t*>(staged_x.data_ptr()),
+            staged_x_scale.data_ptr<float>(),
+            route_weights.data_ptr<float>(),
+            row_combine_ptrs.data_ptr<int64_t>(),
+            actual_m.data_ptr<int32_t>(),
+            reinterpret_cast<uint8_t*>(compact_staged_x.data_ptr()),
+            compact_staged_x_scale.data_ptr<float>(),
+            compact_route_weights.data_ptr<float>(),
+            compact_row_combine_ptrs.data_ptr<int64_t>(),
+            static_cast<int>(local_experts),
+            static_cast<int>(rows_per_expert),
+            static_cast<int>(compact_rows_per_expert),
+            static_cast<int>(hidden));
+    }
+    K1_HIP_CHECK(hipGetLastError());
+}
+
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 k1_symm_fused_l1_asm_impl(
     const torch::Tensor& sym_buffer,
@@ -1148,11 +1394,10 @@ k1_symm_fused_l1_asm_impl(
                 route_capacity_headroom_rows(expected_per_expert));
     const int64_t fixed_capacity_tiles_per_expert =
         ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
-    // The in-ASM route builder was tuned around the original Flash EP8 layout
-    // with 32 local experts. EP16/EP32 and Pro EP8 use the HIP compact
-    // prebuild, which has dynamic route-scratch metadata.
-    const bool default_compact_prebuild =
-        force_compact_prebuild || num_ranks > 8 || local_experts > 32;
+    // Compact prebuild sizes its tile pool for local-rank worst-case skew and
+    // launches only active tiles. The legacy in-ASM route layout is kept as an
+    // opt-in ablation through K1_PREBUILD_MODE=asm.
+    const bool default_compact_prebuild = true;
     bool use_compact_prebuild = default_compact_prebuild;
     bool force_asm_route = false;
     if (!force_compact_prebuild && num_ranks <= 8 && local_experts <= 32) {
@@ -1179,15 +1424,10 @@ k1_symm_fused_l1_asm_impl(
     }
     const int64_t fixed_capacity_tiles =
         local_experts * fixed_capacity_tiles_per_expert;
-    const bool force_fixed_compact_capacity =
-        use_compact_prebuild && (num_ranks > 8 || local_experts > 32);
     const int64_t capacity_tiles = use_compact_prebuild
-                                       ? (force_fixed_compact_capacity
-                                              ? fixed_capacity_tiles
-                                              : compact_capacity_tiles(
-                                              capacity_total_tasks, num_experts,
-                                              local_experts,
-                                              fixed_capacity_tiles_per_expert))
+                                       ? skew_safe_compact_capacity_tiles(
+                                             num_ranks, route_capacity_num_tokens,
+                                             num_topk, local_experts)
                                        : fixed_capacity_tiles;
     const int64_t capacity_rows = capacity_tiles * kK1RouteTileM;
     const int64_t route_workspace_bytes =
@@ -1482,25 +1722,10 @@ k1_symm_fused_l1_v3_pack5(
                     route_capacity_tokens_per_rank <= num_max_tokens_per_rank,
                 "capacity_num_tokens must be in [num_tokens, "
                 "num_max_tokens_per_rank]");
-    const int64_t capacity_total_tasks =
-        num_ranks * route_capacity_tokens_per_rank * num_topk;
-    const int64_t expected_per_expert =
-        (capacity_total_tasks + num_experts - 1) / num_experts;
-    const int64_t rows_per_expert_target =
-        std::max<int64_t>(
-            alignment,
-            expected_per_expert +
-                route_capacity_headroom_rows(expected_per_expert));
-    const int64_t fixed_capacity_tiles_per_expert =
-        ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
-    const int64_t fixed_capacity_tiles =
-        local_experts * fixed_capacity_tiles_per_expert;
     const int64_t compact_capacity_tiles_i64 =
-        compact_capacity_tiles(
-            capacity_total_tasks, num_experts, local_experts,
-            fixed_capacity_tiles_per_expert);
-    const bool use_compact_capacity =
-        !use_ll && compact_capacity_tiles_i64 < fixed_capacity_tiles;
+        skew_safe_compact_capacity_tiles(
+            num_ranks, route_capacity_tokens_per_rank, num_topk,
+            local_experts);
     const int64_t ll_base_rows_per_expert =
         deep_gemm::mega::align_i64(
             std::max<int64_t>(
@@ -1519,7 +1744,6 @@ k1_symm_fused_l1_v3_pack5(
     constexpr int64_t kLlHighHeadroomExpectedRowsThreshold = 512;
     constexpr int64_t kLlHeadroomRows = 64;
     constexpr int64_t kLlHighHeadroomRows = 128;
-    constexpr int64_t kLlSkewGuardRows = 256;
     constexpr int64_t kProEp8LlMaskedK1MinRowsPerExpert = 128;
     // Preserve tiny LL buckets exactly, but reserve enough per-expert headroom
     // for high-token buckets: random routing can exceed the mean per-expert count.
@@ -1535,14 +1759,11 @@ k1_symm_fused_l1_v3_pack5(
                   ll_expected_rows_per_expert + ll_min_slack,
                   row_tile)
             : ll_base_rows_per_expert;
-    if (!ll_stage_only) {
-        const int64_t ll_skew_guard_rows = std::min<int64_t>(
-            kLlSkewGuardRows,
-            route_capacity_tokens_per_rank * static_cast<int64_t>(num_ranks));
-        ll_rows_per_expert = std::max<int64_t>(
-            ll_rows_per_expert,
-            deep_gemm::mega::align_i64(ll_skew_guard_rows, row_tile));
-    }
+    const int64_t ll_worst_rows_per_expert =
+        route_capacity_tokens_per_rank * static_cast<int64_t>(num_ranks);
+    ll_rows_per_expert = std::max<int64_t>(
+        ll_rows_per_expert,
+        deep_gemm::mega::align_i64(ll_worst_rows_per_expert, row_tile));
     const bool pro_ep8_ll_masked_k1 =
         num_ranks == 8 && num_experts == 384 && num_topk == 6 &&
         hidden == 7168 && l1_rows == 6144 && ll_stage_only;
@@ -1553,9 +1774,7 @@ k1_symm_fused_l1_v3_pack5(
     const int64_t capacity_tiles_i64 =
         use_ll
             ? local_experts * ceil_div_i64(ll_rows_per_expert, kK1RouteTileM)
-            : (use_compact_capacity
-                   ? compact_capacity_tiles_i64
-                   : fixed_capacity_tiles);
+            : compact_capacity_tiles_i64;
     const int64_t normal_total_rows = capacity_tiles_i64 * kK1RouteTileM;
     const int64_t rows_aligned_per_expert =
         use_ll ? ll_rows_per_expert
@@ -1825,23 +2044,10 @@ k1_graph_flag_reset_layout(
                     num_tokens >= 0 && num_tokens <= num_max_tokens_per_rank,
                 kK1ShapeContract);
     const int64_t local_experts = num_experts / num_ranks;
-    const int64_t total_tasks = num_ranks * num_max_tokens_per_rank * num_topk;
-    const int64_t expected_per_expert =
-        (total_tasks + num_experts - 1) / num_experts;
-    const int64_t rows_per_expert_target =
-        std::max<int64_t>(
-            alignment,
-            expected_per_expert +
-                route_capacity_headroom_rows(expected_per_expert));
-    const int64_t fixed_capacity_tiles_per_expert =
-        ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
-    const int64_t fixed_capacity_tiles =
-        local_experts * fixed_capacity_tiles_per_expert;
     const int64_t capacity_tiles =
-        num_ranks > 8
-            ? fixed_capacity_tiles
-            : compact_capacity_tiles(total_tasks, num_experts, local_experts,
-                                     fixed_capacity_tiles_per_expert);
+        skew_safe_compact_capacity_tiles(
+            num_ranks, num_max_tokens_per_rank, num_topk, local_experts);
+    const int64_t total_tasks = num_ranks * num_max_tokens_per_rank * num_topk;
     const int64_t total_rows = capacity_tiles * kK1RouteTileM;
     const int64_t route_workspace_bytes =
         deep_gemm::mega::route_task_workspace_bytes(
@@ -1876,7 +2082,7 @@ k1_graph_flag_reset_layout(
         deep_gemm::mega::align_i64(flags_offset + flags_numel * sizeof(int32_t), 16);
     const int64_t meta_flags_numel = (total_rows + 255) / 256;
     return std::make_tuple(flags_offset, flags_numel, meta_flags_offset,
-                           meta_flags_numel, total_rows, fixed_capacity_tiles);
+                           meta_flags_numel, total_rows, capacity_tiles);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1936,6 +2142,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("masked_m"),
           pybind11::arg("expected_m_per_group"),
           pybind11::arg("code_object_path"));
+    m.def("k1_ll_masked_prepare_compact_active_pack5",
+          &k1_ll_masked_prepare_compact_active_pack5,
+          pybind11::arg("staged_x"),
+          pybind11::arg("staged_x_scale"),
+          pybind11::arg("route_weights"),
+          pybind11::arg("row_combine_ptrs"),
+          pybind11::arg("actual_m"),
+          pybind11::arg("compact_staged_x"),
+          pybind11::arg("compact_staged_x_scale"),
+          pybind11::arg("compact_route_weights"),
+          pybind11::arg("compact_row_combine_ptrs"),
+          pybind11::arg("compact_m"),
+          pybind11::arg("rows_per_expert"));
     m.def("k1_graph_flag_reset_layout", &k1_graph_flag_reset_layout,
           pybind11::arg("num_ranks"),
           pybind11::arg("num_experts"),

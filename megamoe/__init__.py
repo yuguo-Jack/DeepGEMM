@@ -10,6 +10,7 @@ from .dcu_megamoe_opt.v3_config import (
     STAGED_PACK5_SHAPE_CONTRACT,
     V3_BACKEND_LL,
     V3_BACKEND_NORMAL,
+    normal_ll_token_threshold,
     normalize_v3_backend,
     staged_pack5_model_shape_supported,
     staged_pack5_shape_supported,
@@ -369,6 +370,25 @@ def get_mega_moe_hip_build_config():
     return config
 
 
+def _check_ll_scratch_capacity(sym_buffer, *, v3_backend: str, required_tokens: int) -> None:
+    if v3_backend != V3_BACKEND_LL:
+        return
+    cap = int(
+        getattr(
+            sym_buffer,
+            "ll_scratch_capacity_tokens_per_rank",
+            sym_buffer.num_max_tokens_per_rank,
+        )
+    )
+    if int(required_tokens) > cap:
+        raise ValueError(
+            "LL backend route capacity exceeds this SymmBuffer's LL scratch cap: "
+            f"required={int(required_tokens)}, cap={cap}. Recreate the buffer "
+            "with a larger cuda_graph_max_tokens_per_rank for LL graph buckets "
+            "or use megamoe_backend='normal' for large-token normal buckets."
+        )
+
+
 class SymmBuffer:
     def __init__(
         self,
@@ -382,6 +402,7 @@ class SymmBuffer:
         activation: str = "swiglu",
         cuda_graph_max_tokens_per_rank: Optional[int] = None,
         prepare_opt_3stage: bool = True,
+        ll_scratch_capacity_tokens_per_rank: Optional[int] = None,
     ):
         if not _is_hip_backend():
             raise RuntimeError("megamoe is the HIP/DCU MegaMoE package")
@@ -403,6 +424,19 @@ class SymmBuffer:
         ):
             raise ValueError(
                 "cuda_graph_max_tokens_per_rank must be in "
+                f"1..{self.num_max_tokens_per_rank}"
+            )
+        self.ll_scratch_capacity_tokens_per_rank = int(
+            ll_scratch_capacity_tokens_per_rank
+            if ll_scratch_capacity_tokens_per_rank is not None
+            else self.num_max_tokens_per_rank
+        )
+        if (
+            self.ll_scratch_capacity_tokens_per_rank <= 0
+            or self.ll_scratch_capacity_tokens_per_rank > self.num_max_tokens_per_rank
+        ):
+            raise ValueError(
+                "ll_scratch_capacity_tokens_per_rank must be in "
                 f"1..{self.num_max_tokens_per_rank}"
             )
         _check_staged_pack5_shape(
@@ -432,6 +466,7 @@ class SymmBuffer:
             intermediate_hidden,
             use_fp8_dispatch,
             activation,
+            self.ll_scratch_capacity_tokens_per_rank,
         )
 
         peer_memory_mode = _dcu_peer_memory_mode()
@@ -498,6 +533,7 @@ class SymmBuffer:
             self.l2_acts_sf,
         ) = slices[:8]
         self.cuda_graph_num_tokens = slices[8]
+        self.combine = slices[9]
         self.cuda_graph_num_tokens.fill_(self.cuda_graph_max_tokens_per_rank)
 
         if prepare_opt_3stage:
@@ -556,6 +592,11 @@ def get_symm_buffer_for_mega_moe(
         if cuda_graph_max_tokens_per_rank is not None
         else requested_num_max_tokens_per_rank
     )
+    ll_scratch_capacity_tokens = max(
+        1,
+        normal_ll_token_threshold(),
+        int(cuda_graph_max_tokens_per_rank or 0),
+    )
     num_max_tokens_per_rank = _align(
         num_max_tokens_per_rank,
         _C.get_token_alignment_for_mega_moe(),
@@ -580,6 +621,10 @@ def get_symm_buffer_for_mega_moe(
                 use_fp8_dispatch,
                 activation,
                 cuda_graph_max_tokens_per_rank=1,
+                ll_scratch_capacity_tokens_per_rank=min(
+                    dummy_tokens,
+                    max(1, normal_ll_token_threshold()),
+                ),
                 prepare_opt_3stage=False,
             )
         finally:
@@ -595,6 +640,10 @@ def get_symm_buffer_for_mega_moe(
         use_fp8_dispatch,
         activation,
         cuda_graph_max_tokens_per_rank=requested_cuda_graph_max_tokens,
+        ll_scratch_capacity_tokens_per_rank=min(
+            num_max_tokens_per_rank,
+            ll_scratch_capacity_tokens,
+        ),
     )
 
 
@@ -749,7 +798,25 @@ def fp8_mega_moe(
         )
 
     if graph:
-        graph_max_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
+        graph_capacity_tokens = int(
+            sym_buffer.cuda_graph_max_tokens_per_rank
+            if capacity_num_tokens is None
+            else capacity_num_tokens
+        )
+        if (
+            graph_capacity_tokens <= 0
+            or graph_capacity_tokens > int(sym_buffer.cuda_graph_max_tokens_per_rank)
+        ):
+            raise ValueError(
+                "graph capacity_num_tokens must be in "
+                f"1..{int(sym_buffer.cuda_graph_max_tokens_per_rank)}"
+            )
+        graph_max_tokens = graph_capacity_tokens
+        _check_ll_scratch_capacity(
+            sym_buffer,
+            v3_backend=v3_backend,
+            required_tokens=graph_max_tokens,
+        )
         capture_rows = int(y.size(0))
         if capture_rows < graph_max_tokens:
             raise ValueError(
@@ -771,6 +838,7 @@ def fp8_mega_moe(
             num_ranks=len(sym_buffer.handle.buffer_ptrs),
             num_experts=sym_buffer.num_experts,
             graph_max_tokens=graph_max_tokens,
+            capacity_num_tokens=graph_capacity_tokens,
             num_topk=sym_buffer.num_topk,
             activation_clamp=activation_clamp,
             fast_math=fast_math,
@@ -780,6 +848,14 @@ def fp8_mega_moe(
         )
         return
     else:
+        route_capacity_tokens = int(
+            capacity_num_tokens if capacity_num_tokens is not None else y.size(0)
+        )
+        _check_ll_scratch_capacity(
+            sym_buffer,
+            v3_backend=v3_backend,
+            required_tokens=route_capacity_tokens,
+        )
         if _is_current_stream_capturing():
             raise RuntimeError(
                 "DCU MegaMoE CUDA Graph capture requires an explicit graph mode: "

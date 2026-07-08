@@ -164,7 +164,7 @@ static void mega_moe_pre_dispatch(
 using MegaMoeSymmBufferSlices = std::tuple<
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor>;
+    torch::Tensor, torch::Tensor>;
 
 static std::tuple<int64_t, std::function<MegaMoeSymmBufferSlices(const torch::Tensor&)>>
 get_symm_buffer_size_for_mega_moe(
@@ -220,11 +220,15 @@ get_symm_buffer_size_for_mega_moe(
             byte_base + topk_weights_offset,
             {num_max_tokens_per_rank, num_topk},
             f32_options);
+        auto combine = torch::from_blob(
+            byte_base + combine_offset,
+            {num_topk * num_max_tokens_per_rank, hidden},
+            torch::TensorOptions().dtype(torch::kBFloat16).device(device));
         auto empty_fp8 = torch::from_blob(byte_base + combine_offset, {0}, fp8_options);
         auto empty_f32 = torch::from_blob(byte_base + combine_offset, {0}, f32_options);
         return std::make_tuple(x, x_sf, topk_idx, topk_weights,
                                empty_fp8, empty_f32, empty_fp8, empty_f32,
-                               runtime_num_tokens);
+                               runtime_num_tokens, combine);
     };
     return {total_bytes, slice_input_buffers};
 }
@@ -233,7 +237,8 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const bool&, const std::string&) {
+    const bool&, const std::string&,
+    const int& ll_capacity_tokens_per_rank = -1) {
     TORCH_CHECK(num_ranks > 0, "num_ranks must be positive");
     TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
     TORCH_CHECK(hidden > 0 && intermediate_hidden > 0, "hidden sizes must be positive");
@@ -247,29 +252,44 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
         "topk=6 hidden=7168 intermediate=3072");
 
     constexpr int64_t kK1RouteTileM = 256;
-    constexpr int64_t kK1Alignment = 256;
-    constexpr int64_t kK1RouteCapacitySlack = 64;
-    constexpr int64_t kK1RouteCapacitySlackDivisor = 10;
     constexpr int64_t kK1LlRowTile = 64;
     constexpr int64_t kK1LlHeadroomExpectedRowsThreshold = 48;
     constexpr int64_t kK1LlHeadroomRows = 64;
-    constexpr int64_t kK1LlSkewGuardRows = 256;
     constexpr int64_t kProEp8LlMaskedK1MinRowsPerExpert = 128;
     constexpr int64_t kK1AsmLaunchArgsBytes = 256;
     const auto ceil_div_i64 = [](const int64_t value, const int64_t divisor) {
         return (value + divisor - 1) / divisor;
     };
-    const auto route_capacity_headroom_rows =
-        [&](const int64_t expected_per_expert) {
+    const auto normal_skew_safe_compact_tiles =
+        [&](const int64_t local_experts) {
+            const int64_t total_routes =
+                static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank * num_topk;
+            if (total_routes <= 0 || local_experts <= 0) {
+                return std::max<int64_t>(1, local_experts);
+            }
+            const int64_t max_routes_per_expert =
+                static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank;
+            const int64_t max_tiles_per_expert =
+                ceil_div_i64(max_routes_per_expert, kK1RouteTileM);
+            const int64_t max_tiles = local_experts * max_tiles_per_expert;
+            const int64_t active_experts =
+                std::min<int64_t>(local_experts, total_routes);
+            int64_t fragmented_tiles = active_experts;
+            if (total_routes > active_experts) {
+                fragmented_tiles += (total_routes - active_experts) / kK1RouteTileM;
+            }
             return std::max<int64_t>(
-                kK1RouteCapacitySlack,
-                ceil_div_i64(expected_per_expert,
-                             kK1RouteCapacitySlackDivisor));
+                local_experts, std::min<int64_t>(max_tiles, fragmented_tiles));
         };
     const int64_t local_experts = num_experts / num_ranks;
+    const int64_t ll_capacity_tokens = ll_capacity_tokens_per_rank > 0
+        ? std::min<int64_t>(
+              num_max_tokens_per_rank,
+              static_cast<int64_t>(ll_capacity_tokens_per_rank))
+        : static_cast<int64_t>(num_max_tokens_per_rank);
     const int64_t ll_expected_rows_per_expert = std::max<int64_t>(
         1, ceil_div_i64(
-               static_cast<int64_t>(num_max_tokens_per_rank) * num_topk,
+               ll_capacity_tokens * num_topk,
                local_experts));
     int64_t ll_rows_per_expert =
         align_i64(ll_expected_rows_per_expert, kK1LlRowTile);
@@ -281,12 +301,11 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
         ll_rows_per_expert = align_i64(
             ll_expected_rows_per_expert + min_slack, kK1LlRowTile);
     }
-    const int64_t ll_skew_guard_rows = std::min<int64_t>(
-        kK1LlSkewGuardRows,
-        static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank);
+    const int64_t ll_worst_rows_per_expert =
+        static_cast<int64_t>(num_ranks) * ll_capacity_tokens;
     ll_rows_per_expert = std::max<int64_t>(
         ll_rows_per_expert,
-        align_i64(ll_skew_guard_rows, kK1LlRowTile));
+        align_i64(ll_worst_rows_per_expert, kK1LlRowTile));
     const bool pro_ep8_ll_masked_k1 =
         num_ranks == 8 && num_experts == 384 && num_topk == 6 &&
         hidden == 7168 && intermediate_hidden == 3072;
@@ -294,19 +313,35 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
         ll_rows_per_expert < kProEp8LlMaskedK1MinRowsPerExpert) {
         ll_rows_per_expert = kProEp8LlMaskedK1MinRowsPerExpert;
     }
+    const auto ll_active_rows_per_expert =
+        [&](const int64_t capacity_tokens) {
+            const int64_t expected_rows = std::max<int64_t>(
+                1, ceil_div_i64(capacity_tokens * num_topk, local_experts));
+            int64_t rows = align_i64(expected_rows, kK1LlRowTile);
+            const int64_t active_min_slack =
+                expected_rows >= kK1LlHeadroomExpectedRowsThreshold
+                    ? kK1LlHeadroomRows
+                    : 0;
+            if (rows - expected_rows < active_min_slack) {
+                rows = align_i64(expected_rows + active_min_slack,
+                                 kK1LlRowTile);
+            }
+            if (pro_ep8_ll_masked_k1 &&
+                rows < kProEp8LlMaskedK1MinRowsPerExpert) {
+                rows = kProEp8LlMaskedK1MinRowsPerExpert;
+            }
+            return rows;
+        };
+    const bool pro_ll_masked_shape =
+        num_experts == 384 && num_topk == 6 && hidden == 7168 &&
+        intermediate_hidden == 3072;
+    const int64_t pro_compact_rows_per_expert =
+        pro_ll_masked_shape ? ll_active_rows_per_expert(ll_capacity_tokens) : 0;
+    const int64_t pro_compact_rows =
+        local_experts * pro_compact_rows_per_expert;
     const int64_t ll_capacity_rows = local_experts * ll_rows_per_expert;
-    const int64_t total_tasks =
-        static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank * num_topk;
-    const int64_t expected_per_expert =
-        ceil_div_i64(total_tasks, num_experts);
-    const int64_t rows_per_expert_target = std::max<int64_t>(
-        kK1Alignment,
-        expected_per_expert +
-            route_capacity_headroom_rows(expected_per_expert));
-    const int64_t fixed_capacity_tiles_per_expert =
-        ceil_div_i64(rows_per_expert_target, kK1RouteTileM);
     const int64_t normal_capacity_rows =
-        local_experts * fixed_capacity_tiles_per_expert * kK1RouteTileM;
+        normal_skew_safe_compact_tiles(local_experts) * kK1RouteTileM;
     const int64_t capacity_rows = std::max(ll_capacity_rows, normal_capacity_rows);
 
     int64_t offset = 0;
@@ -332,6 +367,18 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     offset += capacity_rows * static_cast<int64_t>(intermediate_hidden);
     offset = align_i64(offset, 16);
     offset += capacity_rows * static_cast<int64_t>(sizeof(float));
+    offset = align_i64(offset, 16);
+    offset += pro_compact_rows * static_cast<int64_t>(hidden);
+    offset = align_i64(offset, 16);
+    offset += pro_compact_rows * static_cast<int64_t>(sizeof(float));
+    offset = align_i64(offset, 16);
+    offset += pro_compact_rows * l1_cols * static_cast<int64_t>(sizeof(uint16_t));
+    offset = align_i64(offset, 16);
+    offset += pro_compact_rows * static_cast<int64_t>(sizeof(float));
+    offset = align_i64(offset, 16);
+    offset += pro_compact_rows * static_cast<int64_t>(sizeof(int64_t));
+    offset = align_i64(offset, 16);
+    offset += (local_experts + 2) * static_cast<int64_t>(sizeof(int32_t));
     offset = align_i64(offset, 16);
 
     constexpr int64_t kProbStorageBytes = 256;
@@ -528,7 +575,16 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("get_mega_moe_route_scratch_size_for_mega_moe",
-          &get_mega_moe_route_scratch_size_for_mega_moe);
+          &get_mega_moe_route_scratch_size_for_mega_moe,
+          pybind11::arg("num_ranks"),
+          pybind11::arg("num_experts"),
+          pybind11::arg("num_max_tokens_per_rank"),
+          pybind11::arg("num_topk"),
+          pybind11::arg("hidden"),
+          pybind11::arg("intermediate_hidden"),
+          pybind11::arg("use_fp8_dispatch"),
+          pybind11::arg("activation"),
+          pybind11::arg("ll_capacity_tokens_per_rank") = -1);
     m.def("get_mega_moe_hip_build_config", &get_mega_moe_hip_build_config);
     m.def("set_mega_moe_peer_ptrs", &set_mega_moe_peer_ptrs);
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch,

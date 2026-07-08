@@ -2077,3 +2077,276 @@
 - The first matrix `.cpp` row was polluted by a verification-script restore trap that copied headers/asm after a build and made their mtimes newer than objects. After a clean no-op cache leveling run (`16s`, `0` stale objects, `0` ninja work, `0` asm rebuilds, `6` asm skips), a clean `.cpp` probe on `csrc/python_api_hip.cpp` measured changed/restored `45s`; each had `1` ninja work line, `0` stale-header object removals, `0` asm rebuilds, and `6` asm skips.
 - The earlier current-guard public-header probe remains valid for public `.cuh`: temporary `include/mega_moe_dcu/layout.cuh` change/restored each removed `6` stale objects, produced `6` ninja work lines, rebuilt `0` asm `.co`, and skipped all `6` asm `.co`.
 - Verified all temporary probe files on 151.1 match local SHA256 after restoration: `python_api_hip.cpp`, `k2_fused_ext.cu`, `mega_dcu.hpp`, `k1_v3_pack5_groupgemm_impl.cuh`, `k3_v3_pack5_groupgemm_impl.cuh`, `layout.cuh`, and the tested K1 `.s`. Final no-op build after all restores: `16s`, `0` stale objects, `0` ninja work lines, `0` asm rebuilds, `6` asm skips.
+
+## 2026-07-07 21:14:04 +08:00 - Skew-Safe Capacity Fix Started
+- User requested a real fix for extreme expert-skew correctness risk, not an overflow fallback.
+- Added a new `Skew-Safe Capacity Fix` active section to `task_plan.md`.
+- Restored 151.1 execution profile from planning memory and rechecked node state before this work:
+  - `root@10.17.151.1`, docker `sglang_megamoe`, repo `/root/yuguo/DeepGEMM`, DTK `/root/yuguo/dtk-26.04.1/env.sh`;
+  - 16 HCUs visible and idle, no KFD PIDs, container mount `/root/yuguo -> /root/yuguo`;
+  - `/sys/class/infiniband` is empty, so 151.1 LL runs should use node-actual environment rather than stale HCA/topology settings.
+- Found current 151.1 Python runtime issue: default `LD_LIBRARY_PATH` hits `/opt/hyhal/lib/libamd_smi.so` and `import torch` fails with `undefined symbol: amdsmi_init`. A temporary run-local fix works: prepend `/root/yuguo/dtk-26.04.1/.hyhal/rocm_smi/lib` and filter `/opt/hyhal/lib` plus `/opt/hyhal/lib64`; then `torch 2.10.0`, HIP `6.3.26113`, and `device_count=16` import successfully.
+- Attempted `dcu-rag-kb-optimize` for Hygon/DCU routing capacity guidance, but the CLI timed out after about 30 seconds with no usable result. Proceeding from local source contracts and hardware validation instead of retrying the same query.
+
+## 2026-07-07 21:25:37 +08:00 - Skew-Safe Capacity Implementation Pass
+- Implemented the first code pass for the true skew fix:
+  - `megamoe/opt.py` staged scratch sizing now uses a skew-safe normal compact tile upper bound and LL per-expert rows aligned to `num_ranks * capacity_tokens`.
+  - `K1_fused/k1_fused_ext.cu` now defaults normal routing to HIP compact prebuild and uses the same skew-safe compact tile formula for eager and graph layouts.
+  - `csrc/apis/mega_dcu.hpp` route-scratch sizing now mirrors the Python/C++ runtime formulas instead of the old mean+headroom normal capacity and 256-row LL skew guard.
+  - Normal non-graph K2/K3 calls now receive K1 `active_tiles`; K2 also receives `row_combine_ptrs` for normal compact rows so enlarged capacity does not force full invalid-row compute.
+- The implementation intentionally keeps overflow flags as diagnostics only; the fix is to make declared-capacity legal route patterns fit without relying on overflow fallback.
+
+## 2026-07-07 21:33:23 +08:00 - Local Static Validation
+- Added a test harness route pattern `--route-pattern single-local-rank` that sends each rank's unique top-k routes to the selected target rank's first local experts. This is the adversarial legal top-k case used for the worst-case capacity validation.
+- Added source-contract assertions that the old `K_K1_LL_SKEW_GUARD_ROWS` / `kLlSkewGuardRows = 256` guard is gone, normal uses skew-safe compact capacity, LL uses worst-case capacity rows, normal K2/K3 receive active tiles, and the adversarial route-pattern CLI remains available.
+- Added LL scratch-cap layering so a normal large-token buffer is not forced to allocate LL worst-case rows for the full normal capacity. Default LL scratch cap follows the existing auto-LL threshold (`MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD`, default 512) unless the caller explicitly sets a larger `cuda_graph_max_tokens_per_rank`; forced LL beyond that cap raises a Python configuration error.
+- Local validation passed: `python -m py_compile` for touched Python files, `git diff --check`, and a custom source-contract smoke script. Local `pytest` is unavailable (`No module named pytest`), so pytest and runtime validation are being moved to 151.1.
+
+## 2026-07-07 21:47:36 +08:00 - 151.1 Skew-Safe Validation
+- Synced the changed runtime/test files to `root@10.17.151.1:/root/yuguo/DeepGEMM` and used the 151.1 LD fix (`.hyhal/rocm_smi/lib` before DTK libs, filtered `/opt/hyhal/lib*`) for Python commands.
+- Remote static validation passed:
+  - `python3 -m py_compile` for `megamoe/__init__.py`, `megamoe/opt.py`, and the two touched test files.
+  - Source-contract smoke passed.
+  - `python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` passed: `13 passed in 7.07s`.
+- Remote incremental build passed in docker `sglang_megamoe` with `build_dcu_megamoe.sh`. The build rebuilt the changed C++/HIP extension objects, skipped the six up-to-date staged ASM `.co` files, synced all five `.so` files back into the source tree, verified seven code objects, and imported `megamoe`, `_C`, K1, K2, K3, and K3 V3 extensions successfully.
+- 151.1 HCU state before/after runtime tests: all 16 HCUs showed `0% VRAM` and `0.0% HCU`; no residual card allocation was visible after the runs.
+- Flash EP8 normal adversarial correctness passed on devices `0..7`:
+  - Command shape: `--num-processes 8 --num-max-tokens-per-rank 128 --num-tokens 128 --hidden 4096 --intermediate-hidden 2048 --num-experts 256 --num-topk 6 --megamoe-backend normal --route-pattern single-local-rank --route-target-rank 0 --correctness-iters 1 --skip-bench`.
+  - Result: `max_abs=6.10352e-05`, `mean_abs=6.40284e-10`, stats matched the `normal-contiguous` baseline. Output JSON: `hygon_tmp/supernode_debug/151_1_rpc/skew_safe_normal_ep8_t128.json`.
+- Flash EP8 LL adversarial correctness passed on devices `0..7` after setting the known DeepEP LL heap/context env (`ROCSHMEM_HEAP_SIZE=4737418240`, `DUSHMEM_HEAP_SIZE=4737418240`, `ROCSHMEM_IPC_MNVL=1`, `ROCSHMEM_GDR_DISABLE_XDP=1`, `DEEPEP_ENABLE_LL_DISPATCH_OPT=1`, `ROCSHMEM_DISABLE_HDP_FLUSH=1`, `ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX=288`, `ROCSHMEM_MAX_NUM_CONTEXTS=48`, `MEGAMOE_DCU_PEER_MEMORY=rpc`):
+  - Same Flash EP8 shape and route pattern with `--megamoe-backend ll --baseline-kind ll-masked`.
+  - First LL attempt without the heap env failed in DeepEP baseline init before MegaMoE comparison (`ROCSHMEM_HEAP_SIZE` below `num_rdma_bytes(1090523264)`), matching known 151.1 baseline-environment behavior.
+  - Retried result: `max_abs=0.000244141`, `mean_abs=2.22794e-05`, stats matched the `ll-masked` baseline. Output JSON: `hygon_tmp/supernode_debug/151_1_rpc/skew_safe_ll_ep8_t128.json`.
+
+## 2026-07-07 22:20:50 +08:00 - LL Active-Only Work Started
+- User confirmed the next implementation route: normal exact compact capacity first, then LL worst-capacity plus active-only work, and only then consider compact LL if Pro LL still regresses.
+- Updated `task_plan.md` so the skew-safe capacity section is no longer marked fully complete: capacity correctness is validated, while LL active-only work is now the active subphase.
+- Current source audit found two low-intrusion LL performance hazards after worst-capacity sizing:
+  - K1 LL stage builder still clears `kExperts * m_per_expert` row metadata and staged scales before routing. This should be reduced to counts plus actual/padded active rows.
+  - K3 LL split-tail uses `max(actual_m)` only for the tiny `<=16` case; larger `max(actual_m)` values still leave copy block scheduling tied to the full `m_per_expert` capacity.
+- K2 already receives `actual_m` plus the max-count slot and maps logical rows back to physical `[expert, m_per_expert]`, so it is not the first modification target in this pass.
+
+## 2026-07-07 22:33:00 +08:00 - LL Active-Only Local Patch
+- Implemented the first LL active-only patch:
+  - `K1_fused/k1_v3_pack5_groupgemm_impl.cuh` no longer clears `kExperts * m_per_expert` worth of source pointers, route weights, row pointers, row-expert metadata, and staged scales before every LL route build.
+  - K1 still clears per-expert counts and output-index routes. Valid routed rows write their own metadata, and active tile padding rows write zero staged data plus a safe default scale.
+  - `K3_fused/k3_v3_pack5_groupgemm_impl.cuh` now derives split-tail copy row blocks from the `m_indices[local_experts]` max-count slot for all buckets, not only the `<=16` case; reduce blocks are indexed after `active_copy_blocks`.
+- Added source-contract assertions in `test_dcu_megamoe_v3.py` so row-capacity K1 initialization and the old K3 split-tail full-copy condition do not return silently.
+- Local checks passed: `python -m py_compile` for touched Python/test files, `git diff --check`, and a direct execution of `test_v3_capacity_contract_is_skew_safe_without_overflow_fallback()` with a minimal pytest stub. Local real pytest is still unavailable (`No module named pytest`).
+
+## 2026-07-07 22:49:00 +08:00 - LL Active-Only Performance Regression Triage
+- Rechecked 151.1 before runtime testing: all 16 HCUs were visible, `hy-smi --showpids` reported no KFD PIDs, and the run-local LD fix allowed `torch 2.10.0` / HIP `6.3.26113` to see 16 devices.
+- Synced/rebuilt current sources from the previous active-only patch before this triage. Flash EP8 LL adversarial correctness with `--route-pattern single-local-rank`, tokens=128, passed again against `ll-masked` (`max_abs=0.000244141` in the log), confirming the K1 active-row initialization change did not reintroduce clipping.
+- Flash EP8 LL graph cap512 correctness passed, but graph replay medians regressed to `1.0037/1.1033/1.1262/1.1996/1.4770/2.2573 ms` for replay `8/32/64/128/256/512`, versus the historical post-guard band around `0.5483/0.6529/0.6983/0.7588/1.0272/1.8229 ms`.
+- Triage result: this is too large to accept. K3 split-tail host launch still used capacity-sized `copy_blocks` (`rows_per_expert` worst stride) and only early-returned inside the kernel; K1 unified LL uses a fixed 64-CTA persistent grid and actual per-expert counts, so it is not the first launch-inflation target.
+- Implemented the next local patch: K3 LL split-tail now launches a bounded copy CTA pool (`256` rows/expert for Flash, `128` for Pro) and grid-stride loops over `active_copy_blocks`, preserving worst-skew correctness while avoiding full-capacity empty CTA launches for random graph buckets.
+- Local checks after the K3 CTA-pool patch passed: `python -m py_compile`, `git diff --check`, and the direct capacity-contract source test.
+
+## 2026-07-07 23:22:00 +08:00 - K3 CTA Pool Retest And Pro Compact Trigger
+- Synced the K3 CTA-pool patch and source-contract test to 151.1, ran remote pytest (`13 passed`) and rebuilt in `sglang_megamoe`; incremental build completed successfully and imported all MegaMoE extensions from the source tree.
+- Flash EP8 LL graph cap512 after the K3 pool patch passed correctness and returned to the historical performance band. Replay medians for `8/32/64/128/256/512` were `0.558279/0.668380/0.702880/0.779200/1.046179/1.841059 ms`, versus the earlier bad post-worst run `1.0037/1.1033/1.1262/1.1996/1.4770/2.2573 ms`.
+- Flash EP8 LL adversarial skew correctness was rerun after the K3 pool patch and still passed against `ll-masked` (`max_abs=0.000244141`, `mean_abs=2.22794e-05`). This verifies the copy CTA pool does not merely skip skew rows; it grid-stride processes every active copy block.
+- Pro EP8 LL graph cap512 with the default split path required larger DeepEP baseline heap (`ROCSHMEM_HEAP_SIZE=DUSHMEM_HEAP_SIZE=12884901888`) because the baseline reported `num_rdma_bytes(11450456192)`.
+- Pro EP8 LL graph cap512 with the default split path passed correctness but regressed materially at small/mid replay buckets: MegaMoE `2.158579/2.624898/2.694338/2.854138/3.173478/4.651879 ms`, baseline `1.442240/1.954239/2.123119/2.475079/3.190199/5.727577 ms`. Historical pre-exact MegaMoE was `1.4357/1.9045/1.9807/2.1098/2.4462/3.9351 ms`.
+- Pro EP8 unified-layout LL graph cap512 with the same 12 GiB heap was also correct but slower (`2.384559/3.091958/3.165439/3.264698/3.446359/6.061297 ms`), so it is not a performance replacement for the default split path.
+- Root-cause direction: the remaining Pro regression is the masked K1 launch. Exact LL capacity makes `rows_per_expert = num_ranks * graph_cap = 4096`, and `k1_ll_masked_groupgemm_pack5` passes that as `size_m`, which sets `num_MBlocks=64` and the physical B/C expert stride. The pre-exact path used a small `size_m` such as `128`, so small replay buckets now pay many empty M-blocks.
+- Next implementation target is compact active-K1 for Pro LL split. The fix should preserve worst-capacity correctness without relying on overflow fallback, while making the masked K1/K2/K3 chain operate on active compact rows for ordinary random buckets.
+
+## 2026-07-07 23:42:00 +08:00 - Pro Compact-Head Result And Default Guard
+- Implemented the first Pro compact-head experiment: compact the active head rows into a small masked-K1 layout, copy compact head output back to the original worst-capacity layout, and run the offset masked-K1 tail path for rows beyond the compact head. This is an exact head/tail algorithm rather than an overflow fallback.
+- 151.1 Pro EP8 LL token128 smoke passed against `ll-masked` after the compact-head implementation (`max_abs=0.000976562`, `mean_abs=4.92294e-05`).
+- 151.1 Pro EP8 LL graph cap512 also passed correctness, but performance was worse than the previous exact split run: MegaMoE replay `8/32/64/128/256/512` measured `2.2771/2.7466/2.8233/2.9797/3.2819/4.7923 ms`, while the exact split run before compact-head was `2.1586/2.6249/2.6943/2.8541/3.1735/4.6519 ms`.
+- This regression is too large to accept. The likely costs are compact staged-input copy, compact L1-output copy-back, and the offset tail masked-ASM launch even when ordinary random buckets have no tail rows.
+- Added a local default guard: `MEGAMOE_DCU_PRO_LL_COMPACT_HEAD=1` is now required to allocate/use the compact-head workspace. With the env unset, the default path returns to the known exact split behavior while the slower experiment remains reproducible for ablation.
+- Local checks after the default guard passed: `python -m py_compile`, `git diff --check`, and the direct skew-capacity source-contract function using a local pytest stub. Full pytest and runtime retest are next on 151.1 after checking HCU state.
+
+## 2026-07-08 00:19:09 +08:00 - Graph-Cap Fix And Normal Regression Triage
+- Fixed Pro LL graph capture policy so the default captures MegaMoE per replay bucket instead of reusing one max-capacity graph for every bucket. The old max-cap behavior remains available through `--cuda-graph-single-capture`.
+- Remote static validation on 151.1 passed after syncing the graph-cap patch: `py_compile` passed and `PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` reported `13 passed`.
+- Pro EP8 LL graph cap512 with per-bucket default passed correctness and recovered the small/mid bucket performance band. MegaMoE replay medians for `8/32/64/128/256/512` were `1.4381/1.9296/2.0488/2.2953/2.7740/4.6565 ms`; the aligned `ll-masked` baseline was `1.4446/1.9547/2.1209/2.4758/3.1942/5.7281 ms`.
+- Rechecked Flash EP8 normal eager 4096 after the exact compact-capacity change and found a serious performance regression despite correctness passing. Before any active-launch follow-up, MegaMoE measured `17.2707 ms` versus `normal-contiguous` baseline `9.8965 ms`; the historical same-node MegaMoE reference was `5.7636 ms`.
+- Added a first Normal eager K1 active-launch patch: for non-captured compact K1, the host reads the single `active_tiles` count and launches only `active_tiles * 256` K1 rows while keeping the worst-case workspace capacity. Remote source pytest and rebuild passed.
+- K1 active launch alone is not enough. Flash EP8 normal eager 4096 after that patch passed correctness but still measured `16.1966 ms` versus baseline `9.8811 ms`, far from the historical `5.7636 ms`.
+- Source triage now points to Normal K3 as the next likely launch-inflation site: `K3_fused/k3_fused_ext.cu` still sets `prob.n` and `wg_n` from `total_rows`, and `opt.py` still passes `asm_done_target=((rows+255)//256)*((hidden+255)//256)` from capacity rows. The ASM receives `active_tiles`, but host launch and tail-reduce done target still scale with exact capacity.
+- Do not treat Normal exact capacity as performance-complete until K3 active launch/done-target handling is fixed and Flash EP8 normal eager 4096 is remeasured on clean cards.
+
+## 2026-07-08 01:09:00 +08:00 - Normal Exact Performance Recovery
+- Added the Normal eager follow-up patches after the K1-only result:
+  - K3 normal eager now reads `active_tiles` on the host outside graph capture, launches only active K3 row tiles, and sets the tail-reduce done target to the actually launched GEMM workgroups.
+  - Normal eager K2 now uses the existing active-row CTA pool (`K_K2_GRAPH_ROW_BLOCKS`) when compact `active_tiles` metadata is available, instead of launching one CTA per worst-capacity row block.
+- Remote source-contract pytest passed after syncing these patches to 151.1 (`13 passed`), and the 151.1 incremental rebuild completed with fresh K1/K3 runtime artifacts.
+- Flash EP8 normal eager 4096 progression on 151.1:
+  - exact compact capacity before active follow-up: `17.2707 ms` fused vs `9.8965 ms` baseline, correctness passed;
+  - K1 active launch only: `16.1966 ms` fused vs `9.8811 ms` baseline, correctness passed;
+  - K3 active launch/done-target after K1: `6.6010 ms` fused vs `9.6815 ms` baseline, correctness passed;
+  - K2 active CTA pool after K1/K3: `5.9675 ms` fused vs `9.7207 ms` baseline, correctness passed;
+  - final threshold-reverted recheck: `5.9164 ms` fused vs `9.7064 ms` baseline, correctness passed with `max_abs=0.000671387`, speedup `1.6406x`.
+- Historical same-node Flash EP8 normal eager 4096 reference before exact capacity was `5.7636 ms`; the final exact-capacity result is about `+2.7%`, which is within the current acceptable guardrail and no longer a large regression.
+- Small-bucket evidence after the active-launch work: 512 recheck after reverting the threshold experiment measured `2.0019 ms`; the same active K1/K3/K2 code before the rejected threshold experiment measured `1024/2048 = 2.1515/3.5004 ms`, all with correctness passing.
+- Rejected the host-readback threshold experiment (`active launch only when capacity_tiles >= 512`). It worsened small/mid buckets (`512 -> 3.327 ms`, `1024 -> 5.086 ms`) and the 2048 matrix run ended with an empty log while the container exited `255`; after confirming no KFD PIDs, the existing `sglang_megamoe` container was restarted and the threshold constants were removed.
+- Before the final 4096 run, local and remote SHA256 matched for `megamoe/opt.py`, K1/K3 normal extension sources, and the two test files. After the run, `hy-smi --showpids` again reported no KFD PIDs.
+- Fresh remote source-contract pytest after the final runtime check passed on 151.1: `13 passed in 7.28s`.
+
+## 2026-07-08 03:10:00 +08:00 - Pro LL Compact-Active And Skew Triage
+- Implemented an eager-only Pro LL compact-active path behind the default-on `MEGAMOE_DCU_PRO_LL_COMPACT_ACTIVE` gate. The route/stage builder still keeps exact worst-capacity storage, but ordinary eager buckets compact active rows into a smaller `[expert, compact_rows]` layout before bundled masked K1/K2/K3.
+- Local validation passed after the compact-active patch: `python -m py_compile`, `git diff --check`, and the source-capacity contract smoke.
+- Synced current local sources to 151.1, ran remote source-contract pytest (`13 passed`), and rebuilt in `sglang_megamoe` under `hygon_tmp/supernode_debug/151_1_rpc/compact_active_build_20260708_0215`; the build synced fresh `.so` artifacts and imports resolved from the source tree.
+- Pro EP8 LL eager default compact-active passed random-token correctness and improved the exact worst-capacity eager path:
+  - token256: `2.6022 ms` fused vs `3.1798 ms` baseline, compared with the prior exact-worst `2.7449 ms`;
+  - token512: `4.0952 ms` fused vs `5.6718 ms` baseline, compared with the prior exact-worst `4.6322 ms`.
+- Pro EP8 LL graph cap512 remains intentionally on the exact per-bucket path (`allow_compact_active=False` during capture). It passed correctness with replay medians `1.4345/1.9274/2.0519/2.2848/2.7786/4.6458 ms`, in the same band as the earlier per-bucket graph run.
+- New correctness blocker found: Pro EP8 LL adversarial `single-local-rank` skew fails against `ll-masked` even with compact-active disabled. token128 reports `max_abs ~= 0.107`, so this is not a compact-active-only bug.
+- Ablations collected so far:
+  - `MEGAMOE_DCU_PRO_LL_COMPACT_ACTIVE=0` still fails token128 with the same error scale.
+  - `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` still fails token128, so split-tail copy is not the first boundary.
+  - `K3_USE_ASM_TAIL_REDUCE=0` still fails token64, so the final tail reducer is not the root cause.
+  - Pro unified LL (`MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT=1`) also fails token64, pointing to common LL skew handling rather than only the Pro split masked-K1 wrapper.
+- Threshold sweeps show the failure is row-count sensitive and not monotonic across scratch layouts: compact-active token8/HOT_M64 passes, token16/HOT_M128 fails, token32/HOT_M256 passes, token64/HOT_M512 fails; exact active-off token16 passes but token32/token64 fail. Next work is stage-boundary tracing on the first failing route, not another blind performance patch.
+
+## 2026-07-08 09:55:18 +08:00 - Pro LL Skew K1 Mapping Triage
+- Answered two graph/eager questions during the run:
+  - Normal graph does not use the eager D2H `active_tiles_host` readback. Eager can shrink host launch after synchronizing the metadata kernel; graph capture/replay must keep fixed host launch dimensions and rely on device-side runtime tokens / active-tile early exit for correctness.
+  - Capacity correctness for graph is still protected by the same worst-capacity rows/tiles. The remaining question for Normal graph is performance under a measured graph command, not overflow/cropping correctness.
+- Rechecked 151.1 before the Pro tests; `hy-smi --showpids` was clean before launching. Rebuilt after restoring the Pro masked-K1 wrapper launch.
+- A first attempted Pro masked-K1 wrapper change to launch `num_NBlocks x experts*num_MBlocks` was wrong. Disassembly of the active default masked `.co` (`73184662...`) showed it derives `expert = workgroup_x / num_NBlocks`, `n_tile = workgroup_x % num_NBlocks`, and uses persistent `workgroup_x += 128`; setting x only to `num_NBlocks` forces expert0 only. That change was reverted locally and remotely.
+- Disassembled the scratch balanced `.co` (`0c721483...`) and found a different active-tile scheduler: it linearly maps workgroup_x over actual `masked_m` tiles. It writes all six skewed slots in the trace, but its numeric output is not compatible with the current packaged masked weight storage, so it cannot be used as a drop-in replacement.
+- With the default packaged `.co` restored and persistent launch restored, token64 `single-local-rank` stage tracing shows rank0 writes all six route slots for token44:
+  - `rows_per_expert=512`, counts `[512,512,512,512,512,512,0,...]`.
+  - slot rows `350/862/1376/1888/2428/2940` all have nonzero L1, K3, and combine-slot abs values.
+  - Correctness is still not acceptable: `max_abs=0.0980835`, `mean_abs=0.00504374` against `ll-masked`.
+- Current boundary has therefore moved from "contribution dropped" to "Pro LL skew numeric/layout mismatch versus ll-masked". Next evidence needed when 151.1 is responsive again:
+  - Compare default Pro split against `normal-contiguous` baseline for the same route pattern to check whether the `ll-masked` oracle path has a skew-specific ordering/layout difference.
+  - Add a narrow K1 oracle outside production source, or in the test harness only, to compare the exact staged rows against `deepgemm.m_grouped_fp8_gemm_nt_masked` without introducing the banned production `deepgemm` call.
+  - After resolving correctness, run Normal graph perf (`normal`, cap/replay 4096 or the historical graph bucket) because only Normal eager 4096 has been performance-validated after exact capacity.
+- A follow-up failure-detail run timed out and 151.1 SSH stopped responding immediately afterward. Do not launch additional GPU tests until SSH and `hy-smi --showpids` confirm a clean node.
+
+## 2026-07-08 11:35:08 +08:00 - 151.1 Recovery And Normal Graph Measurement
+- Rechecked 151.1 after the container exit. Host `hy-smi` listed all 16 HCUs normally with VRAM/HCU usage at 0%, and `hy-smi --showpids` reported no KFD PIDs.
+- Restarted the existing `sglang_megamoe` container only. Container device nodes `/dev/kfd`, `/dev/mkfd`, and `/dev/dri/renderD128..143` were present, `hy-smi --showpids` was clean, a minimal Torch HIP kernel passed on `HIP_VISIBLE_DEVICES=0..7`, and `deepgemm` import again reported `DEEPGEMM_GPU_CUS=64` with `gfx938` ASM.
+- Ran the pending Flash EP8 Normal graph check after exact compact capacity:
+  - Command shape: `num_processes=8`, `tokens=4096`, `hidden=4096`, `intermediate=2048`, `experts=256`, `topk=6`, `megamoe_backend=normal`, `baseline_kind=normal-contiguous`, `cuda_graph_test_tokens=4096`, `cuda_graph_replays=20`.
+  - Correctness passed: eager check `max_abs=0.000671387`, graph bucket `max_abs=0.000488281`, `mean_abs=9.37182e-06`.
+  - Graph replay-only timing was `median=6.9654 ms`, `min=6.8656 ms`.
+- Interpretation: Normal graph is correctness-safe after the exact-capacity fix, but performance is not yet recovered to the Normal eager band. The current Normal eager reference is `5.9164 ms`, so graph replay is about `+17.7%` slower even though it excludes input updates.
+- Root cause direction is consistent with the implementation contract: graph capture cannot use the eager `active_tiles_host` D2H shrink, so it still launches a worst-capacity compact grid and relies on device-side active-tile/runtime early exits. This is correct but leaves too many empty CTAs in graph replay.
+- Next Normal performance fix should be capture-compatible active work: a fixed CTA pool or device-side active-tile consumer that decouples graph launch dimensions from worst capacity. Do not add D2H/synchronize inside graph capture.
+
+## 2026-07-08 12:53:52 +08:00 - Pro LL Skew K1 Stage Visibility Work
+- Current LL status: Flash LL worst-capacity plus active-only is correct and back in the expected performance band; Pro LL random graph/eager is correct and performance-acceptable. The active blocker is Pro EP8 LL adversarial `single-local-rank` skew.
+- Latest traces moved the boundary back into K1 stage construction. For traced failing tokens, `row_combine_ptrs` and route slot mapping are valid, but some active route rows have `staged_x=0`, default `staged_x_scale=1.0e-4/448`, zero L1, zero K3, and zero combine contribution.
+- Negative/partial fixes recorded before this entry:
+  - K3 split-tail `glc` load/store and system-scope signal did not fix the skew failure.
+  - Adding a system-scope K1 grid barrier after max-count publication helped one traced token but did not eliminate failures.
+  - Switching per-expert route counts to `atomicAdd_system` plus system-scope acquire count loads recovered more rows, but another token still reproduced the same default-stage-row symptom.
+- Next patch is targeted at K1 per-row source metadata visibility: store `symm_src_x_ptrs[row]` with system-scope release and load it in the stage-copy loops with system-scope acquire. This is a correctness synchronization fix, not an overflow fallback or capacity-policy change.
+
+## 2026-07-08 13:25:00 +08:00 - Pro LL Skew Root Cause Fixed
+- The source-pointer release/acquire experiment compiled but did not fix Pro EP8 LL skew by itself. token64 still failed with only slot0 contributing. Tracing then showed token28 had all slots nonzero, while token18 still had slot1..5 zero/default staged rows.
+- Root cause found: Pro LL stage-only uses `kBlockM=48`, while exact worst rows can be `m_per_expert=512`. K1 stage copy rounded `expert_count=512` up to `stage_rows=528`; for expert0, padding rows 512..527 are physically expert1 rows 0..15, so padding zero writes clobbered real rows in the next expert. This exactly matched failing rows such as expert1 row9 and expert4 row2.
+- Final retained patch clamps stage-copy padding to `m_per_expert` with `v3_k1_stage_rows_for_count_device()`. The heavier diagnostic changes were removed again: K1 source-pointer release/acquire, system-scope count/barrier experiments, and K3 glc split-tail load/store.
+- 151.1 final-light rebuild passed and imports resolved from the source tree for K1/K3. Correctness guardrails after rebuild:
+  - Pro EP8 LL skew token64 with `MEGAMOE_DCU_PRO_LL_COMPACT_ACTIVE=0`: passed, `max_abs=0.000488281`, `mean_abs=4.77837e-05`.
+  - Pro EP8 LL skew token128 default compact-active: passed, `max_abs=0.000488281`, `mean_abs=4.77848e-05`.
+  - Flash EP8 LL skew token128: passed, `max_abs=0.000244141`, `mean_abs=2.22794e-05`.
+- Next step is performance validation on random Pro LL eager/graph plus Flash LL graph guardrails. The expected performance impact of the retained root fix should be negligible because it reduces out-of-stride padding work rather than adding work.
+
+## 2026-07-08 13:45:00 +08:00 - LL Final Performance Guardrails Passed
+- Pro EP8 LL eager random with default compact-active remains in the expected band after the final-light stage-clamp patch:
+  - token256: fused `2.5905 ms`, baseline `3.1838 ms`, correctness `max_abs=0.000976562`.
+  - token512: fused `4.1065 ms`, baseline `5.6630 ms`, correctness `max_abs=0.000976562`.
+  - These match the earlier compact-active references (`2.6022/4.0952 ms`) within noise.
+- Pro EP8 LL graph cap512 per-bucket remains in the recovered band. Replay medians for tokens `8/32/64/128/256/512` are `1.4481/1.9328/2.0492/2.2838/2.7810/4.6494 ms`; correctness passed every bucket.
+- Flash EP8 LL graph cap512 guardrail passed. Replay medians for tokens `8/32/64/128/256/512` are `0.4989/0.6451/0.6853/0.7688/1.0380/1.8168 ms`; correctness passed every bucket. This is at least as good as the prior K3-pool guardrail band.
+- Remote source-contract pytest passed after the final rebuild: `13 passed in 7.55s`. Final card check reported no KFD PIDs.
+- Next cleanup: remove production-only Pro skew trace hooks from `opt.py`; keep the test-only route pattern because it is now the regression trigger for this precision/correctness class.
+
+## 2026-07-08 13:55:00 +08:00 - LL Cleanup Verification
+- Removed the production `MEGAMOE_DCU_TRACE_PRO_LL_SKEW` trace helper and call from `megamoe/opt.py`. The test-only `--route-pattern single-local-rank` support remains because it is the regression harness for the exact skew-capacity correctness class.
+- Local checks after cleanup passed: `python -m py_compile` for `megamoe/opt.py` and the two touched test files, plus `git diff --check`.
+- Synced the cleaned `opt.py` to 151.1. Remote verification passed: Python compile, `PYTHONPATH=. python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py` (`13 passed in 7.24s`), and `hy-smi --showpids` reported no KFD PIDs.
+
+## 2026-07-08 14:37:00 +08:00 - Temporary Debug And Ablation Cleanup
+- Removed the remaining test-harness failure dump path: `--trace-failure-detail`, `TRACE_FAILURE`, the pre-baseline combine clone, combine slot value dumps, and top-column dumps are gone from `test_mega_moe_dcu.py`.
+- Removed the rejected Pro LL compact-head ablation from production sources. `MEGAMOE_DCU_PRO_LL_COMPACT_HEAD`, compact-head staging/copy-back wrappers, and offset masked-K1 pybind exports are no longer present. The retained default Pro LL performance path is compact-active only.
+- Simplified compact-active bookkeeping after the compact-head removal: the extra tail count array was deleted, `pro_compact_head_m/pro_compact_tail_m` became a single `pro_compact_m`, and route_scratch sizing now reserves one compact count array instead of two.
+- Added/updated source-contract guards so retired failure dumps and compact-head entry points cannot silently re-enter: `--trace-failure-detail`, `TRACE_FAILURE`, `MEGAMOE_DCU_PRO_LL_COMPACT_HEAD`, `k1_ll_masked_prepare_compact_head`, `k1_ll_masked_copy_compact_head`, and `k1_ll_masked_groupgemm_pack5_offset` are asserted absent.
+- Local checks after the cleanup passed: `python -m py_compile` for the touched Python files and `git diff --check`. Local `pytest` is unavailable on the Windows Python (`No module named pytest`), so contract pytest was run on 151.1 instead.
+- 151.1 state and verification:
+  - `hy-smi --showpids` was clean before and after GPU work.
+  - Remote source pytest passed after fixing the container library path by prepending `/usr/local/lib/python3.10/dist-packages/amdsmi` to `LD_LIBRARY_PATH`: `13 passed in 7.42s`.
+  - Full remote build passed and synced fresh source-tree `.so` artifacts; build log: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_cleanup/cleanup_build_20260708_142145/build.log`.
+  - Pro EP8 LL adversarial `single-local-rank` token128 passed against `ll-masked`: `max_abs=0.000488281`, `mean_abs=4.77848e-05`.
+  - Pro EP8 LL random token256 performance remained in the pre-cleanup band: fused `2.5879 ms`, baseline `3.1855 ms`, correctness `max_abs=0.000976562`.
+
+## 2026-07-08 15:04:00 +08:00 - EP16 Final LL Retest After Cleanup
+- Rechecked 151.1 before the EP16 runs. Container `torch` import passed after the `amdsmi` library-path prepend, and `hy-smi --showpids` reported no KFD PIDs.
+- Pro EP16 LL adversarial skew is clean after the final stage-copy clamp and cleanup:
+  - token64 `single-local-rank`, target rank0, Pro shape `experts=384 topk=6 hidden=7168 intermediate=3072`, `ll-masked` baseline: passed with `max_abs=0.000488281`, `mean_abs=4.78497e-05`. Log/result dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_ep16_final/ep16_ll_skew_t64_20260708_145950`.
+  - token128 same setup: passed with `max_abs=0.000488281`, `mean_abs=4.79524e-05`. Log/result dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_ep16_final/ep16_ll_skew_t128_20260708_150109`.
+- Pro EP16 LL graph cap512 random route passed against `ll-masked` for all replay buckets. Eager correctness max was `0.000976562`; graph bucket maxes were `0.000488281/0.000488281/0.000488281/0.000976562/0.000976562/0.000976562` for tokens `8/32/64/128/256/512`.
+- EP16 graph replay medians stayed better than the aligned baseline: MegaMoE `1.0938/1.2286/1.3612/1.6362/2.7352/4.8378 ms` versus baseline `1.1465/1.2819/1.4086/1.7139/2.8351/5.0976 ms` for tokens `8/32/64/128/256/512`. Full run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_ep16_final/ep16_ll_graph512_20260708_150225`.
+- The same graph command also reported token512 eager-main performance `4.2887 ms` fused versus `5.2144 ms` baseline, speedup `1.216x`, with correctness passing.
+- Post-run card checks again reported no KFD PIDs.
+- Source scan of runnable code confirmed the then-retained Pro LL addition was `MEGAMOE_DCU_PRO_LL_COMPACT_ACTIVE`, default enabled, while `MEGAMOE_DCU_PRO_LL_COMPACT_HEAD` had no source/API residue. This was later simplified further by removing the compact-active env entirely and making compact-active the fixed eager Pro LL path.
+
+## 2026-07-08 15:20:00 +08:00 - Remove Pro LL Compact-Active Env
+- Removed `MEGAMOE_DCU_PRO_LL_COMPACT_ACTIVE` from the runnable Python/C++ implementation. Pro LL eager compact-active is now fixed-on when the Pro masked shape has compact scratch available; graph remains on the exact per-bucket non-compact-active path via `allow_compact_active=False`.
+- Deleted the Python `pro_ll_compact_active_enabled()` helper and the C++ API-side env parser. Route-scratch sizing now allocates Pro compact scratch solely from the Pro masked shape predicate.
+- Updated source-contract tests to assert the compact-active env/helper stay absent while the compact-active kernels and wrappers remain present.
+- Local verification passed: `python -m py_compile megamoe/opt.py megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py`.
+
+## 2026-07-08 15:32:00 +08:00 - EP16 Single-Capture Graph Reality Check
+- Rechecked 151.1 before the run; `torch` import passed and `hy-smi --showpids` was clean.
+- Ran Pro EP16 LL graph cap512 with `--cuda-graph-single-capture`, so one capture capacity `512` graph replayed runtime tokens `8/32/64/128/256/512`. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_ep16_final/ep16_ll_graph512_single_20260708_153055`.
+- Correctness passed for every bucket. Bucket max errors were `0.000488281/0.000488281/0.000488281/0.000976562/0.000976562/0.000976562`.
+- Single-capture graph replay medians were `1.8298/1.9214/2.0112/2.1938/3.1099/4.8275 ms` for tokens `8/32/64/128/256/512`. The aligned `ll-masked` baseline medians in the same run were `1.1478/1.2832/1.4014/1.7135/2.8365/5.1106 ms`.
+- Interpretation: single cap512 graph is correctness-safe, but it does not match the pre-exact-capacity small/medium bucket performance. The per-bucket capture mode remains the current fair graph performance mode; true single-capture recovery would need a graph-compatible active work consumer or compact graph design.
+
+## 2026-07-08 15:45:00 +08:00 - Baseline Cap512 Single-Capture Attempt Hung Node
+- User correctly pointed out that a fair single-capture comparison should make the `ll-masked` baseline use the same cap512 dispatch capacity. The harness was adjusted locally so `--cuda-graph-single-capture` passes `graph_capture_tokens` to the baseline graph path; source-contract coverage was updated and local `py_compile` plus `git diff --check` passed.
+- Synced the updated Python harness to 151.1 and rechecked cards; `hy-smi --showpids` was clean before launch.
+- Attempted the same Pro EP16 LL `--cuda-graph-single-capture` run with baseline dispatch cap now aligned to 512. The run did not return; after the user interrupted the local command, 151.1 was no longer reachable by SSH or ping from the workstation. Two follow-up probes showed `ssh: connect to host 10.17.151.1 port 22: Connection timed out`, `PingSucceeded=False`, and 100% packet loss.
+- No result numbers should be inferred from this aborted run. Once 151.1 recovers, first action must be host/container/KFD state inspection before any new GPU tests. Treat baseline-cap512 single-capture as unstable until proven otherwise.
+
+## 2026-07-08 16:05:00 +08:00 - README Capacity Token Contract Update
+- Updated `README.md` near the eager uneven-token `capacity_num_tokens` section to document graph-mode behavior explicitly.
+- Documented that `capacity_num_tokens` is accepted by both LL and normal CUDA Graph captures. In graph mode it is the capture capacity, independent of replay-time `sym_buffer.cuda_graph_num_tokens`; when omitted it defaults to `sym_buffer.cuda_graph_max_tokens_per_rank`.
+- Updated the CUDA Graph mode section and test-harness option list:
+  - `--num-max-tokens-per-rank` is now described as the graph capacity upper bound, not necessarily every capture's size.
+  - Default graph testing is documented as per-bucket capture, passing each listed replay token count as graph `capacity_num_tokens`.
+  - `--cuda-graph-single-capture` is documented as one max-capacity capture for all replay buckets, with MegaMoE and `ll-masked` baseline capacities both using the max bucket.
+
+## 2026-07-08 16:15:00 +08:00 - 151.1 Still Unreachable
+- Rechecked 151.1 after the baseline-cap512 single-capture hang. The node is still unreachable from the workstation: ping timed out with 100% packet loss, TCP port 22 failed, and `ssh -F NUL -o ConnectTimeout=10 root@10.17.151.1` timed out.
+- Because host SSH is down, no container `hy-smi --showpids` or KFD PID inspection is currently possible. First action after network/host recovery remains host login, Docker/container status, and DCU PID/state inspection before any further GPU test.
+
+## 2026-07-08 16:13:49 +08:00 - Graph Performance Recheck After Recovery
+- 151.1 recovered. Host SSH works, `sglang_megamoe` had exited with code 255 and was restarted, and host/container `hy-smi --showpids` reported no KFD PIDs before and after the rechecks.
+- Synced the current local runnable sources to `/root/yuguo/DeepGEMM`, ran local `py_compile` plus `git diff --check`, remote source-contract pytest (`13 passed`), and rebuilt the DCU MegaMoE artifacts. Build/import verification passed; build log: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graph_perf/graph_perf_build_20260708_155729/build.log`.
+- Flash EP8 Normal graph token4096 reproduced the known graph/eager gap after the rebuild. Correctness passed against `normal-contiguous`; eager main-call median was `6.0118 ms`, while graph replay-only median was `6.9821 ms`. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graph_perf/normal_graph4096_20260708_160508`.
+- Normal graph with `K3_USE_ASM_TAIL_REDUCE=0` stayed correct but was slower: graph replay token4096 `7.0714 ms`, eager main-call `6.0637 ms`. This rejects "disable normal ASM tail-reduce" as the graph recovery fix for this size. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graph_perf/normal_graph4096_tail0_20260708_160839`.
+- Pro EP8 LL graph cap512 per-bucket also reproduced the post-fix graph/eager gap, but remains faster than the fair `ll-masked` graph baseline. Correctness passed for all replay buckets. Eager token512 was `4.1925 ms`; graph replay medians for `8/32/64/128/256/512` were `1.4391/1.9300/2.0497/2.2888/2.7879/4.6485 ms`, while `ll-masked` baseline graph medians were `1.4463/2.1219/2.2071/2.5399/3.1942/5.7411 ms`. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graph_perf/pro_ep8_ll_graph512_20260708_160649`.
+- Pro EP8 LL graph with `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` was slower: graph replay512 `5.2302 ms`, eager main-call `4.8066 ms`. This keeps split-tail enabled as the correct LL graph direction. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graph_perf/pro_ep8_ll_graph512_split0_20260708_161028`.
+- Source inspection of the remaining Pro LL graph gap found a precise unsafe shortcut: `launch_pro_ll_masked_groupgemm_asm()` currently derives `num_MBlocks` from physical `size_m`. In exact graph cap512, Pro EP8 has `size_m=4096` and `num_MBlocks=64`; eager compact-active uses a smaller compact stride such as `128` rows/expert and `num_MBlocks=2`. Changing graph to use `expected_m_per_group` directly would be faster for random routes but is not correctness-safe under legal skew, because masked K1 would skip rows above the chosen M-block count while K2/K3 still consume `actual_m`.
+- Current safe conclusion: no low-risk one-line performance patch should be applied for LL graph. Real graph recovery needs either masked K1 ASM support for device-side max-count scheduling, or true compact LL where K1/K2/K3 consume a compact active layout without host D2H and without dropping skew rows.
+
+## 2026-07-08 16:29:00 +08:00 - Graph Gap Profiling
+- Checked 151.1 before profiling: `sglang_megamoe` was up, Torch saw 16 devices, and `hy-smi --showpids` reported no KFD PIDs. Post-profile card check was also clean.
+- Ran short `hipprof --stats --hip-trace --follow-fork --devices 0` probes with graph baseline skipped, so the stats focus on MegaMoE graph capture/replay kernels rather than DeepEP baseline work.
+- Normal Flash EP8 graph token4096 profile run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graph_perf/normal_graph4096_hipprof_20260708_162238`.
+  - Main MegaMoE kernels in HIPOPS stats were K1 normal ASM at about `3.745 ms/call` and K3 normal ASM at about `2.798 ms/call`.
+  - Compact route init/count/build/emit kernels were only tens of microseconds each. The remaining Normal graph gap is therefore dominated by K1/K3 captured capacity-grid work/early-exit overhead, not by the compact route builder.
+- Pro EP8 LL graph token512 profile run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graph_perf/pro_ep8_ll_graph512_hipprof_20260708_162358`.
+  - MegaMoE-side heavy kernels were K1 stage-only (`~3.701 ms/call`), K3 split/combine (`~2.699 ms/call`), Pro masked K1 (`~1.731 ms/call`), K3 LL masked GEMM (`~1.042 ms/call`), and K2 SwiGLU/quant (`~0.800 ms/call`) in the captured profile window.
+  - This matches the source analysis: the graph/eager delta is most plausibly from Pro masked K1 still using the exact physical stride, while K2/K3 already consume actual rows / split-tail active copy blocks.
+- No performance patch was applied from these profiles. The safe optimization paths remain larger changes: Normal K1/K3 graph active-work CTA pooling, or Pro LL masked K1 dynamic M-block scheduling / true compact LL graph. Fixed expected-M clamping is explicitly rejected because it would reintroduce legal-skew row loss.
+
+## 2026-07-08 16:42:00 +08:00 - Baseline Cap512 Single-Capture Retest
+- Rechecked 151.1 before rerunning the previously failed baseline-cap512 test. `sglang_megamoe` was up, Torch saw 16 devices, and `hy-smi --showpids` reported no KFD PIDs.
+- Verified the remote test harness contains the intended fair single-capture baseline logic: under `--cuda-graph-single-capture`, `ll-masked` baseline graph capture uses `graph_capture_tokens` rather than the replay token.
+- First ran a short EP16 token512 sanity with baseline cap512. It passed correctness and benchmarked MegaMoE graph replay `4.8772 ms` versus `ll-masked` baseline graph replay `5.1075 ms`. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_baseline_cap512/ep16_ll_single_cap512_t512_20260708_163225`.
+- Then ran the full EP16 single-capture cap512 bucket list with `tokens=8,32,64,128,256,512`, `num_processes=16`, Pro shape, `--megamoe-backend ll`, `--baseline-kind ll-masked`, `--cuda-graph-single-capture`, baseline cap fixed to 512, `repeat=10`. Python reported `STATUS=0`; the outer SSH wrapper ended with a harmless script-tail parse error after printing the complete result.
+- Correctness passed for every replay bucket. MegaMoE graph medians were `1.8216/1.9240/2.0016/2.2017/3.1074/4.8633 ms` for `8/32/64/128/256/512`.
+- The fair baseline-cap512 graph medians were `2.5676/2.6352/2.6780/2.8035/3.5800/5.1097 ms` for `8/32/64/128/256/512`.
+- Full run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_baseline_cap512/ep16_ll_single_cap512_full_20260708_163424`.
+- Post-run `hy-smi --showpids` was clean. This retest did not reproduce the previous node hang.

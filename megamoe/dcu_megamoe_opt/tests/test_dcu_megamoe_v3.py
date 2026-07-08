@@ -256,7 +256,8 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "use_compact_prebuild ? 2u : 4u" not in k1_asm_ext
     assert "kK1AutoCompactMinLocalTileSaving" in k1_asm_ext
     assert "kK1AutoCompactHighTilesPerExpert" in k1_asm_ext
-    assert "force_compact_prebuild || num_ranks > 8 || local_experts > 32" in k1_asm_ext
+    assert "const bool default_compact_prebuild = true" in k1_asm_ext
+    assert "K1_PREBUILD_MODE" in k1_asm_ext
     assert "num_ranks <= 8 && local_experts <= 32" in k1_asm_ext
     assert "label_SymmRouteStoreAbsolutePtr" not in k1_asm_sources
     assert "label_SymmStageLoadAbsolutePtr" not in k1_asm_sources
@@ -420,7 +421,11 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "launch_swiglu_quant_channelwise_auto<false>" in k2_ext
     assert 'pybind11::arg("fast_math") = true' in k2_ext
     assert "const int expected_count = (token_end - token_start) * num_topk" in k3_header
-    assert "max_copy_rows <= kCopyRows" in k3_header
+    assert "max_copy_rows <= kCopyRows" not in k3_header
+    assert "copy_row_blocks_per_expert =\n            (max_copy_rows + kCopyRows - 1) / kCopyRows" in k3_header
+    assert "const int launched_copy_blocks" in k3_header
+    assert "copy_idx += launched_copy_blocks" in k3_header
+    assert "const int reduce_idx = static_cast<int>(blockIdx.x) - launched_copy_blocks;" in k3_header
     assert "graph_ll_split_copy_shrink_out" not in k1_header
     assert "graph_ll_split_copy_shrink" not in opt_py
     assert "expected=%d seen=%d all_done=%d" not in k3_header
@@ -479,6 +484,9 @@ def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
         "MEGAMOE_DCU_REDUCE_COMBINE_GLC_SLC_LOAD",
         "--debug-combine-on-fail",
         "--debug-compare-backends-on-fail",
+        "--trace-failure-detail",
+        "TRACE_FAILURE",
+        "pre_baseline_combine",
         "system_fence_after_write",
         "invalidate_before_read",
         "ll_asm_compatible_layout",
@@ -491,33 +499,113 @@ def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
     assert not (ROOT / "megamoe" / "dcu_megamoe_v2").exists()
 
 
-def test_v3_ll_capacity_headroom_covers_256_and_512_exact_buckets():
+def test_v3_capacity_contract_is_skew_safe_without_overflow_fallback():
     k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
     k1_header = (K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh").read_text(
         encoding="utf-8"
     )
+    k3_header = (K3_FUSED_DIR / "k3_v3_pack5_groupgemm_impl.cuh").read_text(
+        encoding="utf-8"
+    )
+    k3_normal_ext = (K3_FUSED_DIR / "k3_fused_ext.cu").read_text(
+        encoding="utf-8"
+    )
+    k3_ext = (K3_FUSED_DIR / "k3_v3_fused_ext.cu").read_text(encoding="utf-8")
+    k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
     api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
     opt_source = OPT_PATH.read_text(encoding="utf-8")
+    init_source = (ROOT / "megamoe" / "__init__.py").read_text(encoding="utf-8")
+    test_harness_source = (
+        ROOT / "megamoe" / "dcu_megamoe_opt" / "tests" / "test_mega_moe_dcu.py"
+    ).read_text(encoding="utf-8")
 
     assert "kLlHeadroomExpectedRowsThreshold = 48" in k1_ext
     assert "kLlHeadroomRows = 64" in k1_ext
     assert "ll_expected_rows_per_expert >= kLlHeadroomExpectedRowsThreshold" in k1_ext
     assert "ll_expected_rows_per_expert >= 160 ? 64 : 0" not in k1_ext
-    assert "kLlSkewGuardRows = 256" in k1_ext
-    assert "if (!ll_stage_only)" in k1_ext
+    assert "kLlSkewGuardRows = 256" not in k1_ext
+    assert "K_K1_LL_SKEW_GUARD_ROWS" not in opt_source
+    assert "kK1LlSkewGuardRows" not in api_source
+    assert "ll_worst_rows_per_expert" in k1_ext
+    assert "ll_worst_rows_per_expert" in opt_source
+    assert "ll_worst_rows_per_expert" in api_source
     assert "route_capacity_tokens_per_rank * static_cast<int64_t>(num_ranks)" in k1_ext
-    assert "K_K1_LL_SKEW_GUARD_ROWS = 256" in opt_source
-    assert "kK1LlSkewGuardRows = 256" in api_source
     assert "int(num_ranks) * int(num_max_tokens)" in opt_source
     assert "static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank" in api_source
+    assert "_v3_normal_skew_safe_compact_tiles" in opt_source
+    assert "normal_skew_safe_compact_tiles" in api_source
+    assert "skew_safe_compact_capacity_tiles" in k1_ext
+    assert "const bool default_compact_prebuild = true" in k1_ext
+    assert "int launch_wg_n = wg_n" in k1_ext
+    assert "hipMemcpyAsync(\n                &active_tiles_host" in k1_ext
+    assert "hipStreamSynchronize(stream)" in k1_ext
+    assert "prob.n = static_cast<uint32_t>(launch_rows)" in k1_ext
+    assert "local_work_size) * wg_m * launch_wg_n" in k1_ext
+    assert "int launch_wg_n = wg_n" in k3_normal_ext
+    assert "int active_tiles_host = wg_n" in k3_normal_ext
+    assert "hipMemcpyAsync(\n                &active_tiles_host" in k3_normal_ext
+    assert "hipStreamSynchronize(stream)" in k3_normal_ext
+    assert "const int launch_rows = launch_wg_n * 256" in k3_normal_ext
+    assert "prob.n = static_cast<uint32_t>(launch_rows)" in k3_normal_ext
+    assert "const int gemm_workgroups = wg_m * launch_wg_n" in k3_normal_ext
+    assert "effective_asm_done_target" in k3_normal_ext
+    assert "max_row_blocks=K_K2_GRAPH_ROW_BLOCKS if k2_active_tiles is not None else None" in opt_source
+    assert "active_tiles=k2_active_tiles" in opt_source
+    assert "v3_backend != V3_BACKEND_LL" in opt_source
+    assert "ll_scratch_capacity_tokens_per_rank" in init_source
+    assert "normal_ll_token_threshold()" in init_source
+    assert "ll_capacity_tokens_per_rank" in api_source
+    assert 'pybind11::arg("ll_capacity_tokens_per_rank") = -1' in api_source
+    assert "ll_capacity_tokens: int | None = None" in opt_source
+    assert "_check_ll_scratch_capacity(" in init_source
     assert "kProEp8LlMaskedK1MinRowsPerExpert = 128" in k1_ext
     assert "pro_ep8_ll_masked_k1" in k1_ext
     assert "K_PRO_EP8_LL_MASKED_K1_MIN_ROWS_PER_EXPERT = 128" in opt_source
     assert "kProEp8LlMaskedK1MinRowsPerExpert = 128" in api_source
+    assert "MEGAMOE_DCU_PRO_LL_COMPACT_ACTIVE" not in opt_source
+    assert "MEGAMOE_DCU_PRO_LL_COMPACT_ACTIVE" not in api_source
+    assert "pro_ll_compact_active_enabled" not in opt_source
+    assert "pro_ll_compact_active_enabled" not in api_source
+    assert "MEGAMOE_DCU_PRO_LL_COMPACT_HEAD" not in opt_source
+    assert "MEGAMOE_DCU_PRO_LL_COMPACT_HEAD" not in api_source
+    assert "pro_ll_compact_head_enabled" not in opt_source
+    assert "pro_ll_compact_head_enabled" not in api_source
+    assert "allow_compact_active=True" in opt_source
+    assert "allow_compact_active=False" in opt_source
+    assert "actual_max_m <= int(compact_rows_per_expert)" in opt_source
+    assert "return (\n                compact_l1_out" in opt_source
+    assert "pro_compact_route_weights" in opt_source
+    assert "pro_compact_row_combine_ptrs" in opt_source
+    assert "compact_route_weights" in opt_source
+    assert "compact_row_combine_ptrs" in opt_source
+    assert "def k1_ll_masked_prepare_compact_active(" in k1_py
+    assert "k1_ll_masked_prepare_compact_active_pack5" in k1_py
+    assert "void k1_ll_masked_prepare_compact_active_pack5(" in k1_ext
+    assert "pro_ll_masked_compact_stage_active_kernel" in k1_ext
+    assert "compact_route_weights.data_ptr<float>()" in k1_ext
+    assert "compact_row_combine_ptrs.data_ptr<int64_t>()" in k1_ext
+    assert '"k1_ll_masked_prepare_compact_active_pack5"' in k1_ext
+    assert "k1_ll_masked_prepare_compact_head" not in k1_py
+    assert "k1_ll_masked_prepare_compact_head" not in k1_ext
+    assert "k1_ll_masked_copy_compact_head" not in k1_py
+    assert "k1_ll_masked_copy_compact_head" not in k1_ext
+    assert "k1_ll_masked_groupgemm_pack5_offset" not in k1_ext
     assert "atomicExch(symm_counts + kExperts + 1, 1)" in k1_header
-    assert "capacity-overflow flag" in k1_ext
     assert "make_i32_view(route_scratch_i32_offset, {local_experts + 2})" in k1_ext
     assert "symm_counts[expert] > 0 ? symm_counts[expert] : 0" in k1_header
+    assert "const int row_capacity = kExperts * m_per_expert" not in k1_header
+    assert "for (int idx = global_tid; idx < row_capacity" not in k1_header
+    assert "staged_x_scale[row] = kDefaultStagedScale" in k1_header
+    assert "if (max_copy_rows_ptr != nullptr)" in k3_header
+    assert "if (max_copy_rows <= kCopyRows)" not in k3_header
+    assert "const int launched_copy_blocks" in k3_header
+    assert "copy_idx += launched_copy_blocks" in k3_header
+    assert "const int reduce_idx = static_cast<int>(blockIdx.x) - launched_copy_blocks;" in k3_header
+    assert "copy_launch_rows_per_expert = hidden == 7168 ? 128 : 256" in k3_ext
+    assert "std::min(full_copy_blocks, copy_blocks) + reduce_blocks" in k3_ext
+    assert 'ROUTE_PATTERN_SINGLE_LOCAL_RANK = "single-local-rank"' in test_harness_source
+    assert "--route-pattern" in test_harness_source
+    assert "topk_idx.copy_(experts.view(1, -1).expand_as(topk_idx))" in test_harness_source
 
 
 def test_v3_pro_ll_masked_k1_stage_only_path_is_additive():
@@ -546,7 +634,8 @@ def test_v3_pro_ll_masked_k1_stage_only_path_is_additive():
     assert "PRO_LL_MASKED_L1_ASM_CO" in k1_py
     assert "deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co" in k1_py
     assert "PREBUILT_CODE_OBJECTS" in setup_source
-    assert "prebuilt/gfx938" in setup_source.replace("\\", "/")
+    assert "'prebuilt'," in setup_source
+    assert "'gfx938'," in setup_source
     assert "deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.s" not in setup_source
     assert "k1_ll_masked_groupgemm_pack5" in k1_pybind
     assert "kProLlMaskedL1AsmKernelName" in k1_pybind
@@ -656,7 +745,7 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "includes_input_quantization" not in test_source
     assert "megamoe.mega_moe_pre_dispatch(" in test_source
     assert "num_tokens=num_tokens" in test_source
-    assert "num_tokens=capture_tokens" in test_source
+    assert "num_tokens=graph_capture_tokens" in test_source
     assert "sym_buffer.x[:num_tokens]" not in test_source
     assert "sym_buffer.x[:capture_tokens]" not in test_source
     assert "normal_baseline_predispatch_buffers = {}" in test_source
@@ -703,11 +792,12 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
         1,
     )[0]
     assert "dispatch_num_tokens" not in graph_signature
-    assert "capacity_num_tokens" not in graph_signature
+    assert "capacity_num_tokens: Optional[int] = None" in graph_signature
     assert "v3_backend: str" in graph_signature
 
     assert "--megamoe-backend" in test_source
     assert "--cuda-graph" in test_source
+    assert "--cuda-graph-single-capture" in test_source
     assert "--k1-only-bench" not in test_source
     assert "--k1-only-ll-block-m" not in test_source
     assert "--k1-only-ll-block-n" not in test_source
@@ -728,7 +818,7 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "ll_k1_main_call_with_host_epoch_barrier" not in test_source
     assert "ll_k1_pure_groupgemm_call_with_host_epoch_barrier" not in test_source
     assert "dist.barrier(group=group)" in test_source
-    assert "_v3_ll_block_m(" in test_source
+    assert "ll_block_m = _v3_ll_block_m(" in opt_source
     assert "--opt-3stage" not in test_source
     assert "--ll-cuda-graph" not in test_source
     assert "--normal-cuda-graph" not in test_source
@@ -740,7 +830,7 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
         1,
     )[0]
     graph_call = test_source.split("def run_graph_bucket_once(", 1)[1].split(
-        "fill_graph_inputs(capture_tokens)",
+        "fill_graph_inputs(graph_capture_tokens)",
         1,
     )[0]
     assert "megamoe_backend=v3_backend" in run_fused_call
@@ -748,14 +838,19 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "dispatch_num_tokens=" not in run_fused_call
     assert "megamoe_backend=v3_backend" in graph_call
     assert "graph=True" in graph_call
+    assert "capacity_num_tokens=graph_capture_tokens" in graph_call
     assert "dispatch_num_tokens=" not in graph_call
-    assert "capacity_num_tokens=" not in graph_call
+    assert "max_capture_tokens if args.cuda_graph_single_capture else token" in test_source
+    assert "baseline_capacity_token = (" in test_source
+    assert "graph_capture_tokens if args.cuda_graph_single_capture else token" in test_source
+    assert '"graph_capture_tokens_per_rank": graph_capture_tokens' in test_source
     assert "pro_model_shape" not in test_source
     assert "UNIFIED_WEIGHT_LAYOUT_ENV" in test_source
     assert '"normal" if v3_backend == "normal" else "unified"' in test_source
 
 
 def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
+    init_source = (ROOT / "megamoe" / "__init__.py").read_text(encoding="utf-8")
     api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
     opt_source = OPT_PATH.read_text(encoding="utf-8")
 
@@ -786,8 +881,6 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
 
     for py_name, cpp_name in (
         ("K_K1_ROUTE_TILE_M", "kK1RouteTileM"),
-        ("K_K1_ALIGNMENT", "kK1Alignment"),
-        ("K_K1_ROUTE_CAPACITY_SLACK", "kK1RouteCapacitySlack"),
         ("K_K1_LL_ROW_TILE", "kK1LlRowTile"),
         (
             "K_K1_LL_HEADROOM_EXPECTED_ROWS_THRESHOLD",
@@ -812,9 +905,14 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
         "capacity_rows",
         "route_task_workspace_bytes",
         "tail_signal_addrs_offset",
+        "ll_capacity_tokens",
     ):
         assert mirrored_name in api_source
         assert mirrored_name in opt_source
+    assert "ll_scratch_capacity_tokens_per_rank" in init_source
+    assert "self.ll_scratch_capacity_tokens_per_rank" in init_source
+    assert "ll_capacity_tokens_per_rank" in api_source
+    assert "ll_capacity_tokens" in opt_source
     assert "capacity_rows * static_cast<int64_t>(hidden)" in api_source
     assert "capacity_rows * hidden" in opt_source
 
@@ -851,8 +949,9 @@ def test_v3_supernode_source_support():
     assert "return V3_LL_DEFAULT_BLOCK_M" in opt_source
     assert "K1_SUPPORTED_RANKS = SUPPORTED_STAGED_EP_RANKS" in k1_py
     assert "counts[local_experts]" in k1_asm_ext
-    assert "num_ranks > 8 || local_experts > 32" in k1_asm_ext
-    assert "? fixed_capacity_tiles" in k1_asm_ext
+    assert "const bool default_compact_prebuild = true" in k1_asm_ext
+    assert "legacy in-ASM route layout is kept as an" in k1_asm_ext
+    assert "? fixed_capacity_tiles" not in k1_asm_ext
     assert "dcu_required_signal_slots" in layout_source
     assert "dcu_split_tail_chunk_signal_slot_base(num_ranks)" in k1_header
     assert "dcu_split_tail_chunk_signal_slot_base(num_ranks)" in k3_header

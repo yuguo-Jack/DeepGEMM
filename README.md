@@ -315,6 +315,18 @@ request max, the conservative fallback is the symmetric-buffer
 `num_max_tokens_per_rank` bucket, but that may do more K1 route work than
 necessary.
 
+For CUDA Graph capture, the same `capacity_num_tokens` argument is also
+accepted by both LL and normal backends, but its meaning is the graph capture
+capacity.  When omitted, graph capture uses
+`sym_buffer.cuda_graph_max_tokens_per_rank`.  When provided, it must be in
+`1..sym_buffer.cuda_graph_max_tokens_per_rank` and fixes the captured graph
+shape plus the exact route-capacity bound for that graph.  Replay-time actual
+tokens still come from the device scalar `sym_buffer.cuda_graph_num_tokens`;
+a graph captured with `capacity_num_tokens=128` may replay smaller local token
+counts, but it cannot replay 256 tokens.  This lets frameworks keep one larger
+`SymmBuffer` while capturing smaller per-bucket LL or normal graphs when that
+is the desired graph-cache policy.
+
 The V3 staged path keeps all K1/K2/K3 implementation files under
 `megamoe.dcu_megamoe_opt`.  Its temporary activations reuse the DCU
 MegaMoE `route_scratch` allocation; the integration does not allocate a second
@@ -356,11 +368,13 @@ bucket does not require duplicate input copies.
 ### CUDA Graph Mode
 
 DCU MegaMoE exposes graph-bucket mode through the public
-`megamoe.fp8_w8a8_mega_moe` API.  The graph bucket size is the symmetric
-buffer's requested `num_max_tokens_per_rank`; no separate CUDA Graph max-token
-environment variable is used.  The internal buffer capacity may be aligned up
-for kernel requirements, but graph replay uses
-`sym_buffer.cuda_graph_max_tokens_per_rank`.
+`megamoe.fp8_w8a8_mega_moe` API.  The symmetric buffer owns the maximum graph
+capacity, `sym_buffer.cuda_graph_max_tokens_per_rank`; no separate CUDA Graph
+max-token environment variable is used.  A particular capture may use that
+maximum, or a smaller explicit `capacity_num_tokens` capture capacity.  The
+internal buffer capacity may be aligned up for kernel requirements, but graph
+capture and replay use the explicit graph capacity and
+`sym_buffer.cuda_graph_num_tokens` contract described below.
 
 Use `graph=True` during graph capture and pass the same explicit
 `megamoe_backend` that the framework selected for that graph bucket.
@@ -370,7 +384,8 @@ otherwise a fixed eager launch could be captured with the wrong token count or
 implementation choice for later replays.
 
 ```python
-y_graph = torch.empty((sym_buffer.cuda_graph_max_tokens_per_rank, hidden),
+graph_capacity_tokens = 128
+y_graph = torch.empty((graph_capacity_tokens, hidden),
                       dtype=torch.bfloat16, device="cuda")
 megamoe.fp8_w8a8_mega_moe(
     y_graph,
@@ -379,6 +394,7 @@ megamoe.fp8_w8a8_mega_moe(
     sym_buffer,
     megamoe_backend="ll",
     graph=True,
+    capacity_num_tokens=graph_capacity_tokens,
 )
 ```
 
@@ -396,17 +412,20 @@ This matches the usual static-buffer CUDA Graph usage: the graph shape is fixed,
 while the framework owns the valid-token prefix and chooses which captured graph
 to replay.  The V3 backend captured into the graph is explicit in
 `megamoe_backend`, not inferred from the capture bucket size.  For example, a
-framework may capture a single 8192-token LL graph with
-`megamoe_backend="ll"` for small-token replay and a separate 8192-token normal
-graph with `megamoe_backend="normal"` for larger replay.  The choice of which
-graph to capture or replay should use the same global token-bucket rule as
-eager mode, so uneven ranks still agree on LL vs normal.
+framework may create one large `SymmBuffer`, capture several smaller LL graphs
+with `megamoe_backend="ll"` and different `capacity_num_tokens` values for
+small-token replay, and capture separate normal graphs with
+`megamoe_backend="normal"` for larger replay.  A framework that wants one
+single graph for the full bucket can omit `capacity_num_tokens` or set it to
+`sym_buffer.cuda_graph_max_tokens_per_rank`.  The choice of which graph to
+capture or replay should use the same global token-bucket rule as eager mode,
+so uneven ranks still agree on LL vs normal.
 
 In `megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py`, the CUDA Graph test options separate capacity,
 ordinary correctness input, and replay buckets:
 
 - `--num-max-tokens-per-rank` is the symmetric-buffer capacity and graph capture
-  bucket size.
+  capacity upper bound.
 - `--num-tokens` is the normal fused-vs-baseline correctness input size.  When
   set to `0`, the test enables uneven per-rank local tokens with
   `--num-max-removed-tokens`.
@@ -422,13 +441,21 @@ ordinary correctness input, and replay buckets:
   `capacity_num_tokens` capacity bound.
 - `--cuda-graph` captures the selected V3 staged backend as a graph.
 - `--cuda-graph-test-tokens` is only the list of runtime token counts replayed
-  against the captured graph, for example `32,64,128`.
-  For graph-only performance sweeps, keep `--num-tokens` equal to the capture
-  bucket so the test's auxiliary setup does not perturb allocator state; replay
-  work is still controlled solely by `--cuda-graph-test-tokens`.
+  by the graph test, for example `32,64,128`.  By default the harness captures
+  one graph per listed token count and passes that token count as graph
+  `capacity_num_tokens`, while still using the same symmetric-buffer allocation.
+  This is the per-bucket graph-cache mode.
+- `--cuda-graph-single-capture` changes the graph test to capture one graph at
+  the maximum `--num-max-tokens-per-rank` capacity and replay all listed token
+  counts through that graph.  In this mode the MegaMoE capture capacity and the
+  `ll-masked` baseline dispatch capacity are both the maximum graph bucket.
 - `--cuda-graph-skip-baseline` smoke-tests graph capture/replay without running
   the DeepEP baseline checker, which is useful when isolating graph
   compatibility from baseline communication behavior.
+
+For graph-only performance sweeps, keep `--num-tokens` equal to the intended
+capture bucket so the test's auxiliary setup does not perturb allocator state;
+replay work is still controlled solely by `--cuda-graph-test-tokens`.
 
 Example eager uneven-rank check with a uniform auto-dispatch decision:
 

@@ -514,6 +514,14 @@ __device__ static inline int v3_k1_load_signal_system_acquire_device(
     return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
+__device__ static inline int v3_k1_stage_rows_for_count_device(
+    int expert_count,
+    int block_m,
+    int m_per_expert) {
+    int stage_rows = ((expert_count + block_m - 1) / block_m) * block_m;
+    return stage_rows > m_per_expert ? m_per_expert : stage_rows;
+}
+
 __device__ static inline void v3_k1_ll_start_rank_barrier_device(
     uint8_t* local_sym_buffer,
     int32_t* tail_done_counter,
@@ -697,7 +705,6 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
     int32_t* symm_counts = route_scratch_i32;
     int64_t* symm_src_x_ptrs =
         reinterpret_cast<int64_t*>(route_scratch_i32 + kExperts + 2);
-    const int row_capacity = kExperts * m_per_expert;
     const int max_output_routes_per_rank = num_max_tokens_per_rank * num_topk;
     const int total_output_routes = num_ranks * max_output_routes_per_rank;
     const int tid = static_cast<int>(threadIdx.x);
@@ -707,6 +714,7 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
         static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
     uint8_t* staged_x = const_cast<uint8_t*>(x);
     float* staged_x_scale = const_cast<float*>(x_scale);
+    constexpr float kDefaultStagedScale = 1.0e-4f / 448.0f;
 
     v3_k1_ll_grid_barrier_init_device(grid_barrier, barrier_epoch);
     if (enable_start_rank_barrier) {
@@ -723,17 +731,6 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
     if (global_tid == 0) {
         symm_counts[kExperts] = 0;
         symm_counts[kExperts + 1] = 0;
-    }
-    for (int idx = global_tid; idx < row_capacity; idx += grid_threads) {
-        const int expert = idx / m_per_expert;
-        symm_src_x_ptrs[idx] = 0;
-        if (route_weights_out != nullptr)
-            route_weights_out[idx] = 0.0f;
-        if (row_expert_out != nullptr)
-            row_expert_out[idx] = expert;
-        if (row_combine_ptrs_out != nullptr)
-            row_combine_ptrs_out[idx] = 0;
-        staged_x_scale[idx] = 1.0e-4f / 448.0f;
     }
     if (output_index != nullptr) {
         for (int route_linear = global_tid;
@@ -886,8 +883,8 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
                 const int expert_count = symm_counts[expert] > m_per_expert
                                              ? m_per_expert
                                              : symm_counts[expert];
-                const int stage_rows =
-                    ((expert_count + kBlockM - 1) / kBlockM) * kBlockM;
+                const int stage_rows = v3_k1_stage_rows_for_count_device(
+                    expert_count, kBlockM, m_per_expert);
                 const int64_t expert_vecs =
                     static_cast<int64_t>(stage_rows) * kStageVecsPerRow;
                 const int64_t stride =
@@ -912,6 +909,8 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
                                     static_cast<uintptr_t>(
                                         source_x_ptr)))[vec_col];
                         }
+                    } else if (vec_col == 0) {
+                        staged_x_scale[row] = kDefaultStagedScale;
                     }
                     staged_vecs[static_cast<int64_t>(row) *
                                     kStageVecsPerRow +
@@ -924,8 +923,8 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
                 const int expert_count = symm_counts[expert] > m_per_expert
                                              ? m_per_expert
                                              : symm_counts[expert];
-                const int stage_rows =
-                    ((expert_count + kBlockM - 1) / kBlockM) * kBlockM;
+                const int stage_rows = v3_k1_stage_rows_for_count_device(
+                    expert_count, kBlockM, m_per_expert);
                 const int64_t expert_vecs =
                     static_cast<int64_t>(stage_rows) * kStageVecsPerRow;
                 for (int64_t expert_vec = tid; expert_vec < expert_vecs;
@@ -947,6 +946,8 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
                                     static_cast<uintptr_t>(
                                         source_x_ptr)))[vec_col];
                         }
+                    } else if (vec_col == 0) {
+                        staged_x_scale[row] = kDefaultStagedScale;
                     }
                     staged_vecs[static_cast<int64_t>(row) *
                                     kStageVecsPerRow +
@@ -960,8 +961,8 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
             const int expert_count = symm_counts[expert] > m_per_expert
                                          ? m_per_expert
                                          : symm_counts[expert];
-            const int stage_rows =
-                ((expert_count + kBlockM - 1) / kBlockM) * kBlockM;
+            const int stage_rows = v3_k1_stage_rows_for_count_device(
+                expert_count, kBlockM, m_per_expert);
             const int64_t expert_vecs =
                 static_cast<int64_t>(stage_rows) * kStageVecsPerRow;
             for (int64_t expert_vec = tid; expert_vec < expert_vecs;
@@ -982,6 +983,8 @@ __device__ static inline int32_t* v3_k1_build_ll_stage_device(
                             reinterpret_cast<const uint8_t*>(
                                 static_cast<uintptr_t>(source_x_ptr)))[vec_col];
                     }
+                } else if (vec_col == 0) {
+                    staged_x_scale[row] = kDefaultStagedScale;
                 }
                 staged_vecs[static_cast<int64_t>(row) * kStageVecsPerRow +
                             vec_col] = value;

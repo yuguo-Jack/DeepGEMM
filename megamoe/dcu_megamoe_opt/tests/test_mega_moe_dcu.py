@@ -44,6 +44,8 @@ UNIFIED_WEIGHT_LAYOUT_ENV = "MEGAMOE_DCU_UNIFIED_WEIGHT_LAYOUT"
 BASELINE_AUTO = "auto"
 BASELINE_NORMAL_CONTIGUOUS = "normal-contiguous"
 BASELINE_LL_MASKED = "ll-masked"
+ROUTE_PATTERN_RANDOM = "random"
+ROUTE_PATTERN_SINGLE_LOCAL_RANK = "single-local-rank"
 
 
 def env_flag_enabled(name: str) -> bool:
@@ -58,6 +60,38 @@ def dcu_peer_memory_fabric_enabled() -> bool:
 def print_once(rank: int, msg: str = ""):
     if rank == 0:
         print(msg, flush=True)
+
+
+def apply_route_pattern(
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    pattern: str,
+    target_rank: int,
+    num_ranks: int,
+    num_experts_per_rank: int,
+    num_topk: int,
+) -> None:
+    if pattern == ROUTE_PATTERN_RANDOM:
+        return
+    if pattern != ROUTE_PATTERN_SINGLE_LOCAL_RANK:
+        raise ValueError(f"unsupported route pattern: {pattern}")
+    if target_rank < 0 or target_rank >= num_ranks:
+        raise ValueError(f"route target rank {target_rank} is outside 0..{num_ranks - 1}")
+    if num_topk > num_experts_per_rank:
+        raise ValueError(
+            "single-local-rank route pattern requires topk <= local experts "
+            f"({num_topk} > {num_experts_per_rank})"
+        )
+    first_expert = int(target_rank) * int(num_experts_per_rank)
+    experts = torch.arange(
+        first_expert,
+        first_expert + int(num_topk),
+        device=topk_idx.device,
+        dtype=topk_idx.dtype,
+    )
+    topk_idx.copy_(experts.view(1, -1).expand_as(topk_idx))
+    topk_weights.fill_(1.0 / float(num_topk))
 
 
 def baseline_kind_description(kind: str, prepost_backend: str) -> str:
@@ -815,6 +849,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         needs_deepep_baseline = (
             args.correctness_iters > 0
             or (not args.skip_bench and not args.skip_baseline_bench)
+            or (
+                args.cuda_graph
+                and not args.cuda_graph_skip_baseline
+            )
         )
     else:
         needs_deepep_baseline = (
@@ -858,6 +896,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda")
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
     topk_weights = torch.softmax(topk_weights.float(), dim=-1)
+    apply_route_pattern(
+        topk_idx,
+        topk_weights,
+        pattern=args.route_pattern,
+        target_rank=args.route_target_rank,
+        num_ranks=num_ranks,
+        num_experts_per_rank=num_experts_per_rank,
+        num_topk=num_topk,
+    )
 
     l1_fp8, l1_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l1_bf16)
     l2_fp8, l2_scale = megamoe.cast_grouped_weight_to_fp8_channelwise(l2_bf16)
@@ -1148,27 +1195,46 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         return baseline_y, baseline_stats, meta
 
     def run_cuda_graph_bucket_check():
-        capture_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
+        max_capture_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
         if args.cuda_graph_test_tokens:
             token_list = parse_int_list(args.cuda_graph_test_tokens)
         else:
-            token_list = [capture_tokens if args.num_tokens == 0 else num_tokens]
+            token_list = [max_capture_tokens if args.num_tokens == 0 else num_tokens]
         if not token_list:
             raise ValueError("--cuda-graph-test-tokens did not contain any token counts")
         for token in token_list:
-            if token <= 0 or token > capture_tokens:
-                raise ValueError(f"graph test token {token} is outside 1..{capture_tokens}")
+            if token <= 0 or token > max_capture_tokens:
+                raise ValueError(
+                    f"graph test token {token} is outside 1..{max_capture_tokens}"
+                )
 
         graph_x_bf16 = (
-            torch.randn((capture_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+            torch.randn((max_capture_tokens, hidden), dtype=torch.bfloat16, device="cuda")
             * args.input_scale
         )
-        graph_scores = torch.randn((capture_tokens, num_experts), dtype=torch.float32, device="cuda")
+        graph_scores = torch.randn(
+            (max_capture_tokens, num_experts),
+            dtype=torch.float32,
+            device="cuda",
+        )
         graph_topk_weights, graph_topk_idx = torch.topk(
             graph_scores, num_topk, dim=-1, largest=True, sorted=False
         )
         graph_topk_weights = torch.softmax(graph_topk_weights.float(), dim=-1)
-        y_graph = torch.empty((capture_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+        apply_route_pattern(
+            graph_topk_idx,
+            graph_topk_weights,
+            pattern=args.route_pattern,
+            target_rank=args.route_target_rank,
+            num_ranks=num_ranks,
+            num_experts_per_rank=num_experts_per_rank,
+            num_topk=num_topk,
+        )
+        y_graph = torch.empty(
+            (max_capture_tokens, hidden),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
 
         def local_graph_token_count(token_count: int) -> int:
             if exact_num_tokens_per_rank is not None:
@@ -1185,45 +1251,59 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             sym_buffer.cuda_graph_num_tokens.fill_(local_token_count)
             return local_token_count
 
-        def run_graph_bucket_once():
-            megamoe.mega_moe_pre_dispatch(
-                graph_x_bf16,
-                graph_topk_idx,
-                graph_topk_weights,
-                sym_buffer.x,
-                sym_buffer.x_sf,
-                sym_buffer.topk_idx,
-                sym_buffer.topk_weights,
-                num_tokens=capture_tokens,
-            )
-            megamoe.fp8_w8a8_mega_moe(
-                y_graph,
-                fused_l1_weights,
-                fused_l2_weights,
-                sym_buffer,
-                cumulative_local_expert_recv_stats=None,
-                activation_clamp=args.activation_clamp,
-                fast_math=bool(args.fast_math),
-                megamoe_backend=v3_backend,
-                graph=True,
-            )
+        def capture_megamoe_graph(graph_capture_tokens: int):
+            def run_graph_bucket_once():
+                megamoe.mega_moe_pre_dispatch(
+                    graph_x_bf16,
+                    graph_topk_idx,
+                    graph_topk_weights,
+                    sym_buffer.x,
+                    sym_buffer.x_sf,
+                    sym_buffer.topk_idx,
+                    sym_buffer.topk_weights,
+                    num_tokens=graph_capture_tokens,
+                )
+                megamoe.fp8_w8a8_mega_moe(
+                    y_graph,
+                    fused_l1_weights,
+                    fused_l2_weights,
+                    sym_buffer,
+                    cumulative_local_expert_recv_stats=None,
+                    activation_clamp=args.activation_clamp,
+                    fast_math=bool(args.fast_math),
+                    megamoe_backend=v3_backend,
+                    graph=True,
+                    capacity_num_tokens=graph_capture_tokens,
+                )
 
-        fill_graph_inputs(capture_tokens)
-        torch.cuda.synchronize()
-        graph_warmup_stream = torch.cuda.Stream()
-        graph_warmup_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(graph_warmup_stream):
-            for _ in range(args.cuda_graph_warmup):
+            fill_graph_inputs(graph_capture_tokens)
+            torch.cuda.synchronize()
+            graph_warmup_stream = torch.cuda.Stream()
+            graph_warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(graph_warmup_stream):
+                for _ in range(args.cuda_graph_warmup):
+                    run_graph_bucket_once()
+            torch.cuda.current_stream().wait_stream(graph_warmup_stream)
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
                 run_graph_bucket_once()
-        torch.cuda.current_stream().wait_stream(graph_warmup_stream)
-        torch.cuda.synchronize()
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run_graph_bucket_once()
+            return graph
 
         graph_timing_rows = []
+        single_capture_graph = None
+        if args.cuda_graph_single_capture:
+            single_capture_graph = capture_megamoe_graph(max_capture_tokens)
         for token in token_list:
+            graph_capture_tokens = (
+                max_capture_tokens if args.cuda_graph_single_capture else token
+            )
+            graph = (
+                single_capture_graph
+                if single_capture_graph is not None
+                else capture_megamoe_graph(graph_capture_tokens)
+            )
             local_token = fill_graph_inputs(token)
             for _ in range(args.cuda_graph_replays):
                 graph.replay()
@@ -1231,14 +1311,17 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if args.cuda_graph_skip_baseline:
                 print_once(
                     rank,
-                    f"CUDA graph bucket token={token}/{capture_tokens}, local={local_token}: "
+                    f"CUDA graph bucket token={token}/{graph_capture_tokens}, local={local_token}: "
                     f"replays={args.cuda_graph_replays}, baseline_skipped=True",
                 )
                 continue
             if baseline_kind == BASELINE_LL_MASKED:
+                baseline_capacity_token = (
+                    graph_capture_tokens if args.cuda_graph_single_capture else token
+                )
                 baseline_graph, baseline_y = get_ll_masked_baseline_graph(
                     "graph_bucket",
-                    token,
+                    baseline_capacity_token,
                     local_token,
                     graph_x_bf16,
                     graph_topk_idx,
@@ -1302,7 +1385,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 )
             print_once(
                 rank,
-                f"CUDA graph bucket token={token}/{capture_tokens}, local={local_token}: "
+                f"CUDA graph bucket token={token}/{graph_capture_tokens}, local={local_token}: "
                 f"max_abs={max_abs:.6g}, mean_abs={mean_abs:.6g}, "
                 f"replays={args.cuda_graph_replays}",
             )
@@ -1325,9 +1408,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 baseline_rank_graph_metrics = None
                 baseline_graph_timing = None
                 if baseline_kind == BASELINE_LL_MASKED and not args.cuda_graph_skip_baseline:
+                    baseline_capacity_token = (
+                        graph_capture_tokens if args.cuda_graph_single_capture else token
+                    )
                     baseline_graph, _ = get_ll_masked_baseline_graph(
                         "graph_bucket",
-                        token,
+                        baseline_capacity_token,
                         local_token,
                         graph_x_bf16,
                         graph_topk_idx,
@@ -1352,7 +1438,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         {
                             "tokens": token,
                             "local_tokens_rank0": local_token,
-                            "graph_max_tokens_per_rank": capture_tokens,
+                            "graph_max_tokens_per_rank": max_capture_tokens,
+                            "graph_capture_tokens_per_rank": graph_capture_tokens,
+                            "cuda_graph_single_capture": bool(args.cuda_graph_single_capture),
                             "graph_replay_median_ms_avg_per_rank": graph_avg_s * 1e3,
                             "graph_replay_min_ms_avg_per_rank": graph_min_s * 1e3,
                             "bench_backend": f"tilelang_{graph_timing['backend']}",
@@ -1375,7 +1463,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         )
                     print_once(
                         rank,
-                        f"CUDA graph bucket bench token={token}/{capture_tokens}: "
+                        f"CUDA graph bucket bench token={token}/{graph_capture_tokens}: "
                         f"local_rank0={local_token}, "
                         f"median={graph_avg_s * 1e6:.1f} us, min={graph_min_s * 1e6:.1f} us "
                         "(replay only)",
@@ -1390,6 +1478,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     print_once(rank, f" > scale modes=input/weight/l2_act channelwise fp32")
     baseline_desc = baseline_kind_description(baseline_kind, args.prepost_backend)
     print_once(rank, f" > baseline={baseline_desc} (kind={baseline_kind}, requested={args.baseline_kind})")
+    print_once(
+        rank,
+        f" > route_pattern={args.route_pattern}, route_target_rank={args.route_target_rank}",
+    )
     print_once(rank, " > router weights=CUDA MegaMoE compatible SwiGLU-pre-L2-quant")
     print_once(
         rank,
@@ -1466,6 +1558,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "baseline_kind_requested": args.baseline_kind,
                 "baseline_execution": baseline_execution,
                 "fused_execution": fused_execution,
+                "route_pattern": args.route_pattern,
+                "route_target_rank": args.route_target_rank,
                 "fused_timing_scope": "eager_main_call",
                 "baseline_timing_scope": baseline_execution,
                 "cuda_graph_requested": bool(args.cuda_graph),
@@ -1589,6 +1683,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "baseline_kind_requested": args.baseline_kind,
             "baseline_execution": baseline_execution,
             "fused_execution": fused_execution,
+            "route_pattern": args.route_pattern,
+            "route_target_rank": args.route_target_rank,
             "fused_timing_scope": "eager_main_call",
             "baseline_timing_scope": baseline_execution,
             "cuda_graph_requested": bool(args.cuda_graph),
@@ -1675,6 +1771,18 @@ def parse_args():
     parser.add_argument("--fast-math", type=int, default=1)
     parser.add_argument("--input-scale", type=float, default=0.05)
     parser.add_argument("--weight-scale", type=float, default=0.05)
+    parser.add_argument(
+        "--route-pattern",
+        choices=(ROUTE_PATTERN_RANDOM, ROUTE_PATTERN_SINGLE_LOCAL_RANK),
+        default=ROUTE_PATTERN_RANDOM,
+        help="router distribution for correctness/perf probes",
+    )
+    parser.add_argument(
+        "--route-target-rank",
+        type=int,
+        default=0,
+        help="target rank for --route-pattern=single-local-rank",
+    )
     parser.add_argument("--prepost-backend", choices=("hip", "triton"), default="hip")
     parser.add_argument(
         "--baseline-kind",
@@ -1703,11 +1811,16 @@ def parse_args():
     parser.add_argument("--cuda-graph", action="store_true",
                         help="capture the selected V3 staged backend as a CUDA graph")
     parser.add_argument("--cuda-graph-test-tokens", type=str, default="",
-                        help="comma/space separated token counts to replay against one captured graph")
+                        help="comma/space separated token counts to capture/replay as graph buckets")
     parser.add_argument("--cuda-graph-warmup", type=int, default=1)
     parser.add_argument("--cuda-graph-replays", type=int, default=3)
     parser.add_argument("--cuda-graph-bench", action="store_true",
                         help="benchmark graph.replay() for each --cuda-graph-test-tokens entry")
+    parser.add_argument(
+        "--cuda-graph-single-capture",
+        action="store_true",
+        help="reuse one max-capacity MegaMoE graph for every replay bucket",
+    )
     parser.add_argument("--cuda-graph-skip-baseline", action="store_true",
                         help="smoke-test graph capture/replay without the DeepEP baseline check")
     parser.add_argument("--out", type=str, default="hygon_tmp/megamoe_dcu_baseline/default_perf.json")

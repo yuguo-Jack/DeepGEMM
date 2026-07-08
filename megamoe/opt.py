@@ -8,6 +8,7 @@ import torch
 
 from .dcu_megamoe_opt.K1_fused.k1_fused import (
     k1_graph_flag_reset_layout,
+    k1_ll_masked_prepare_compact_active,
     k1_ll_masked_groupgemm,
     k1_symm_fused_l1_v3,
     k1_symm_fused_l1_v3_graph,
@@ -37,7 +38,6 @@ K_K1_ROUTE_CAPACITY_SLACK_DIVISOR = 10
 K_K1_LL_ROW_TILE = 64
 K_K1_LL_HEADROOM_EXPECTED_ROWS_THRESHOLD = 48
 K_K1_LL_HEADROOM_ROWS = 64
-K_K1_LL_SKEW_GUARD_ROWS = 256
 K_PRO_EP8_LL_MASKED_K1_MIN_ROWS_PER_EXPERT = 128
 K_K1_ASM_LAUNCH_ARGS_BYTES = 256
 K_K2_GRAPH_ROW_BLOCKS = 8192
@@ -86,10 +86,79 @@ def _run_pro_ll_masked_k1_groupgemm(
     local_experts: int,
     hidden: int,
     expected_m_per_group: int,
+    route_weights: torch.Tensor,
+    row_combine_ptrs: torch.Tensor,
+    compact_staged_x: torch.Tensor | None = None,
+    compact_staged_x_scale: torch.Tensor | None = None,
+    compact_l1_out: torch.Tensor | None = None,
+    compact_route_weights: torch.Tensor | None = None,
+    compact_row_combine_ptrs: torch.Tensor | None = None,
+    compact_m: torch.Tensor | None = None,
+    compact_rows_per_expert: int = 0,
+    allow_compact_active: bool = False,
     verbose_build: bool = False,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     rows_per_expert = int(l1_out.size(0)) // int(local_experts)
     l1_rows = int(l1_scale.size(1))
+    if (
+        allow_compact_active
+        and compact_rows_per_expert > 0
+        and rows_per_expert > compact_rows_per_expert
+        and compact_staged_x is not None
+        and compact_staged_x_scale is not None
+        and compact_l1_out is not None
+        and compact_route_weights is not None
+        and compact_row_combine_ptrs is not None
+        and compact_m is not None
+    ):
+        # Eager only: this host read chooses the exact active compact stride for
+        # the current route distribution. If the distribution is too skewed for
+        # the active compact buffer, fall through to the worst-capacity exact
+        # path rather than dropping rows.
+        actual_max_m = int(m_indices[local_experts].detach().cpu().item())
+        if actual_max_m <= int(compact_rows_per_expert):
+            compact_rows = int(local_experts) * int(compact_rows_per_expert)
+            compact_staged_x = compact_staged_x[:compact_rows]
+            compact_staged_x_scale = compact_staged_x_scale[:compact_rows]
+            compact_l1_out = compact_l1_out[:compact_rows]
+            compact_route_weights = compact_route_weights[:compact_rows]
+            compact_row_combine_ptrs = compact_row_combine_ptrs[:compact_rows]
+            k1_ll_masked_prepare_compact_active(
+                staged_x,
+                staged_x_scale,
+                route_weights,
+                row_combine_ptrs,
+                m_indices,
+                compact_staged_x,
+                compact_staged_x_scale,
+                compact_route_weights,
+                compact_row_combine_ptrs,
+                compact_m,
+                rows_per_expert,
+                verbose_build=verbose_build,
+            )
+            k1_ll_masked_groupgemm(
+                compact_staged_x.view(
+                    local_experts, compact_rows_per_expert, hidden
+                ),
+                compact_staged_x_scale.view(
+                    local_experts, compact_rows_per_expert
+                ).unsqueeze(-1),
+                l1_weight,
+                l1_scale.unsqueeze(-1),
+                compact_l1_out.view(
+                    local_experts, compact_rows_per_expert, l1_rows
+                ),
+                compact_m.narrow(0, 0, local_experts),
+                int(expected_m_per_group),
+                verbose_build=verbose_build,
+            )
+            return (
+                compact_l1_out,
+                compact_route_weights,
+                compact_m,
+                compact_row_combine_ptrs,
+            )
     k1_ll_masked_groupgemm(
         staged_x.view(local_experts, rows_per_expert, hidden),
         staged_x_scale.view(local_experts, rows_per_expert).unsqueeze(-1),
@@ -100,6 +169,7 @@ def _run_pro_ll_masked_k1_groupgemm(
         int(expected_m_per_group),
         verbose_build=verbose_build,
     )
+    return l1_out, route_weights, m_indices, row_combine_ptrs
 
 
 @dataclass
@@ -109,6 +179,13 @@ class _RouteScratchViews:
     k3_out: torch.Tensor
     act_fp8: torch.Tensor
     act_scale: torch.Tensor
+    pro_compact_staged_x: torch.Tensor
+    pro_compact_staged_x_scale: torch.Tensor
+    pro_compact_l1_out: torch.Tensor
+    pro_compact_route_weights: torch.Tensor
+    pro_compact_row_combine_ptrs: torch.Tensor
+    pro_compact_m: torch.Tensor
+    pro_compact_rows_per_expert: int
     k3_prob_storage: torch.Tensor
     graph_runtime_num_tokens: torch.Tensor
     graph_tail_signal_generation: torch.Tensor
@@ -205,11 +282,17 @@ def _v3_staged_capacity_rows(
     num_experts: int,
     num_max_tokens: int,
     num_topk: int,
+    ll_capacity_tokens: int | None = None,
 ) -> int:
     local_experts = num_experts // num_ranks
+    ll_capacity_tokens = (
+        int(num_max_tokens)
+        if ll_capacity_tokens is None
+        else min(int(num_max_tokens), int(ll_capacity_tokens))
+    )
     ll_expected_rows_per_expert = max(
         1,
-        _ceil_div(num_max_tokens * num_topk, local_experts),
+        _ceil_div(ll_capacity_tokens * num_topk, local_experts),
     )
     ll_rows_per_expert = _align(ll_expected_rows_per_expert, K_K1_LL_ROW_TILE)
     min_slack = (
@@ -222,13 +305,10 @@ def _v3_staged_capacity_rows(
             ll_expected_rows_per_expert + min_slack,
             K_K1_LL_ROW_TILE,
         )
-    ll_skew_guard_rows = min(
-        K_K1_LL_SKEW_GUARD_ROWS,
-        int(num_ranks) * int(num_max_tokens),
-    )
+    ll_worst_rows_per_expert = int(num_ranks) * int(ll_capacity_tokens)
     ll_rows_per_expert = max(
         ll_rows_per_expert,
-        _align(ll_skew_guard_rows, K_K1_LL_ROW_TILE),
+        _align(ll_worst_rows_per_expert, K_K1_LL_ROW_TILE),
     )
     if int(num_experts) == 384 and int(num_ranks) == 8 and int(num_topk) == 6:
         ll_rows_per_expert = max(
@@ -236,20 +316,92 @@ def _v3_staged_capacity_rows(
             K_PRO_EP8_LL_MASKED_K1_MIN_ROWS_PER_EXPERT,
         )
     ll_capacity_rows = local_experts * ll_rows_per_expert
-    total_tasks = num_ranks * num_max_tokens * num_topk
-    expected_per_expert = _ceil_div(total_tasks, num_experts)
-    rows_per_expert_target = max(
-        K_K1_ALIGNMENT,
-        expected_per_expert + _k1_route_capacity_headroom_rows(expected_per_expert),
-    )
-    fixed_capacity_tiles_per_expert = _ceil_div(
-        rows_per_expert_target,
-        K_K1_ROUTE_TILE_M,
-    )
     normal_capacity_rows = (
-        local_experts * fixed_capacity_tiles_per_expert * K_K1_ROUTE_TILE_M
+        _v3_normal_skew_safe_compact_tiles(
+            num_ranks=num_ranks,
+            num_max_tokens=num_max_tokens,
+            num_topk=num_topk,
+            local_experts=local_experts,
+        )
+        * K_K1_ROUTE_TILE_M
     )
     return max(ll_capacity_rows, normal_capacity_rows)
+
+
+def _v3_ll_active_rows_per_expert(
+    *,
+    num_ranks: int,
+    num_experts: int,
+    num_topk: int,
+    capacity_tokens: int,
+) -> int:
+    local_experts = int(num_experts) // int(num_ranks)
+    expected_rows = max(1, _ceil_div(int(capacity_tokens) * int(num_topk), local_experts))
+    rows = _align(expected_rows, K_K1_LL_ROW_TILE)
+    min_slack = (
+        K_K1_LL_HEADROOM_ROWS
+        if expected_rows >= K_K1_LL_HEADROOM_EXPECTED_ROWS_THRESHOLD
+        else 0
+    )
+    if rows - expected_rows < min_slack:
+        rows = _align(expected_rows + min_slack, K_K1_LL_ROW_TILE)
+    if int(num_experts) == 384 and int(num_ranks) == 8 and int(num_topk) == 6:
+        rows = max(rows, K_PRO_EP8_LL_MASKED_K1_MIN_ROWS_PER_EXPERT)
+    return rows
+
+
+def _v3_pro_ll_compact_rows_per_expert(
+    *,
+    num_ranks: int,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+    ll_capacity_tokens: int | None,
+    num_max_tokens: int,
+) -> int:
+    if (
+        int(num_experts),
+        int(num_topk),
+        int(hidden),
+        int(intermediate_hidden),
+    ) != (384, 6, 7168, 3072):
+        return 0
+    capacity_tokens = (
+        int(num_max_tokens)
+        if ll_capacity_tokens is None
+        else min(int(num_max_tokens), int(ll_capacity_tokens))
+    )
+    return _v3_ll_active_rows_per_expert(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_topk=num_topk,
+        capacity_tokens=capacity_tokens,
+    )
+
+
+def _v3_normal_skew_safe_compact_tiles(
+    *,
+    num_ranks: int,
+    num_max_tokens: int,
+    num_topk: int,
+    local_experts: int,
+) -> int:
+    total_routes = int(num_ranks) * int(num_max_tokens) * int(num_topk)
+    local_experts = int(local_experts)
+    if total_routes <= 0 or local_experts <= 0:
+        return max(1, local_experts)
+    # Top-k is unique per token, so any one local expert can receive at most
+    # num_ranks * capacity_tokens rows. Compact routing also needs one partial
+    # tile per touched expert for fragmentation.
+    max_routes_per_expert = int(num_ranks) * int(num_max_tokens)
+    max_tiles_per_expert = _ceil_div(max_routes_per_expert, K_K1_ROUTE_TILE_M)
+    max_tiles = local_experts * max_tiles_per_expert
+    active_experts = min(local_experts, total_routes)
+    fragmented_tiles = active_experts
+    if total_routes > active_experts:
+        fragmented_tiles += (total_routes - active_experts) // K_K1_ROUTE_TILE_M
+    return max(local_experts, min(max_tiles, fragmented_tiles))
 
 
 def _route_tile_offsets(
@@ -260,12 +412,14 @@ def _route_tile_offsets(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
-) -> tuple[int, int, int, int, int, int]:
+    ll_capacity_tokens: int | None = None,
+) -> tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int]:
     capacity_rows = _v3_staged_capacity_rows(
         num_ranks=num_ranks,
         num_experts=num_experts,
         num_max_tokens=num_max_tokens,
         num_topk=num_topk,
+        ll_capacity_tokens=ll_capacity_tokens,
     )
     offset = 0
     offset += capacity_rows * hidden
@@ -293,14 +447,51 @@ def _route_tile_offsets(
     act_scale_offset = offset
     offset += capacity_rows * K_DTYPE_SIZES[torch.float32]
     offset = _align(offset, 16)
-    act_chunk_amax_offset = offset
+    act_scale_end_offset = offset
+    pro_compact_rows_per_expert = _v3_pro_ll_compact_rows_per_expert(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+        ll_capacity_tokens=ll_capacity_tokens,
+        num_max_tokens=num_max_tokens,
+    )
+    pro_compact_rows = (num_experts // num_ranks) * pro_compact_rows_per_expert
+    pro_compact_staged_x_offset = offset
+    offset += pro_compact_rows * hidden * K_DTYPE_SIZES[torch.float8_e4m3fn]
+    offset = _align(offset, 16)
+    pro_compact_staged_x_scale_offset = offset
+    offset += pro_compact_rows * K_DTYPE_SIZES[torch.float32]
+    offset = _align(offset, 16)
+    pro_compact_l1_out_offset = offset
+    offset += pro_compact_rows * l1_cols * K_DTYPE_SIZES[torch.bfloat16]
+    offset = _align(offset, 16)
+    pro_compact_route_weights_offset = offset
+    offset += pro_compact_rows * K_DTYPE_SIZES[torch.float32]
+    offset = _align(offset, 16)
+    pro_compact_row_combine_ptrs_offset = offset
+    offset += pro_compact_rows * K_DTYPE_SIZES[torch.int64]
+    offset = _align(offset, 16)
+    pro_compact_counts_offset = offset
+    offset += ((num_experts // num_ranks) + 2) * K_DTYPE_SIZES[torch.int32]
+    offset = _align(offset, 16)
+    scratch_end_offset = offset
     return (
         capacity_rows,
         act_bf16_offset,
         k3_out_offset,
         act_fp8_offset,
         act_scale_offset,
-        act_chunk_amax_offset,
+        act_scale_end_offset,
+        pro_compact_staged_x_offset,
+        pro_compact_staged_x_scale_offset,
+        pro_compact_l1_out_offset,
+        pro_compact_route_weights_offset,
+        pro_compact_row_combine_ptrs_offset,
+        pro_compact_counts_offset,
+        pro_compact_rows_per_expert,
+        scratch_end_offset,
     )
 
 
@@ -346,22 +537,57 @@ def _route_scratch_views(
         num_experts=num_experts,
         num_max_tokens=num_max_tokens,
     )
-    capacity_rows, act_bf16_offset, k3_out_offset, act_fp8_offset, act_scale_offset, act_chunk_amax_offset = (
-        _route_tile_offsets(
-            num_ranks=num_ranks,
-            num_experts=num_experts,
-            num_max_tokens=num_max_tokens,
-            num_topk=num_topk,
-            hidden=hidden,
-            intermediate_hidden=intermediate_hidden,
-        )
+    (
+        capacity_rows,
+        act_bf16_offset,
+        k3_out_offset,
+        act_fp8_offset,
+        act_scale_offset,
+        act_scale_end_offset,
+        pro_compact_staged_x_offset,
+        pro_compact_staged_x_scale_offset,
+        pro_compact_l1_out_offset,
+        pro_compact_route_weights_offset,
+        pro_compact_row_combine_ptrs_offset,
+        pro_compact_counts_offset,
+        pro_compact_rows_per_expert,
+        scratch_end_offset,
+    ) = _route_tile_offsets(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_max_tokens=num_max_tokens,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+        ll_capacity_tokens=getattr(
+            sym_buffer,
+            "ll_scratch_capacity_tokens_per_rank",
+            num_max_tokens,
+        ),
     )
     l1_cols = intermediate_hidden * 2
     l1_capacity_bytes = capacity_rows * l1_cols * K_DTYPE_SIZES[torch.bfloat16]
     k3_out_capacity_bytes = capacity_rows * hidden * K_DTYPE_SIZES[torch.bfloat16]
     act_fp8_capacity_bytes = act_scale_offset - act_fp8_offset
-    act_scale_capacity_bytes = act_chunk_amax_offset - act_scale_offset
-    prob_offset = route_base + act_chunk_amax_offset
+    act_scale_capacity_bytes = act_scale_end_offset - act_scale_offset
+    pro_compact_rows = local_experts * pro_compact_rows_per_expert
+    pro_compact_staged_x_bytes = (
+        pro_compact_rows * hidden * K_DTYPE_SIZES[torch.float8_e4m3fn]
+    )
+    pro_compact_staged_x_scale_bytes = (
+        pro_compact_rows * K_DTYPE_SIZES[torch.float32]
+    )
+    pro_compact_l1_out_bytes = (
+        pro_compact_rows * l1_cols * K_DTYPE_SIZES[torch.bfloat16]
+    )
+    pro_compact_route_weights_bytes = (
+        pro_compact_rows * K_DTYPE_SIZES[torch.float32]
+    )
+    pro_compact_row_combine_ptrs_bytes = (
+        pro_compact_rows * K_DTYPE_SIZES[torch.int64]
+    )
+    pro_compact_counts_bytes = (local_experts + 2) * K_DTYPE_SIZES[torch.int32]
+    prob_offset = route_base + scratch_end_offset
     tail_done_offset = _align(prob_offset + K_PROB_STORAGE_BYTES, K_DTYPE_SIZES[torch.int32])
     tail_signal_addrs_count = _dcu_tail_signal_addrs_count(num_ranks)
     tail_signal_addrs_offset = _align(
@@ -405,6 +631,49 @@ def _route_scratch_views(
             dtype=torch.float32,
             shape=(capacity_rows,),
         ),
+        pro_compact_staged_x=_route_scratch_tensor(
+            route_scratch,
+            byte_offset=route_base + pro_compact_staged_x_offset,
+            byte_capacity=pro_compact_staged_x_bytes,
+            dtype=torch.float8_e4m3fn,
+            shape=(pro_compact_rows, hidden),
+        ),
+        pro_compact_staged_x_scale=_route_scratch_tensor(
+            route_scratch,
+            byte_offset=route_base + pro_compact_staged_x_scale_offset,
+            byte_capacity=pro_compact_staged_x_scale_bytes,
+            dtype=torch.float32,
+            shape=(pro_compact_rows,),
+        ),
+        pro_compact_l1_out=_route_scratch_tensor(
+            route_scratch,
+            byte_offset=route_base + pro_compact_l1_out_offset,
+            byte_capacity=pro_compact_l1_out_bytes,
+            dtype=torch.bfloat16,
+            shape=(pro_compact_rows, l1_cols),
+        ),
+        pro_compact_route_weights=_route_scratch_tensor(
+            route_scratch,
+            byte_offset=route_base + pro_compact_route_weights_offset,
+            byte_capacity=pro_compact_route_weights_bytes,
+            dtype=torch.float32,
+            shape=(pro_compact_rows,),
+        ),
+        pro_compact_row_combine_ptrs=_route_scratch_tensor(
+            route_scratch,
+            byte_offset=route_base + pro_compact_row_combine_ptrs_offset,
+            byte_capacity=pro_compact_row_combine_ptrs_bytes,
+            dtype=torch.int64,
+            shape=(pro_compact_rows,),
+        ),
+        pro_compact_m=_route_scratch_tensor(
+            route_scratch,
+            byte_offset=route_base + pro_compact_counts_offset,
+            byte_capacity=pro_compact_counts_bytes,
+            dtype=torch.int32,
+            shape=(local_experts + 2,),
+        ),
+        pro_compact_rows_per_expert=pro_compact_rows_per_expert,
         k3_prob_storage=_route_scratch_tensor(
             route_scratch,
             byte_offset=prob_offset,
@@ -697,17 +966,29 @@ def fp8_mega_moe_opt_3stage(
             (num_tokens * num_ranks * num_topk + num_experts)
             // num_experts,
         )
-        _run_pro_ll_masked_k1_groupgemm(
-            l1_out,
-            staged_x,
-            staged_x_scale,
-            l1_weight,
-            l1_scale,
-            m_indices,
-            local_experts=local_experts,
-            hidden=hidden,
-            expected_m_per_group=expected_m_per_group,
-            verbose_build=verbose_build,
+        l1_out, route_weights, m_indices, row_combine_ptrs = (
+            _run_pro_ll_masked_k1_groupgemm(
+                l1_out,
+                staged_x,
+                staged_x_scale,
+                l1_weight,
+                l1_scale,
+                m_indices,
+                local_experts=local_experts,
+                hidden=hidden,
+                expected_m_per_group=expected_m_per_group,
+                route_weights=route_weights,
+                row_combine_ptrs=row_combine_ptrs,
+                compact_staged_x=state.scratch.pro_compact_staged_x,
+                compact_staged_x_scale=state.scratch.pro_compact_staged_x_scale,
+                compact_l1_out=state.scratch.pro_compact_l1_out,
+                compact_route_weights=state.scratch.pro_compact_route_weights,
+                compact_row_combine_ptrs=state.scratch.pro_compact_row_combine_ptrs,
+                compact_m=state.scratch.pro_compact_m,
+                compact_rows_per_expert=state.scratch.pro_compact_rows_per_expert,
+                allow_compact_active=True,
+                verbose_build=verbose_build,
+            )
         )
     else:
         l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_result
@@ -717,6 +998,9 @@ def fp8_mega_moe_opt_3stage(
     k3_out = state.scratch.k3_out[:rows]
     k2_actual_m = m_indices if v3_backend == V3_BACKEND_LL else None
     k2_m_per_expert = rows // (num_experts // num_ranks) if k2_actual_m is not None else 0
+    k2_active_tiles = (
+        state.scratch.k1_active_tiles if v3_backend != V3_BACKEND_LL else None
+    )
     swiglu_quant_channelwise_out(
         l1_out,
         route_weights,
@@ -728,11 +1012,18 @@ def fp8_mega_moe_opt_3stage(
         clamp_value=activation_clamp,
         row_combine_ptrs=(
             row_combine_ptrs
-            if (force_safe_compact or k2_skip_inactive_rows_enabled(num_tokens))
+            if (
+                v3_backend != V3_BACKEND_LL
+                or force_safe_compact
+                or k2_skip_inactive_rows_enabled(num_tokens)
+            )
             else None
         ),
+        max_row_blocks=K_K2_GRAPH_ROW_BLOCKS if k2_active_tiles is not None else None,
         actual_m=k2_actual_m,
         m_per_expert=k2_m_per_expert,
+        active_tiles=k2_active_tiles,
+        active_tile_m=K_K1_ROUTE_TILE_M if k2_active_tiles is not None else 0,
         fast_math=fast_math,
         verbose_build=verbose_build,
     )
@@ -756,6 +1047,7 @@ def fp8_mega_moe_opt_3stage(
             output_workspace=k3_out,
             prob_storage=state.scratch.k3_prob_storage,
             ll_split_tail=use_ll_split_tail,
+            active_tiles=k2_active_tiles,
             use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
@@ -775,6 +1067,7 @@ def fp8_mega_moe_opt_3stage(
         k3_kwargs = dict(
             output_workspace=k3_out,
             prob_storage=state.scratch.k3_prob_storage,
+            active_tiles=k2_active_tiles,
             use_unified_weight_layout=use_unified_weight_layout,
             verbose_build=verbose_build,
         )
@@ -806,7 +1099,6 @@ def fp8_mega_moe_opt_3stage(
             hidden=hidden,
             verbose_build=verbose_build,
         )
-
 def _run_opt_3stage_graph(
     y: torch.Tensor,
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -821,6 +1113,7 @@ def _run_opt_3stage_graph(
     activation_clamp: Optional[float],
     fast_math: bool,
     graph_max_tokens: Optional[int] = None,
+    capacity_num_tokens: Optional[int] = None,
     v3_backend: str,
     use_unified_weight_layout: bool = False,
     use_pro_ll_masked_k1: bool = False,
@@ -839,8 +1132,21 @@ def _run_opt_3stage_graph(
     if int(y.size(0)) < graph_max_tokens:
         raise ValueError(
             "opt graph path requires y to have at least graph_max_tokens rows"
-    )
+        )
     num_max_tokens_per_rank = int(sym_buffer.num_max_tokens_per_rank)
+    route_capacity_num_tokens = (
+        graph_max_tokens
+        if capacity_num_tokens is None
+        else int(capacity_num_tokens)
+    )
+    if (
+        route_capacity_num_tokens < graph_max_tokens
+        or route_capacity_num_tokens > num_max_tokens_per_rank
+    ):
+        raise ValueError(
+            "graph capacity_num_tokens must be in "
+            f"{graph_max_tokens}..{num_max_tokens_per_rank}"
+        )
     v3_backend = normalize_v3_backend(v3_backend)
     _check_shape(
         num_ranks=num_ranks,
@@ -925,6 +1231,7 @@ def _run_opt_3stage_graph(
         num_topk=num_topk,
         hidden=hidden,
         runtime_num_tokens=runtime_num_tokens,
+        capacity_num_tokens=route_capacity_num_tokens,
         alignment=alignment,
         l1_out_workspace=state.scratch.l1_out,
         use_unified_weight_layout=use_unified_weight_layout,
@@ -964,21 +1271,33 @@ def _run_opt_3stage_graph(
             staged_x,
             staged_x_scale,
         ) = k1_result
-        _run_pro_ll_masked_k1_groupgemm(
-            l1_out,
-            staged_x,
-            staged_x_scale,
-            l1_weight,
-            l1_scale,
-            m_indices,
-            local_experts=num_experts // num_ranks,
-            hidden=hidden,
-            expected_m_per_group=max(
-                1,
-                (graph_max_tokens * num_ranks * num_topk + num_experts)
-                // num_experts,
-            ),
-            verbose_build=verbose_build,
+        l1_out, route_weights, m_indices, row_combine_ptrs = (
+            _run_pro_ll_masked_k1_groupgemm(
+                l1_out,
+                staged_x,
+                staged_x_scale,
+                l1_weight,
+                l1_scale,
+                m_indices,
+                local_experts=num_experts // num_ranks,
+                hidden=hidden,
+                expected_m_per_group=max(
+                    1,
+                    (graph_max_tokens * num_ranks * num_topk + num_experts)
+                    // num_experts,
+                ),
+                route_weights=route_weights,
+                row_combine_ptrs=row_combine_ptrs,
+                compact_staged_x=state.scratch.pro_compact_staged_x,
+                compact_staged_x_scale=state.scratch.pro_compact_staged_x_scale,
+                compact_l1_out=state.scratch.pro_compact_l1_out,
+                compact_route_weights=state.scratch.pro_compact_route_weights,
+                compact_row_combine_ptrs=state.scratch.pro_compact_row_combine_ptrs,
+                compact_m=state.scratch.pro_compact_m,
+                compact_rows_per_expert=state.scratch.pro_compact_rows_per_expert,
+                allow_compact_active=False,
+                verbose_build=verbose_build,
+            )
         )
     else:
         l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_result

@@ -305,9 +305,44 @@ void launch_l2_deepgemm_original_asm(
                     "asm tail reduce vector counts must fit in uint32");
     }
 
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const bool stream_capturing = is_stream_capturing(stream);
+    const int wg_m = (hidden + 255) / 256;
+    const int wg_n = (total_rows + 255) / 256;
+    int launch_wg_n = wg_n;
+    if (active_tiles != nullptr) {
+        check_cuda_contiguous(*active_tiles, "active_tiles");
+        TORCH_CHECK(active_tiles->scalar_type() == torch::kInt,
+                    "active_tiles must be int32");
+        TORCH_CHECK(active_tiles->numel() >= 1,
+                    "active_tiles must contain at least one int32");
+        if (!stream_capturing && graph_runtime_offset_from_active_tiles == 0) {
+            int active_tiles_host = wg_n;
+            K3_HIP_CHECK(hipMemcpyAsync(
+                &active_tiles_host,
+                active_tiles->data_ptr<int32_t>(),
+                sizeof(int32_t),
+                hipMemcpyDeviceToHost,
+                stream));
+            K3_HIP_CHECK(hipStreamSynchronize(stream));
+            if (active_tiles_host < 0) {
+                active_tiles_host = 0;
+            }
+            if (active_tiles_host > wg_n) {
+                active_tiles_host = wg_n;
+            }
+            launch_wg_n = std::max(1, active_tiles_host);
+        }
+    }
+    const int launch_rows = launch_wg_n * 256;
+    const int gemm_workgroups = wg_m * launch_wg_n;
+    const uint32_t effective_asm_done_target = asm_tail_signal
+        ? static_cast<uint32_t>(gemm_workgroups)
+        : static_cast<uint32_t>(asm_done_target);
+
     GpuProb prob{};
     prob.m = static_cast<uint32_t>(hidden);
-    prob.n = static_cast<uint32_t>(total_rows);
+    prob.n = static_cast<uint32_t>(launch_rows);
     prob.batch = 1;
     prob.k = static_cast<uint32_t>(k);
     prob.d = row_combine_ptrs == nullptr
@@ -334,7 +369,7 @@ void launch_l2_deepgemm_original_asm(
         prob.asm_done_counter = asm_done_counter->data_ptr<int32_t>();
         prob.asm_signal_addrs =
             asm_signal_addrs == nullptr ? nullptr : asm_signal_addrs->data_ptr<int64_t>();
-        prob.asm_done_target = static_cast<uint32_t>(asm_done_target);
+        prob.asm_done_target = effective_asm_done_target;
         prob.asm_signal_num_ranks = static_cast<uint32_t>(asm_signal_num_ranks);
         prob.asm_tail_signal = 1;
     }
@@ -369,11 +404,6 @@ void launch_l2_deepgemm_original_asm(
         }
     }
     if (active_tiles != nullptr) {
-        check_cuda_contiguous(*active_tiles, "active_tiles");
-        TORCH_CHECK(active_tiles->scalar_type() == torch::kInt,
-                    "active_tiles must be int32");
-        TORCH_CHECK(active_tiles->numel() >= 1,
-                    "active_tiles must contain at least one int32");
         prob.active_tiles = active_tiles->data_ptr<int32_t>();
         if (graph_runtime_offset_from_active_tiles != 0) {
             TORCH_CHECK(graph_runtime_offset_from_active_tiles > 0 &&
@@ -385,7 +415,6 @@ void launch_l2_deepgemm_original_asm(
         }
     }
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
     torch::Tensor prob_storage;
     void* prob_device = nullptr;
     if (prob_storage_override != nullptr) {
@@ -401,7 +430,7 @@ void launch_l2_deepgemm_original_asm(
             torch::TensorOptions().dtype(torch::kUInt8).device(output.device()));
         prob_device = prob_storage.data_ptr();
     }
-    if (!is_stream_capturing(stream)) {
+    if (!stream_capturing) {
         K3_HIP_CHECK(hipMemcpyAsync(
             prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice, stream));
     }
@@ -418,9 +447,6 @@ void launch_l2_deepgemm_original_asm(
         : reinterpret_cast<int32_t*>(row_combine_ptrs->data_ptr<int64_t>());
 
     const int local_work_size = 768;
-    const int wg_m = (hidden + 255) / 256;
-    const int wg_n = (total_rows + 255) / 256;
-    const int gemm_workgroups = wg_m * wg_n;
     const int reduce_workgroups = static_cast<int>(prob.asm_reduce_blocks);
     const size_t global_work_items =
         static_cast<size_t>(local_work_size) *

@@ -24,6 +24,22 @@ Scope boundaries:
 - TX32 runtime validation is active; keep node-local and cross-node results separated because the two nodes do not share storage.
 - Preserve performance-first contracts: no extra hot-path kernels and no runtime weight transforms. EP16/EP32 shape support must not implicitly switch peer-memory mode; `MEGAMOE_DCU_PEER_MEMORY=rpc` is the only Fabric/RPC selector.
 
+## 2026-07-08 Active Queue Update
+Status: active, 151.1 SSH/GPU/container state recovered; runtime tests resumed.
+
+- Completed: restored the Pro masked-K1 wrapper after proving the attempted 2D launch was wrong for the default `.co`.
+- Completed: disassembled default and scratch balanced Pro masked `.co` files and recorded their different work mapping contracts.
+- Completed: proved the current token64 skew failure is no longer a simple missing-slot issue under the restored default `.co`; rank0 token44 has nonzero L1/K3/combine for slots 0..5, but still differs from `ll-masked` by about `0.098`.
+- Completed: 151.1 recovery check after container exit. Host/container `hy-smi --showpids` were clean, Torch HIP kernel passed, and `deepgemm` import reported `DEEPGEMM_GPU_CUS=64` / `gfx938`.
+- Completed: Normal graph correctness/performance is now measured after exact compact capacity. Flash EP8 token4096 graph replay passed correctness but measured `6.9654 ms`, about `+17.7%` slower than the recovered eager `5.9164 ms`.
+- Pending: Normal graph performance fix. Use a capture-compatible fixed CTA pool or device-side active-tile consumer; do not introduce D2H `active_tiles_host` into graph capture.
+- Pending: rerun a short Pro token64 failure-detail command with a bounded timeout.
+- Pending: compare the same Pro token64 `single-local-rank` case against `normal-contiguous` baseline to separate MegaMoE numeric mismatch from `ll-masked` oracle/layout behavior.
+- Pending: add a temporary test-harness-only K1 oracle if needed; do not add production `deepgemm` imports or banned Pro masked debug env knobs.
+- Active: Pro EP8 LL adversarial skew is currently isolated to K1 stage-row construction. K3/final-reduce ablations are negative, count/barrier system-scope fixes are partial, and the next patch is release/acquire visibility for `symm_src_x_ptrs[row]`.
+- Completed update: Pro EP8 LL skew root cause is K1 stage padding crossing the fixed expert stride when `m_per_expert` is not divisible by Pro `kBlockM=48`. The retained fix clamps padded stage rows to `m_per_expert`; Pro token64/token128 skew and Flash token128 skew now pass on 151.1. Performance validation is active.
+- Completed update: LL performance validation passed. Pro eager token256/token512, Pro graph cap512 per-bucket, and Flash graph cap512 per-bucket are in the expected band. Production Pro skew trace hooks were removed and remote pytest still passes.
+
 ## Phase 1: Read Examples And Current Assumptions
 Status: ✅ completed
 
@@ -211,6 +227,36 @@ Checklist:
 - ✅ Checked DCU visibility across `c0..c9` inside `lj_sgl_0512`; current result is no `/dev/kfd` or `/dev/dri/renderD*`, `hy-smi` reports no `hycu` driver / `WAIT GLOBAL TOPO`, and `c2` reports `LINK FAILED`.
 - [ ] Resolve Pod2 DCU driver/device exposure before any 40-card GPU run.
 
+## Skew-Safe Capacity Fix
+Status: [ ] capacity correctness is validated on 151.1 for Flash normal/LL; Normal exact compact capacity performance is recovered to the historical band after active-launch work; LL active-only work restored Flash performance. Pro LL compact-active improves random eager buckets, but Pro adversarial LL skew now exposes a correctness blocker that must be fixed before this section can close.
+
+Target:
+- Extreme expert skew must not silently drop valid route rows in DCU MegaMoE normal or LL paths.
+- Preserve performance by keeping primary compute proportional to active rows / `actual_m`, not padded worst-case capacity.
+- Use 151.1 single-node 16-card RPC as the first hardware validation target, then keep TX32/EP32 validation as follow-up if required.
+
+Plan:
+- ✅ Normal path: make compact prebuild the correctness-bearing route layout and size its tile pool for local-rank worst-case routes, `num_ranks * capacity_tokens * topk`, while retaining active-tile execution.
+- ✅ Normal path: remove correctness dependence on mean-plus-headroom per-expert capacity; any remaining capacity clip is now a guard rather than the expected valid-capacity behavior.
+- ✅ LL path: increase correctness capacity to per-expert worst-case `num_ranks * capacity_tokens`, while K2/K3 and activation work stay driven by `actual_m` / active tiles.
+- ✅ Keep Pro split `ll_pro_masked` performance protected by separating LL scratch capacity from full normal buffer capacity; default LL scratch cap follows the auto-LL threshold unless graph cap is explicitly raised.
+- ✅ Add adversarial routing test support: `--route-pattern single-local-rank` routes unique top-k entries from all ranks into a selected target rank's local experts.
+- ✅ Validate on 151.1 with clean HCU state: source tests, build, Flash EP8 normal adversarial correctness, and Flash EP8 LL adversarial correctness passed.
+- ✅ Normal performance recovery: Flash EP8 normal eager 4096 regressed to `17.2707 ms` after exact compact capacity, versus historical `5.7636 ms`. K1 active launch alone improved only to `16.1966 ms`; adding K3 active launch/done-target handling and K2 active CTA pooling recovered the final same-node check to `5.9164 ms` versus `9.7064 ms` baseline, about `+2.7%` from the historical MegaMoE reference and `1.64x` faster than baseline.
+- 鉁?LL active-only work: remove row-capacity-wide K1 stage metadata/scale initialization while preserving safe padding rows for the active tile tail.
+- 鉁?LL active-only work: make K3 split-tail copy blocks follow `max(actual_m)` without launching a full `m_per_expert` capacity grid. The bounded CTA pool grid-strides over active copy blocks and preserves the adversarial skew case.
+- 鉁?Performance guardrail: Flash EP8 LL graph cap512 returned to the historical post-guard band after the K3 CTA-pool rebuild (`0.558/0.668/0.703/0.779/1.046/1.841 ms` for replay `8/32/64/128/256/512`) and adversarial LL correctness still passed.
+- ✅ Pro LL graph default now captures MegaMoE per replay bucket instead of forcing every bucket through one max-capacity graph. Pro EP8 cap512 per-bucket medians are `1.438/1.930/2.049/2.295/2.774/4.656 ms`, faster than the aligned `ll-masked` baseline.
+- [ ] Pro LL performance fix: default Pro split still regresses after exact worst-capacity because the bundled masked K1 ASM uses `size_m = rows_per_expert` for both work and physical expert stride. Pro EP8 cap512 exact-worst measured `2.159/2.625/2.694/2.854/3.173/4.652 ms`, and eager compact-active improves token256/token512 to `2.602/4.095 ms` while preserving random correctness. Continue performance work only after the current Pro skew correctness blocker is resolved.
+- ✅ First Pro compact-head attempt was rejected and removed: correctness passed, but graph cap512 measured `2.277/2.747/2.823/2.980/3.282/4.792 ms`, slower than the exact split run. The production branch now keeps only compact-active plus exact per-bucket graph behavior.
+- [ ] Pro compact active-K1 design/implementation: eager-only compact-active is implemented and random token256/token512 are faster than exact-worst. Remaining work is to fix the adversarial Pro LL skew failure and then remeasure compact-active on the full eager/graph guardrail matrix.
+- [ ] Pro LL skew blocker: `single-local-rank` Pro EP8 LL fails even with compact-active disabled, split-tail disabled, tail-reduce disabled, and unified LL enabled. Trace the first bad route through stage/K1/K2/K3 combine before changing the performance path again.
+- [ ] Follow-up if requested: extend the adversarial matrix to EP16/EP32 and Pro shapes.
+
+Notes:
+- This is not an overflow fallback task. Overflow flags remain diagnostic only; the production capacity contract should avoid overflow for declared `capacity_tokens`.
+- 151.1 currently needs a temporary Python runtime LD fix for `torch` import: prepend `/root/yuguo/dtk-26.04.1/.hyhal/rocm_smi/lib` and remove `/opt/hyhal/lib*` from `LD_LIBRARY_PATH`.
+
 ## Risks
 
 - Risk: Supernode fabric memory APIs may differ across DTK versions; code should prefer current HIP wrappers when available or use HSA extensions from the examples.
@@ -362,8 +408,8 @@ Status: ✅ source cleanup, final 151.1 rebuild, and Pro EP16 LL split runtime s
 - ✅ Update README with the final Pro LL split behavior and the unified-layout compatibility override.
 - ✅ Clean the public FP8 weight-transform surface: remove the legacy `transform_fp8_weights_for_mega_moe`, rename the Pro helper to `transform_fp8_weights_for_mega_moe_pro_ll_masked_k1`, and remove unused `v3_layout.py` transform/unpack helpers while keeping the pack5 layout contract helpers.
 - ✅ Rebuild on 151.1 and run Pro EP16 LL split sanity/performance after SGLang/prefix-cache released the cards. Default Pro LL now uses packaged develop masked `.co` hash `73184662ec644cf9f4e9cfacec720a15428e84c5f84ad06e6e9e57bfa06543b4`; eager tokens `8/32/64/128/256/512` and graph cap512 replay `8/32/64/128/256/512` all passed against `ll-masked`.
-- [ ] Finish Pro EP8 LL split correctness retest on clean cards. Current token256 failing examples show final local reduce matches the visible combine slots, so the next isolation is split-tail on/off under a clean node and then route-slot diagnostics for the first bad `(token, slot, col)`.
-- [ ] Remove temporary Pro EP8 LL diagnostics after root cause is fixed: combine-slot assertion detail and route-slot print hooks used for the split-tail/per-route isolation.
+- ✅ Finish Pro EP8 LL split correctness retest on clean cards. The final retained root cause is Pro K1 stage-copy padding crossing the physical expert stride; the stage-copy clamp fixes the skew class without overflow fallback.
+- ✅ Remove temporary Pro EP8 LL diagnostics after root cause is fixed: combine-slot assertion detail, trace/failure dumps, route trace hooks, and the rejected compact-head ablation are cleaned from runnable source.
 
 ## 2026-07-06 Pro LL Correctness And Regression Queue
 Status: [] active; ordered by current user priority.
@@ -379,3 +425,33 @@ Status: [] active; ordered by current user priority.
 - [] Reconcile Pro LL split versus `ll-masked` baseline numbers under the runtime-token-aligned baseline policy. The earlier Pro EP8 LL graph baseline numbers were inflated by using graph allocation cap as DeepEP LL dispatch cap; corrected Pro EP8 LL graph cap512 data is now collected, while any final eager/uneven table should cite only runtime-token-aligned runs.
 - ✅ Run necessary Flash guardrails after the Pro LL fix to confirm Flash behavior/performance is unaffected.
 - ✅ Clean all temporary diagnostics and update README only with stable final behavior. No new README text is needed for the internal Pro EP8 masked-K1 launch-shape guard.
+
+## 2026-07-08 Graph Performance Follow-Up
+Status: [] measured; no low-risk correctness-safe performance patch has been applied.
+
+- 鉁?Reproduced the current post-fix graph/eager gaps on rebuilt 151.1 artifacts:
+  - Normal Flash EP8 token4096 graph `6.9821 ms` versus eager `6.0118 ms`.
+  - Pro EP8 LL cap512 graph replay512 `4.6485 ms` versus eager `4.1925 ms`.
+- 鉁?Rejected simple toggles:
+  - `K3_USE_ASM_TAIL_REDUCE=0` made Normal graph slower (`7.0714 ms`).
+  - `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` made Pro LL graph slower (`5.2302 ms`).
+- 鉁?Profiled graph kernels on 151.1:
+  - Normal gap is dominated by K1/K3 normal ASM capacity-grid early-exit overhead; compact route prebuild kernels are not the bottleneck.
+  - Pro LL graph gap still points to Pro masked K1 exact physical stride / `num_MBlocks`, not K2/K3 full-capacity copy work.
+- 鉁?Collected the previously missing fair Pro EP16 `ll-masked` baseline cap512 single-capture data. With both MegaMoE and baseline captured at cap512, MegaMoE replay medians were `1.8216/1.9240/2.0016/2.2017/3.1074/4.8633 ms` and baseline medians were `2.5676/2.6352/2.6780/2.8035/3.5800/5.1097 ms` for `8/32/64/128/256/512`.
+- [ ] If graph performance becomes required, implement one of the correctness-safe graph work-shaping designs:
+  - Normal: K1/K3 capture-compatible active-tile CTA pool or device-side active-tile consumer.
+  - Pro LL: masked K1 device-side max-count M-block scheduling, or true compact LL graph where K1/K2/K3 consume compact active rows.
+- 馃毇 Do not use expected-M or compact-stride clamping as a graph shortcut. It would skip legal skew rows and reintroduce the precision hazard fixed by exact capacity.
+
+## 2026-07-08 Final LL Follow-Up
+Status: [] active; final correctness/performance retest is complete for EP8 and EP16 LL, with Normal graph performance deferred by user direction.
+
+- ✅ Normal eager exact compact-capacity is correctness-safe and performance-recovered; Normal graph is correctness-safe but still has known empty-CTA performance overhead and is not prioritized because production use is eager.
+- ✅ LL worst-capacity and active-only fixes are retained without overflow fallback. Pro EP8/Flash guardrails passed after cleanup.
+- ✅ Pro EP16 final retest passed after cleanup:
+  - adversarial `single-local-rank` token64/token128 both passed against `ll-masked`;
+  - graph cap512 replay buckets `8/32/64/128/256/512` all passed and remained faster than the aligned `ll-masked` baseline;
+  - post-run `hy-smi --showpids` was clean.
+- ✅ Environment surface cleaned. Pro LL eager compact-active is fixed-on with no retained `MEGAMOE_DCU_PRO_LL_COMPACT_ACTIVE` user switch; the rejected `MEGAMOE_DCU_PRO_LL_COMPACT_HEAD` experiment and temporary debug/failure envs are removed from runnable sources.
+- Optional follow-up: if Normal graph performance becomes important, implement a capture-compatible active-work consumer/fixed CTA pool instead of adding host D2H active-tile readback inside graph capture.
