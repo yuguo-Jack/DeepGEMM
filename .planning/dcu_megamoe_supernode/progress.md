@@ -2350,3 +2350,42 @@
 - The fair baseline-cap512 graph medians were `2.5676/2.6352/2.6780/2.8035/3.5800/5.1097 ms` for `8/32/64/128/256/512`.
 - Full run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_baseline_cap512/ep16_ll_single_cap512_full_20260708_163424`.
 - Post-run `hy-smi --showpids` was clean. This retest did not reproduce the previous node hang.
+
+## 2026-07-08 17:10:00 +08:00 - Graph Optimization Direction Correction
+- Committed and pushed the stable skew-safe capacity work before starting larger graph optimization exploration: `a9b8598 Fix MegaMoE skew-safe capacity` on `origin/supernode`.
+- Briefly inspected a historical scratch masked K1 `.s` from 151.1, then discarded that direction after the user pointed out it was previously known to use a different weight layout. No production source change from that `.s` is retained.
+- Verified the packaged Pro masked K1 `.co` hash is the current production object on both local and 151.1: `73184662ec644cf9f4e9cfacec720a15428e84c5f84ad06e6e9e57bfa06543b4`.
+- Disassembly of the current packaged `.co` confirms it already uses device-side `masked_m` to bound M-block work. The kernel loads the `masked_m` pointer from the existing kernarg block, compares `m_block * 64 >= masked_m[expert]`, branches to `BlockEnd`, then continues persistent scheduling with `workgroup_x += 0x80`.
+- This invalidates the earlier simplified hypothesis that Pro LL graph masked K1 is doing all fixed `size_m` M-blocks. The remaining graph/eager gap is more accurately a physical-stride / compact-layout issue: `size_m` still defines the per-expert memory stride and output layout, even though scheduled M-blocks are bounded by `masked_m`.
+- A focused masked-K1 microbench with fixed `actual_m=128` found little sensitivity to the physical `size_m` stride itself. For local experts `E=12`, median K1 time was about `0.727/0.734/0.739 ms` for `size_m=128/512/4096`; for `E=48`, `size_m=128` was `2.9086 ms` and `size_m=4096` was `2.9275 ms`. This makes a simple masked-K1 stride patch unlikely to recover the full graph/eager delta.
+- Safe next directions are therefore narrowed:
+  - Normal graph: still needs a capture-compatible K1/K3 active CTA pool or device-side active-tile consumer if graph performance is prioritized.
+  - Pro LL graph: do not replace the packaged `.co` with the scratch balanced `.s`; first isolate the remaining fixed-capture work outside masked-K1 stride alone, then either obtain/modify a layout-compatible masked-K1 ABI that consumes compact rows or implement a true compact LL graph where masked K1, K2, and K3 all consume compact active rows.
+
+## 2026-07-08 18:22:00 +08:00 - Pro LL Graph K2 CTA Pool Fix
+- Re-profiled Pro EP8 LL graph versus eager with a cleaner graph-only profile. The corrected evidence showed masked K1 and K3 local GEMM are close between graph and eager, while K2 SwiGLU/quant was the large graph-only outlier: graph `~0.797 ms/call` versus eager `~0.085 ms/call`.
+- Root cause: K2's 2048/4096 register kernels already respect `max_row_blocks` with a grid-stride loop, but the generic hidden path used by Pro `hidden=3072` ignored the computed `launch_blocks` and launched `dim3(rows)`. In exact graph cap512, `rows = local_experts * rows_per_expert = 48 * 4096 = 196608`, so graph paid a capacity-sized empty CTA launch. Eager compact-active only had `48 * 128 = 6144` rows.
+- Implemented a low-intrusion K2 fix: the generic K2 kernel now grid-strides over `effective_rows`, and the generic launch branch uses `dim3(launch_blocks)`. This preserves exact worst-capacity correctness because if legal skew makes `effective_rows > launch_blocks`, each CTA loops by `gridDim.x` until all active logical rows are covered.
+- Verification:
+  - Local `py_compile` and `git diff --check` passed; local pytest was unavailable in the Windows Python.
+  - 151.1 source-contract pytest passed: `13 passed`.
+  - 151.1 rebuild/import passed; K2 extension rebuilt from the modified source.
+  - Pro EP8 LL graph random buckets passed against `ll-masked`. Replay medians improved to `1.444/1.916/1.993/2.134/2.447/3.956 ms` for tokens `8/32/64/128/256/512`, versus prior post-fix `1.439/1.930/2.050/2.289/2.788/4.649 ms`.
+  - Same run reported eager token512 `4.0986 ms`, so graph token512 is now slightly faster than eager on this measurement.
+  - Pro EP8 LL graph `single-local-rank` token128 passed with `max_abs=0.000488281`.
+  - Post-fix graph profile shows K2 down to `~0.099 ms/call`; remaining Pro graph costs are mainly K1 stage-only, masked K1, K3 local GEMM, and K3 combine.
+  - Pro EP16 token512 graph sanity passed using IPC peer mode after an unrelated fabric attach failure. Graph replay was `4.0927 ms` versus `ll-masked` baseline `5.0378 ms`, with `max_abs=0.000976562`.
+  - Pro EP16 full graph bucket run also passed against `ll-masked` with medians `1.103/1.216/1.301/1.495/2.406/4.178 ms` versus baseline `1.147/1.278/1.405/1.709/2.840/5.118 ms` for tokens `8/32/64/128/256/512`.
+
+## 2026-07-08 18:20:00 +08:00 - Pro LL Graph K2 CTA-Pool Fix
+- Re-profiled Pro EP8 LL graph versus eager after the masked-K1 `.co` correction. The packaged masked K1 itself was not the main graph/eager delta: a clean graph profile showed K2 `swiglu_quant_channelwise_kernel` at about `0.797 ms/call`, while eager compact-active K2 was about `0.085 ms/call`.
+- Root cause: the generic K2 path used by Pro hidden `3072` computed `launch_blocks` but still launched `dim3(rows)`. In graph exact-capacity mode this meant `48 * 4096 = 196608` CTAs for Pro EP8 cap512, even though the kernel already had actual-M logic to process active rows.
+- Applied a low-intrusion fix in K2 generic kernel: it now loops `logical_row += gridDim.x`, and the generic launch uses `dim3(launch_blocks)`. This matches the existing 2048/4096 reg-kernel CTA-pool behavior and preserves legal skew coverage by grid-striding through all `effective_rows`.
+- Verification:
+  - Local `py_compile` and `git diff --check` passed; local pytest is unavailable on the workstation.
+  - 151.1 remote `python3 -m pytest -q megamoe/dcu_megamoe_opt/tests/test_dcu_megamoe_v3.py`: `13 passed`.
+  - Rebuild/import passed; K2 extension was recompiled and synced. Build run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/k2_pool_build_20260708_181154`.
+  - Pro EP8 LL cap512 graph buckets passed correctness. Graph medians improved to `1.444/1.916/1.993/2.134/2.447/3.956 ms` for tokens `8/32/64/128/256/512`, versus the previous `1.439/1.930/2.050/2.289/2.788/4.648 ms`. Token512 graph is now slightly faster than same-run eager `4.099 ms`. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/pro_ep8_ll_graph512_k2pool_20260708_181412`.
+  - Pro EP8 LL adversarial `single-local-rank` graph token128 passed with `max_abs=0.000488281`. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/pro_ep8_ll_skew_graph_k2pool_20260708_181646`.
+  - Post-fix graph profile confirmed K2 dropped to about `0.098 ms/call`; remaining large kernels are masked K1, K3 LL GEMM, K3 combine, and K1 stage-only. Profile dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/pro_ep8_ll_graph_only_hipprof_k2pool_20260708_181752`.
+  - Pro EP16 LL single-capture cap512 improved substantially and passed all buckets: MegaMoE graph medians `1.132/1.224/1.309/1.498/2.406/4.144 ms` versus fair `ll-masked` cap512 baseline `2.563/2.633/2.673/2.804/3.578/5.118 ms` for tokens `8/32/64/128/256/512`. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/pro_ep16_ll_single_cap512_k2pool_20260708_181907`.

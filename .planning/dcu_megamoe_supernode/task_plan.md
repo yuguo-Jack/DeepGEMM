@@ -455,3 +455,33 @@ Status: [] active; final correctness/performance retest is complete for EP8 and 
   - post-run `hy-smi --showpids` was clean.
 - ✅ Environment surface cleaned. Pro LL eager compact-active is fixed-on with no retained `MEGAMOE_DCU_PRO_LL_COMPACT_ACTIVE` user switch; the rejected `MEGAMOE_DCU_PRO_LL_COMPACT_HEAD` experiment and temporary debug/failure envs are removed from runnable sources.
 - Optional follow-up: if Normal graph performance becomes important, implement a capture-compatible active-work consumer/fixed CTA pool instead of adding host D2H active-tile readback inside graph capture.
+
+## 2026-07-08 Graph Optimization Exploration
+Status: [] active; evidence correction complete, implementation not started.
+
+- Stable skew-safe capacity work is committed and pushed: `a9b8598 Fix MegaMoE skew-safe capacity`.
+- Rejected the historical scratch masked K1 `.s` as a production replacement after confirming it is layout-incompatible with the current packaged Pro LL masked weight layout.
+- Confirmed current packaged Pro masked K1 `.co` already reads `masked_m` and bounds scheduled M-block work from device-side actual rows. The remaining Pro LL graph issue is physical stride / compact-row ABI, not a missing actual-M early exit.
+- [ ] Normal graph feasibility: inspect whether K1/K3 ASM can safely loop a fixed captured CTA pool over `active_tiles` without rewriting the full generated GEMM body.
+- [ ] Pro LL graph feasibility: either find a layout-compatible masked K1 source/ABI path that separates physical stride from scheduled compact M, or design a true compact LL graph where K1/K2/K3 all consume compact active rows.
+- Do not use expected-M clamping, scratch balanced `.s` replacement, or graph D2H active-count reads as shortcuts.
+
+### 2026-07-08 Masked K1 Graph Correction
+
+- Confirmed current packaged Pro masked K1 `.co` already uses device-side `masked_m` to gate M-block work, so the first "host fixed M-block scheduler" hypothesis is not accurate.
+- Confirmed with masked-K1 microbench that physical `size_m=4096` is only slightly slower than `size_m=128` at fixed active rows. Isolated stride alone is unlikely to explain the full Pro LL graph/eager gap.
+- Updated Pro LL graph feasibility direction: profile the whole exact captured path first, then pursue either a layout-compatible compact-row masked-K1 ABI or a true compact LL graph where K1/K2/K3 all consume compact active rows.
+
+### 2026-07-08 Pro LL Graph K2 Pool
+
+- [x] Profile whole Pro LL graph exact path again after the masked-K1 correction. Clean profile showed K2 generic hidden=3072 was the major graph-only outlier.
+- [x] Fix K2 generic kernel to use the existing graph fixed CTA pool contract: `dim3(launch_blocks)` plus grid-stride over `effective_rows`.
+- [x] Verify EP8 graph random and skew correctness/performance on 151.1.
+- [x] Verify EP16 token512 graph sanity on 151.1 using IPC peer mode after a fabric attach failure.
+- [ ] Continue graph optimization only after measuring the remaining K3 combine / K1 stage-only gap; do not touch the packaged masked K1 `.co` unless a layout-compatible ABI source is proven.
+
+### 2026-07-08 Pro LL K2 Graph Pool
+
+- Implemented and validated a low-risk K2 graph work-shaping fix for Pro hidden `3072`: generic K2 now uses the same fixed CTA-pool/grid-stride pattern as the existing reg-kernel path.
+- Status: correctness and performance validated on 151.1 for Pro EP8 random graph cap512, Pro EP8 adversarial `single-local-rank` graph token128, and Pro EP16 single-capture cap512.
+- Next graph optimization, if needed: inspect K3 combine/reduce or K1 stage-only. Do not revisit masked-K1 scheduler changes unless new profile evidence points there.

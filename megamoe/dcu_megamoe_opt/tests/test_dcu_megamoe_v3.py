@@ -685,6 +685,8 @@ def test_v3_normal_graph_runtime_work_is_limited_without_d2h():
     assert "runtime_num_tokens == nullptr ? 0 : 1" in k1_ext
     assert "runtime_num_tokens != nullptr\n            ? 12" in k1_ext
     assert "if (!has_actual_m && active_tiles != nullptr && active_tile_m > 0)" in k2_ext
+    assert "logical_row += static_cast<int>(gridDim.x)" in k2_ext
+    assert "dim3(launch_blocks)" in k2_ext
     assert "K_K2_GRAPH_ROW_BLOCKS = 8192" in opt_source
     assert "active_tiles=k2_active_tiles" in opt_source
     assert "state.scratch.k1_active_tiles if v3_backend != V3_BACKEND_LL else None" in opt_source

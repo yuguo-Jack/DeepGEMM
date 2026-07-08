@@ -225,92 +225,99 @@ void swiglu_quant_channelwise_kernel(
                                     : 0;
         effective_rows = active_rows < effective_rows ? active_rows : effective_rows;
     }
-    const int logical_row = static_cast<int>(blockIdx.x);
-    if (logical_row >= effective_rows)
-        return;
-    int row = logical_row;
-    if (has_actual_m) {
-        const int expert = logical_row / logical_m_per_expert;
-        const int row_in_expert = logical_row - expert * logical_m_per_expert;
-        const int expert_count =
-            clamp_actual_m_count(actual_m[expert], m_per_expert);
-        if (row_in_expert >= expert_count)
-            return;
-        row = expert * m_per_expert + row_in_expert;
-    }
-
     const int tid = static_cast<int>(threadIdx.x);
-    const int stride = hidden * 2;
-    const int64_t row_base = static_cast<int64_t>(row) * stride;
-    if (!compact_active_rows && !output_bf16 && row_combine_ptrs != nullptr &&
-        row_combine_ptrs[row] == 0) {
-        return;
-    }
-    const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
-    if (!compact_active_rows && has_topk_weights && route_weight == 0.0f) {
+    for (int logical_row = static_cast<int>(blockIdx.x);
+         logical_row < effective_rows;
+         logical_row += static_cast<int>(gridDim.x)) {
+        int row = logical_row;
+        if (has_actual_m) {
+            const int expert = logical_row / logical_m_per_expert;
+            const int row_in_expert =
+                logical_row - expert * logical_m_per_expert;
+            const int expert_count =
+                clamp_actual_m_count(actual_m[expert], m_per_expert);
+            if (row_in_expert >= expert_count)
+                continue;
+            row = expert * m_per_expert + row_in_expert;
+        }
+
+        const int stride = hidden * 2;
+        const int64_t row_base = static_cast<int64_t>(row) * stride;
+        if (!compact_active_rows && !output_bf16 && row_combine_ptrs != nullptr &&
+            row_combine_ptrs[row] == 0) {
+            continue;
+        }
+        const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
+        if (!compact_active_rows && has_topk_weights && route_weight == 0.0f) {
+            if (tid == 0)
+                out_scale[row] = 1.0e-4f / 448.0f;
+            const int64_t out_base = static_cast<int64_t>(row) * hidden;
+            for (int col = tid * 4; col < hidden; col += Threads * 4) {
+                *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) = 0u;
+                if (output_bf16) {
+                    uint32_t* bf16_ptr =
+                        reinterpret_cast<uint32_t*>(out_bf16 + out_base + col);
+                    bf16_ptr[0] = 0u;
+                    bf16_ptr[1] = 0u;
+                }
+            }
+            continue;
+        }
+
+        float local_amax = 0.0f;
+        for (int col = tid * 4; col < hidden; col += Threads * 4) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float gate = bf16_bits_to_float(x[row_base + col + i]);
+                float up = bf16_bits_to_float(x[row_base + hidden + col + i]);
+                if (has_clamp_value) {
+                    up = fminf(clamp_value, fmaxf(-clamp_value, up));
+                    gate = fminf(clamp_value, gate);
+                }
+                const float y = swiglu_gate<kFastMath>(gate) * up * route_weight;
+                y_smem[col + i] = y;
+                local_amax = fmaxf(local_amax, fabsf(y));
+            }
+        }
+
+        reduce_smem[tid] = local_amax;
+        __syncthreads();
+
+        for (int offset = Threads / 2; offset > 0; offset >>= 1) {
+            if (tid < offset)
+                reduce_smem[tid] =
+                    fmaxf(reduce_smem[tid], reduce_smem[tid + offset]);
+            __syncthreads();
+        }
+
+        const float clamped_amax = fmaxf(reduce_smem[0], 1.0e-4f);
+        const float scale = clamped_amax / 448.0f;
+        const float inv_scale = 448.0f / clamped_amax;
         if (tid == 0)
-            out_scale[row] = 1.0e-4f / 448.0f;
+            out_scale[row] = scale;
+
         const int64_t out_base = static_cast<int64_t>(row) * hidden;
         for (int col = tid * 4; col < hidden; col += Threads * 4) {
-            *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) = 0u;
+            const float y0 = y_smem[col + 0];
+            const float y1 = y_smem[col + 1];
+            const float y2 = y_smem[col + 2];
+            const float y3 = y_smem[col + 3];
+            *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) =
+                pack4_e4m3fn(
+                    y0 * inv_scale, y1 * inv_scale, y2 * inv_scale,
+                    y3 * inv_scale);
             if (output_bf16) {
-                uint32_t* bf16_ptr = reinterpret_cast<uint32_t*>(out_bf16 + out_base + col);
-                bf16_ptr[0] = 0u;
-                bf16_ptr[1] = 0u;
+                const uint32_t b01 =
+                    static_cast<uint32_t>(float_to_bf16_bits(y0)) |
+                    (static_cast<uint32_t>(float_to_bf16_bits(y1)) << 16);
+                const uint32_t b23 =
+                    static_cast<uint32_t>(float_to_bf16_bits(y2)) |
+                    (static_cast<uint32_t>(float_to_bf16_bits(y3)) << 16);
+                uint32_t* bf16_ptr =
+                    reinterpret_cast<uint32_t*>(out_bf16 + out_base + col);
+                bf16_ptr[0] = b01;
+                bf16_ptr[1] = b23;
             }
-        }
-        return;
-    }
-
-    float local_amax = 0.0f;
-    for (int col = tid * 4; col < hidden; col += Threads * 4) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            float gate = bf16_bits_to_float(x[row_base + col + i]);
-            float up = bf16_bits_to_float(x[row_base + hidden + col + i]);
-            if (has_clamp_value) {
-                up = fminf(clamp_value, fmaxf(-clamp_value, up));
-                gate = fminf(clamp_value, gate);
-            }
-            const float y = swiglu_gate<kFastMath>(gate) * up * route_weight;
-            y_smem[col + i] = y;
-            local_amax = fmaxf(local_amax, fabsf(y));
-        }
-    }
-
-    reduce_smem[tid] = local_amax;
-    __syncthreads();
-
-    for (int offset = Threads / 2; offset > 0; offset >>= 1) {
-        if (tid < offset)
-            reduce_smem[tid] = fmaxf(reduce_smem[tid], reduce_smem[tid + offset]);
-        __syncthreads();
-    }
-
-    const float clamped_amax = fmaxf(reduce_smem[0], 1.0e-4f);
-    const float scale = clamped_amax / 448.0f;
-    const float inv_scale = 448.0f / clamped_amax;
-    if (tid == 0)
-        out_scale[row] = scale;
-
-    const int64_t out_base = static_cast<int64_t>(row) * hidden;
-    for (int col = tid * 4; col < hidden; col += Threads * 4) {
-        const float y0 = y_smem[col + 0];
-        const float y1 = y_smem[col + 1];
-        const float y2 = y_smem[col + 2];
-        const float y3 = y_smem[col + 3];
-        *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) =
-            pack4_e4m3fn(y0 * inv_scale, y1 * inv_scale, y2 * inv_scale, y3 * inv_scale);
-        if (output_bf16) {
-            const uint32_t b01 =
-                static_cast<uint32_t>(float_to_bf16_bits(y0)) |
-                (static_cast<uint32_t>(float_to_bf16_bits(y1)) << 16);
-            const uint32_t b23 =
-                static_cast<uint32_t>(float_to_bf16_bits(y2)) |
-                (static_cast<uint32_t>(float_to_bf16_bits(y3)) << 16);
-            uint32_t* bf16_ptr = reinterpret_cast<uint32_t*>(out_bf16 + out_base + col);
-            bf16_ptr[0] = b01;
-            bf16_ptr[1] = b23;
         }
     }
 }
@@ -567,7 +574,7 @@ void launch_swiglu_quant_channelwise(
             static_cast<size_t>(hidden + Threads) * sizeof(float);
         hipLaunchKernelGGL(
             (swiglu_quant_channelwise_kernel<Threads, kFastMath>),
-            dim3(rows),
+            dim3(launch_blocks),
             dim3(Threads),
             shared_bytes,
             stream,
