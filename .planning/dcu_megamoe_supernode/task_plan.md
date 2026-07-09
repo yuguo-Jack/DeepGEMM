@@ -485,3 +485,10 @@ Status: [] active; evidence correction complete, implementation not started.
 - Implemented and validated a low-risk K2 graph work-shaping fix for Pro hidden `3072`: generic K2 now uses the same fixed CTA-pool/grid-stride pattern as the existing reg-kernel path.
 - Status: correctness and performance validated on 151.1 for Pro EP8 random graph cap512, Pro EP8 adversarial `single-local-rank` graph token128, and Pro EP16 single-capture cap512.
 - Next graph optimization, if needed: inspect K3 combine/reduce or K1 stage-only. Do not revisit masked-K1 scheduler changes unless new profile evidence points there.
+
+### 2026-07-08 Normal Graph Recheck After K2 Pool
+
+- [x] Rerun Flash EP8 Normal graph token4096 after the K2 generic CTA-pool fix.
+- Result: correctness passed; graph replay `6.9424 ms` versus eager `5.9765 ms`. This is noise-level versus the earlier `6.9821 ms` / `6.0118 ms`, so the K2 pool fix does not recover the Flash Normal graph/eager gap.
+- Interpretation: expected, because Flash Normal uses K2 `hidden=2048` register-kernel path, which already used CTA pooling. The remaining Normal graph work is still K1/K3 ASM active-tile scheduling.
+- [ ] Optional later: rerun Pro Normal graph on a clean-VRAM node to measure the `intermediate=3072` generic-K2 normal-backend case. The first attempt failed with HIP OOM during baseline weight packing, and the node reported persistent `86%` VRAM usage with no visible KFD PIDs.

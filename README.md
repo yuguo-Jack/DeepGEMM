@@ -271,15 +271,23 @@ ASM code objects and is intended as a compatibility path, not the default
 best-performance path.
 
 For the DeepSeek-V4-Pro LL performance path, L1 can use the Pro-only masked-K1
-layout while L2 stays on the existing unified pack5 layout:
+layout while L2 stays on the existing unified pack5 layout.  Like the helpers
+above, these layout transforms take already-quantized FP8 weights plus their
+channelwise scales:
 
 ```python
-l1_weights, l2_weights = (
-    megamoe.transform_fp8_weights_for_mega_moe_pro_ll_masked_k1(
-        l1_bf16,
-        l2_bf16,
-    )
-)
+l1_weights = {
+    "ll_pro_masked": (
+        megamoe.weight8bit_nt_kpack2_marlin_masked(l1_fp8),
+        l1_scale,
+    ),
+}
+l2_weights = {
+    "unified": (
+        megamoe.flatten_pack5_weight(l2_fp8),
+        l2_scale,
+    ),
+}
 megamoe.fp8_w8a8_mega_moe(
     y,
     l1_weights,

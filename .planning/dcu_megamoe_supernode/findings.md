@@ -947,3 +947,8 @@ Pro LL graph K2 CTA-pool finding:
 - The fix is correctness-safe because it does not clamp rows or change capacity. It launches a fixed CTA pool and grid-strides through `effective_rows`, which is derived from device-side `actual_m/max_m`; skew rows beyond the first pool are still processed by later loop iterations.
 - Measured impact is large and favorable. Pro EP8 LL graph replay512 improved from `4.6485 ms` to `3.9561 ms`, and EP16 single cap512 small buckets improved from roughly `1.82/1.92/2.00/2.20/3.11/4.86 ms` to `1.13/1.22/1.31/1.50/2.41/4.14 ms` for `8/32/64/128/256/512`.
 - Remaining Pro LL graph hotspots after this fix are K3 combine/reduce, K3 LL GEMM, masked K1, and K1 stage-only. K2 is no longer the dominant graph/eager gap.
+
+Normal graph post-K2-pool finding:
+- Flash EP8 Normal token4096 does not materially benefit from the K2 generic CTA-pool fix. The post-fix same-run numbers were graph replay `6.9424 ms` versus eager `5.9765 ms`, compared with the earlier `6.9821 ms` versus `6.0118 ms`.
+- This matches the source expectation: Flash Normal uses K2 `hidden=2048`, which already had the register-kernel CTA-pool path before the generic K2 fix. The remaining Normal graph gap is still K1/K3 normal ASM capacity-grid early-exit overhead, not K2 launch waste.
+- Pro Normal may still be the normal-backend case that benefits from K2 generic pooling because it uses `intermediate=3072`, but the attempted Pro EP8 Normal graph512 probe could not complete on 151.1 due to HIP OOM during baseline weight packing and persistent `86%` VRAM reporting with no visible KFD PIDs. Do not infer a Pro Normal graph result from that failed run.

@@ -2389,3 +2389,10 @@
   - Pro EP8 LL adversarial `single-local-rank` graph token128 passed with `max_abs=0.000488281`. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/pro_ep8_ll_skew_graph_k2pool_20260708_181646`.
   - Post-fix graph profile confirmed K2 dropped to about `0.098 ms/call`; remaining large kernels are masked K1, K3 LL GEMM, K3 combine, and K1 stage-only. Profile dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/pro_ep8_ll_graph_only_hipprof_k2pool_20260708_181752`.
   - Pro EP16 LL single-capture cap512 improved substantially and passed all buckets: MegaMoE graph medians `1.132/1.224/1.309/1.498/2.406/4.144 ms` versus fair `ll-masked` cap512 baseline `2.563/2.633/2.673/2.804/3.578/5.118 ms` for tokens `8/32/64/128/256/512`. Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/pro_ep16_ll_single_cap512_k2pool_20260708_181907`.
+
+## 2026-07-08 19:18:00 +08:00 - Normal Graph Recheck After K2 Pool
+- Rechecked 151.1 before the run: `hy-smi --showpids` reported no KFD PIDs.
+- Flash EP8 Normal graph token4096 was rerun after the K2 generic CTA-pool fix. Correctness still passed against `normal-contiguous`; same-run eager main-call median was `5.9765 ms`, while graph replay-only median was `6.9424 ms`.
+- This is only a tiny/noise-level change from the pre-K2-pool `6.9821 ms` graph / `6.0118 ms` eager run, as expected because Flash Normal uses the K2 `hidden=2048` register path that already had CTA pooling.
+- Run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/normal_ep8_graph4096_after_k2pool_20260708_191411`.
+- A follow-up Pro EP8 Normal graph512 probe was attempted to exercise the K2 generic `hidden=3072` path, but it failed during `normal-contiguous` baseline weight packing with HIP OOM on rank7. After the failure, `hy-smi --showpids` showed no KFD PIDs, but all 16 HCUs still reported `86%` VRAM usage, so no further GPU pressure was added without explicit cleanup/restart approval. Failed run dir: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_graphopt/pro_ep8_normal_graph512_after_k2pool_20260708_191535`.
