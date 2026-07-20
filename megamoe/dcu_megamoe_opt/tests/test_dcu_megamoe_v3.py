@@ -195,6 +195,25 @@ def test_v3_build_surface_is_minimal_and_explicit():
         assert retired not in setup_source
 
 
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s",
+        "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.s",
+    ),
+)
+def test_v3_normal_pack5_k1_omits_dead_fixed_expert_division(filename):
+    source = (K1_FUSED_DIR / filename).read_text(encoding="utf-8")
+
+    assert "label_SymmFixedExpertDivLoop" not in source
+    assert "label_SymmFixedExpertDivDone" not in source
+    assert source.count(
+        "s_load_dword s10, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xcc"
+    ) == 1
+    assert "label_SymmRouteExpertDivLoop" in source
+    assert "v_readfirstlane_b32 s[sgprScaleFlag], v252" in source
+
+
 def test_v3_runtime_sources_have_clear_backend_boundaries():
     opt_py = OPT_PATH.read_text(encoding="utf-8")
     k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")

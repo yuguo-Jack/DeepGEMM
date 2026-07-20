@@ -1582,18 +1582,8 @@ v_mov_b32 v243, v[vgprLocalReadAddrA]
 ; s_mul_i32 s56, s56, 8                              // blockId * WGM
 ; s_add_u32 s[sgprWorkGroup1], s[sgprWorkGroup1], s56 // wg1 += blockId * WGM
 
-/***********************fixed layout: derive local expert from wg1********************/
-s_load_dword s10, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xcc
-s_waitcnt lgkmcnt(0)
-s_mov_b32 s[sgprScaleFlag], 0
-s_mov_b32 s58, s[sgprWorkGroup1]
-label_SymmFixedExpertDivLoop:
-s_cmp_lt_u32 s58, s10
-s_cbranch_scc1 label_SymmFixedExpertDivDone
-s_sub_u32 s58, s58, s10
-s_add_u32 s[sgprScaleFlag], s[sgprScaleFlag], 1
-s_branch label_SymmFixedExpertDivLoop
-label_SymmFixedExpertDivDone:
+/* The route stage below defines sgprScaleFlag on both the prebuilt and
+ * legacy metadata paths; the earlier fixed-layout quotient was dead. */
 
 /* global read addresses: tile offset assignment a */
 v_and_b32 v6, 0xff, v[vgprSerial]
