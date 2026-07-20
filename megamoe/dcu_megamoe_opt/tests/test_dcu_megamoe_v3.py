@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -672,6 +674,133 @@ def test_v3_compact_routes_overwrite_zero_weight_reuse_slots():
     assert "topk_weights.zero_()" in test_harness
     assert "zero-weight reuse exposed stale combine data" in test_harness
     assert "zero-weight reuse stats mismatch" in test_harness
+
+
+def test_symm_buffer_destroy_uses_two_phase_remote_mapping_teardown():
+    init_source = (ROOT / "megamoe" / "__init__.py").read_text(encoding="utf-8")
+    destroy_source = init_source.split("    def destroy(self):", 1)[1].split(
+        "\n\ndef get_symm_buffer_for_mega_moe(", 1
+    )[0]
+
+    handle_lookup = destroy_source.index('handle = getattr(self, "handle", None)')
+    initialized_check = destroy_source.index("not dist.is_initialized()")
+    synchronize = destroy_source.index(
+        "torch.cuda.synchronize(device=self.buffer.device)"
+    )
+    handle_claim = destroy_source.index("self.handle = None")
+    close_fabric_data = destroy_source.index(
+        "_C.close_hip_fabric_handles(remote_ptrs)"
+    )
+    close_fabric_signal = destroy_source.index(
+        "_C.close_hip_fabric_handles(remote_signal_ptrs)"
+    )
+    close_ipc_data = destroy_source.index("_C.close_hip_ipc_handles(remote_ptrs)")
+    close_ipc_signal = destroy_source.index(
+        "_C.close_hip_ipc_handles(remote_signal_ptrs)"
+    )
+    barriers = [
+        match.start()
+        for match in re.finditer(r"dist\.barrier\(group=group\)", destroy_source)
+    ]
+    free_signal = destroy_source.index(
+        "_C.free_hip_ipc_signal_buffer(handle.signal_buffer_ptr)"
+    )
+    free_data = destroy_source.index("_C.free_hip_ipc_buffer(handle.buffer_ptr)")
+    clear_group = destroy_source.index("self.group = None")
+
+    assert len(barriers) == 2
+    assert handle_lookup < initialized_check < synchronize < handle_claim
+    assert handle_claim < min(
+        close_fabric_data, close_fabric_signal, close_ipc_data, close_ipc_signal
+    )
+    assert max(
+        close_fabric_data, close_fabric_signal, close_ipc_data, close_ipc_signal
+    ) < barriers[0]
+    assert barriers[0] < free_signal < free_data < barriers[1]
+    assert barriers[1] < clear_group
+    for stale_view in (
+        "self.l1_acts = None",
+        "self.l1_acts_sf = None",
+        "self.l2_acts = None",
+        "self.l2_acts_sf = None",
+        "self.combine = None",
+        "self._opt_3stage_state = None",
+    ):
+        assert stale_view in destroy_source
+
+
+@pytest.mark.parametrize("peer_memory_mode", ["fabric", None])
+def test_symm_buffer_destroy_runtime_order_and_idempotence(peer_memory_mode):
+    init_source = (ROOT / "megamoe" / "__init__.py").read_text(encoding="utf-8")
+    module_ast = ast.parse(init_source)
+    symm_buffer_ast = next(
+        node
+        for node in module_ast.body
+        if isinstance(node, ast.ClassDef) and node.name == "SymmBuffer"
+    )
+    destroy_ast = next(
+        node
+        for node in symm_buffer_ast.body
+        if isinstance(node, ast.FunctionDef) and node.name == "destroy"
+    )
+    destroy_module = ast.Module(body=[destroy_ast], type_ignores=[])
+    ast.fix_missing_locations(destroy_module)
+
+    events = []
+    group = SimpleNamespace(rank=lambda: 1, size=lambda: 3)
+    fake_dist = SimpleNamespace(
+        is_initialized=lambda: True,
+        barrier=lambda *, group: events.append(("barrier", group)),
+    )
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            synchronize=lambda *, device: events.append(("synchronize", device))
+        )
+    )
+    fake_runtime = SimpleNamespace(
+        close_hip_fabric_handles=lambda ptrs: events.append(
+            ("close_fabric", tuple(ptrs))
+        ),
+        close_hip_ipc_handles=lambda ptrs: events.append(("close_ipc", tuple(ptrs))),
+        free_hip_ipc_signal_buffer=lambda ptr: events.append(("free_signal", ptr)),
+        free_hip_ipc_buffer=lambda ptr: events.append(("free_data", ptr)),
+    )
+    namespace = {"torch": fake_torch, "dist": fake_dist, "_C": fake_runtime}
+    exec(compile(destroy_module, str(ROOT / "megamoe" / "__init__.py"), "exec"), namespace)
+
+    handle = SimpleNamespace(
+        buffer_ptrs=[10, 20, 30],
+        buffer_ptr=20,
+        signal_ptrs=[110, 120, 130],
+        signal_buffer_ptr=120,
+    )
+    if peer_memory_mode is not None:
+        handle.peer_memory_mode = peer_memory_mode
+    sym_buffer = SimpleNamespace(
+        handle=handle,
+        group=group,
+        buffer=SimpleNamespace(device="cuda:1"),
+    )
+
+    namespace["destroy"](sym_buffer)
+    close_name = "close_fabric" if peer_memory_mode == "fabric" else "close_ipc"
+    assert events == [
+        ("synchronize", "cuda:1"),
+        (close_name, (10, 0, 30)),
+        (close_name, (110, 0, 130)),
+        ("barrier", group),
+        ("free_signal", 120),
+        ("free_data", 20),
+        ("barrier", group),
+    ]
+    assert sym_buffer.handle is None
+    assert sym_buffer.group is None
+    assert sym_buffer.buffer is None
+    assert sym_buffer._opt_3stage_state is None
+
+    events.clear()
+    namespace["destroy"](sym_buffer)
+    assert events == []
 
 
 def test_v3_pro_ll_masked_k1_stage_only_path_is_additive():

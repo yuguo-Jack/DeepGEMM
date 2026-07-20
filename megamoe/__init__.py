@@ -545,25 +545,54 @@ class SymmBuffer:
             )
 
     def destroy(self):
-        if self.handle is not None:
-            torch.cuda.synchronize()
+        handle = getattr(self, "handle", None)
+        if handle is not None:
+            group = getattr(self, "group", None)
+            if group is None or not dist.is_initialized():
+                raise RuntimeError(
+                    "SymmBuffer.destroy() must be called collectively before "
+                    "destroy_process_group()"
+                )
+            group_size = group.size()
+            if (
+                len(handle.buffer_ptrs) != group_size
+                or len(handle.signal_ptrs) != group_size
+            ):
+                raise RuntimeError(
+                    "SymmBuffer handle peer count does not match its process group"
+                )
+
+            torch.cuda.synchronize(device=self.buffer.device)
+            group_rank = group.rank()
             remote_ptrs = [
-                ptr if rank != self.group.rank() else 0
-                for rank, ptr in enumerate(self.handle.buffer_ptrs)
+                ptr if rank != group_rank else 0
+                for rank, ptr in enumerate(handle.buffer_ptrs)
             ]
             remote_signal_ptrs = [
-                ptr if rank != self.group.rank() else 0
-                for rank, ptr in enumerate(self.handle.signal_ptrs)
+                ptr if rank != group_rank else 0
+                for rank, ptr in enumerate(handle.signal_ptrs)
             ]
-            peer_memory_mode = getattr(self.handle, "peer_memory_mode", "ipc")
+            peer_memory_mode = getattr(handle, "peer_memory_mode", "ipc")
+
+            # From this point teardown is fail-stop: never retry native close or
+            # free operations on a partially destroyed handle.
+            self.handle = None
             if peer_memory_mode == "fabric":
                 _C.close_hip_fabric_handles(remote_ptrs)
                 _C.close_hip_fabric_handles(remote_signal_ptrs)
             else:
                 _C.close_hip_ipc_handles(remote_ptrs)
                 _C.close_hip_ipc_handles(remote_signal_ptrs)
-            _C.free_hip_ipc_signal_buffer(self.handle.signal_buffer_ptr)
-            _C.free_hip_ipc_buffer(self.handle.buffer_ptr)
+
+            # Every importer must close/detach its remote mappings before any
+            # owner frees the corresponding exported allocation.
+            dist.barrier(group=group)
+            _C.free_hip_ipc_signal_buffer(handle.signal_buffer_ptr)
+            _C.free_hip_ipc_buffer(handle.buffer_ptr)
+
+            # Keep the process group alive until every rank has released its
+            # local exports, so immediate distributed teardown is also safe.
+            dist.barrier(group=group)
         self.handle = None
         self.buffer = None
         self.group = None
@@ -571,8 +600,14 @@ class SymmBuffer:
         self.x_sf = None
         self.topk_idx = None
         self.topk_weights = None
+        self.l1_acts = None
+        self.l1_acts_sf = None
+        self.l2_acts = None
+        self.l2_acts_sf = None
+        self.combine = None
         self.route_scratch = None
         self.cuda_graph_num_tokens = None
+        self._opt_3stage_state = None
 
 
 def get_symm_buffer_for_mega_moe(
