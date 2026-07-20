@@ -2492,3 +2492,11 @@
 - Pro EP8 fixed-K3 `single-local-rank` token128 passed eager and graph correctness against `ll-masked`, both with `max_abs=0.000488281`. Run: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_pro_ll_k3_validation/ep8_fixed_skew_t128_20260714_132833`; status 0.
 - A host-level follow-up found an external 16-card DeepSeek-V4-Pro SGLang server in `wanghl_dev1`, started at `2026-07-14 14:25:52 +08:00` and using about `87%-93%` VRAM per card. Exact result mtimes show all completed Pro tests ended at `13:25-13:29`, so their timings were collected before that server started. No external process was stopped or modified.
 - Verified the saved original/fixed K3 A/B artifacts remain present and correct, and the runtime still equals the fixed artifact. Per user request, paused without launching EP16 skew or attribution A/B. Resume only after host-level card state is clean.
+
+## 2026-07-20 Generic MegaMoE hardening landings
+
+- Isolated and landed the normal-path zero-weight compact-route fix as `3499767`; same-buffer nonzero-to-zero reuse and EP8/EP16 extreme-skew gates prevent stale combine rows.
+- Isolated the dead fixed-expert quotient from both normal K1 PACK5 layouts and landed `3c41e8d` after legal-size A/B plus PACK5/UNIFIED skew/graph gates. Token512 improved by `4.241%` on paired repeat-50 evidence; larger legal sizes stayed within `±0.5%`.
+- Landed collective teardown as `e12ba9f`: every rank closes/detaches remote data and signal mappings, barriers, then frees its local exports and barriers again. Clean local and remote source/runtime suites each passed `20` tests; isolated EP8/EP16 cap128 RPC graph-vs-eager buckets `8/32/128` all had `max_abs=0` and clean kernel logs.
+- EP16 cap512 token512 correctness passed, but six delayed exit-time `gpu_bo_vm_destroy/list_del` warnings remain. There was no `gpu_remote_man_free`; this is recorded as a non-blocking driver/lifecycle residual, not claimed fixed.
+- Local `supernode` now points to `e12ba9f` with history `e12ba9f -> 3c41e8d -> 3499767 -> d192ea1`. `origin/supernode` remains `d192ea1`; no push occurred. The generic semantics were manually mirrored into the dirty `ygzp-int8` tree, and no INT8 files were merged back.

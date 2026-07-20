@@ -1100,6 +1100,13 @@ Normal graph post-K2-pool finding:
 - Container-local `hy-smi --showpids` cannot resolve process directories owned by the other container and reports a generic error; host-level `hy-smi` is authoritative while that service is active. Do not run EP16 skew or binary A/B until host-level cards are clean, and do not terminate the external service without explicit authority.
 - Both attribution artifacts remain intact: saved original K3 SHA256 `41abd49f6f96f430894c0e8aeaeba2c623932d3bbb2fe314574d8976e332676c`; retained early-clobber K3 SHA256 `e32d9b94784d584ad7fdd0aaf699938742d4affa827134b4598a2feb3c53047c`. The source-tree runtime still matches the retained artifact.
 
+### 2026-07-20 generic correctness and teardown conclusions
+
+- Compact-route zero experts must explicitly emit cleared row metadata/output state on buffer reuse; otherwise a previous nonzero route can leave a stale combine row. Commit `3499767` locks this behavior with reuse tests.
+- The initial fixed-expert quotient is dead in both normal K1 PACK5 layouts because all produced scalar values are overwritten before use. Commit `3c41e8d` removes it; the repeat-confirmed benefit is `4.241%` at token512 and noise-scale elsewhere.
+- Importer mappings must close/detach on every rank before any owner frees its local exported allocation. The repository protocol is therefore `remote close/detach -> group barrier -> local export free -> group barrier`, implemented for MegaMoE `SymmBuffer` by `e12ba9f`.
+- `e12ba9f` does not cover external DeepEP. The remaining cap512 exit warning correlates with an extra full Fabric dummy-buffer export/attach/detach/free lifecycle absent at cap128; this is a hypothesis and separate hardening debt, not a proven root cause.
+
 ### K3 artifact-attribution correction in progress
 
 - `dccobjdump --show-sass` successfully produced full baseline/candidate gfx938 ISA files after extracting device ELFs and passing an output directory rather than a filename. The device ELFs and SASS hashes differ, but the inspected `k3_v3_fused_ext.so` diff currently shows changed branch offsets without changed `global_load_dwordx4`/`s_waitcnt` sequences.
