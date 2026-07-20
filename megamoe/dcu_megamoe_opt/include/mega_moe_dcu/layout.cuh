@@ -14,6 +14,10 @@ static constexpr int kDcuMegaMoeFlashIntermediate = 2048;
 static constexpr int kDcuMegaMoeProExperts = 384;
 static constexpr int kDcuMegaMoeProHidden = 7168;
 static constexpr int kDcuMegaMoeProIntermediate = 3072;
+static constexpr int kDcuMegaMoeYgzpExperts = 288;
+static constexpr int kDcuMegaMoeYgzpTopk = 8;
+static constexpr int kDcuMegaMoeYgzpHidden = 4096;
+static constexpr int kDcuMegaMoeYgzpIntermediate = 2048;
 static constexpr int kDcuMegaMoeTailDoneCounterRingSlots = 16;
 static constexpr int kDcuMegaMoeTailCopyExpertDoneCount = 64;
 static constexpr int kDcuMegaMoeTailDoneCounterInts =
@@ -76,7 +80,33 @@ __host__ __device__ static inline bool dcu_supported_staged_k3_dims(
     return (hidden == kDcuMegaMoeFlashHidden &&
             intermediate_hidden == kDcuMegaMoeFlashIntermediate) ||
            (hidden == kDcuMegaMoeProHidden &&
-            intermediate_hidden == kDcuMegaMoeProIntermediate);
+           intermediate_hidden == kDcuMegaMoeProIntermediate);
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_int8_normal_shape(
+    const int num_ranks,
+    const int num_experts,
+    const int num_topk,
+    const int hidden,
+    const int intermediate_hidden) {
+    return num_ranks == 8 &&
+           num_experts == kDcuMegaMoeYgzpExperts &&
+           num_topk == kDcuMegaMoeYgzpTopk &&
+           hidden == kDcuMegaMoeYgzpHidden &&
+           intermediate_hidden == kDcuMegaMoeYgzpIntermediate &&
+           num_experts % num_ranks == 0;
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_int8_normal_k1_shape(
+    const int num_ranks,
+    const int num_experts,
+    const int num_topk,
+    const int hidden,
+    const int l1_rows) {
+    return l1_rows == 2 * kDcuMegaMoeYgzpIntermediate &&
+           dcu_supported_staged_int8_normal_shape(
+               num_ranks, num_experts, num_topk, hidden,
+               kDcuMegaMoeYgzpIntermediate);
 }
 
 __host__ __device__ static inline int64_t dcu_sym_buffer_ptrs_offset() {

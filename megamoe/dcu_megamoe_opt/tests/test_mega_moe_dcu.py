@@ -46,6 +46,8 @@ BASELINE_NORMAL_CONTIGUOUS = "normal-contiguous"
 BASELINE_LL_MASKED = "ll-masked"
 ROUTE_PATTERN_RANDOM = "random"
 ROUTE_PATTERN_SINGLE_LOCAL_RANK = "single-local-rank"
+DEFAULT_FP8_ATOL = 0.0035
+DEFAULT_INT8_ATOL = 0.01
 
 
 def env_flag_enabled(name: str) -> bool:
@@ -793,6 +795,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     backend_mode = v3_backend_mode(args.megamoe_backend)
     v3_backend = select_v3_backend(backend_selector_tokens, backend_mode)
+    quant_mode = str(args.quant_mode).strip().lower()
+    atol_source = "explicit"
+    if args.atol is None:
+        args.atol = DEFAULT_INT8_ATOL if quant_mode == "int8" else DEFAULT_FP8_ATOL
+        atol_source = f"{quant_mode}-default"
+    if quant_mode == "int8":
+        if v3_backend != "normal":
+            raise ValueError("--quant-mode int8 requires --megamoe-backend normal")
+        if args.cuda_graph:
+            raise ValueError("--quant-mode int8 currently supports eager execution only")
     baseline_kind = (
         BASELINE_LL_MASKED
         if args.baseline_kind == BASELINE_AUTO and v3_backend == "ll"
@@ -813,7 +825,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         weight_layout = "unified" if force_unified_layout else "ll_pro_masked"
     else:
         weight_layout = "normal" if v3_backend == "normal" else "unified"
-    fused_execution = f"v3_{v3_backend}_eager"
+    fused_execution = f"v3_{v3_backend}_{quant_mode}_eager"
     graph_execution = f"v3_{v3_backend}_cuda_graph_replay" if args.cuda_graph else "disabled"
     print_once(rank, "DCU MegaMoE channelwise W8A8 test:")
     print_once(rank, f" > megamoe: {getattr(megamoe, '__file__', None)}")
@@ -821,6 +833,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     print_once(rank, f" > deepgemm: {getattr(deepgemm, '__file__', None)}")
     print_once(rank, f" > build config: {megamoe.get_mega_moe_hip_build_config()}")
     print_once(rank, f" > fused execution={fused_execution}")
+    print_once(rank, f" > fused quant mode={quant_mode}")
     print_once(rank, f" > cuda graph execution={graph_execution}")
 
     sym_buffer = megamoe.get_symm_buffer_for_mega_moe(
@@ -830,6 +843,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_topk,
         hidden,
         intermediate_hidden,
+        quant_mode=quant_mode,
     )
     ll_masked_baseline = baseline_kind == BASELINE_LL_MASKED
     baseline_execution = (
@@ -927,7 +941,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             )
         baseline_l1_weights = (baseline_l1_packed, l1_scale)
         baseline_l2_weights = (baseline_l2_packed, l2_scale)
-    if weight_layout == "normal":
+    if quant_mode == "int8":
+        fused_l1_weights, fused_l2_weights = (
+            megamoe.transform_int8_weights_for_mega_moe_normal(
+                l1_bf16,
+                l2_bf16,
+            )
+        )
+        layout_desc = "YGZP signed-INT8 normal ASM plain pack5"
+    elif weight_layout == "normal":
         fused_l1_weights = {
             "normal": (megamoe.flatten_pack5_weight_asm_normal(l1_fp8), l1_scale),
         }
@@ -964,7 +986,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     normal_baseline_predispatch_buffers = {}
 
     def copy_inputs_to_sym_buffer():
-        megamoe.mega_moe_pre_dispatch(
+        pre_dispatch = (
+            megamoe.mega_moe_pre_dispatch_int8
+            if quant_mode == "int8"
+            else megamoe.mega_moe_pre_dispatch
+        )
+        pre_dispatch(
             x_bf16,
             topk_idx,
             topk_weights,
@@ -979,7 +1006,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if reset_stats:
             stats_fused.copy_(stats_initial)
         copy_inputs_to_sym_buffer()
-        megamoe.fp8_w8a8_mega_moe(
+        fused_api = (
+            megamoe.int8_w8a8_mega_moe
+            if quant_mode == "int8"
+            else megamoe.fp8_w8a8_mega_moe
+        )
+        fused_api(
             y_fused,
             fused_l1_weights,
             fused_l2_weights,
@@ -1193,6 +1225,50 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
         baseline_stats = stats_initial + baseline_counts if baseline_counts is not None else None
         return baseline_y, baseline_stats, meta
+
+    def run_zero_weight_reuse_check():
+        if v3_backend != "normal":
+            raise ValueError("--check-zero-weight-reuse requires --megamoe-backend normal")
+        if num_tokens <= 0:
+            raise ValueError("--check-zero-weight-reuse requires at least one local token")
+        saved_topk_weights = topk_weights.clone()
+        try:
+            nonzero_y, _ = run_fused(reset_stats=True)
+            torch.cuda.synchronize()
+            if nonfinite_count(nonzero_y):
+                raise AssertionError("zero-weight reuse precondition produced nonfinite output")
+            if int(torch.count_nonzero(nonzero_y).item()) == 0:
+                raise AssertionError(
+                    "zero-weight reuse precondition did not populate combine output"
+                )
+
+            topk_weights.zero_()
+            zero_y, zero_stats = run_fused(reset_stats=True)
+            torch.cuda.synchronize()
+            zero_nonfinite = nonfinite_count(zero_y)
+            zero_max_abs = zero_y.float().abs().max().item() if zero_y.numel() else 0.0
+            expected_stats = stats_initial + get_expected_local_counts_eager()
+            if zero_nonfinite:
+                raise AssertionError(
+                    f"zero-weight reuse output has {zero_nonfinite} nonfinite values"
+                )
+            if zero_max_abs > args.atol:
+                raise AssertionError(
+                    "zero-weight reuse exposed stale combine data: "
+                    f"max_abs={zero_max_abs} exceeds --atol={args.atol}"
+                )
+            if not torch.equal(zero_stats, expected_stats):
+                raise AssertionError(
+                    "zero-weight reuse stats mismatch: "
+                    f"fused={zero_stats}, expected={expected_stats}"
+                )
+            print_once(
+                rank,
+                "Zero-weight same-buffer reuse: "
+                f"max_abs={zero_max_abs:.6g}, stats_exact=True",
+            )
+        finally:
+            topk_weights.copy_(saved_topk_weights)
 
     def run_cuda_graph_bucket_check():
         max_capture_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
@@ -1476,6 +1552,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     print_once(rank, f" > hidden={hidden}, intermediate={intermediate_hidden}")
     print_once(rank, f" > experts={num_experts}, topk={num_topk}, local_experts={num_experts_per_rank}")
     print_once(rank, f" > scale modes=input/weight/l2_act channelwise fp32")
+    print_once(rank, f" > correctness atol={args.atol} ({atol_source})")
     baseline_desc = baseline_kind_description(baseline_kind, args.prepost_backend)
     print_once(rank, f" > baseline={baseline_desc} (kind={baseline_kind}, requested={args.baseline_kind})")
     print_once(
@@ -1500,6 +1577,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_weights,
         )
 
+    if args.check_zero_weight_reuse:
+        run_zero_weight_reuse_check()
+
+    correctness_metrics = []
     for i in range(args.correctness_iters):
         fused_y, fused_stats = run_fused(reset_stats=True)
         baseline_y, baseline_stats, _ = run_baseline(return_stats=True)
@@ -1510,24 +1591,69 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         baseline_nonfinite = nonfinite_count(baseline_y)
         diff = (fused_y.float() - baseline_y.float()).abs()
         diff_nonfinite = nonfinite_count(diff)
-        max_abs = diff.max().item() if diff.numel() else 0.0
-        mean_abs = diff.mean().item() if diff.numel() else 0.0
         if baseline_stats is None:
             raise AssertionError("baseline stats missing in correctness check")
         stats_ok = torch.equal(fused_stats, baseline_stats)
-        if fused_nonfinite or baseline_nonfinite or diff_nonfinite:
+        correctness_status = torch.tensor(
+            [
+                int(fused_nonfinite),
+                int(baseline_nonfinite),
+                int(diff_nonfinite),
+                int(not stats_ok),
+            ],
+            dtype=torch.int64,
+            device=diff.device,
+        )
+        dist.all_reduce(correctness_status, op=dist.ReduceOp.SUM, group=group)
+        global_status = [int(value) for value in correctness_status.cpu().tolist()]
+        if any(global_status[:3]):
             raise AssertionError(
-                f"fused/baseline nonfinite fused={fused_nonfinite} "
-                f"baseline={baseline_nonfinite} diff={diff_nonfinite}"
+                "fused/baseline nonfinite rank-counts "
+                f"fused={global_status[0]} baseline={global_status[1]} "
+                f"diff={global_status[2]}"
             )
-        if max_abs > args.atol:
-            raise AssertionError(f"fused/baseline max_abs={max_abs} exceeds --atol={args.atol}")
-        if not stats_ok:
-            raise AssertionError(f"stats mismatch: fused={fused_stats}, baseline={baseline_stats}")
+        if global_status[3]:
+            raise AssertionError(
+                f"stats mismatch on {global_status[3]} rank(s): "
+                f"local fused={fused_stats}, baseline={baseline_stats}"
+            )
+
+        global_max_abs_tensor = (
+            diff.max()
+            if diff.numel()
+            else torch.zeros((), dtype=torch.float32, device=diff.device)
+        )
+        dist.all_reduce(global_max_abs_tensor, op=dist.ReduceOp.MAX, group=group)
+        global_sum_count = torch.tensor(
+            [float(diff.sum().item()), float(diff.numel())],
+            dtype=torch.float64,
+            device=diff.device,
+        )
+        dist.all_reduce(global_sum_count, op=dist.ReduceOp.SUM, group=group)
+        global_max_abs = float(global_max_abs_tensor.item())
+        global_abs_sum, global_element_count = global_sum_count.cpu().tolist()
+        global_mean_abs = (
+            float(global_abs_sum / global_element_count)
+            if global_element_count
+            else 0.0
+        )
+        correctness_metrics.append(
+            {
+                "iteration": i + 1,
+                "max_abs": global_max_abs,
+                "mean_abs": global_mean_abs,
+            }
+        )
+        if global_max_abs > args.atol:
+            raise AssertionError(
+                f"fused/baseline global max_abs={global_max_abs} "
+                f"exceeds --atol={args.atol}"
+            )
         print_once(
             rank,
             f"Correctness {i + 1}/{args.correctness_iters}: "
-            f"max_abs={max_abs:.6g}, mean_abs={mean_abs:.6g}",
+            f"max_abs={global_max_abs:.6g}, mean_abs={global_mean_abs:.6g} "
+            "(all ranks)",
         )
 
     cuda_graph_timing_rows = (
@@ -1538,6 +1664,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     if args.skip_bench:
         if rank == 0:
+            correctness_max_abs = max(
+                (row["max_abs"] for row in correctness_metrics),
+                default=0.0,
+            )
+            correctness_mean_abs = (
+                sum(row["mean_abs"] for row in correctness_metrics)
+                / len(correctness_metrics)
+                if correctness_metrics
+                else 0.0
+            )
             result = {
                 "correct": True,
                 "bench_skipped": True,
@@ -1547,6 +1683,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "backend_selector_tokens": backend_selector_tokens,
                 "megamoe_backend": v3_backend,
                 "megamoe_backend_mode": backend_mode,
+                "quant_mode": quant_mode,
                 "weight_layout": weight_layout,
                 "hidden": hidden,
                 "intermediate_hidden": intermediate_hidden,
@@ -1566,6 +1703,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "graph_execution": graph_execution,
                 "correctness_iters": args.correctness_iters,
                 "atol": args.atol,
+                "atol_source": atol_source,
+                "max_abs": correctness_max_abs,
+                "mean_abs": correctness_mean_abs,
+                "correctness_metrics": correctness_metrics,
                 "cuda_graph_timings": cuda_graph_timing_rows,
             }
             print("Correctness-only:")
@@ -1667,6 +1808,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "backend_selector_tokens": backend_selector_tokens,
             "megamoe_backend": v3_backend,
             "megamoe_backend_mode": backend_mode,
+            "quant_mode": quant_mode,
             "weight_layout": weight_layout,
             "hidden": hidden,
             "intermediate_hidden": intermediate_hidden,
@@ -1769,6 +1911,12 @@ def parse_args():
     parser.add_argument("--num-topk", type=int, default=2)
     parser.add_argument("--activation-clamp", type=float, default=10.0)
     parser.add_argument("--fast-math", type=int, default=1)
+    parser.add_argument(
+        "--quant-mode",
+        choices=("fp8", "int8"),
+        default="fp8",
+        help="fused MegaMoE activation/weight quantization; INT8 is YGZP EP8 normal eager only",
+    )
     parser.add_argument("--input-scale", type=float, default=0.05)
     parser.add_argument("--weight-scale", type=float, default=0.05)
     parser.add_argument(
@@ -1795,7 +1943,23 @@ def parse_args():
         ),
     )
     parser.add_argument("--correctness-iters", type=int, default=1)
-    parser.add_argument("--atol", type=float, default=0.0035)
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=None,
+        help=(
+            "absolute correctness tolerance; defaults to 0.0035 for FP8 and "
+            "0.01 for the INT8-vs-FP8 cross-quantization oracle"
+        ),
+    )
+    parser.add_argument(
+        "--check-zero-weight-reuse",
+        action="store_true",
+        help=(
+            "run an eager-normal same-buffer nonzero-to-zero route regression "
+            "and require exact cumulative local-expert stats"
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--skip-bench", action="store_true")

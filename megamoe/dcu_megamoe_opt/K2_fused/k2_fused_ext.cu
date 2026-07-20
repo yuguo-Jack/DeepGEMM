@@ -151,6 +151,35 @@ __device__ __forceinline__ uint32_t pack4_e4m3fn(
     return lo | (hi << 16);
 }
 
+__device__ __forceinline__ uint8_t float_to_int8_rne_bits(const float x) {
+    const float rounded = nearbyintf(x);
+    const int value = static_cast<int>(
+        fminf(127.0f, fmaxf(-128.0f, rounded)));
+    return static_cast<uint8_t>(static_cast<int8_t>(value));
+}
+
+__device__ __forceinline__ uint32_t pack4_int8_rne(
+    const float x0,
+    const float x1,
+    const float x2,
+    const float x3) {
+    return static_cast<uint32_t>(float_to_int8_rne_bits(x0)) |
+           (static_cast<uint32_t>(float_to_int8_rne_bits(x1)) << 8) |
+           (static_cast<uint32_t>(float_to_int8_rne_bits(x2)) << 16) |
+           (static_cast<uint32_t>(float_to_int8_rne_bits(x3)) << 24);
+}
+
+template <bool kInt8>
+__device__ __forceinline__ uint32_t pack4_quantized(
+    const float x0,
+    const float x1,
+    const float x2,
+    const float x3) {
+    if constexpr (kInt8)
+        return pack4_int8_rne(x0, x1, x2, x3);
+    return pack4_e4m3fn(x0, x1, x2, x3);
+}
+
 __device__ __forceinline__ int clamp_actual_m_count(
     const int count,
     const int m_per_expert) {
@@ -183,7 +212,7 @@ __device__ __forceinline__ float swiglu_gate(const float gate) {
     }
 }
 
-template <int Threads, bool kFastMath>
+template <int Threads, bool kFastMath, bool kInt8>
 __global__ __launch_bounds__(Threads)
 void swiglu_quant_channelwise_kernel(
     const uint16_t* __restrict__ x,
@@ -250,7 +279,7 @@ void swiglu_quant_channelwise_kernel(
         const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
         if (!compact_active_rows && has_topk_weights && route_weight == 0.0f) {
             if (tid == 0)
-                out_scale[row] = 1.0e-4f / 448.0f;
+                out_scale[row] = 1.0e-4f / (kInt8 ? 127.0f : 448.0f);
             const int64_t out_base = static_cast<int64_t>(row) * hidden;
             for (int col = tid * 4; col < hidden; col += Threads * 4) {
                 *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) = 0u;
@@ -291,8 +320,9 @@ void swiglu_quant_channelwise_kernel(
         }
 
         const float clamped_amax = fmaxf(reduce_smem[0], 1.0e-4f);
-        const float scale = clamped_amax / 448.0f;
-        const float inv_scale = 448.0f / clamped_amax;
+        constexpr float quant_max = kInt8 ? 127.0f : 448.0f;
+        const float scale = clamped_amax / quant_max;
+        const float inv_scale = quant_max / clamped_amax;
         if (tid == 0)
             out_scale[row] = scale;
 
@@ -303,7 +333,7 @@ void swiglu_quant_channelwise_kernel(
             const float y2 = y_smem[col + 2];
             const float y3 = y_smem[col + 3];
             *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) =
-                pack4_e4m3fn(
+                pack4_quantized<kInt8>(
                     y0 * inv_scale, y1 * inv_scale, y2 * inv_scale,
                     y3 * inv_scale);
             if (output_bf16) {
@@ -322,7 +352,7 @@ void swiglu_quant_channelwise_kernel(
     }
 }
 
-template <int Threads, int VecGroups, bool kFastMath>
+template <int Threads, int VecGroups, bool kFastMath, bool kInt8>
 __global__ __launch_bounds__(Threads)
 void swiglu_quant_channelwise_reg_kernel(
     const uint16_t* __restrict__ x,
@@ -387,7 +417,7 @@ void swiglu_quant_channelwise_reg_kernel(
         const float route_weight = has_topk_weights ? topk_weights[row] : 1.0f;
         if (!compact_active_rows && has_topk_weights && route_weight == 0.0f) {
             if (tid == 0)
-                out_scale[row] = 1.0e-4f / 448.0f;
+                out_scale[row] = 1.0e-4f / (kInt8 ? 127.0f : 448.0f);
             const int64_t out_base = static_cast<int64_t>(row) * hidden;
 #pragma unroll
             for (int g = 0; g < VecGroups; ++g) {
@@ -455,17 +485,19 @@ void swiglu_quant_channelwise_reg_kernel(
         }
 
         const float clamped_amax = fmaxf(row_amax, 1.0e-4f);
-        const float inv_scale = 448.0f / clamped_amax;
+        constexpr float quant_max = kInt8 ? 127.0f : 448.0f;
+        const float inv_scale = quant_max / clamped_amax;
         if (tid == 0)
-            out_scale[row] = clamped_amax / 448.0f;
+            out_scale[row] = clamped_amax / quant_max;
 
         const int64_t out_base = static_cast<int64_t>(row) * hidden;
 #pragma unroll
         for (int g = 0; g < VecGroups; ++g) {
             const int col = (g * Threads + tid) * 4;
             *reinterpret_cast<uint32_t*>(out_fp8 + out_base + col) =
-                pack4_e4m3fn(y0[g] * inv_scale, y1[g] * inv_scale,
-                             y2[g] * inv_scale, y3[g] * inv_scale);
+                pack4_quantized<kInt8>(
+                    y0[g] * inv_scale, y1[g] * inv_scale,
+                    y2[g] * inv_scale, y3[g] * inv_scale);
             if (output_bf16) {
                 const uint32_t b01 =
                     static_cast<uint32_t>(float_to_bf16_bits(y0[g])) |
@@ -489,7 +521,7 @@ void swiglu_quant_channelwise_reg_kernel(
     }
 }
 
-template <int Threads, bool kFastMath>
+template <int Threads, bool kFastMath, bool kInt8>
 void launch_swiglu_quant_channelwise(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
@@ -522,7 +554,8 @@ void launch_swiglu_quant_channelwise(
     if (hidden == 2048) {
         constexpr int vec_groups = 2048 / (Threads * 4);
         hipLaunchKernelGGL(
-            (swiglu_quant_channelwise_reg_kernel<Threads, vec_groups, kFastMath>),
+            (swiglu_quant_channelwise_reg_kernel<
+                Threads, vec_groups, kFastMath, kInt8>),
             dim3(launch_blocks),
             dim3(Threads),
             shared_bytes_for_reg,
@@ -547,7 +580,8 @@ void launch_swiglu_quant_channelwise(
     } else if (hidden == 4096) {
         constexpr int vec_groups = 4096 / (Threads * 4);
         hipLaunchKernelGGL(
-            (swiglu_quant_channelwise_reg_kernel<Threads, vec_groups, kFastMath>),
+            (swiglu_quant_channelwise_reg_kernel<
+                Threads, vec_groups, kFastMath, kInt8>),
             dim3(launch_blocks),
             dim3(Threads),
             shared_bytes_for_reg,
@@ -573,7 +607,7 @@ void launch_swiglu_quant_channelwise(
         const size_t shared_bytes =
             static_cast<size_t>(hidden + Threads) * sizeof(float);
         hipLaunchKernelGGL(
-            (swiglu_quant_channelwise_kernel<Threads, kFastMath>),
+            (swiglu_quant_channelwise_kernel<Threads, kFastMath, kInt8>),
             dim3(launch_blocks),
             dim3(Threads),
             shared_bytes,
@@ -600,7 +634,7 @@ void launch_swiglu_quant_channelwise(
     K2_HIP_CHECK(hipGetLastError());
 }
 
-template <bool kFastMath>
+template <bool kFastMath, bool kInt8>
 void launch_swiglu_quant_channelwise_auto(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
@@ -620,28 +654,28 @@ void launch_swiglu_quant_channelwise_auto(
     const int64_t active_tile_m) {
     const int hidden = static_cast<int>(x.size(1) / 2);
     if (hidden <= 2048 && !output_bf16) {
-        launch_swiglu_quant_channelwise<64, kFastMath>(
+        launch_swiglu_quant_channelwise<64, kFastMath, kInt8>(
             x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
             active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
     } else if (hidden <= 2048) {
-        launch_swiglu_quant_channelwise<128, kFastMath>(
+        launch_swiglu_quant_channelwise<128, kFastMath, kInt8>(
             x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
             active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
     } else if (hidden == 4096) {
-        launch_swiglu_quant_channelwise<128, kFastMath>(
+        launch_swiglu_quant_channelwise<128, kFastMath, kInt8>(
             x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
             active_tiles,
             out_fp8, out_scale, out_bf16,
             output_bf16, has_clamp_value, clamp_value, max_row_blocks,
             m_per_expert, local_experts, active_tile_m);
     } else {
-        launch_swiglu_quant_channelwise<256, kFastMath>(
+        launch_swiglu_quant_channelwise<256, kFastMath, kInt8>(
             x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
             active_tiles,
             out_fp8, out_scale, out_bf16,
@@ -657,7 +691,7 @@ void check_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
 
 } // namespace
 
-void swiglu_quant_channelwise_out(
+void swiglu_quant_channelwise_out_impl(
     const torch::Tensor& x,
     const torch::Tensor& topk_weights,
     const torch::Tensor& out_fp8,
@@ -672,13 +706,16 @@ void swiglu_quant_channelwise_out(
     const int64_t m_per_expert,
     const std::optional<torch::Tensor>& active_tiles,
     const int64_t active_tile_m,
-    const bool fast_math) {
+    const bool fast_math,
+    const bool int8_output) {
     check_cuda_contiguous(x, "x");
     check_cuda_contiguous(out_fp8, "out_fp8");
     check_cuda_contiguous(out_scale, "out_scale");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
-    TORCH_CHECK(out_fp8.scalar_type() == torch::kFloat8_e4m3fn,
-                "out_fp8 must be FP8 E4M3");
+    TORCH_CHECK(
+        out_fp8.scalar_type() ==
+            (int8_output ? torch::kInt8 : torch::kFloat8_e4m3fn),
+        int8_output ? "out_int8 must be INT8" : "out_fp8 must be FP8 E4M3");
     TORCH_CHECK(out_scale.scalar_type() == torch::kFloat32,
                 "out_scale must be FP32");
     TORCH_CHECK(x.dim() == 2 && x.size(1) % 2 == 0,
@@ -754,29 +791,88 @@ void swiglu_quant_channelwise_out(
     auto out_scale_view = out_scale.view({-1});
     auto out_bf16_view = out_bf16;
     if (fast_math) {
-        launch_swiglu_quant_channelwise_auto<true>(
-            x, topk_weights, row_combine_ptrs_data, actual_m_data,
-            actual_m_max_data,
-            active_tiles_data,
-            out_fp8_view, out_scale_view, out_bf16_view,
-            output_bf16, has_clamp_value, clamp_value, max_row_blocks,
-            m_per_expert, local_experts, active_tile_m);
+        if (int8_output) {
+            launch_swiglu_quant_channelwise_auto<true, true>(
+                x, topk_weights, row_combine_ptrs_data, actual_m_data,
+                actual_m_max_data, active_tiles_data,
+                out_fp8_view, out_scale_view, out_bf16_view,
+                output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+                m_per_expert, local_experts, active_tile_m);
+        } else {
+            launch_swiglu_quant_channelwise_auto<true, false>(
+                x, topk_weights, row_combine_ptrs_data, actual_m_data,
+                actual_m_max_data, active_tiles_data,
+                out_fp8_view, out_scale_view, out_bf16_view,
+                output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+                m_per_expert, local_experts, active_tile_m);
+        }
     } else {
-        launch_swiglu_quant_channelwise_auto<false>(
-            x, topk_weights, row_combine_ptrs_data, actual_m_data,
-            actual_m_max_data,
-            active_tiles_data,
-            out_fp8_view, out_scale_view, out_bf16_view,
-            output_bf16, has_clamp_value, clamp_value, max_row_blocks,
-            m_per_expert, local_experts, active_tile_m);
+        if (int8_output) {
+            launch_swiglu_quant_channelwise_auto<false, true>(
+                x, topk_weights, row_combine_ptrs_data, actual_m_data,
+                actual_m_max_data, active_tiles_data,
+                out_fp8_view, out_scale_view, out_bf16_view,
+                output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+                m_per_expert, local_experts, active_tile_m);
+        } else {
+            launch_swiglu_quant_channelwise_auto<false, false>(
+                x, topk_weights, row_combine_ptrs_data, actual_m_data,
+                actual_m_max_data, active_tiles_data,
+                out_fp8_view, out_scale_view, out_bf16_view,
+                output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+                m_per_expert, local_experts, active_tile_m);
+        }
     }
 }
+
+#define K2_SWIGLU_QUANT_ARGS                                                   \
+    const torch::Tensor& x, const torch::Tensor& topk_weights,                 \
+    const torch::Tensor& out_quant, const torch::Tensor& out_scale,            \
+    const torch::Tensor& out_bf16, const bool output_bf16,                     \
+    const bool has_clamp_value, const double clamp_value,                      \
+    const std::optional<torch::Tensor>& row_combine_ptrs,                      \
+    const int64_t max_row_blocks, const std::optional<torch::Tensor>& actual_m,\
+    const int64_t m_per_expert, const std::optional<torch::Tensor>& active_tiles,\
+    const int64_t active_tile_m, const bool fast_math
+
+void swiglu_quant_channelwise_out(K2_SWIGLU_QUANT_ARGS) {
+    swiglu_quant_channelwise_out_impl(
+        x, topk_weights, out_quant, out_scale, out_bf16, output_bf16,
+        has_clamp_value, clamp_value, row_combine_ptrs, max_row_blocks,
+        actual_m, m_per_expert, active_tiles, active_tile_m, fast_math, false);
+}
+
+void swiglu_quant_int8_channelwise_out(K2_SWIGLU_QUANT_ARGS) {
+    swiglu_quant_channelwise_out_impl(
+        x, topk_weights, out_quant, out_scale, out_bf16, output_bf16,
+        has_clamp_value, clamp_value, row_combine_ptrs, max_row_blocks,
+        actual_m, m_per_expert, active_tiles, active_tile_m, fast_math, true);
+}
+
+#undef K2_SWIGLU_QUANT_ARGS
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("swiglu_quant_channelwise_out", &swiglu_quant_channelwise_out,
           pybind11::arg("x"),
           pybind11::arg("topk_weights"),
           pybind11::arg("out_fp8"),
+          pybind11::arg("out_scale"),
+          pybind11::arg("out_bf16"),
+          pybind11::arg("output_bf16") = false,
+          pybind11::arg("has_clamp_value") = true,
+          pybind11::arg("clamp_value") = 10.0,
+          pybind11::arg("row_combine_ptrs") = std::nullopt,
+          pybind11::arg("max_row_blocks") = -1,
+          pybind11::arg("actual_m") = std::nullopt,
+          pybind11::arg("m_per_expert") = 0,
+          pybind11::arg("active_tiles") = std::nullopt,
+          pybind11::arg("active_tile_m") = 0,
+          pybind11::arg("fast_math") = true);
+    m.def("swiglu_quant_int8_channelwise_out",
+          &swiglu_quant_int8_channelwise_out,
+          pybind11::arg("x"),
+          pybind11::arg("topk_weights"),
+          pybind11::arg("out_int8"),
           pybind11::arg("out_scale"),
           pybind11::arg("out_bf16"),
           pybind11::arg("output_bf16") = false,

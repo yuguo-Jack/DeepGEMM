@@ -60,9 +60,10 @@ Then, import `deep_gemm` in your Python project, and enjoy!
 
 ## DCU/HIP W8A8 Mega MoE Quick Start
 
-The DCU path builds a standalone `megamoe` HIP extension for Hygon `gfx938`.
-It is separate from the CUDA `deep_gemm` JIT flow above and is specialized for
-the DeepSeek-V4 staged W8A8 FP8 channelwise MegaMoE shapes:
+The DCU path builds a standalone `megamoe` HIP extension for Hygon `gfx938` or
+`gfx936`.  It is separate from the CUDA `deep_gemm` JIT flow above.  The
+default `gfx938` build supports the DeepSeek-V4 staged W8A8 FP8 channelwise
+MegaMoE shapes:
 
 - EP size: 8, 16, or 32 ranks on the V3 staged path
 - Top-K: 6
@@ -72,6 +73,18 @@ the DeepSeek-V4 staged W8A8 FP8 channelwise MegaMoE shapes:
   48/24/12 local experts per rank for EP8/EP16/EP32
 - Maximum tokens per rank: set by `num_max_tokens_per_rank`
 
+The signed W8A8 INT8 path currently supports one exact YGZP contract:
+
+- EP size: 8 ranks, normal eager backend only
+- Top-K: 8
+- Experts=288, hidden=4096, intermediate hidden=2048; 36 local experts per rank
+- Normal PACK5 weights with FP32 per-output-channel scales and signed INT8
+  per-token activation scales
+
+The `gfx936` build is intentionally architecture-clean and INT8-only: its wheel
+contains the two YGZP INT8 K1/K3 code objects, not the `gfx938` FP8 or masked
+code objects.  CUDA Graph and LL are not exposed for the INT8 contract.
+
 ### Build
 
 Build on a DTK 26.04 environment:
@@ -79,6 +92,15 @@ Build on a DTK 26.04 environment:
 ```bash
 source /opt/dtk-26.04/env.sh
 ./megamoe/dcu_megamoe_opt/scripts/build_dcu_megamoe.sh
+```
+
+`gfx938` is the default target.  Select the final YGZP target explicitly when
+building on a `gfx936` node:
+
+```bash
+source /opt/dtk-26.04/env.sh
+MEGAMOE_DCU_ARCH=gfx936 \
+  ./megamoe/dcu_megamoe_opt/scripts/build_dcu_megamoe.sh
 ```
 
 The build script keeps intermediate files under `build/`, writes the wheel to
@@ -633,6 +655,31 @@ python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --warmup 3 \
   --repeat 8 \
   --out hygon_tmp/megamoe_dcu_dsv4_flash_512.json
+```
+
+Run the YGZP signed-INT8 EP8 normal eager path against the unchanged FP8
+normal-contiguous correctness/performance oracle.  Eager performance validation
+uses token sizes of at least 512:
+
+```bash
+source /opt/dtk-26.04/env.sh
+HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+MEGAMOE_DCU_PEER_MEMORY=ipc \
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
+  --num-processes 8 \
+  --num-max-tokens-per-rank 512 \
+  --num-tokens 512 \
+  --hidden 4096 \
+  --intermediate-hidden 2048 \
+  --num-experts 288 \
+  --num-topk 8 \
+  --quant-mode int8 \
+  --megamoe-backend normal \
+  --baseline-kind normal-contiguous \
+  --correctness-iters 1 \
+  --warmup 10 \
+  --repeat 50 \
+  --out hygon_tmp/megamoe_dcu_ygzp_int8_ep8_512.json
 ```
 
 For the DeepSeek-V4-Pro EP16 shape, use the same harness with:

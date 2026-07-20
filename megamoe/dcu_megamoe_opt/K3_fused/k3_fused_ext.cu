@@ -31,6 +31,8 @@ namespace {
 
 static constexpr const char* kCombineAsmKernelName =
     "DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE";
+static constexpr const char* kCombineInt8AsmKernelName =
+    "DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE";
 struct __attribute__((packed)) GpuProb {
     uint32_t m;
     uint32_t n;
@@ -97,6 +99,14 @@ static_assert(offsetof(GpuProb, asm_reduce_hidden_vecs) == 0xd8,
               "K3 graph asm expects hidden vec count at GpuProb+0xd8");
 static_assert(sizeof(GpuProb) <= 256,
               "K3 GpuProb must fit in the 256-byte prob storage");
+
+__global__ void store_gpu_prob_kernel(uint8_t* dst, const GpuProb prob) {
+    const auto* src = reinterpret_cast<const uint8_t*>(&prob);
+    for (uint32_t index = threadIdx.x; index < sizeof(GpuProb);
+         index += blockDim.x) {
+        dst[index] = src[index];
+    }
+}
 
 struct __attribute__((packed)) KernelArgs {
     uint32_t gemm_count;
@@ -189,7 +199,8 @@ void launch_l2_deepgemm_original_asm(
     const torch::Tensor* active_tiles = nullptr,
     const int64_t graph_runtime_offset_from_active_tiles = 0,
     const torch::Tensor* asm_signal_generation_tensor = nullptr,
-    const bool weight_pack5_layout = false) {
+    const bool weight_pack5_layout = false,
+    const int64_t active_tiles_host_hint = -1) {
     check_cuda_contiguous(output, "output");
     check_cuda_contiguous(act_fp8, "act_fp8");
     check_cuda_contiguous(act_scale, "act_scale");
@@ -198,16 +209,23 @@ void launch_l2_deepgemm_original_asm(
     check_cuda_contiguous(l2_scale, "l2_scale");
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16,
                 "output must be BF16");
-    TORCH_CHECK(act_fp8.scalar_type() == torch::kFloat8_e4m3fn,
-                "act_fp8 must be FP8 E4M3");
+    const auto act_dtype = act_fp8.scalar_type();
+    const auto weight_dtype = l2_weight.scalar_type();
+    const bool int8_compute = act_dtype == torch::kInt8;
+    TORCH_CHECK(
+        (act_dtype == torch::kFloat8_e4m3fn &&
+         weight_dtype == torch::kFloat8_e4m3fn) ||
+            (int8_compute && weight_dtype == torch::kInt8),
+        "K3 activation and weight must have the same quantized dtype "
+        "(FP8 E4M3 or signed INT8)");
     TORCH_CHECK(act_scale.scalar_type() == torch::kFloat32,
                 "act_scale must be FP32");
     TORCH_CHECK(m_indices.scalar_type() == torch::kInt,
                 "m_indices must be int32");
-    TORCH_CHECK(l2_weight.scalar_type() == torch::kFloat8_e4m3fn,
-                "l2_weight must be FP8 E4M3");
     TORCH_CHECK(l2_scale.scalar_type() == torch::kFloat32,
                 "l2_scale must be FP32");
+    TORCH_CHECK(!int8_compute || (!asm_tail_signal && asm_reduce_y == nullptr),
+                "INT8 K3 supports the normal no-tail route only");
 
     const int total_rows = static_cast<int>(act_fp8.size(0));
     const int k = static_cast<int>(act_fp8.size(1));
@@ -229,6 +247,14 @@ void launch_l2_deepgemm_original_asm(
                     l2_scale.size(1) == hidden,
                 "invalid L2 scale shape");
     const int local_experts = static_cast<int>(l2_scale.size(0));
+    if (int8_compute) {
+        TORCH_CHECK(hidden == deep_gemm::mega::kDcuMegaMoeYgzpHidden &&
+                        k == deep_gemm::mega::kDcuMegaMoeYgzpIntermediate &&
+                        local_experts ==
+                            deep_gemm::mega::kDcuMegaMoeYgzpExperts / 8,
+                    "INT8 K3 supports only YGZP EP8 "
+                    "(hidden=4096, intermediate=2048, local_experts=36)");
+    }
     if (weight_pack5_layout) {
         TORCH_CHECK(
             l2_weight.dim() >= 1 &&
@@ -310,13 +336,27 @@ void launch_l2_deepgemm_original_asm(
     const int wg_m = (hidden + 255) / 256;
     const int wg_n = (total_rows + 255) / 256;
     int launch_wg_n = wg_n;
+    if (active_tiles_host_hint >= 0) {
+        TORCH_CHECK(int8_compute,
+                    "active_tiles_host_hint is available for INT8 K3 only");
+        TORCH_CHECK(active_tiles != nullptr,
+                    "active_tiles_host_hint requires device active_tiles");
+        TORCH_CHECK(!stream_capturing,
+                    "active_tiles_host_hint is eager-only");
+        TORCH_CHECK(graph_runtime_offset_from_active_tiles == 0,
+                    "active_tiles_host_hint cannot use graph runtime offsets");
+        TORCH_CHECK(active_tiles_host_hint <= wg_n,
+                    "active_tiles_host_hint exceeds K3 capacity tiles");
+        launch_wg_n = std::max(1, static_cast<int>(active_tiles_host_hint));
+    }
     if (active_tiles != nullptr) {
         check_cuda_contiguous(*active_tiles, "active_tiles");
         TORCH_CHECK(active_tiles->scalar_type() == torch::kInt,
                     "active_tiles must be int32");
         TORCH_CHECK(active_tiles->numel() >= 1,
                     "active_tiles must contain at least one int32");
-        if (!stream_capturing && graph_runtime_offset_from_active_tiles == 0) {
+        if (active_tiles_host_hint < 0 && !stream_capturing &&
+            graph_runtime_offset_from_active_tiles == 0) {
             int active_tiles_host = wg_n;
             K3_HIP_CHECK(hipMemcpyAsync(
                 &active_tiles_host,
@@ -431,8 +471,18 @@ void launch_l2_deepgemm_original_asm(
         prob_device = prob_storage.data_ptr();
     }
     if (!stream_capturing) {
-        K3_HIP_CHECK(hipMemcpyAsync(
-            prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice, stream));
+        if (int8_compute) {
+            // Passing the complete POD by value to a tiny stream-ordered
+            // kernel avoids pageable staging without a shared pinned-host
+            // lifetime or multi-stream reuse hazard.
+            hipLaunchKernelGGL(store_gpu_prob_kernel, dim3(1), dim3(64), 0,
+                               stream, static_cast<uint8_t*>(prob_device), prob);
+            K3_HIP_CHECK(hipGetLastError());
+        } else {
+            K3_HIP_CHECK(hipMemcpyAsync(
+                prob_device, &prob, sizeof(GpuProb), hipMemcpyHostToDevice,
+                stream));
+        }
     }
 
     KernelArgs args{};
@@ -720,15 +770,20 @@ void k3_l2_combine_asm_pack5_out(
     const torch::Tensor& prob_storage,
     const std::string& code_object_path,
     const std::optional<torch::Tensor>& active_tiles,
-    const int64_t graph_runtime_offset_from_active_tiles) {
+    const int64_t graph_runtime_offset_from_active_tiles,
+    const int64_t active_tiles_host_hint) {
+    const char* kernel_name = l2_weight.scalar_type() == torch::kInt8
+        ? kCombineInt8AsmKernelName
+        : kCombineAsmKernelName;
     launch_l2_deepgemm_original_asm(
         output_workspace, act_fp8, act_scale, m_indices, l2_weight, l2_scale,
-        code_object_path, kCombineAsmKernelName, &row_combine_ptrs,
+        code_object_path, kernel_name, &row_combine_ptrs,
         nullptr, nullptr, 0, 0, false,
         nullptr, nullptr,
         0, 0, 0, 0, 0, 0, 0, &prob_storage,
         active_tiles.has_value() ? &active_tiles.value() : nullptr,
-        graph_runtime_offset_from_active_tiles, nullptr, true);
+        graph_runtime_offset_from_active_tiles, nullptr, true,
+        active_tiles_host_hint);
 }
 
 void k3_l2_combine_asm_tail_reduce_pack5_out(
@@ -757,6 +812,10 @@ void k3_l2_combine_asm_tail_reduce_pack5_out(
     const std::optional<torch::Tensor>& active_tiles,
     const int64_t graph_runtime_offset_from_active_tiles,
     const std::optional<torch::Tensor>& asm_signal_generation_tensor) {
+    TORCH_CHECK(act_fp8.scalar_type() == torch::kFloat8_e4m3fn &&
+                    l2_weight.scalar_type() == torch::kFloat8_e4m3fn,
+                "K3 integrated tail reduction is FP8-only; INT8 uses the "
+                "normal no-tail route plus generic reduction");
     const int64_t hidden = output_workspace.size(1);
     TORCH_CHECK(hidden_arg == hidden,
                 "hidden_arg must match output_workspace hidden");
@@ -985,7 +1044,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("prob_storage"),
           pybind11::arg("code_object_path"),
           pybind11::arg("active_tiles") = std::nullopt,
-          pybind11::arg("graph_runtime_offset_from_active_tiles") = 0);
+          pybind11::arg("graph_runtime_offset_from_active_tiles") = 0,
+          pybind11::arg("active_tiles_host_hint") = -1);
     m.def("k3_l2_combine_asm_tail_reduce_pack5_out", &k3_l2_combine_asm_tail_reduce_pack5_out,
           pybind11::arg("act_fp8"),
           pybind11::arg("act_scale"),

@@ -4,7 +4,12 @@ from pathlib import Path
 
 import torch
 
-from ..v3_config import normalize_v3_backend
+from ..v3_config import (
+    V3_QUANT_FP8,
+    V3_QUANT_INT8,
+    normalize_v3_backend,
+    normalize_v3_quant,
+)
 from . import k3_fused_ext as _ext
 
 
@@ -16,6 +21,10 @@ K3_COMBINE_TAIL_REDUCE_PACK5_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_TAILRED
 K3_COMBINE_UNIFIED_PACK5_ASM_CO = THIS_DIR / f"{K3_COMBINE_ASM_NAME}_UNIFIED_PACK5.co"
 K3_COMBINE_TAIL_REDUCE_UNIFIED_PACK5_ASM_CO = (
     THIS_DIR / f"{K3_COMBINE_ASM_NAME}_TAILREDUCE_UNIFIED_PACK5.co"
+)
+K3_COMBINE_INT8_PACK5_ASM_CO = (
+    THIS_DIR
+    / "DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co"
 )
 
 
@@ -30,7 +39,16 @@ def _ensure_prebuilt_code_object(co: Path, label: str) -> Path:
 
 def ensure_k3_combine_pack5_asm_code_object(
     use_unified_weight_layout: bool = False,
+    quant_mode: str = V3_QUANT_FP8,
 ) -> Path:
+    quant_mode = normalize_v3_quant(quant_mode)
+    if quant_mode == V3_QUANT_INT8:
+        if use_unified_weight_layout:
+            raise ValueError("INT8 K3 does not support the unified weight layout")
+        return _ensure_prebuilt_code_object(
+            K3_COMBINE_INT8_PACK5_ASM_CO,
+            "K3 YGZP INT8 pack5 combine",
+        )
     co = (
         K3_COMBINE_UNIFIED_PACK5_ASM_CO
         if use_unified_weight_layout
@@ -217,6 +235,7 @@ def k3_l2_fused_v3_to_combine(
     row_combine_ptrs: torch.Tensor,
     *,
     backend: str,
+    quant_mode: str = V3_QUANT_FP8,
     asm_done_counter: torch.Tensor | None = None,
     asm_signal_addrs: torch.Tensor | None = None,
     asm_done_target: int = 0,
@@ -235,6 +254,7 @@ def k3_l2_fused_v3_to_combine(
     prob_storage: torch.Tensor | None = None,
     active_tiles: torch.Tensor | None = None,
     graph_runtime_offset_from_active_tiles: int = 0,
+    active_tiles_host_hint: int | None = None,
     graph_runtime_num_tokens: torch.Tensor | None = None,
     ll_split_tail: bool = False,
     ll_block_m: int = 32,
@@ -248,8 +268,20 @@ def k3_l2_fused_v3_to_combine(
     captured capacity while doing GEMM work for the runtime-token rows.
     """
     backend = normalize_v3_backend(backend)
+    quant_mode = normalize_v3_quant(quant_mode)
     if backend not in ("normal", "ll"):
         raise NotImplementedError("V3 K3 staged path supports normal or LL backend only")
+    if quant_mode == V3_QUANT_INT8:
+        if backend != "normal":
+            raise NotImplementedError("INT8 K3 supports the normal backend only")
+        if use_unified_weight_layout:
+            raise NotImplementedError("INT8 K3 does not support unified weights")
+        if asm_reduce_y is not None:
+            raise NotImplementedError(
+                "INT8 K3 uses no-tail combine followed by generic reduction"
+            )
+    if active_tiles_host_hint is not None and quant_mode != V3_QUANT_INT8:
+        raise ValueError("active_tiles_host_hint is available for INT8 K3 only")
     if sym_buffer is None and asm_signal_addrs is not None:
         raise ValueError("V3 K3 no-tail path must not receive peer signal tensors")
     if asm_signal_num_ranks or asm_signal_generation:
@@ -259,11 +291,18 @@ def k3_l2_fused_v3_to_combine(
         raise ValueError("integrated V3 K3 path requires output_workspace and prob_storage")
 
     l2_weight, l2_scale = l2_weights
+    expected_dtype = torch.int8 if quant_mode == V3_QUANT_INT8 else torch.float8_e4m3fn
+    if act_fp8.dtype != expected_dtype or l2_weight.dtype != expected_dtype:
+        raise TypeError(
+            f"K3 {quant_mode} requires matching activation/weight dtype "
+            f"{expected_dtype}; got {act_fp8.dtype} and {l2_weight.dtype}"
+        )
     if backend == "normal":
         ext = load_extension(verbose=verbose_build)
         if asm_reduce_y is None:
             code_object = ensure_k3_combine_pack5_asm_code_object(
-                use_unified_weight_layout=use_unified_weight_layout
+                use_unified_weight_layout=use_unified_weight_layout,
+                quant_mode=quant_mode,
             )
             ext.k3_l2_combine_asm_pack5_out(
                 output_workspace,
@@ -277,6 +316,7 @@ def k3_l2_fused_v3_to_combine(
                 str(code_object),
                 active_tiles.contiguous() if active_tiles is not None else None,
                 int(graph_runtime_offset_from_active_tiles),
+                -1 if active_tiles_host_hint is None else int(active_tiles_host_hint),
             )
             return None
         if sym_buffer is None or asm_done_counter is None or asm_signal_addrs is None:

@@ -30,7 +30,13 @@ static pybind11::dict get_mega_moe_hip_build_config() {
     config["input_scale_mode"] = "channelwise_fp32";
     config["l2_act_scale_mode"] = "channelwise_fp32";
     config["has_fp8_api"] = true;
+    config["has_int8_api"] = true;
     config["has_fp4_api"] = false;
+    config["int8_operator"] = "int8_w8a8_mega_moe";
+    config["int8_capability"] =
+        "YGZP EP8 normal eager experts=288 topk=8 hidden=4096 intermediate=2048";
+    config["int8_quantization"] =
+        "signed symmetric per-token activation and per-output-channel weight scales";
     config["fusion_boundary"] = "dispatch_pool_l1_swiglu_quant_l2_combine";
     return config;
 }
@@ -80,7 +86,21 @@ void launch_mega_moe_pre_dispatch_fp8_channelwise_hip(
     bool topk_idx_i64,
     bool topk_weights_bf16);
 
-static void mega_moe_pre_dispatch(
+void launch_mega_moe_pre_dispatch_int8_channelwise_hip(
+    const void* x_bf16,
+    const void* topk_idx,
+    const void* topk_weights,
+    void* out_int8,
+    float* out_scale,
+    int64_t* out_topk_idx,
+    float* out_topk_weights,
+    int rows,
+    int hidden,
+    int topk,
+    bool topk_idx_i64,
+    bool topk_weights_bf16);
+
+static void mega_moe_pre_dispatch_impl(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -88,15 +108,19 @@ static void mega_moe_pre_dispatch(
     const torch::Tensor& out_scale,
     const torch::Tensor& out_topk_idx,
     const torch::Tensor& out_topk_weights,
-    int64_t num_tokens) {
+    int64_t num_tokens,
+    bool int8_output) {
     TORCH_CHECK(x.is_cuda() && topk_idx.is_cuda() && topk_weights.is_cuda() &&
                 out_fp8.is_cuda() && out_scale.is_cuda() && out_topk_idx.is_cuda() &&
                 out_topk_weights.is_cuda(),
                 "MegaMoE pre-dispatch tensors must be CUDA/HIP tensors");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16,
                 "MegaMoE pre-dispatch currently expects BF16 input activations");
-    TORCH_CHECK(out_fp8.scalar_type() == torch::kFloat8_e4m3fn,
-                "MegaMoE pre-dispatch out_fp8 must be FP8 E4M3");
+    TORCH_CHECK(
+        out_fp8.scalar_type() ==
+            (int8_output ? torch::kInt8 : torch::kFloat8_e4m3fn),
+        int8_output ? "MegaMoE pre-dispatch out_int8 must be INT8"
+                    : "MegaMoE pre-dispatch out_fp8 must be FP8 E4M3");
     TORCH_CHECK(out_scale.scalar_type() == torch::kFloat32,
                 "MegaMoE pre-dispatch out_scale must be FP32");
     TORCH_CHECK(topk_idx.scalar_type() == torch::kLong ||
@@ -146,20 +170,42 @@ static void mega_moe_pre_dispatch(
         return;
     }
 
-    launch_mega_moe_pre_dispatch_fp8_channelwise_hip(
-        x.data_ptr(),
-        topk_idx.data_ptr(),
-        topk_weights.data_ptr(),
-        out_fp8.data_ptr(),
-        out_scale.data_ptr<float>(),
-        out_topk_idx.data_ptr<int64_t>(),
-        out_topk_weights.data_ptr<float>(),
-        rows,
-        hidden,
-        topk,
-        topk_idx.scalar_type() == torch::kLong,
-        topk_weights.scalar_type() == torch::kBFloat16);
+    if (int8_output) {
+        launch_mega_moe_pre_dispatch_int8_channelwise_hip(
+            x.data_ptr(), topk_idx.data_ptr(), topk_weights.data_ptr(),
+            out_fp8.data_ptr(), out_scale.data_ptr<float>(),
+            out_topk_idx.data_ptr<int64_t>(), out_topk_weights.data_ptr<float>(),
+            rows, hidden, topk, topk_idx.scalar_type() == torch::kLong,
+            topk_weights.scalar_type() == torch::kBFloat16);
+    } else {
+        launch_mega_moe_pre_dispatch_fp8_channelwise_hip(
+            x.data_ptr(), topk_idx.data_ptr(), topk_weights.data_ptr(),
+            out_fp8.data_ptr(), out_scale.data_ptr<float>(),
+            out_topk_idx.data_ptr<int64_t>(), out_topk_weights.data_ptr<float>(),
+            rows, hidden, topk, topk_idx.scalar_type() == torch::kLong,
+            topk_weights.scalar_type() == torch::kBFloat16);
+    }
 }
+
+#define MEGA_MOE_PREDISPATCH_API_ARGS                                          \
+    const torch::Tensor& x, const torch::Tensor& topk_idx,                     \
+    const torch::Tensor& topk_weights, const torch::Tensor& out_quant,         \
+    const torch::Tensor& out_scale, const torch::Tensor& out_topk_idx,         \
+    const torch::Tensor& out_topk_weights, int64_t num_tokens
+
+static void mega_moe_pre_dispatch(MEGA_MOE_PREDISPATCH_API_ARGS) {
+    mega_moe_pre_dispatch_impl(
+        x, topk_idx, topk_weights, out_quant, out_scale, out_topk_idx,
+        out_topk_weights, num_tokens, false);
+}
+
+static void mega_moe_pre_dispatch_int8(MEGA_MOE_PREDISPATCH_API_ARGS) {
+    mega_moe_pre_dispatch_impl(
+        x, topk_idx, topk_weights, out_quant, out_scale, out_topk_idx,
+        out_topk_weights, num_tokens, true);
+}
+
+#undef MEGA_MOE_PREDISPATCH_API_ARGS
 
 using MegaMoeSymmBufferSlices = std::tuple<
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -171,7 +217,8 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const bool&, const std::string&) {
+    const bool&, const std::string&,
+    const bool& use_int8_dispatch = false) {
     TORCH_CHECK(num_ranks > 0, "num_ranks must be positive");
     TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
     TORCH_CHECK(hidden > 0 && intermediate_hidden > 0, "hidden sizes must be positive");
@@ -195,7 +242,9 @@ get_symm_buffer_size_for_mega_moe(
     auto slice_input_buffers = [=](const torch::Tensor& buffer) {
         auto* byte_base = static_cast<uint8_t*>(buffer.data_ptr());
         const auto device = buffer.device();
-        const auto fp8_options = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(device);
+        const auto quant_dtype =
+            use_int8_dispatch ? torch::kInt8 : torch::kFloat8_e4m3fn;
+        const auto quant_options = torch::TensorOptions().dtype(quant_dtype).device(device);
         const auto f32_options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
         const auto i64_options = torch::TensorOptions().dtype(torch::kInt64).device(device);
         const auto i32_options = torch::TensorOptions().dtype(torch::kInt).device(device);
@@ -207,7 +256,7 @@ get_symm_buffer_size_for_mega_moe(
         auto x = torch::from_blob(
             byte_base + input_token_offset,
             {num_max_tokens_per_rank, hidden},
-            fp8_options);
+            quant_options);
         auto x_sf = torch::from_blob(
             byte_base + input_sf_offset,
             {num_max_tokens_per_rank},
@@ -224,10 +273,11 @@ get_symm_buffer_size_for_mega_moe(
             byte_base + combine_offset,
             {num_topk * num_max_tokens_per_rank, hidden},
             torch::TensorOptions().dtype(torch::kBFloat16).device(device));
-        auto empty_fp8 = torch::from_blob(byte_base + combine_offset, {0}, fp8_options);
+        auto empty_quant = torch::from_blob(
+            byte_base + combine_offset, {0}, quant_options);
         auto empty_f32 = torch::from_blob(byte_base + combine_offset, {0}, f32_options);
         return std::make_tuple(x, x_sf, topk_idx, topk_weights,
-                               empty_fp8, empty_f32, empty_fp8, empty_f32,
+                               empty_quant, empty_f32, empty_quant, empty_f32,
                                runtime_num_tokens, combine);
     };
     return {total_bytes, slice_input_buffers};
@@ -238,18 +288,27 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const bool&, const std::string&,
-    const int& ll_capacity_tokens_per_rank = -1) {
+    const int& ll_capacity_tokens_per_rank = -1,
+    const bool& enable_ll_scratch = true,
+    const bool& use_int8_dispatch = false) {
     TORCH_CHECK(num_ranks > 0, "num_ranks must be positive");
     TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
     TORCH_CHECK(hidden > 0 && intermediate_hidden > 0, "hidden sizes must be positive");
 
+    const bool fp8_pack5_shape =
+        !use_int8_dispatch && dcu_supported_staged_pack5_shape(
+            num_ranks, num_experts, num_topk, hidden, intermediate_hidden);
+    const bool ygzp_int8_normal_ep8_shape =
+        use_int8_dispatch && !enable_ll_scratch &&
+        dcu_supported_staged_int8_normal_shape(
+            num_ranks, num_experts, num_topk, hidden, intermediate_hidden);
     TORCH_CHECK(
-        dcu_supported_staged_pack5_shape(
-            num_ranks, num_experts, num_topk, hidden, intermediate_hidden),
-        "DCU MegaMoE staged LL/normal route_scratch currently supports only "
-        "DeepSeek-V4-Flash EP8/EP16/EP32 experts=256 topk=6 hidden=4096 "
-        "intermediate=2048 and DeepSeek-V4-Pro EP8/EP16/EP32 experts=384 "
-        "topk=6 hidden=7168 intermediate=3072");
+        fp8_pack5_shape || ygzp_int8_normal_ep8_shape,
+        "DCU MegaMoE route_scratch supports FP8 DeepSeek-V4-Flash "
+        "EP8/EP16/EP32 experts=256 topk=6 hidden=4096 intermediate=2048 "
+        "and DeepSeek-V4-Pro EP8/EP16/EP32 experts=384 topk=6 hidden=7168 "
+        "intermediate=3072; or INT8 YGZP normal-only EP8 experts=288 topk=8 "
+        "hidden=4096 intermediate=2048");
 
     constexpr int64_t kK1RouteTileM = 256;
     constexpr int64_t kK1LlRowTile = 64;
@@ -282,11 +341,13 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
                 local_experts, std::min<int64_t>(max_tiles, fragmented_tiles));
         };
     const int64_t local_experts = num_experts / num_ranks;
-    const int64_t ll_capacity_tokens = ll_capacity_tokens_per_rank > 0
-        ? std::min<int64_t>(
-              num_max_tokens_per_rank,
-              static_cast<int64_t>(ll_capacity_tokens_per_rank))
-        : static_cast<int64_t>(num_max_tokens_per_rank);
+    const int64_t ll_capacity_tokens = enable_ll_scratch
+        ? (ll_capacity_tokens_per_rank > 0
+               ? std::min<int64_t>(
+                     num_max_tokens_per_rank,
+                     static_cast<int64_t>(ll_capacity_tokens_per_rank))
+               : static_cast<int64_t>(num_max_tokens_per_rank))
+        : 0;
     const int64_t ll_expected_rows_per_expert = std::max<int64_t>(
         1, ceil_div_i64(
                ll_capacity_tokens * num_topk,
@@ -336,10 +397,13 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
         num_experts == 384 && num_topk == 6 && hidden == 7168 &&
         intermediate_hidden == 3072;
     const int64_t pro_compact_rows_per_expert =
-        pro_ll_masked_shape ? ll_active_rows_per_expert(ll_capacity_tokens) : 0;
+        enable_ll_scratch && pro_ll_masked_shape
+            ? ll_active_rows_per_expert(ll_capacity_tokens)
+            : 0;
     const int64_t pro_compact_rows =
         local_experts * pro_compact_rows_per_expert;
-    const int64_t ll_capacity_rows = local_experts * ll_rows_per_expert;
+    const int64_t ll_capacity_rows =
+        enable_ll_scratch ? local_experts * ll_rows_per_expert : 0;
     const int64_t normal_capacity_rows =
         normal_skew_safe_compact_tiles(local_experts) * kK1RouteTileM;
     const int64_t capacity_rows = std::max(ll_capacity_rows, normal_capacity_rows);
@@ -378,7 +442,9 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     offset = align_i64(offset, 16);
     offset += pro_compact_rows * static_cast<int64_t>(sizeof(int64_t));
     offset = align_i64(offset, 16);
-    offset += (local_experts + 2) * static_cast<int64_t>(sizeof(int32_t));
+    const int64_t pro_compact_counts =
+        enable_ll_scratch ? local_experts + 2 : 0;
+    offset += pro_compact_counts * static_cast<int64_t>(sizeof(int32_t));
     offset = align_i64(offset, 16);
 
     constexpr int64_t kProbStorageBytes = 256;
@@ -573,7 +639,16 @@ static void deepep_deepgemm_postprocess_channelwise(
 
 static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
-    m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
+    m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe,
+          pybind11::arg("num_ranks"),
+          pybind11::arg("num_experts"),
+          pybind11::arg("num_max_tokens_per_rank"),
+          pybind11::arg("num_topk"),
+          pybind11::arg("hidden"),
+          pybind11::arg("intermediate_hidden"),
+          pybind11::arg("use_fp8_dispatch"),
+          pybind11::arg("activation"),
+          pybind11::arg("use_int8_dispatch") = false);
     m.def("get_mega_moe_route_scratch_size_for_mega_moe",
           &get_mega_moe_route_scratch_size_for_mega_moe,
           pybind11::arg("num_ranks"),
@@ -584,7 +659,9 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("intermediate_hidden"),
           pybind11::arg("use_fp8_dispatch"),
           pybind11::arg("activation"),
-          pybind11::arg("ll_capacity_tokens_per_rank") = -1);
+          pybind11::arg("ll_capacity_tokens_per_rank") = -1,
+          pybind11::arg("enable_ll_scratch") = true,
+          pybind11::arg("use_int8_dispatch") = false);
     m.def("get_mega_moe_hip_build_config", &get_mega_moe_hip_build_config);
     m.def("set_mega_moe_peer_ptrs", &set_mega_moe_peer_ptrs);
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch,
@@ -592,6 +669,15 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("topk_idx"),
           pybind11::arg("topk_weights"),
           pybind11::arg("out_fp8"),
+          pybind11::arg("out_scale"),
+          pybind11::arg("out_topk_idx"),
+          pybind11::arg("out_topk_weights"),
+          pybind11::arg("num_tokens"));
+    m.def("mega_moe_pre_dispatch_int8", &mega_moe_pre_dispatch_int8,
+          pybind11::arg("x"),
+          pybind11::arg("topk_idx"),
+          pybind11::arg("topk_weights"),
+          pybind11::arg("out_int8"),
           pybind11::arg("out_scale"),
           pybind11::arg("out_topk_idx"),
           pybind11::arg("out_topk_weights"),

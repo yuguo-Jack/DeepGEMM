@@ -7,8 +7,13 @@ import torch
 from ..v3_config import (
     STAGED_PACK5_SHAPE_CONTRACT,
     SUPPORTED_STAGED_EP_RANKS,
+    V3_BACKEND_NORMAL,
+    V3_QUANT_FP8,
+    V3_QUANT_INT8,
     normalize_v3_backend,
+    normalize_v3_quant,
     staged_pack5_k1_shape_supported,
+    staged_v3_capability_supported,
 )
 from . import k1_fused_ext as _ext
 
@@ -23,6 +28,11 @@ FUSED_L1_ASM_PACK5_NAME = f"{FUSED_L1_ASM_NAME}_PACK5"
 FUSED_L1_ASM_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_PACK5_NAME}.co"
 FUSED_L1_ASM_UNIFIED_PACK5_NAME = f"{FUSED_L1_ASM_NAME}_UNIFIED_PACK5"
 FUSED_L1_ASM_UNIFIED_PACK5_CO = THIS_DIR / f"{FUSED_L1_ASM_UNIFIED_PACK5_NAME}.co"
+FUSED_L1_INT8_ASM_NAME = (
+    "DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_"
+    "MEGAMOE_DISPATCH_PULL_L1"
+)
+FUSED_L1_INT8_ASM_PACK5_CO = THIS_DIR / f"{FUSED_L1_INT8_ASM_NAME}_PACK5.co"
 PRO_LL_MASKED_L1_ASM_NAME = (
     "DEEPGEMM_FP8_FP8_BF16_PERCHANNEL_MARLIN_ASM_TN_"
     "MT256x64x128_WGM8_GROUPGEMM_MASKED"
@@ -50,15 +60,30 @@ def _check_fused_l1_shape(
     hidden: int,
     l1_rows: int,
     alignment: int,
+    quant_mode: str = V3_QUANT_FP8,
 ) -> None:
-    if (
-        not staged_pack5_k1_shape_supported(
+    quant_mode = normalize_v3_quant(quant_mode)
+    shape_supported = (
+        staged_v3_capability_supported(
+            quant=quant_mode,
+            backend=V3_BACKEND_NORMAL,
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=l1_rows // 2,
+        )
+        if quant_mode == V3_QUANT_INT8 and l1_rows % 2 == 0
+        else staged_pack5_k1_shape_supported(
             num_ranks=num_ranks,
             num_experts=num_experts,
             num_topk=num_topk,
             hidden=hidden,
             l1_rows=l1_rows,
         )
+    )
+    if (
+        not shape_supported
         or int(alignment) != K1_SUPPORTED_ALIGNMENT
         or int(num_tokens) < 0
         or int(num_tokens) > int(num_max_tokens_per_rank)
@@ -68,12 +93,18 @@ def _check_fused_l1_shape(
 
 def ensure_fused_l1_asm_pack5_code_object(
     use_unified_weight_layout: bool = False,
+    int8_compute: bool = False,
 ) -> Path:
-    co = (
-        FUSED_L1_ASM_UNIFIED_PACK5_CO
-        if use_unified_weight_layout
-        else FUSED_L1_ASM_PACK5_CO
-    )
+    if int8_compute and use_unified_weight_layout:
+        raise ValueError("YGZP INT8 K1 supports normal non-unified PACK5 only")
+    if int8_compute:
+        co = FUSED_L1_INT8_ASM_PACK5_CO
+    else:
+        co = (
+            FUSED_L1_ASM_UNIFIED_PACK5_CO
+            if use_unified_weight_layout
+            else FUSED_L1_ASM_PACK5_CO
+        )
     if not co.exists():
         raise FileNotFoundError(
             f"prebuilt K1 V3 pack5 asm code object not found: {co}. "
@@ -192,9 +223,14 @@ def k1_symm_fused_l1_v3_asm_pack5(
     force_compact_prebuild: bool = False,
     capacity_num_tokens: int | None = None,
     use_unified_weight_layout: bool = False,
+    quant_mode: str = V3_QUANT_FP8,
     verbose_build: bool = False,
+    return_active_tiles_host_hint: bool = False,
 ):
     l1_weight_pack5, l1_scale = l1_weights
+    quant_mode = normalize_v3_quant(quant_mode)
+    if return_active_tiles_host_hint and quant_mode != V3_QUANT_INT8:
+        raise ValueError("active_tiles host hint is available for INT8 K1 only")
     _check_fused_l1_shape(
         num_ranks=num_ranks,
         num_experts=num_experts,
@@ -204,10 +240,15 @@ def k1_symm_fused_l1_v3_asm_pack5(
         hidden=hidden,
         l1_rows=int(l1_scale.size(1)),
         alignment=alignment,
+        quant_mode=quant_mode,
     )
+    expected_dtype = torch.int8 if quant_mode == V3_QUANT_INT8 else torch.float8_e4m3fn
+    if l1_weight_pack5.dtype != expected_dtype:
+        raise ValueError(f"K1 {quant_mode} weight must have {expected_dtype} dtype")
     ext = load_extension(verbose=verbose_build)
     code_object = ensure_fused_l1_asm_pack5_code_object(
-        use_unified_weight_layout=use_unified_weight_layout
+        use_unified_weight_layout=use_unified_weight_layout,
+        int8_compute=quant_mode == V3_QUANT_INT8,
     )
     symm_base_addr, symm_x_span = _cached_symm_x_addr_range(
         sym_buffer, num_ranks, hidden
@@ -239,6 +280,7 @@ def k1_symm_fused_l1_v3_asm_pack5(
         None,
         bool(force_compact_prebuild),
         -1 if capacity_num_tokens is None else int(capacity_num_tokens),
+        bool(return_active_tiles_host_hint),
     )
 
 
@@ -385,9 +427,18 @@ def k1_symm_fused_l1_v3(
     graph_tail_signal_generation_out: torch.Tensor | None = None,
     ll_stage_only: bool = False,
     ll_return_staged: bool = False,
+    quant_mode: str = V3_QUANT_FP8,
     verbose_build: bool = False,
+    return_active_tiles_host_hint: bool = False,
 ):
     backend = normalize_v3_backend(backend)
+    quant_mode = normalize_v3_quant(quant_mode)
+    if quant_mode == V3_QUANT_INT8 and backend != V3_BACKEND_NORMAL:
+        raise ValueError("YGZP INT8 K1 supports normal backend only")
+    if return_active_tiles_host_hint and backend != V3_BACKEND_NORMAL:
+        raise ValueError("active_tiles host hint is available on normal K1 only")
+    if return_active_tiles_host_hint and quant_mode != V3_QUANT_INT8:
+        raise ValueError("active_tiles host hint is available for INT8 K1 only")
     l1_weight_pack5, l1_scale = l1_weights
     _check_fused_l1_shape(
         num_ranks=num_ranks,
@@ -398,6 +449,7 @@ def k1_symm_fused_l1_v3(
         hidden=hidden,
         l1_rows=int(l1_scale.size(1)),
         alignment=alignment,
+        quant_mode=quant_mode,
     )
     ext = load_extension(verbose=verbose_build)
     if backend == "normal":
@@ -416,7 +468,9 @@ def k1_symm_fused_l1_v3(
             force_compact_prebuild=force_compact_prebuild,
             capacity_num_tokens=capacity_num_tokens,
             use_unified_weight_layout=use_unified_weight_layout,
+            quant_mode=quant_mode,
             verbose_build=verbose_build,
+            return_active_tiles_host_hint=return_active_tiles_host_hint,
         )
     return ext.k1_symm_fused_l1_v3_pack5(
         sym_buffer.buffer,

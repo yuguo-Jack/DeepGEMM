@@ -5,13 +5,13 @@
 // Component.Signature.SignatureCOV3
 .amdgcn_target "amdgcn-amd-amdhsa--gfx938"
 .text
-	.protected DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1
-	.globl DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1
+	.protected DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE
+	.globl DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE
 	.p2align 8
-	.type DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1,@function
+	.type DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE,@function
 	.section .rodata,#alloc
 	.p2align 6
-	.amdhsa_kernel DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1
+	.amdhsa_kernel DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE
 	  .amdhsa_user_sgpr_kernarg_segment_ptr 1
 	  .amdhsa_next_free_vgpr 255 // vgprs
 	  .amdhsa_next_free_sgpr 102 // sgprs
@@ -32,8 +32,8 @@ amdhsa.version:
   - 1
   - 0
 amdhsa.kernels:
-  - .name: DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1
-    .symbol: 'DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1.kd'
+  - .name: DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE
+    .symbol: 'DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE.kd'
     .language:                   OpenCL C
     .language_version:
       - 2
@@ -194,7 +194,7 @@ amdhsa.kernels:
     .wavefront_size:             64
 ...
 .end_amdgpu_metadata
-DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1:
+DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE:
 
 /******************************************/
 /* Asm syntax workarounds                 */
@@ -229,6 +229,394 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1:
 
 .macro _v_add_lshl_u32 dst:req, src0:req, src1:req, shiftCnt:req
     v_add_lshl_u32 \dst, \src0, \src1, \shiftCnt
+.endm
+
+.macro K3_ADDR_ADD_COL lo:req, hi:req
+   _v_add_co_u32 \lo, vcc, \lo, v134
+   v_addc_co_u32 \hi, vcc, \hi, v144, vcc
+.endm
+
+.macro K3_ADDR_INC lo:req, hi:req
+   _v_add_co_u32 \lo, vcc, \lo, 0x20
+   v_addc_co_u32 \hi, vcc, \hi, v144, vcc
+.endm
+
+.macro K3_TABLE_ADDR_INC bytes:req
+   v_mov_b32 v147, \bytes
+   _v_add_co_u32 v145, vcc, v145, v147
+   v_addc_co_u32 v146, vcc, v146, v144, vcc
+.endm
+
+.macro K3_LOAD_COMBINE_ADDR4 off0:req, off1:req, off2:req, off3:req
+   v_mov_b32 v144, 0
+   v_lshlrev_b32 v134, 1, v128
+
+   v_add_u32 v145, \off0, v129
+   v_lshlrev_b32 v145, 3, v145
+   v_mov_b32 v146, s93
+   _v_add_co_u32 v145, vcc, v145, s92
+   v_addc_co_u32 v146, vcc, v146, v144, vcc
+   global_load_dwordx2 v[136:137], v[145:146], off
+
+   v_add_u32 v145, \off1, v129
+   v_lshlrev_b32 v145, 3, v145
+   v_mov_b32 v146, s93
+   _v_add_co_u32 v145, vcc, v145, s92
+   v_addc_co_u32 v146, vcc, v146, v144, vcc
+   global_load_dwordx2 v[138:139], v[145:146], off
+
+   v_add_u32 v145, \off2, v129
+   v_lshlrev_b32 v145, 3, v145
+   v_mov_b32 v146, s93
+   _v_add_co_u32 v145, vcc, v145, s92
+   v_addc_co_u32 v146, vcc, v146, v144, vcc
+   global_load_dwordx2 v[140:141], v[145:146], off
+
+   v_add_u32 v145, \off3, v129
+   v_lshlrev_b32 v145, 3, v145
+   v_mov_b32 v146, s93
+   _v_add_co_u32 v145, vcc, v145, s92
+   v_addc_co_u32 v146, vcc, v146, v144, vcc
+   global_load_dwordx2 v[142:143], v[145:146], off
+
+   s_waitcnt vmcnt(0)
+   v_or_b32 v152, v136, v137
+   v_or_b32 v153, v138, v139
+   v_or_b32 v154, v140, v141
+   v_or_b32 v155, v142, v143
+   K3_ADDR_ADD_COL v136, v137
+   K3_ADDR_ADD_COL v138, v139
+   K3_ADDR_ADD_COL v140, v141
+   K3_ADDR_ADD_COL v142, v143
+.endm
+
+.macro K3_STORE4 data0:req, data1:req, data2:req, data3:req
+   global_store_short v[136:137], \data0, off
+   global_store_short v[138:139], \data1, off
+   global_store_short v[140:141], \data2, off
+   global_store_short v[142:143], \data3, off
+.endm
+
+.macro K3_PACK8_BF16 data:req
+   v_lshrrev_b32 v148, 6, v[vgprSerial]
+   v_lshlrev_b32 v148, 7, v148
+   v_lshlrev_b32 v149, 5, v133
+   v_add_u32 v148, v148, v149
+   v_lshrrev_b32 v149, 3, v132
+   v_lshlrev_b32 v149, 4, v149
+   v_add_u32 v148, v148, v149
+   v_and_b32 v149, 7, v132
+   v_lshlrev_b32 v149, 1, v149
+   v_add_u32 v149, v148, v149
+   ds_write_b16 v149, \data
+   s_waitcnt lgkmcnt(0)
+   ds_read_b128 v[232:235], v148
+   s_waitcnt lgkmcnt(0)
+.endm
+
+.macro K3_STORE_VEC8 addr:req, valid:req
+   v_and_b32 v148, 7, v132
+   v_cmp_eq_u32 vcc, 0, v148
+   s_and_saveexec_b64 s[82:83], vcc
+   s_cbranch_execz .L_k3_store_vec8_done_\@
+   v_cmp_ne_u32 vcc, 0, \valid
+   s_and_saveexec_b64 s[84:85], vcc
+   s_cbranch_execz .L_k3_store_vec8_skip_\@
+   global_store_dwordx4 \addr, v[232:235], off
+.L_k3_store_vec8_skip_\@:
+   s_mov_b64 exec, s[84:85]
+.L_k3_store_vec8_done_\@:
+   s_mov_b64 exec, s[82:83]
+.endm
+
+.macro K3_STORE_C4 data0:req, data1:req, data2:req, data3:req
+   K3_PACK8_BF16 \data0
+   K3_STORE_VEC8 v[136:137], v152
+   K3_PACK8_BF16 \data1
+   K3_STORE_VEC8 v[138:139], v153
+   K3_PACK8_BF16 \data2
+   K3_STORE_VEC8 v[140:141], v154
+   K3_PACK8_BF16 \data3
+   K3_STORE_VEC8 v[142:143], v155
+.endm
+
+.macro K3_STAGE_ONE_H0 data:req, rowoff:req, colbytes:req
+   v_add_u32 v148, \rowoff, v147
+   v_lshlrev_b32 v148, 9, v148
+   v_add_u32 v148, \colbytes, v148
+   v_add_u32 v148, v148, v200
+   ds_write_b16 v148, \data
+.endm
+
+.macro K3_STAGE_ONE_H1 data:req, rowoff:req, colbytes:req
+   v_add_u32 v148, \rowoff, v147
+   v_sub_u32 v148, v148, v201
+   v_lshlrev_b32 v148, 9, v148
+   v_add_u32 v148, \colbytes, v148
+   v_add_u32 v148, v148, v200
+   ds_write_b16 v148, \data
+.endm
+
+.macro K3_STAGE_C4_H0 data0:req, data1:req, data2:req, data3:req, rowoff0:req, rowoff1:req, rowoff2:req, rowoff3:req, colbytes:req
+   K3_STAGE_ONE_H0 \data0, \rowoff0, \colbytes
+   K3_STAGE_ONE_H0 \data1, \rowoff1, \colbytes
+   K3_STAGE_ONE_H0 \data2, \rowoff2, \colbytes
+   K3_STAGE_ONE_H0 \data3, \rowoff3, \colbytes
+.endm
+
+.macro K3_STAGE_C4_H1 data0:req, data1:req, data2:req, data3:req, rowoff0:req, rowoff1:req, rowoff2:req, rowoff3:req, colbytes:req
+   K3_STAGE_ONE_H1 \data0, \rowoff0, \colbytes
+   K3_STAGE_ONE_H1 \data1, \rowoff1, \colbytes
+   K3_STAGE_ONE_H1 \data2, \rowoff2, \colbytes
+   K3_STAGE_ONE_H1 \data3, \rowoff3, \colbytes
+.endm
+
+.macro K3_STAGE_TILE_H0
+   K3_STAGE_C4_H0 v0, v1, v2, v3, 0, 4, 8, 12, 0
+   K3_STAGE_C4_H0 v4, v5, v6, v7, 0, 4, 8, 12, 32
+   K3_STAGE_C4_H0 v8, v9, v10, v11, 0, 4, 8, 12, 64
+   K3_STAGE_C4_H0 v12, v13, v14, v15, 0, 4, 8, 12, 96
+   K3_STAGE_C4_H0 v16, v17, v18, v19, 0, 4, 8, 12, 128
+   K3_STAGE_C4_H0 v20, v21, v22, v23, 0, 4, 8, 12, 160
+   K3_STAGE_C4_H0 v24, v25, v26, v27, 0, 4, 8, 12, 192
+   K3_STAGE_C4_H0 v28, v29, v30, v31, 0, 4, 8, 12, 224
+   K3_STAGE_C4_H0 v32, v33, v34, v35, 0, 4, 8, 12, 256
+   K3_STAGE_C4_H0 v36, v37, v38, v39, 0, 4, 8, 12, 288
+   K3_STAGE_C4_H0 v40, v41, v42, v43, 0, 4, 8, 12, 320
+   K3_STAGE_C4_H0 v44, v45, v46, v47, 0, 4, 8, 12, 352
+   K3_STAGE_C4_H0 v48, v49, v50, v51, 0, 4, 8, 12, 384
+   K3_STAGE_C4_H0 v52, v53, v54, v55, 0, 4, 8, 12, 416
+   K3_STAGE_C4_H0 v56, v57, v58, v59, 0, 4, 8, 12, 448
+   K3_STAGE_C4_H0 v60, v61, v62, v63, 0, 4, 8, 12, 480
+   K3_STAGE_C4_H0 v64, v65, v66, v67, 16, 20, 24, 28, 0
+   K3_STAGE_C4_H0 v68, v69, v70, v71, 16, 20, 24, 28, 32
+   K3_STAGE_C4_H0 v72, v73, v74, v75, 16, 20, 24, 28, 64
+   K3_STAGE_C4_H0 v76, v77, v78, v79, 16, 20, 24, 28, 96
+   K3_STAGE_C4_H0 v80, v81, v82, v83, 16, 20, 24, 28, 128
+   K3_STAGE_C4_H0 v84, v85, v86, v87, 16, 20, 24, 28, 160
+   K3_STAGE_C4_H0 v88, v89, v90, v91, 16, 20, 24, 28, 192
+   K3_STAGE_C4_H0 v92, v93, v94, v95, 16, 20, 24, 28, 224
+   K3_STAGE_C4_H0 v96, v97, v98, v99, 16, 20, 24, 28, 256
+   K3_STAGE_C4_H0 v100, v101, v102, v103, 16, 20, 24, 28, 288
+   K3_STAGE_C4_H0 v104, v105, v106, v107, 16, 20, 24, 28, 320
+   K3_STAGE_C4_H0 v108, v109, v110, v111, 16, 20, 24, 28, 352
+   K3_STAGE_C4_H0 v112, v113, v114, v115, 16, 20, 24, 28, 384
+   K3_STAGE_C4_H0 v116, v117, v118, v119, 16, 20, 24, 28, 416
+   K3_STAGE_C4_H0 v120, v121, v122, v123, 16, 20, 24, 28, 448
+   K3_STAGE_C4_H0 v124, v125, v126, v127, 16, 20, 24, 28, 480
+.endm
+
+.macro K3_STAGE_TILE_H1
+   K3_STAGE_C4_H1 v0, v1, v2, v3, 0, 4, 8, 12, 0
+   K3_STAGE_C4_H1 v4, v5, v6, v7, 0, 4, 8, 12, 32
+   K3_STAGE_C4_H1 v8, v9, v10, v11, 0, 4, 8, 12, 64
+   K3_STAGE_C4_H1 v12, v13, v14, v15, 0, 4, 8, 12, 96
+   K3_STAGE_C4_H1 v16, v17, v18, v19, 0, 4, 8, 12, 128
+   K3_STAGE_C4_H1 v20, v21, v22, v23, 0, 4, 8, 12, 160
+   K3_STAGE_C4_H1 v24, v25, v26, v27, 0, 4, 8, 12, 192
+   K3_STAGE_C4_H1 v28, v29, v30, v31, 0, 4, 8, 12, 224
+   K3_STAGE_C4_H1 v32, v33, v34, v35, 0, 4, 8, 12, 256
+   K3_STAGE_C4_H1 v36, v37, v38, v39, 0, 4, 8, 12, 288
+   K3_STAGE_C4_H1 v40, v41, v42, v43, 0, 4, 8, 12, 320
+   K3_STAGE_C4_H1 v44, v45, v46, v47, 0, 4, 8, 12, 352
+   K3_STAGE_C4_H1 v48, v49, v50, v51, 0, 4, 8, 12, 384
+   K3_STAGE_C4_H1 v52, v53, v54, v55, 0, 4, 8, 12, 416
+   K3_STAGE_C4_H1 v56, v57, v58, v59, 0, 4, 8, 12, 448
+   K3_STAGE_C4_H1 v60, v61, v62, v63, 0, 4, 8, 12, 480
+   K3_STAGE_C4_H1 v64, v65, v66, v67, 16, 20, 24, 28, 0
+   K3_STAGE_C4_H1 v68, v69, v70, v71, 16, 20, 24, 28, 32
+   K3_STAGE_C4_H1 v72, v73, v74, v75, 16, 20, 24, 28, 64
+   K3_STAGE_C4_H1 v76, v77, v78, v79, 16, 20, 24, 28, 96
+   K3_STAGE_C4_H1 v80, v81, v82, v83, 16, 20, 24, 28, 128
+   K3_STAGE_C4_H1 v84, v85, v86, v87, 16, 20, 24, 28, 160
+   K3_STAGE_C4_H1 v88, v89, v90, v91, 16, 20, 24, 28, 192
+   K3_STAGE_C4_H1 v92, v93, v94, v95, 16, 20, 24, 28, 224
+   K3_STAGE_C4_H1 v96, v97, v98, v99, 16, 20, 24, 28, 256
+   K3_STAGE_C4_H1 v100, v101, v102, v103, 16, 20, 24, 28, 288
+   K3_STAGE_C4_H1 v104, v105, v106, v107, 16, 20, 24, 28, 320
+   K3_STAGE_C4_H1 v108, v109, v110, v111, 16, 20, 24, 28, 352
+   K3_STAGE_C4_H1 v112, v113, v114, v115, 16, 20, 24, 28, 384
+   K3_STAGE_C4_H1 v116, v117, v118, v119, 16, 20, 24, 28, 416
+   K3_STAGE_C4_H1 v120, v121, v122, v123, 16, 20, 24, 28, 448
+   K3_STAGE_C4_H1 v124, v125, v126, v127, 16, 20, 24, 28, 480
+.endm
+
+.macro K3_STORE_STAGED_HALF rowptr_offset:req, step:req
+   /* K3COMBINE: staged loop walks the 128 routed rows in this half tile.
+    * Keep this tile-local bound fixed; model hidden is handled by wg0. */
+   v_mov_b32 v149, 4096
+.L_k3_staged_loop_\@:
+   v_cmp_lt_u32 vcc, v150, v149
+   s_and_saveexec_b64 s[80:81], vcc
+   s_cbranch_execz .L_k3_staged_done_\@
+
+   v_lshrrev_b32 v151, 5, v150
+   _v_add_co_u32 v152, vcc, v151, s56
+   v_lshlrev_b32 v153, 3, v152
+   buffer_load_dwordx2 v[136:137], v153, s[92:95], 0, offen, offset:\rowptr_offset
+
+   v_add_u32 v157, 8, v151
+   _v_add_co_u32 v158, vcc, v157, s56
+   v_lshlrev_b32 v159, 3, v158
+   buffer_load_dwordx2 v[138:139], v159, s[92:95], 0, offen, offset:\rowptr_offset
+
+   v_add_u32 v163, 16, v151
+   _v_add_co_u32 v164, vcc, v163, s56
+   v_lshlrev_b32 v164, 3, v164
+   buffer_load_dwordx2 v[140:141], v164, s[92:95], 0, offen, offset:\rowptr_offset
+
+   v_add_u32 v165, 24, v151
+   _v_add_co_u32 v166, vcc, v165, s56
+   v_lshlrev_b32 v166, 3, v166
+   buffer_load_dwordx2 v[142:143], v166, s[92:95], 0, offen, offset:\rowptr_offset
+
+   v_lshlrev_b32 v148, 9, v151
+   v_and_b32 v154, 31, v150
+   v_lshlrev_b32 v154, 4, v154
+   v_add_u32 v148, v148, v154
+   ds_read_b128 v[232:235], v148
+
+   v_lshlrev_b32 v161, 9, v157
+   v_add_u32 v161, v161, v154
+   ds_read_b128 v[236:239], v161
+
+   v_lshlrev_b32 v163, 9, v163
+   v_add_u32 v163, v163, v154
+   ds_read_b128 v[240:243], v163
+
+   v_lshlrev_b32 v165, 9, v165
+   v_add_u32 v165, v165, v154
+   ds_read_b128 v[244:247], v165
+
+   s_waitcnt vmcnt(0)
+   s_waitcnt lgkmcnt(0)
+   v_or_b32 v155, v136, v137
+   v_or_b32 v161, v138, v139
+   v_or_b32 v163, v140, v141
+   v_or_b32 v165, v142, v143
+   v_add_u32 v162, v154, s54
+   v_mov_b32 v156, 0
+   _v_add_co_u32 v136, vcc, v136, v162
+   v_addc_co_u32 v137, vcc, v137, v156, vcc
+   _v_add_co_u32 v138, vcc, v138, v162
+   v_addc_co_u32 v139, vcc, v139, v156, vcc
+   _v_add_co_u32 v140, vcc, v140, v162
+   v_addc_co_u32 v141, vcc, v141, v156, vcc
+   _v_add_co_u32 v142, vcc, v142, v162
+   v_addc_co_u32 v143, vcc, v143, v156, vcc
+   v_cmp_ne_u32 vcc, 0, v155
+   s_and_saveexec_b64 s[82:83], vcc
+   global_store_dwordx4 v[136:137], v[232:235], off
+   s_mov_b64 exec, s[82:83]
+   v_cmp_ne_u32 vcc, 0, v161
+   s_and_saveexec_b64 s[82:83], vcc
+   global_store_dwordx4 v[138:139], v[236:239], off
+   s_mov_b64 exec, s[82:83]
+   v_cmp_ne_u32 vcc, 0, v163
+   s_and_saveexec_b64 s[82:83], vcc
+   global_store_dwordx4 v[140:141], v[240:243], off
+   s_mov_b64 exec, s[82:83]
+   v_cmp_ne_u32 vcc, 0, v165
+   s_and_saveexec_b64 s[82:83], vcc
+   global_store_dwordx4 v[142:143], v[244:247], off
+   s_mov_b64 exec, s[82:83]
+   s_mov_b64 exec, s[80:81]
+   v_add_u32 v150, \step, v150
+   s_branch .L_k3_staged_loop_\@
+
+.L_k3_staged_done_\@:
+   s_mov_b64 exec, s[80:81]
+.endm
+
+.macro K3_TAIL_ATOMIC_SIGNAL offset:req, value:req
+   v_mov_b32 v153, s56
+   v_mov_b32 v154, s57
+   v_mov_b32 v156, \offset
+   _v_add_co_u32 v153, vcc, v153, v156
+   v_mov_b32 v156, 0
+   v_addc_co_u32 v154, vcc, v154, v156, vcc
+   global_load_dwordx2 v[136:137], v[153:154], off glc
+   s_waitcnt vmcnt(0)
+   v_or_b32 v155, v136, v137
+   v_cmp_ne_u32 vcc, 0, v155
+   s_and_saveexec_b64 s[66:67], vcc
+   s_cbranch_execz .L_k3_tail_atomic_skip_\@
+   v_mov_b32 v238, \value
+   global_atomic_add v240, v[136:137], v238, off glc
+.L_k3_tail_atomic_skip_\@:
+   s_mov_b64 exec, s[66:67]
+.endm
+
+.macro K3_INC_C_COL
+   K3_ADDR_INC v136, v137
+   K3_ADDR_INC v138, v139
+   K3_ADDR_INC v140, v141
+   K3_ADDR_INC v142, v143
+.endm
+
+.macro K3_SELECT_VEC8_LANES
+.endm
+
+.macro K3_RESTORE_ALL_LANES
+.endm
+
+.macro K3_INC_ADDR4
+   K3_ADDR_INC v136, v137
+   K3_ADDR_INC v138, v139
+   K3_ADDR_INC v140, v141
+   K3_ADDR_INC v142, v143
+.endm
+
+.macro K3_SCATTER_C_TILE_TO_COMBINE
+   s_waitcnt vmcnt(0)
+   buffer_wbinvl1_vol
+   s_barrier
+
+   s_mov_b32 s52, s[sgprAddressC+0]
+   s_mov_b32 s53, s[sgprAddressC+1]
+   s_mov_b32 s54, BufferLimit
+   s_mov_b32 s55, Srd127_96
+   s_mov_b64 s[56:57], s[92:93]
+   s_mul_i32 s58, s[sgprWorkGroup1], 0x100
+   s_mul_i32 s59, s[sgprWorkGroup0], 0x200
+   s_mov_b32 s60, 8192
+   v_mov_b32 v148, v[vgprSerial]
+
+K3_Scatter_C_Tile_Loop:
+   v_cmp_lt_u32 vcc, v148, s60
+   s_and_saveexec_b64 s[80:81], vcc
+   s_cbranch_execz K3_Scatter_C_Tile_Done
+
+   v_lshrrev_b32 v149, 5, v148
+   v_and_b32 v150, 31, v148
+   v_lshlrev_b32 v151, 4, v150
+   v_add_u32 v151, s59, v151
+   v_add_u32 v152, s58, v149
+
+   v_mul_lo_u32 v153, s[sgprSizeI], v152
+   v_lshlrev_b32 v153, 1, v153
+   v_add_u32 v153, v153, v151
+   buffer_load_dwordx4 v[232:235], v153, s[52:55], 0, offen, offset:0
+
+   v_lshlrev_b32 v154, 3, v152
+   v_mov_b32 v155, s57
+   _v_add_co_u32 v154, vcc, v154, s56
+   v_addc_co_u32 v155, vcc, v155, 0, vcc
+   global_load_dwordx2 v[156:157], v[154:155], off
+   s_waitcnt vmcnt(0)
+   v_mov_b32 v155, 0
+   _v_add_co_u32 v156, vcc, v156, v151
+   v_addc_co_u32 v157, vcc, v157, v155, vcc
+   global_store_dwordx4 v[156:157], v[232:235], off
+
+   s_mov_b64 exec, s[80:81]
+   v_add_u32 v148, 0x300, v148
+   s_branch K3_Scatter_C_Tile_Loop
+
+K3_Scatter_C_Tile_Done:
+   s_mov_b64 exec, s[80:81]
+   s_waitcnt vmcnt(0)
+   s_barrier
 .endm
 
 .macro _v_lshl_add_u32 dst:req, src0:req, src1:req, shiftCnt:req
@@ -707,7 +1095,36 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1:
    v_add_co_u32 v254, vcc, 0x1000, v252
 .endm
 
+.macro INT32_TO_FP32 vgprValue:req
+	v_cvt_f32_i32_e32 v[\vgprValue+0], v[\vgprValue+0]
+	v_cvt_f32_i32_e32 v[\vgprValue+1], v[\vgprValue+1]
+	v_cvt_f32_i32_e32 v[\vgprValue+2], v[\vgprValue+2]
+	v_cvt_f32_i32_e32 v[\vgprValue+3], v[\vgprValue+3]
+
+	v_cvt_f32_i32_e32 v[\vgprValue+4], v[\vgprValue+4]
+	v_cvt_f32_i32_e32 v[\vgprValue+5], v[\vgprValue+5]
+	v_cvt_f32_i32_e32 v[\vgprValue+6], v[\vgprValue+6]
+	v_cvt_f32_i32_e32 v[\vgprValue+7], v[\vgprValue+7]
+
+	v_cvt_f32_i32_e32 v[\vgprValue+8], v[\vgprValue+8]
+	v_cvt_f32_i32_e32 v[\vgprValue+9], v[\vgprValue+9]
+	v_cvt_f32_i32_e32 v[\vgprValue+10], v[\vgprValue+10]
+	v_cvt_f32_i32_e32 v[\vgprValue+11], v[\vgprValue+11]
+
+	v_cvt_f32_i32_e32 v[\vgprValue+12], v[\vgprValue+12]
+	v_cvt_f32_i32_e32 v[\vgprValue+13], v[\vgprValue+13]
+	v_cvt_f32_i32_e32 v[\vgprValue+14], v[\vgprValue+14]
+	v_cvt_f32_i32_e32 v[\vgprValue+15], v[\vgprValue+15]
+.endm
 .macro SMQUANT
+	INT32_TO_FP32  0
+	INT32_TO_FP32  16
+	INT32_TO_FP32  32
+	INT32_TO_FP32  48
+	INT32_TO_FP32  64
+	INT32_TO_FP32  80
+	INT32_TO_FP32  96
+	INT32_TO_FP32  112
 	COMPUTE_ADDRESS_SCALE
 	
 	s_waitcnt lgkmcnt(0)
@@ -965,7 +1382,7 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1:
 .macro GLOBAL_OFFSET_A vgprAddr:req vgprOffsetL:req vgprOffset0I:req vgprTmp:req
    v_lshlrev_b32 v[\vgprTmp+0], 10, v[\vgprOffset0I] // pack5 ni16 * (4 * 256)
    _v_add_co_u32 v[\vgprAddr+0], vcc, v[vgprPack5OffsetBaseA], v[\vgprTmp+0]
-   _v_add_u32 v[\vgprAddr+0], 0x10, v[\vgprAddr+0]    // add prepad for pointer shift
+   _v_add_u32 v[\vgprAddr+0], 0x10, v[\vgprAddr+0]    // keep original ASM prepad compensation
                                                       // offset *= bytes/element (multiplier is 1, do nothing)
 .endm
 
@@ -996,319 +1413,319 @@ DeepGemm_W8A8_F8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1:
 /* 16x8 thread-tile                       */
 /******************************************/
 .macro MAC_16x8_X0
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+0:vgprValuC+3], v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+0:vgprValuC+3] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+0:vgprValuC+3], v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+0:vgprValuC+3] 
 s_setprio 1 // Raise priority while processing macs
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+4:vgprValuC+7], v[vgprValuA_X0_I0+2:vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+4:vgprValuC+7] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+8:vgprValuC+11], v[vgprValuA_X0_I0+4:vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+8:vgprValuC+11] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+12:vgprValuC+15], v[vgprValuA_X0_I0+6:vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+12:vgprValuC+15] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+16:vgprValuC+19], v[vgprValuA_X0_I0+8:vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+16:vgprValuC+19] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+20:vgprValuC+23], v[vgprValuA_X0_I0+10:vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+20:vgprValuC+23] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+24:vgprValuC+27], v[vgprValuA_X0_I0+12:vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+24:vgprValuC+27] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+28:vgprValuC+31], v[vgprValuA_X0_I0+14:vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+28:vgprValuC+31] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+32:vgprValuC+35], v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+32:vgprValuC+35] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+36:vgprValuC+39], v[vgprValuA_X0_I0+2:vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+36:vgprValuC+39] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+40:vgprValuC+43], v[vgprValuA_X0_I0+4:vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+40:vgprValuC+43] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+44:vgprValuC+47], v[vgprValuA_X0_I0+6:vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+44:vgprValuC+47] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+48:vgprValuC+51], v[vgprValuA_X0_I0+8:vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+48:vgprValuC+51] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+52:vgprValuC+55], v[vgprValuA_X0_I0+10:vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+52:vgprValuC+55] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+56:vgprValuC+59], v[vgprValuA_X0_I0+12:vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+56:vgprValuC+59] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+60:vgprValuC+63], v[vgprValuA_X0_I0+14:vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+60:vgprValuC+63] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+64:vgprValuC+67], v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+64:vgprValuC+67] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+68:vgprValuC+71], v[vgprValuA_X0_I0+2:vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+68:vgprValuC+71] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+72:vgprValuC+75], v[vgprValuA_X0_I0+4:vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+72:vgprValuC+75] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+76:vgprValuC+79], v[vgprValuA_X0_I0+6:vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+76:vgprValuC+79] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+80:vgprValuC+83], v[vgprValuA_X0_I0+8:vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+80:vgprValuC+83] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+84:vgprValuC+87], v[vgprValuA_X0_I0+10:vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+84:vgprValuC+87] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+88:vgprValuC+91], v[vgprValuA_X0_I0+12:vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+88:vgprValuC+91] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+92:vgprValuC+95], v[vgprValuA_X0_I0+14:vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+92:vgprValuC+95] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+96:vgprValuC+99], v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+96:vgprValuC+99] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+100:vgprValuC+103], v[vgprValuA_X0_I0+2:vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+100:vgprValuC+103] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+104:vgprValuC+107], v[vgprValuA_X0_I0+4:vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+104:vgprValuC+107] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+108:vgprValuC+111], v[vgprValuA_X0_I0+6:vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+108:vgprValuC+111] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+112:vgprValuC+115], v[vgprValuA_X0_I0+8:vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+112:vgprValuC+115] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+116:vgprValuC+119], v[vgprValuA_X0_I0+10:vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+116:vgprValuC+119] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+120:vgprValuC+123], v[vgprValuA_X0_I0+12:vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+120:vgprValuC+123] 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+124:vgprValuC+127], v[vgprValuA_X0_I0+14:vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+124:vgprValuC+127] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+4:vgprValuC+7], v[vgprValuA_X0_I0+2:vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+4:vgprValuC+7] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+8:vgprValuC+11], v[vgprValuA_X0_I0+4:vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+8:vgprValuC+11] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+12:vgprValuC+15], v[vgprValuA_X0_I0+6:vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+12:vgprValuC+15] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+16:vgprValuC+19], v[vgprValuA_X0_I0+8:vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+16:vgprValuC+19] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+20:vgprValuC+23], v[vgprValuA_X0_I0+10:vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+20:vgprValuC+23] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+24:vgprValuC+27], v[vgprValuA_X0_I0+12:vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+24:vgprValuC+27] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+28:vgprValuC+31], v[vgprValuA_X0_I0+14:vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+1], v[vgprValuC+28:vgprValuC+31] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+32:vgprValuC+35], v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+32:vgprValuC+35] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+36:vgprValuC+39], v[vgprValuA_X0_I0+2:vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+36:vgprValuC+39] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+40:vgprValuC+43], v[vgprValuA_X0_I0+4:vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+40:vgprValuC+43] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+44:vgprValuC+47], v[vgprValuA_X0_I0+6:vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+44:vgprValuC+47] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+48:vgprValuC+51], v[vgprValuA_X0_I0+8:vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+48:vgprValuC+51] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+52:vgprValuC+55], v[vgprValuA_X0_I0+10:vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+52:vgprValuC+55] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+56:vgprValuC+59], v[vgprValuA_X0_I0+12:vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+56:vgprValuC+59] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+60:vgprValuC+63], v[vgprValuA_X0_I0+14:vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+2:vgprValuB_X0_I0+3], v[vgprValuC+60:vgprValuC+63] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+64:vgprValuC+67], v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+64:vgprValuC+67] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+68:vgprValuC+71], v[vgprValuA_X0_I0+2:vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+68:vgprValuC+71] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+72:vgprValuC+75], v[vgprValuA_X0_I0+4:vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+72:vgprValuC+75] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+76:vgprValuC+79], v[vgprValuA_X0_I0+6:vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+76:vgprValuC+79] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+80:vgprValuC+83], v[vgprValuA_X0_I0+8:vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+80:vgprValuC+83] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+84:vgprValuC+87], v[vgprValuA_X0_I0+10:vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+84:vgprValuC+87] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+88:vgprValuC+91], v[vgprValuA_X0_I0+12:vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+88:vgprValuC+91] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+92:vgprValuC+95], v[vgprValuA_X0_I0+14:vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+5], v[vgprValuC+92:vgprValuC+95] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+96:vgprValuC+99], v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+96:vgprValuC+99] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+100:vgprValuC+103], v[vgprValuA_X0_I0+2:vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+100:vgprValuC+103] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+104:vgprValuC+107], v[vgprValuA_X0_I0+4:vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+104:vgprValuC+107] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+108:vgprValuC+111], v[vgprValuA_X0_I0+6:vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+108:vgprValuC+111] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+112:vgprValuC+115], v[vgprValuA_X0_I0+8:vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+112:vgprValuC+115] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+116:vgprValuC+119], v[vgprValuA_X0_I0+10:vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+116:vgprValuC+119] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+120:vgprValuC+123], v[vgprValuA_X0_I0+12:vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+120:vgprValuC+123] 
+v_mmac_i32_16x16x32_i8 v[vgprValuC+124:vgprValuC+127], v[vgprValuA_X0_I0+14:vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+6:vgprValuB_X0_I0+7], v[vgprValuC+124:vgprValuC+127] 
 s_setprio 0 // Reset priority after macs 
 .endm
 
 
 
 .macro MAC_32x4x2_X0_I0
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+0: vgprValuC+0+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+0: vgprValuC+0+3]
 s_setprio 1 // Raise priority while processing macs
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+4: vgprValuC+4+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+8: vgprValuC+8+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+12: vgprValuC+12+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+16: vgprValuC+16+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+20: vgprValuC+20+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+24: vgprValuC+24+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+28: vgprValuC+28+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+32: vgprValuC+32+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+36: vgprValuC+36+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+40: vgprValuC+40+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+44: vgprValuC+44+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+48: vgprValuC+48+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+52: vgprValuC+52+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+56: vgprValuC+56+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+60: vgprValuC+60+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+64: vgprValuC+64+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+68: vgprValuC+68+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+72: vgprValuC+72+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+76: vgprValuC+76+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+80: vgprValuC+80+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+84: vgprValuC+84+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+88: vgprValuC+88+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+92: vgprValuC+92+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+96: vgprValuC+96+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+100: vgprValuC+100+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+104: vgprValuC+104+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+108: vgprValuC+108+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+112: vgprValuC+112+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+116: vgprValuC+116+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+120: vgprValuC+120+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+124: vgprValuC+124+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+4: vgprValuC+4+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+8: vgprValuC+8+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+12: vgprValuC+12+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+16: vgprValuC+16+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+20: vgprValuC+20+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+24: vgprValuC+24+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+28: vgprValuC+28+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+32: vgprValuC+32+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+36: vgprValuC+36+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+40: vgprValuC+40+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+44: vgprValuC+44+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+48: vgprValuC+48+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+52: vgprValuC+52+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+56: vgprValuC+56+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X0_I0+0: vgprValuB_X0_I0+1], v[vgprValuC+60: vgprValuC+60+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+64: vgprValuC+64+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+68: vgprValuC+68+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+72: vgprValuC+72+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+76: vgprValuC+76+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+80: vgprValuC+80+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+84: vgprValuC+84+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+88: vgprValuC+88+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+92: vgprValuC+92+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+96: vgprValuC+96+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+100: vgprValuC+100+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+104: vgprValuC+104+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+108: vgprValuC+108+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+112: vgprValuC+112+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+116: vgprValuC+116+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+120: vgprValuC+120+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X0_I0+8: vgprValuB_X0_I0+9], v[vgprValuC+124: vgprValuC+124+3]
 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+0: vgprValuC+0+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+4: vgprValuC+4+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+8: vgprValuC+8+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+12: vgprValuC+12+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+16: vgprValuC+16+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+20: vgprValuC+20+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+24: vgprValuC+24+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+28: vgprValuC+28+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+32: vgprValuC+32+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+36: vgprValuC+36+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+40: vgprValuC+40+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+44: vgprValuC+44+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+48: vgprValuC+48+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+52: vgprValuC+52+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+56: vgprValuC+56+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+60: vgprValuC+60+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+64: vgprValuC+64+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+68: vgprValuC+68+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+72: vgprValuC+72+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+76: vgprValuC+76+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+80: vgprValuC+80+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+84: vgprValuC+84+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+88: vgprValuC+88+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+92: vgprValuC+92+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+96: vgprValuC+96+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+100: vgprValuC+100+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+104: vgprValuC+104+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+108: vgprValuC+108+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+112: vgprValuC+112+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+116: vgprValuC+116+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+120: vgprValuC+120+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+124: vgprValuC+124+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+0: vgprValuC+0+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+4: vgprValuC+4+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+8: vgprValuC+8+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+12: vgprValuC+12+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+16: vgprValuC+16+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+20: vgprValuC+20+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+24: vgprValuC+24+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+28: vgprValuC+28+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+32: vgprValuC+32+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+36: vgprValuC+36+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+40: vgprValuC+40+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+44: vgprValuC+44+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+48: vgprValuC+48+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+52: vgprValuC+52+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+56: vgprValuC+56+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X0_I0+2: vgprValuB_X0_I0+3], v[vgprValuC+60: vgprValuC+60+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+64: vgprValuC+64+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+68: vgprValuC+68+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+72: vgprValuC+72+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+76: vgprValuC+76+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+80: vgprValuC+80+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+84: vgprValuC+84+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+88: vgprValuC+88+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+92: vgprValuC+92+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+96: vgprValuC+96+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+100: vgprValuC+100+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+104: vgprValuC+104+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+108: vgprValuC+108+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+112: vgprValuC+112+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+116: vgprValuC+116+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+120: vgprValuC+120+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X0_I0+10: vgprValuB_X0_I0+11], v[vgprValuC+124: vgprValuC+124+3]
 s_setprio 0 // Reset priority after macs 
 .endm
 
 .macro MAC_32x4x2_X0_I1
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+0: vgprValuC+0+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+0: vgprValuC+0+3]
 s_setprio 1 // Raise priority while processing macs
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+4: vgprValuC+4+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+8: vgprValuC+8+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+12: vgprValuC+12+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+16: vgprValuC+16+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+20: vgprValuC+20+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+24: vgprValuC+24+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+28: vgprValuC+28+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+32: vgprValuC+32+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+36: vgprValuC+36+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+40: vgprValuC+40+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+44: vgprValuC+44+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+48: vgprValuC+48+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+52: vgprValuC+52+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+56: vgprValuC+56+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+60: vgprValuC+60+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+64: vgprValuC+64+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+68: vgprValuC+68+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+72: vgprValuC+72+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+76: vgprValuC+76+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+80: vgprValuC+80+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+84: vgprValuC+84+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+88: vgprValuC+88+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+92: vgprValuC+92+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+96: vgprValuC+96+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+100: vgprValuC+100+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+104: vgprValuC+104+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+108: vgprValuC+108+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+112: vgprValuC+112+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+116: vgprValuC+116+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+120: vgprValuC+120+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+124: vgprValuC+124+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+4: vgprValuC+4+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+8: vgprValuC+8+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+12: vgprValuC+12+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+16: vgprValuC+16+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+20: vgprValuC+20+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+24: vgprValuC+24+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+28: vgprValuC+28+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+32: vgprValuC+32+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+36: vgprValuC+36+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+40: vgprValuC+40+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+44: vgprValuC+44+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+48: vgprValuC+48+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+52: vgprValuC+52+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+56: vgprValuC+56+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X0_I0+4: vgprValuB_X0_I0+5], v[vgprValuC+60: vgprValuC+60+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+64: vgprValuC+64+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+68: vgprValuC+68+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+72: vgprValuC+72+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+76: vgprValuC+76+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+80: vgprValuC+80+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+84: vgprValuC+84+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+88: vgprValuC+88+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+92: vgprValuC+92+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+96: vgprValuC+96+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+100: vgprValuC+100+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+104: vgprValuC+104+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+108: vgprValuC+108+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+112: vgprValuC+112+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+116: vgprValuC+116+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+120: vgprValuC+120+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X0_I0+12: vgprValuB_X0_I0+13], v[vgprValuC+124: vgprValuC+124+3]
 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+0: vgprValuC+0+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+4: vgprValuC+4+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+8: vgprValuC+8+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+12: vgprValuC+12+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+16: vgprValuC+16+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+20: vgprValuC+20+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+24: vgprValuC+24+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+28: vgprValuC+28+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+32: vgprValuC+32+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+36: vgprValuC+36+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+40: vgprValuC+40+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+44: vgprValuC+44+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+48: vgprValuC+48+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+52: vgprValuC+52+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+56: vgprValuC+56+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+60: vgprValuC+60+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+64: vgprValuC+64+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+68: vgprValuC+68+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+72: vgprValuC+72+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+76: vgprValuC+76+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+80: vgprValuC+80+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+84: vgprValuC+84+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+88: vgprValuC+88+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+92: vgprValuC+92+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+96: vgprValuC+96+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+100: vgprValuC+100+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+104: vgprValuC+104+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+108: vgprValuC+108+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+112: vgprValuC+112+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+116: vgprValuC+116+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+120: vgprValuC+120+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+124: vgprValuC+124+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+0: vgprValuC+0+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+4: vgprValuC+4+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+8: vgprValuC+8+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+12: vgprValuC+12+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+16: vgprValuC+16+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+20: vgprValuC+20+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+24: vgprValuC+24+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+28: vgprValuC+28+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+32: vgprValuC+32+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+36: vgprValuC+36+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+40: vgprValuC+40+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+44: vgprValuC+44+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+48: vgprValuC+48+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+52: vgprValuC+52+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+56: vgprValuC+56+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X0_I0+6: vgprValuB_X0_I0+7], v[vgprValuC+60: vgprValuC+60+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+64: vgprValuC+64+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+68: vgprValuC+68+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+72: vgprValuC+72+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+76: vgprValuC+76+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+80: vgprValuC+80+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+84: vgprValuC+84+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+88: vgprValuC+88+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+92: vgprValuC+92+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+96: vgprValuC+96+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+100: vgprValuC+100+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+104: vgprValuC+104+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+108: vgprValuC+108+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+112: vgprValuC+112+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+116: vgprValuC+116+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+120: vgprValuC+120+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X0_I0+14: vgprValuB_X0_I0+15], v[vgprValuC+124: vgprValuC+124+3]
 s_setprio 0 // Reset priority after macs 
 .endm
 .macro MAC_32x4x2_X1_I0
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+0: vgprValuC+0+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+0: vgprValuC+0+3]
 s_setprio 1 // Raise priority while processing macs
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+4: vgprValuC+4+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+8: vgprValuC+8+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+12: vgprValuC+12+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+16: vgprValuC+16+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+20: vgprValuC+20+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+24: vgprValuC+24+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+28: vgprValuC+28+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+32: vgprValuC+32+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+36: vgprValuC+36+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+40: vgprValuC+40+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+44: vgprValuC+44+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+48: vgprValuC+48+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+52: vgprValuC+52+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+56: vgprValuC+56+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+60: vgprValuC+60+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+64: vgprValuC+64+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+68: vgprValuC+68+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+72: vgprValuC+72+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+76: vgprValuC+76+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+80: vgprValuC+80+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+84: vgprValuC+84+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+88: vgprValuC+88+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+92: vgprValuC+92+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+96: vgprValuC+96+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+100: vgprValuC+100+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+104: vgprValuC+104+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+108: vgprValuC+108+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+112: vgprValuC+112+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+116: vgprValuC+116+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+120: vgprValuC+120+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+124: vgprValuC+124+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+4: vgprValuC+4+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+8: vgprValuC+8+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+12: vgprValuC+12+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+16: vgprValuC+16+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+20: vgprValuC+20+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+24: vgprValuC+24+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+28: vgprValuC+28+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+32: vgprValuC+32+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+36: vgprValuC+36+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+40: vgprValuC+40+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+44: vgprValuC+44+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+48: vgprValuC+48+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+52: vgprValuC+52+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+56: vgprValuC+56+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X1_I0+0: vgprValuB_X1_I0+1], v[vgprValuC+60: vgprValuC+60+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+64: vgprValuC+64+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+68: vgprValuC+68+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+72: vgprValuC+72+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+76: vgprValuC+76+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+80: vgprValuC+80+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+84: vgprValuC+84+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+88: vgprValuC+88+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+92: vgprValuC+92+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+96: vgprValuC+96+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+100: vgprValuC+100+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+104: vgprValuC+104+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+108: vgprValuC+108+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+112: vgprValuC+112+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+116: vgprValuC+116+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+120: vgprValuC+120+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X1_I0+8: vgprValuB_X1_I0+9], v[vgprValuC+124: vgprValuC+124+3]
 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+0: vgprValuC+0+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+4: vgprValuC+4+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+8: vgprValuC+8+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+12: vgprValuC+12+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+16: vgprValuC+16+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+20: vgprValuC+20+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+24: vgprValuC+24+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+28: vgprValuC+28+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+32: vgprValuC+32+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+36: vgprValuC+36+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+40: vgprValuC+40+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+44: vgprValuC+44+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+48: vgprValuC+48+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+52: vgprValuC+52+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+56: vgprValuC+56+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+60: vgprValuC+60+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+64: vgprValuC+64+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+68: vgprValuC+68+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+72: vgprValuC+72+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+76: vgprValuC+76+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+80: vgprValuC+80+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+84: vgprValuC+84+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+88: vgprValuC+88+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+92: vgprValuC+92+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+96: vgprValuC+96+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+100: vgprValuC+100+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+104: vgprValuC+104+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+108: vgprValuC+108+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+112: vgprValuC+112+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+116: vgprValuC+116+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+120: vgprValuC+120+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+124: vgprValuC+124+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+0: vgprValuC+0+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+4: vgprValuC+4+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+8: vgprValuC+8+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+12: vgprValuC+12+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+16: vgprValuC+16+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+20: vgprValuC+20+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+24: vgprValuC+24+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+28: vgprValuC+28+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+32: vgprValuC+32+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+36: vgprValuC+36+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+40: vgprValuC+40+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+44: vgprValuC+44+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+48: vgprValuC+48+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+52: vgprValuC+52+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+56: vgprValuC+56+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X1_I0+2: vgprValuB_X1_I0+3], v[vgprValuC+60: vgprValuC+60+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+64: vgprValuC+64+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+68: vgprValuC+68+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+72: vgprValuC+72+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+76: vgprValuC+76+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+80: vgprValuC+80+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+84: vgprValuC+84+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+88: vgprValuC+88+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+92: vgprValuC+92+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+96: vgprValuC+96+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+100: vgprValuC+100+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+104: vgprValuC+104+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+108: vgprValuC+108+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+112: vgprValuC+112+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+116: vgprValuC+116+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+120: vgprValuC+120+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X1_I0+10: vgprValuB_X1_I0+11], v[vgprValuC+124: vgprValuC+124+3]
 s_setprio 0 // Reset priority after macs 
 .endm
 .macro MAC_32x4x2_X1_I1
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+0: vgprValuC+0+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+0: vgprValuC+0+3]
 s_setprio 1 // Raise priority while processing macs
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+4: vgprValuC+4+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+8: vgprValuC+8+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+12: vgprValuC+12+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+16: vgprValuC+16+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+20: vgprValuC+20+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+24: vgprValuC+24+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+28: vgprValuC+28+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+32: vgprValuC+32+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+36: vgprValuC+36+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+40: vgprValuC+40+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+44: vgprValuC+44+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+48: vgprValuC+48+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+52: vgprValuC+52+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+56: vgprValuC+56+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+60: vgprValuC+60+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+64: vgprValuC+64+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+68: vgprValuC+68+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+72: vgprValuC+72+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+76: vgprValuC+76+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+80: vgprValuC+80+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+84: vgprValuC+84+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+88: vgprValuC+88+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+92: vgprValuC+92+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+96: vgprValuC+96+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+100: vgprValuC+100+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+104: vgprValuC+104+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+108: vgprValuC+108+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+112: vgprValuC+112+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+116: vgprValuC+116+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+120: vgprValuC+120+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+124: vgprValuC+124+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+4: vgprValuC+4+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+8: vgprValuC+8+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+12: vgprValuC+12+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+16: vgprValuC+16+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+20: vgprValuC+20+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+24: vgprValuC+24+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+28: vgprValuC+28+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+32: vgprValuC+32+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+36: vgprValuC+36+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+40: vgprValuC+40+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+44: vgprValuC+44+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+48: vgprValuC+48+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+52: vgprValuC+52+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+56: vgprValuC+56+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X1_I0+4: vgprValuB_X1_I0+5], v[vgprValuC+60: vgprValuC+60+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+0: vgprValuA_X0_I0+1], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+64: vgprValuC+64+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+4: vgprValuA_X0_I0+5], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+68: vgprValuC+68+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+8: vgprValuA_X0_I0+9], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+72: vgprValuC+72+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+12: vgprValuA_X0_I0+13], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+76: vgprValuC+76+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+16: vgprValuA_X0_I0+17], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+80: vgprValuC+80+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+20: vgprValuA_X0_I0+21], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+84: vgprValuC+84+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+24: vgprValuA_X0_I0+25], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+88: vgprValuC+88+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+28: vgprValuA_X0_I0+29], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+92: vgprValuC+92+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+32: vgprValuA_X0_I0+33], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+96: vgprValuC+96+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+36: vgprValuA_X0_I0+37], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+100: vgprValuC+100+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+40: vgprValuA_X0_I0+41], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+104: vgprValuC+104+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+44: vgprValuA_X0_I0+45], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+108: vgprValuC+108+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+48: vgprValuA_X0_I0+49], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+112: vgprValuC+112+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+52: vgprValuA_X0_I0+53], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+116: vgprValuC+116+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+56: vgprValuA_X0_I0+57], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+120: vgprValuC+120+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+60: vgprValuA_X0_I0+61], v[vgprValuB_X1_I0+12: vgprValuB_X1_I0+13], v[vgprValuC+124: vgprValuC+124+3]
 
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+0: vgprValuC+0+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+4: vgprValuC+4+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+8: vgprValuC+8+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+12: vgprValuC+12+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+16: vgprValuC+16+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+20: vgprValuC+20+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+24: vgprValuC+24+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+28: vgprValuC+28+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+32: vgprValuC+32+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+36: vgprValuC+36+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+40: vgprValuC+40+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+44: vgprValuC+44+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+48: vgprValuC+48+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+52: vgprValuC+52+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+56: vgprValuC+56+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+60: vgprValuC+60+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+64: vgprValuC+64+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+68: vgprValuC+68+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+72: vgprValuC+72+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+76: vgprValuC+76+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+80: vgprValuC+80+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+84: vgprValuC+84+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+88: vgprValuC+88+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+92: vgprValuC+92+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+96: vgprValuC+96+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+100: vgprValuC+100+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+104: vgprValuC+104+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+108: vgprValuC+108+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+112: vgprValuC+112+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+116: vgprValuC+116+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+120: vgprValuC+120+3]
-v_mmac_f32_16x16x32_fp8_fp8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+124: vgprValuC+124+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+0: vgprValuC+0+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+0: vgprValuC+0+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+4: vgprValuC+4+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+4: vgprValuC+4+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+8: vgprValuC+8+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+8: vgprValuC+8+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+12: vgprValuC+12+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+12: vgprValuC+12+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+16: vgprValuC+16+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+16: vgprValuC+16+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+20: vgprValuC+20+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+20: vgprValuC+20+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+24: vgprValuC+24+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+24: vgprValuC+24+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+28: vgprValuC+28+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+28: vgprValuC+28+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+32: vgprValuC+32+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+32: vgprValuC+32+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+36: vgprValuC+36+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+36: vgprValuC+36+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+40: vgprValuC+40+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+40: vgprValuC+40+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+44: vgprValuC+44+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+44: vgprValuC+44+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+48: vgprValuC+48+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+48: vgprValuC+48+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+52: vgprValuC+52+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+52: vgprValuC+52+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+56: vgprValuC+56+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+56: vgprValuC+56+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+60: vgprValuC+60+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X1_I0+6: vgprValuB_X1_I0+7], v[vgprValuC+60: vgprValuC+60+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+64: vgprValuC+64+3], v[vgprValuA_X0_I0+2: vgprValuA_X0_I0+3], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+64: vgprValuC+64+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+68: vgprValuC+68+3], v[vgprValuA_X0_I0+6: vgprValuA_X0_I0+7], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+68: vgprValuC+68+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+72: vgprValuC+72+3], v[vgprValuA_X0_I0+10: vgprValuA_X0_I0+11], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+72: vgprValuC+72+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+76: vgprValuC+76+3], v[vgprValuA_X0_I0+14: vgprValuA_X0_I0+15], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+76: vgprValuC+76+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+80: vgprValuC+80+3], v[vgprValuA_X0_I0+18: vgprValuA_X0_I0+19], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+80: vgprValuC+80+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+84: vgprValuC+84+3], v[vgprValuA_X0_I0+22: vgprValuA_X0_I0+23], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+84: vgprValuC+84+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+88: vgprValuC+88+3], v[vgprValuA_X0_I0+26: vgprValuA_X0_I0+27], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+88: vgprValuC+88+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+92: vgprValuC+92+3], v[vgprValuA_X0_I0+30: vgprValuA_X0_I0+31], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+92: vgprValuC+92+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+96: vgprValuC+96+3], v[vgprValuA_X0_I0+34: vgprValuA_X0_I0+35], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+96: vgprValuC+96+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+100: vgprValuC+100+3], v[vgprValuA_X0_I0+38: vgprValuA_X0_I0+39], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+100: vgprValuC+100+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+104: vgprValuC+104+3], v[vgprValuA_X0_I0+42: vgprValuA_X0_I0+43], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+104: vgprValuC+104+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+108: vgprValuC+108+3], v[vgprValuA_X0_I0+46: vgprValuA_X0_I0+47], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+108: vgprValuC+108+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+112: vgprValuC+112+3], v[vgprValuA_X0_I0+50: vgprValuA_X0_I0+51], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+112: vgprValuC+112+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+116: vgprValuC+116+3], v[vgprValuA_X0_I0+54: vgprValuA_X0_I0+55], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+116: vgprValuC+116+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+120: vgprValuC+120+3], v[vgprValuA_X0_I0+58: vgprValuA_X0_I0+59], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+120: vgprValuC+120+3]
+v_mmac_i32_16x16x32_i8 v[vgprValuC+124: vgprValuC+124+3], v[vgprValuA_X0_I0+62: vgprValuA_X0_I0+63], v[vgprValuB_X1_I0+14: vgprValuB_X1_I0+15], v[vgprValuC+124: vgprValuC+124+3]
 s_setprio 0 // Reset priority after macs 
 .endm
 
@@ -1327,13 +1744,6 @@ s_load_dword s[sgprGSU], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x18
 s_load_dwordx2 s[sgprExternalArgAddress:sgprExternalArgAddress+1], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x4
 
 s_load_dwordx2 s[98:99], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x1c
-
-/* MegaMoE dispatch-pull L1: D-side aux kernarg carries row x metadata.
- * Default mode stores rank-local uint32 offsets in the low dword. Bit2 mode
- * stores {rank-local uint32 offset, source rank}. s52:s55 are reused by
- * COMPUTE_ADDRESS_SCALE, so keep the pointer in s100:s101 until B offset
- * initialization. */
-s_load_dwordx2 s[100:101], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x24
 /* Grouped Gemm: Load address of kernel arguments */
 s_load_dwordx2 s[sgprKernArgAddress:sgprKernArgAddress+1], s[sgprKernArgAddress:sgprKernArgAddress+1], 0xc
 s_waitcnt lgkmcnt(0)
@@ -1513,6 +1923,20 @@ label_EarlyStop_if_wg_exceed:
 s_endpgm
 label_NoEarlyStop_wgExceed:
 
+/* K3 graph bucket: skip row tiles beyond K1 compact runtime active tile count. */
+s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
+s_cbranch_scc1 .L_k3_active_tile_gate_done
+s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
+s_waitcnt lgkmcnt(0)
+s_cmp_eq_u64 s[90:91], 0
+s_cbranch_scc1 .L_k3_active_tile_gate_done
+s_load_dword s88, s[90:91], 0x0
+s_waitcnt lgkmcnt(0)
+s_cmp_ge_u32 s[sgprWorkGroup1], s88
+s_cbranch_scc0 .L_k3_active_tile_gate_done
+s_branch label_GW_End_20
+.L_k3_active_tile_gate_done:
+
 s_sub_u32 s[sgprAddressA+0], s[sgprAddressA+0], 16 // pre-pad to make room for possible pointer shift
 s_subb_u32 s[sgprAddressA+1], s[sgprAddressA+1], 0 // pre-pad to make room for possible pointer shift
 s_sub_u32 s[sgprAddressB+0], s[sgprAddressB+0], 16 // pre-pad to make room for possible pointer shift
@@ -1582,8 +2006,23 @@ v_mov_b32 v243, v[vgprLocalReadAddrA]
 ; s_mul_i32 s56, s56, 8                              // blockId * WGM
 ; s_add_u32 s[sgprWorkGroup1], s[sgprWorkGroup1], s56 // wg1 += blockId * WGM
 
-/* The route stage below defines sgprScaleFlag on both the prebuilt and
- * legacy metadata paths; the earlier fixed-layout quotient was dead. */
+/***********************读取m_indincs********************/
+s_mul_hi_u32 s13, MT1, s[sgprWorkGroup1]
+s_mul_i32    s12, MT1, s[sgprWorkGroup1]
+s_lshl_b64 s[12:13], s[12:13], 2
+
+s_add_u32 s[sgprSrdA+0], s98, s12
+s_addc_u32 s[sgprSrdA+1], s99, s13
+s_lshl_b32 s[sgprSrdA+2], s[sgprSizeJ], 2
+s_sub_i32 s[sgprSrdA+2], s[sgprSrdA+2], s12
+s_mov_b32 s[sgprSrdA+3], Srd127_96
+
+v_mov_b32 v10, 0
+buffer_load_dword v250, v10, s[sgprSrdA:sgprSrdA+3], 0, offen, offset:0x00
+s_waitcnt vmcnt(0)
+s_barrier
+
+v_readfirstlane_b32 s[sgprScaleFlag], v250
 
 /* global read addresses: tile offset assignment a */
 v_and_b32 v6, 0xff, v[vgprSerial]
@@ -1680,811 +2119,6 @@ Skip_supply_offset1B:
 s_mov_b32 s[sgprStrideStructB], 1                  // stride struct b
 s_mov_b32 s[sgprOffsetStructB], 0                  // offset struct b
 Skip_supply_offset2B:
-/* SYMMROUTE stage:
- * True fusion with one route scan for the local rank. The first four row
- * tiles (wg1 < 4) split source ranks, build metadata for all local expert
- * tiles, then publish meta_flags for those tiles. GEMM CTAs wait on their
- * per-tile flag; no full grid barrier is used.
- */
-s_lshl_b32 s56, s[sgprWorkGroup1], 8              // row tile base
-s_load_dword s10, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xcc
-s_load_dword s11, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
-s_load_dwordx2 s[82:83], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x78
-s_load_dwordx2 s[84:85], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xd0
-s_load_dwordx2 s[86:87], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xd8
-s_load_dwordx2 s[88:89], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xe0
-s_load_dwordx2 s[92:93], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa0 // route_scratch/counts base
-s_load_dwordx2 s[94:95], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x88 // staged_flags base
-s_load_dword s12, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc0
-s_waitcnt lgkmcnt(0)
-s_and_b32 s63, s12, 1
-s_cmp_eq_u32 s63, 1
-s_cbranch_scc1 label_SymmRoutePrebuiltWait
-s_mov_b32 s59, 0                                  // no compact tile_count fast path
-s_mov_b32 s[sgprScaleFlag], 0
-s_mov_b32 s58, s[sgprWorkGroup1]
-label_SymmRouteExpertDivLoop:
-s_cmp_lt_u32 s58, s10
-s_cbranch_scc1 label_SymmRouteExpertDivDone
-s_sub_u32 s58, s58, s10
-s_add_u32 s[sgprScaleFlag], s[sgprScaleFlag], 1
-s_branch label_SymmRouteExpertDivLoop
-label_SymmRouteExpertDivDone:
-s_lshl_b32 s58, s58, 8                            // first route row in expert tile
-s_add_u32 s57, s58, 0x100                         // one-past tile route row
-
-s_cmp_lt_u32 s[sgprWorkGroup1], 4
-s_cbranch_scc1 label_SymmRouteBuildTile
-s_branch label_SymmRouteWaitMeta
-
-label_SymmRouteBuildTile:
-s_cmp_eq_u32 s[sgprWorkGroup1], 0
-s_cbranch_scc1 label_SymmRouteCheckInitOwnerWg0
-s_branch label_SymmRouteWaitInit
-
-label_SymmRouteCheckInitOwnerWg0:
-s_cmp_eq_u32 s[sgprWorkGroup0], 0
-s_cbranch_scc1 label_SymmRouteInitOwner
-s_branch label_SymmRouteWaitInit
-
-label_SymmRouteInitOwner:
-/* Reset all local experts' atomic row counters. */
-s_mov_b64 s[52:53], s[92:93]
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_mov_b32 v250, v[vgprSerial]
-v_cmp_lt_u32 vcc, v250, 32
-s_and_saveexec_b64 s[80:81], vcc
-s_cbranch_execz label_SymmRouteCountsResetDone
-v_mov_b32 v252, 0
-v_lshlrev_b32 v253, 2, v250
-buffer_store_dword v252, v253, s[52:55], 0, offen, offset:0 glc
-label_SymmRouteCountsResetDone:
-s_mov_b64 exec, s[80:81]
-s_waitcnt vmcnt(0)
-
-/* Reset the route scanner done counter used by wg1==0 builders. */
-s_mov_b64 s[76:77], s[94:95]
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-s_mul_i32 s61, s[sgprWorkGroup1], s[sgprNumWorkGroups0]
-v_mov_b32 v253, s61
-v_lshlrev_b32 v253, 2, v253
-v_mov_b32 v252, 0
-buffer_store_dword v252, v253, s[76:79], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-
-/* Initialize every 256-row metadata tile for all local experts. */
-v_mov_b32 v250, v[vgprSerial]
-s_mov_b32 s60, 32
-s_mul_i32 s60, s60, s10
-s_lshl_b32 s60, s60, 8
-label_SymmRouteInitLoop:
-v_cmp_lt_u32 vcc, v250, s60
-s_and_saveexec_b64 s[80:81], vcc
-s_cbranch_execz label_SymmRouteInitDone
-v_mov_b32 v251, v250
-v_mov_b32 v252, 0xffffffff
-v_mov_b32 v253, 0xffffffff
-s_mov_b64 s[52:53], s[100:101]                    // row_x_offsets
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_lshlrev_b32 v254, 3, v251
-buffer_store_dwordx2 v[252:253], v254, s[52:55], 0, offen, offset:0 glc
-v_mov_b32 v252, 0
-v_mov_b32 v253, 0
-s_mov_b64 s[52:53], s[88:89]                    // row_combine_ptrs
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-buffer_store_dwordx2 v[252:253], v254, s[52:55], 0, offen, offset:0 glc
-v_mov_b32 v252, 0
-s_mov_b64 s[52:53], s[98:99]                    // m_indices
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_lshlrev_b32 v254, 2, v251
-buffer_store_dword v252, v254, s[52:55], 0, offen, offset:0 glc
-s_mov_b64 exec, s[80:81]
-v_add_u32 v250, 0x300, v250
-s_branch label_SymmRouteInitLoop
-label_SymmRouteInitDone:
-s_mov_b64 exec, s[80:81]
-s_waitcnt vmcnt(0)
-
-/* Clear the row_combine_ptrs padding used by vectorized K3 stores. */
-v_mov_b32 v250, v[vgprSerial]
-s_mov_b32 s61, 512
-label_SymmRouteCombinePaddingInitLoop:
-v_cmp_lt_u32 vcc, v250, s61
-s_and_saveexec_b64 s[80:81], vcc
-s_cbranch_execz label_SymmRouteCombinePaddingInitDone
-v_add_u32 v251, s60, v250
-v_mov_b32 v252, 0
-v_mov_b32 v253, 0
-s_mov_b64 s[52:53], s[88:89]                    // row_combine_ptrs
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_lshlrev_b32 v254, 3, v251
-buffer_store_dwordx2 v[252:253], v254, s[52:55], 0, offen, offset:0 glc
-s_mov_b64 exec, s[80:81]
-v_add_u32 v250, 0x300, v250
-s_branch label_SymmRouteCombinePaddingInitLoop
-label_SymmRouteCombinePaddingInitDone:
-s_mov_b64 exec, s[80:81]
-s_waitcnt vmcnt(0)
-
-/* For non-256 token tails, clear only the short tail output_index slices before
- * the route scan. Valid tail routes are emitted later and overwrite these -1s. */
-s_load_dword s90, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb8
-s_waitcnt lgkmcnt(0)
-s_and_b32 s63, s90, 0xff                             // tail tokens
-s_cmp_eq_u32 s63, 0
-s_cbranch_scc1 label_SymmOutputIndexTailClearDone
-s_sub_u32 s60, s90, s63                              // tail token start
-s_mul_i32 s60, s60, 6                                // tail route start in rank
-s_mul_i32 s62, s90, 6                                // routes per rank
-s_mul_i32 s63, s63, 6                                // tail routes per rank
-s_mov_b64 s[52:53], s[86:87]                         // output_index
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-s_mov_b32 s64, 0                                     // source rank
-label_SymmOutputIndexTailClearRankLoop:
-s_mul_i32 s65, s64, s62
-s_add_u32 s65, s65, s60                              // tail task base
-v_mov_b32 v250, v[vgprSerial]
-v_mov_b32 v252, 0xffffffff
-label_SymmOutputIndexTailClearLoop:
-v_cmp_lt_u32 vcc, v250, s63
-s_and_saveexec_b64 s[80:81], vcc
-s_cbranch_execz label_SymmOutputIndexTailClearRankDone
-v_add_u32 v253, s65, v250
-v_lshlrev_b32 v253, 2, v253
-buffer_store_dword v252, v253, s[52:55], 0, offen, offset:0 glc
-s_mov_b64 exec, s[80:81]
-v_add_u32 v250, 0x300, v250
-s_branch label_SymmOutputIndexTailClearLoop
-label_SymmOutputIndexTailClearRankDone:
-s_mov_b64 exec, s[80:81]
-s_add_u32 s64, s64, 1
-s_cmp_lt_u32 s64, 8
-s_cbranch_scc1 label_SymmOutputIndexTailClearRankLoop
-s_waitcnt vmcnt(0)
-label_SymmOutputIndexTailClearDone:
-s_barrier
-
-/* Publish init flag for sibling wg0 CTAs. Final meta_ready uses generation+1. */
-s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xe8
-s_waitcnt lgkmcnt(0)
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_mov_b32 v252, s11
-v_mov_b32 v253, 0
-v_lshlrev_b32 v253, 2, v253
-buffer_store_dword v252, v253, s[52:55], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-s_branch label_SymmRouteInitReady
-
-label_SymmRouteWaitInit:
-s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xe8
-s_waitcnt lgkmcnt(0)
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_mov_b32 v253, 0
-v_lshlrev_b32 v253, 2, v253
-label_SymmRouteInitWaitRetry:
-buffer_load_dword v252, v253, s[52:55], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s63, v252
-s_cmp_eq_u32 s63, s11
-s_cbranch_scc1 label_SymmRouteInitReady
-s_sleep 1
-s_branch label_SymmRouteInitWaitRetry
-
-label_SymmRouteInitReady:
-
-/* Atomic route scan: the 16 wg0 CTAs of this expert tile split token-topk
- * routes. Row order is intentionally nondeterministic; output_index carries the
- * row mapping used by the correctness harness and downstream combine path. */
-s_load_dword s90, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb8 // num_tokens
-s_load_dword s91, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb4 // max tokens/rank
-s_load_dwordx2 s[68:69], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x90
-s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x98 // local_sym_buffer
-s_load_dword s70, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xa8 // rank
-s_waitcnt lgkmcnt(0)
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_mov_b32 v253, 0x84
-buffer_load_dword v236, v253, s[52:55], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s13, v236                     // uniform runtime num_tokens flag
-s_mov_b32 s14, s91                                // preserve max tokens; s[90:91] is reused for exec masks below
-s_lshl_b32 s70, s70, 5                            // global expert base for rank
-s_add_u32 s74, s70, s[sgprScaleFlag]              // target global expert
-s_mul_i32 s71, s91, s[sgprSizeL]
-s_add_u32 s71, s71, 0x90                          // x_sf offset
-s_lshl_b32 s72, s91, 2
-s_add_u32 s72, s71, s72                           // topk_idx offset
-s_mul_i32 s73, s91, 6
-s_lshl_b32 s73, s73, 3
-s_add_u32 s73, s72, s73                           // topk_weights offset
-s_mov_b32 s57, s10
-s_lshl_b32 s57, s57, 8                            // one-past expert route row
-s_mov_b32 s60, s[sgprWorkGroup1]                 // source rank split by builder row tile
-
-label_SymmRouteParallelRankLoop:
-s_load_dword s90, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xb8 // refresh num_tokens after s90:s91 saveexec reuse
-s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x98
-s_waitcnt lgkmcnt(0)
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_mov_b32 v253, s60
-v_lshlrev_b32 v253, 3, v253
-buffer_load_dwordx2 v[236:237], v253, s[52:55], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s64, v236
-v_readfirstlane_b32 s65, v237
-s_mov_b32 s66, BufferLimit
-s_mov_b32 s67, Srd127_96
-s_cmp_eq_u32 s13, 0
-s_cbranch_scc1 label_SymmRouteLoadSourceNumTokens
-s_mul_i32 s63, s60, s90
-s_branch label_SymmRouteSourceTaskBaseReady
-label_SymmRouteLoadSourceNumTokens:
-v_mov_b32 v253, 0x80
-buffer_load_dword v236, v253, s[64:67], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s90, v236                     // source rank runtime num_tokens
-s_mul_i32 s63, s60, s14
-label_SymmRouteSourceTaskBaseReady:
-s_mul_i32 s63, s63, 6                             // task base for source rank
-
-s_mul_i32 s62, s90, 6                              // routes per source rank
-s_mul_i32 s61, s[sgprWorkGroup0], 0x300
-v_add_u32 v250, s61, v[vgprSerial]                // route offset in source rank
-s_mul_i32 s61, s[sgprNumWorkGroups0], 0x300       // route offset stride
-label_SymmRouteAtomicRouteLoop:
-v_cmp_lt_u32 vcc, v250, s62
-s_and_saveexec_b64 s[80:81], vcc
-s_cbranch_execz label_SymmRouteAtomicRoutesDone
-
-/* token = route / 6, slot = route % 6 */
-v_mov_b32 v236, 0xaaaaaaab
-v_mul_hi_u32 v251, v250, v236
-v_lshrrev_b32 v251, 2, v251
-v_mul_u32_u24 v252, v251, 6
-v_sub_u32 v253, v250, v252
-v_mov_b32 v245, v253                              // topk slot for combine row
-v_add_u32 v239, s63, v250                         // global task
-
-v_lshlrev_b32 v254, 3, v250
-v_add_u32 v254, s72, v254
-buffer_load_dword v236, v254, s[64:67], 0, offen, offset:0 glc
-v_lshlrev_b32 v252, 2, v250
-v_add_u32 v252, s73, v252
-buffer_load_dword v237, v252, s[64:67], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-
-s_add_u32 s75, s70, 32
-v_cmp_lt_u32 s[52:53], v236, s70
-v_cmp_ge_u32 vcc, v236, s75
-s_or_b64 s[52:53], s[52:53], vcc
-v_cmp_eq_u32 vcc, 0, v237
-s_or_b64 s[52:53], s[52:53], vcc
-s_and_saveexec_b64 s[54:55], s[52:53]
-s_cbranch_execz label_SymmRouteEmitInvalidDone
-s_mov_b64 s[76:77], s[86:87]
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-v_mov_b32 v252, 0xffffffff
-v_lshlrev_b32 v253, 2, v239
-buffer_store_dword v252, v253, s[76:79], 0, offen, offset:0
-label_SymmRouteEmitInvalidDone:
-s_mov_b64 exec, s[54:55]
-
-v_cmp_ge_u32 s[52:53], v236, s70
-v_cmp_lt_u32 vcc, v236, s75
-s_and_b64 s[52:53], s[52:53], vcc
-v_cmp_ne_u32 vcc, 0, v237
-s_and_b64 s[52:53], s[52:53], vcc
-s_and_saveexec_b64 s[54:55], s[52:53]
-s_cbranch_execz label_SymmRouteEmitTargetDone
-v_sub_u32 v244, v236, s70                         // local expert
-v_mov_b32 v252, v244
-v_lshlrev_b32 v252, 2, v252
-v_mov_b32 v238, 1
-global_atomic_add v240, v252, v238, s[92:93] glc
-s_waitcnt vmcnt(0)
-v_cmp_lt_u32 vcc, v240, s57
-s_and_saveexec_b64 s[90:91], vcc
-s_cbranch_execz label_SymmRouteEmitTileDone
-s_lshl_b32 s59, s10, 8                            // rows per expert
-v_mul_lo_u32 v241, s59, v244
-v_add_u32 v241, v241, v240                         // global metadata row
-
-s_mov_b64 s[76:77], s[86:87]                      // output_index
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-v_mov_b32 v252, v241
-v_lshlrev_b32 v253, 2, v239
-buffer_store_dword v252, v253, s[76:79], 0, offen, offset:0
-
-s_and_b32 s78, s12, 4
-s_cmp_eq_u32 s78, 4
-s_cbranch_scc1 label_SymmRouteStoreRankLocalPtr
-v_lshlrev_b32 v252, 12, v251
-s_add_u32 s76, s64, 0x90
-s_addc_u32 s77, s65, 0
-s_sub_u32 s76, s76, s68
-s_subb_u32 s77, s77, s69
-v_add_u32 v252, s76, v252
-v_mov_b32 v253, 0
-s_branch label_SymmRouteStorePtrReady
-label_SymmRouteStoreRankLocalPtr:
-v_lshlrev_b32 v252, 12, v251
-v_add_u32 v252, 0x90, v252
-v_mov_b32 v253, s60
-label_SymmRouteStorePtrReady:
-v_lshlrev_b32 v254, 3, v241
-s_mov_b64 s[76:77], s[100:101]
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-buffer_store_dwordx2 v[252:253], v254, s[76:79], 0, offen, offset:0 glc
-
-v_lshlrev_b32 v252, 2, v251
-v_add_u32 v252, s71, v252
-buffer_load_dword v238, v252, s[64:67], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-v_lshlrev_b32 v253, 2, v241
-s_mov_b64 s[76:77], s[82:83]
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-buffer_store_dword v238, v253, s[76:79], 0, offen, offset:0 glc
-s_mov_b64 s[76:77], s[84:85]
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-buffer_store_dword v237, v253, s[76:79], 0, offen, offset:0
-v_lshlrev_b32 v254, 3, v241
-v_mul_lo_u32 v238, v245, s14
-v_add_u32 v238, v238, v251
-v_lshlrev_b32 v238, 13, v238
-s_mul_i32 s76, s14, 0x104c
-s_add_u32 s76, s76, 0x90
-v_add_u32 v238, s76, v238
-v_add_u32 v252, s64, v238
-v_cmp_lt_u32 s[50:51], v252, v238
-v_cndmask_b32 v239, 0, 1, s[50:51]
-v_add_u32 v239, s65, v239
-v_mov_b32 v238, v252
-s_mov_b64 s[76:77], s[88:89]
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-buffer_store_dwordx2 v[238:239], v254, s[76:79], 0, offen, offset:0
-s_mov_b64 s[76:77], s[98:99]
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-v_mov_b32 v252, v244
-buffer_store_dword v252, v253, s[76:79], 0, offen, offset:0
-label_SymmRouteEmitTileDone:
-s_mov_b64 exec, s[90:91]
-label_SymmRouteEmitTargetDone:
-s_mov_b64 exec, s[54:55]
-
-s_mov_b64 exec, s[80:81]
-v_add_u32 v250, s61, v250
-s_branch label_SymmRouteAtomicRouteLoop
-label_SymmRouteAtomicRoutesDone:
-s_mov_b64 exec, s[80:81]
-s_add_u32 s60, s60, 4
-s_cmp_lt_u32 s60, 8
-s_cbranch_scc1 label_SymmRouteParallelRankLoop
-
-s_waitcnt vmcnt(0)
-
-/* Mark this wg0 scan done. Lane0 of the last scanner publishes final
- * meta_ready; no CTA waits for sibling route scanners. */
-s_mov_b64 s[76:77], s[94:95]
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-s_mov_b32 s61, 0
-v_mov_b32 v253, 0
-v_cmp_eq_u32 vcc, v[vgprSerial], 0
-s_and_saveexec_b64 s[54:55], vcc
-s_cbranch_execz label_SymmRouteClearLastFlagDone
-v_mov_b32 v252, 0
-ds_write_b32 v253, v252, offset:65532
-label_SymmRouteClearLastFlagDone:
-s_mov_b64 exec, s[54:55]
-s_waitcnt lgkmcnt(0)
-s_barrier
-
-v_cmp_eq_u32 vcc, v[vgprSerial], 0
-s_and_saveexec_b64 s[54:55], vcc
-s_cbranch_execz label_SymmRouteDoneCounterAtomicDone
-v_mov_b32 v253, s61
-v_lshlrev_b32 v253, 2, v253
-v_mov_b32 v238, 1
-global_atomic_add v240, v253, v238, s[76:77] glc
-s_waitcnt vmcnt(0)
-s_lshl_b32 s62, s[sgprNumWorkGroups0], 2
-s_sub_u32 s62, s62, 1
-v_cmp_eq_u32 vcc, v240, s62
-s_and_saveexec_b64 s[52:53], vcc
-s_cbranch_execz label_SymmRouteNotLastScanner
-v_mov_b32 v253, 0
-v_mov_b32 v252, 1
-ds_write_b32 v253, v252, offset:65532
-s_branch label_SymmRouteLastFlagSet
-label_SymmRouteNotLastScanner:
-s_mov_b64 exec, s[52:53]
-label_SymmRouteLastFlagSet:
-s_mov_b64 exec, s[52:53]
-label_SymmRouteDoneCounterAtomicDone:
-s_mov_b64 exec, s[54:55]
-s_waitcnt lgkmcnt(0)
-s_barrier
-v_mov_b32 v253, 0
-ds_read_b32 v252, v253, offset:65532
-s_waitcnt lgkmcnt(0)
-v_readfirstlane_b32 s63, v252
-s_cmp_eq_u32 s63, 1
-s_cbranch_scc1 label_SymmRoutePublishMeta
-s_branch label_SymmRouteWaitMeta
-
-label_SymmRoutePublishMeta:
-s_waitcnt vmcnt(0)
-s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xe8
-s_load_dwordx2 s[76:77], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xf0
-s_waitcnt lgkmcnt(0)
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-/* Fold per-expert receive stats into the route scan's final publisher. */
-s_cmp_eq_u64 s[76:77], 0
-s_cbranch_scc1 label_SymmRouteStatsDone
-v_mov_b32 v250, v[vgprSerial]
-v_cmp_lt_u32 vcc, v250, 32
-s_and_saveexec_b64 s[80:81], vcc
-s_cbranch_execz label_SymmRouteStatsLaneDone
-s_mov_b64 s[52:53], s[92:93]
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_lshlrev_b32 v253, 2, v250
-buffer_load_dword v252, v253, s[52:55], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-s_mov_b32 s78, BufferLimit
-s_mov_b32 s79, Srd127_96
-global_atomic_add v240, v253, v252, s[76:77] glc
-label_SymmRouteStatsLaneDone:
-s_mov_b64 exec, s[80:81]
-s_waitcnt vmcnt(0)
-s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xe8
-s_waitcnt lgkmcnt(0)
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-label_SymmRouteStatsDone:
-/* Publish every tile for all local experts. */
-s_mov_b32 s60, 32
-s_mul_i32 s60, s60, s10
-s_mov_b32 s61, 0
-label_SymmRoutePublishMetaLoop:
-s_add_u32 s62, s11, 1
-v_mov_b32 v252, s62
-v_mov_b32 v253, s61
-v_lshlrev_b32 v253, 2, v253
-buffer_store_dword v252, v253, s[52:55], 0, offen, offset:0 glc
-s_add_u32 s61, s61, 1
-s_cmp_lt_u32 s61, s60
-s_cbranch_scc1 label_SymmRoutePublishMetaLoop
-s_waitcnt vmcnt(0)
-
-label_SymmRouteScanDone:
-s_mov_b64 exec, s[80:81]
-s_barrier
-s_branch label_SymmRouteMetaReady
-
-label_SymmRouteWaitMeta:
-s_load_dwordx2 s[52:53], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xe8
-s_waitcnt lgkmcnt(0)
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-v_mov_b32 v253, s[sgprWorkGroup1]
-v_lshlrev_b32 v253, 2, v253
-label_SymmRouteMetaWaitRetry:
-buffer_load_dword v252, v253, s[52:55], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s63, v252
-s_add_u32 s62, s11, 1
-s_cmp_eq_u32 s63, s62
-s_cbranch_scc1 label_SymmRouteMetaReady
-s_sleep 1
-s_branch label_SymmRouteMetaWaitRetry
-
-label_SymmRoutePrebuiltWait:
-s_mov_b64 s[52:53], s[92:93]
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-s_load_dword s61, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc4 // packed compact metadata
-s_waitcnt lgkmcnt(0)
-s_and_b32 s62, s61, 0xffff                         // route_scratch active_tiles i32 offset
-v_mov_b32 v253, s62
-v_lshlrev_b32 v253, 2, v253
-buffer_load_dword v252, v253, s[52:55], 0, offen, offset:0
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s60, v252
-s_cmp_ge_u32 s[sgprWorkGroup1], s60
-s_cbranch_scc0 label_SymmRoutePrebuiltActiveTile
-s_endpgm
-
-label_SymmRoutePrebuiltActiveTile:
-	s_and_b32 s62, s61, 0xffff                         // active_tiles offset
-	s_add_u32 s62, s62, 1                              // tile_experts offset
-	s_add_u32 s62, s62, s[sgprWorkGroup1]
-	v_mov_b32 v253, s62
-	v_lshlrev_b32 v253, 2, v253                        // route_scratch_i32[tile_experts + compact tile]
-	buffer_load_dword v252, v253, s[52:55], 0, offen, offset:0
-	s_waitcnt vmcnt(0)
-	v_readfirstlane_b32 s[sgprScaleFlag], v252
-	s_lshr_b32 s62, s61, 16                            // local_experts
-s_cmp_ge_u32 s[sgprScaleFlag], s62
-s_cmov_b32 s[sgprScaleFlag], 0
-s_branch label_SymmRouteMetaReady
-
-label_SymmRouteMetaReady:
-/* MegaMoE dispatch-pull stage:
- * The N-tile CTAs for each row tile cooperatively pull one 256 x hidden x tile.
- * Each CTA copies a disjoint vector slice, atomically bumps one row-tile done
- * counter, then waits on that single counter before the original DeepGEMM B
- * addressing reads the shared staged_x.
- */
-s_lshl_b32 s56, s[sgprWorkGroup1], 8
-s_load_dwordx2 s[64:65], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x80
-s_load_dwordx2 s[72:73], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x88
-s_load_dwordx2 s[68:69], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x90
-s_load_dword s11, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
-s_load_dword s12, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc0
-s_waitcnt lgkmcnt(0)
-s_and_b32 s63, s12, 4
-s_cmp_eq_u32 s63, 4
-s_cbranch_scc0 label_SymmStageLocalSymBufferReady
-s_load_dwordx2 s[76:77], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x98
-s_waitcnt lgkmcnt(0)
-label_SymmStageLocalSymBufferReady:
-s_mov_b32 s62, 0                                  // shared staged_x plane
-s_mov_b64 s[52:53], s[100:101]                    // row_x_offsets SRD
-s_mov_b32 s54, BufferLimit
-s_mov_b32 s55, Srd127_96
-s_mov_b32 s66, BufferLimit                        // staged_x SRD
-s_mov_b32 s67, Srd127_96
-s_mov_b32 s70, BufferLimit                        // symm source SRD
-s_mov_b32 s71, Srd127_96
-s_mov_b32 s74, BufferLimit                        // staged_flags SRD
-s_mov_b32 s75, Srd127_96
-
-/* Reset one per-row-tile done counter. Slot base+0 holds the counter and
- * base+1 holds a generation flag that releases sibling CTAs after reset. */
-s_mul_i32 s61, s[sgprWorkGroup1], s[sgprNumWorkGroups0]
-s_add_u32 s63, s61, 1
-s_cmp_eq_u32 s[sgprWorkGroup0], 0
-s_cbranch_scc1 label_SymmStageResetOwner
-s_branch label_SymmStageWaitReset
-
-label_SymmStageResetOwner:
-v_cmp_eq_u32 vcc, v[vgprSerial], 0
-s_and_saveexec_b64 s[90:91], vcc
-s_cbranch_execz label_SymmStageResetOwnerDone
-v_mov_b32 v253, s61
-v_lshlrev_b32 v253, 2, v253
-v_mov_b32 v252, 0
-buffer_store_dword v252, v253, s[72:75], 0, offen, offset:0 glc
-v_mov_b32 v253, s63
-v_lshlrev_b32 v253, 2, v253
-v_mov_b32 v252, s11
-buffer_store_dword v252, v253, s[72:75], 0, offen, offset:0 glc
-label_SymmStageResetOwnerDone:
-s_mov_b64 exec, s[90:91]
-s_waitcnt vmcnt(0)
-s_branch label_SymmStageResetReady
-
-label_SymmStageWaitReset:
-v_mov_b32 v253, s63
-v_lshlrev_b32 v253, 2, v253
-label_SymmStageWaitResetRetry:
-buffer_load_dword v252, v253, s[72:75], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s60, v252
-s_cmp_eq_u32 s60, s11
-s_cbranch_scc1 label_SymmStageResetReady
-s_sleep 1
-s_branch label_SymmStageWaitResetRetry
-
-label_SymmStageResetReady:
-
-v_mov_b32 v250, v[vgprSerial]
-s_mov_b32 s60, 0x100
-v_cmp_lt_u32 vcc, v250, s60
-s_and_saveexec_b64 s[90:91], vcc
-s_cbranch_execz label_SymmOffsetCacheDone
-v_add_u32 v251, s56, v250                         // global staged row
-v_lshlrev_b32 v254, 3, v251
-buffer_load_dwordx2 v[252:253], v254, s[52:55], 0, offen, offset:0
-v_lshlrev_b32 v254, 3, v250                       // LDS row-pointer slot
-s_waitcnt vmcnt(0)
-ds_write_b32 v254, v252, offset:0
-v_add_u32 v254, 4, v254
-ds_write_b32 v254, v253, offset:0
-label_SymmOffsetCacheDone:
-s_mov_b64 exec, s[90:91]
-s_waitcnt lgkmcnt(0)
-s_barrier
-
-s_mov_b32 s58, 5                                  // staging producer CTA count
-s_cmp_ge_u32 s10, 2
-s_cmov_b32 s58, 8
-s_cmp_lt_u32 s[sgprWorkGroup0], s58
-s_cbranch_scc0 label_SymmSliceDone
-s_mul_i32 s61, s[sgprWorkGroup0], 0x300           // slice start = wg0 * blockDim
-v_add_u32 v250, s61, v[vgprSerial]
-s_lshl_b32 s60, s[sgprSizeL], 3                  // 256 rows * hidden bytes / 32
-s_mul_i32 s61, s58, 0x300                         // slice stride = producer CTAs * blockDim
-label_SymmStageLoop:
-v_cmp_lt_u32 vcc, v250, s60
-s_and_saveexec_b64 s[90:91], vcc
-s_cbranch_execz label_SymmSliceDone
-s_cmp_eq_u32 s[sgprSizeL], 4096
-s_cbranch_scc0 label_SymmStageProIndex
-v_lshrrev_b32 v251, 7, v250                       // Flash row in 256-row tile
-v_and_b32 v252, 127, v250                         // Flash 32-byte vector index in row
-s_branch label_SymmStageIndexDone
-label_SymmStageProIndex:
-v_lshrrev_b32 v251, 5, v250                       // Pro: divide vector index by 32
-s_mov_b32 s63, 9363                               // exact /7 for q <= 1791
-v_mul_lo_u32 v251, s63, v251
-v_lshrrev_b32 v251, 16, v251                      // row = vec / 224
-s_mov_b32 s63, 224                                // Pro row stride in 32-byte vectors
-v_mul_lo_u32 v252, s63, v251                      // row start vector
-v_sub_u32 v252, v250, v252                        // Pro 32-byte vector index in row
-label_SymmStageIndexDone:
-v_lshlrev_b32 v253, 3, v251
-ds_read_b64 v[253:254], v253, offset:0
-s_waitcnt lgkmcnt(0)
-v_lshlrev_b32 v252, 5, v252
-v_cmp_ne_u32 vcc, v254, 0xffffffff
-s_and_saveexec_b64 s[54:55], vcc
-s_cbranch_execz label_SymmStageSkipSourceLoad
-s_and_b32 s63, s12, 4
-s_cmp_eq_u32 s63, 4
-s_cbranch_scc1 label_SymmStageLoadRankLocalPtr
-v_add_u32 v253, v253, v252
-buffer_load_dwordx4 v[232:235], v253, s[68:71], 0, offen, offset:0
-v_add_u32 v253, 16, v253
-buffer_load_dwordx4 v[236:239], v253, s[68:71], 0, offen, offset:0
-s_branch label_SymmStageSourceLoadIssued
-
-label_SymmStageLoadRankLocalPtr:
-/* Pro rows are 224 x 32-byte chunks, so a wave can cover the tail of one
- * staged row and the head of the next. The rows may come from different source
- * ranks; do not scalarize v254 once for the whole wave. */
-s_mov_b64 s[78:79], exec
-label_SymmStageRankLocalLoop:
-s_cbranch_execz label_SymmStageRankLocalDone
-v_readfirstlane_b32 s63, v254
-s_lshl_b32 s62, s63, 3
-s_load_dwordx2 s[68:69], s[76:77], s62
-v_cmp_eq_u32 vcc, v254, s63
-s_and_saveexec_b64 s[80:81], vcc
-s_waitcnt lgkmcnt(0)
-v_add_u32 v253, v253, v252
-buffer_load_dwordx4 v[232:235], v253, s[68:71], 0, offen, offset:0
-v_add_u32 v253, 16, v253
-buffer_load_dwordx4 v[236:239], v253, s[68:71], 0, offen, offset:0
-s_waitcnt vmcnt(0)
-s_mov_b64 exec, s[80:81]
-v_cmp_ne_u32 vcc, v254, s63
-s_and_b64 exec, exec, vcc
-s_branch label_SymmStageRankLocalLoop
-label_SymmStageRankLocalDone:
-s_mov_b64 exec, s[78:79]
-label_SymmStageSourceLoadIssued:
-s_waitcnt vmcnt(0)
-label_SymmStageSkipSourceLoad:
-s_andn2_b64 exec, s[54:55], exec
-s_cbranch_execz label_SymmStageZeroFillDone
-v_mov_b32 v232, 0
-v_mov_b32 v233, 0
-v_mov_b32 v234, 0
-v_mov_b32 v235, 0
-v_mov_b32 v236, 0
-v_mov_b32 v237, 0
-v_mov_b32 v238, 0
-v_mov_b32 v239, 0
-label_SymmStageZeroFillDone:
-s_mov_b64 exec, s[54:55]
-v_add_u32 v251, s56, v251                         // global staged row
-s_cmp_eq_u32 s[sgprSizeL], 4096
-s_cbranch_scc0 label_SymmStageStoreDynamicStride
-v_lshlrev_b32 v251, 12, v251
-s_branch label_SymmStageStoreStrideDone
-label_SymmStageStoreDynamicStride:
-v_mul_lo_u32 v251, s[sgprSizeL], v251              // global staged row * hidden
-label_SymmStageStoreStrideDone:
-v_add_u32 v251, v251, v252
-buffer_store_dwordx4 v[232:235], v251, s[64:67], 0, offen, offset:0
-v_add_u32 v251, 16, v251
-buffer_store_dwordx4 v[236:239], v251, s[64:67], 0, offen, offset:0
-s_mov_b64 exec, s[90:91]
-v_add_u32 v250, s61, v250
-s_branch label_SymmStageLoop
-
-label_SymmSliceDone:
-s_mov_b64 exec, s[90:91]
-s_waitcnt vmcnt(0)
-s_barrier                                          // this CTA's waves finish before its done counter
-s_mul_i32 s61, s[sgprWorkGroup1], s[sgprNumWorkGroups0]
-s_cmp_lt_u32 s[sgprWorkGroup0], s58
-s_cbranch_scc0 label_SymmStageCounterAtomicDone
-v_cmp_eq_u32 vcc, v[vgprSerial], 0
-s_and_saveexec_b64 s[90:91], vcc
-s_cbranch_execz label_SymmStageCounterAtomicDone
-v_mov_b32 v253, s61
-v_lshlrev_b32 v253, 2, v253
-v_mov_b32 v238, 1
-global_atomic_add v240, v253, v238, s[72:73] glc
-label_SymmStageCounterAtomicDone:
-s_mov_b64 exec, s[90:91]
-s_waitcnt vmcnt(0)
-
-label_SymmDoneCounterWait:
-v_mov_b32 v253, s61
-v_lshlrev_b32 v253, 2, v253
-buffer_load_dword v252, v253, s[72:75], 0, offen, offset:0 glc
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s63, v252
-s_cmp_ge_u32 s63, s58
-s_cbranch_scc1 label_SymmStageReady
-s_sleep 1
-s_branch label_SymmDoneCounterWait
-
-label_SymmStageReady:
-s_waitcnt vmcnt(0)
-buffer_wbinvl1
-
-/* Route build borrows s92:s95 for scratch bases; restore scaleA/scaleB before
- * the original DeepGEMM address macros consume them. */
-s_load_dwordx4 s[92:95], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0x70
-s_waitcnt lgkmcnt(0)
-
-/* Restore SGPRs that overlap the temporary staged_flags SRD. */
-v_lshrrev_b32 v[vgprValuA_X0_I0], 6, v[vgprSerial]
-v_readfirstlane_b32 s[sgprWaveiD], v[vgprValuA_X0_I0]
-s_mov_b32 s[sgprMask], 0x10000
-/* Route emit used s76:s79 as temporary SRDs; rebuild B swizzle state before
- * the original B offset macros consume it. */
-s_mov_b32 s[sgprStructBitB], 0
-s_cmp_ge_u32 s[sgprStrideB1J], 256
-s_cmov_b32 s[sgprStructBitB], 8
-s_cmp_ge_u32 s[sgprStrideB1J], 512
-s_cmov_b32 s[sgprStructBitB], 9
-s_cmp_ge_u32 s[sgprStrideB1J], 1024
-s_cmov_b32 s[sgprStructBitB], 10
-s_cmp_ge_u32 s[sgprStrideB1J], 2048
-s_cmov_b32 s[sgprStructBitB], 11
-s_cmp_ge_u32 s[sgprStrideB1J], 4096
-s_cmov_b32 s[sgprStructBitB], 12
-s_lshl_b32 s[sgprStrideSwizzleB], 1, s[sgprStructBitB]
-s_cmp_lt_u32 s[sgprStrideB1J], s[sgprStrideSwizzleB]
-s_cbranch_scc1 label_SymmRestoreStructSmallB
-s_lshr_b32 s[sgprStrideStructB], s[sgprStrideB1J], s[sgprStructBitB]
-s_lshl_b32 s[sgprOffsetStructB], s[sgprStrideStructB], s[sgprStructBitB]
-s_sub_u32 s[sgprOffsetStructB], s[sgprStrideB1J], s[sgprOffsetStructB]
-s_branch label_SymmRestoreStructDoneB
-label_SymmRestoreStructSmallB:
-s_mov_b32 s[sgprStrideStructB], 1
-s_mov_b32 s[sgprOffsetStructB], 0
-label_SymmRestoreStructDoneB:
-/* The rank-local staging loop reuses s62 for source-rank pointer slots.  B
- * reads from the staged_x plane, whose extra base offset is zero. */
-s_mov_b32 s62, 0
-s_add_u32 s[sgprAddressB+0], s[sgprAddressB+0], s62
-s_addc_u32 s[sgprAddressB+1], s[sgprAddressB+1], 0
-
 GLOBAL_OFFSET_B vgprGlobalReadOffsetBForSWTL+0,  9,  6, 10 // gROB_0_0_0_0
 GLOBAL_OFFSET_B vgprGlobalReadOffsetBForSWTL+1,  18, 6, 10 // gROB_0_0_1_0
 GLOBAL_OFFSET_B vgprGlobalReadOffsetBForSWTL+2,  9,  7, 10 // gROB_0_0_0_0
@@ -2625,10 +2259,6 @@ s_lshl_b32 s[sgprStructNumB], s[sgprStructNumB], 0x10  //
 skip_fix_set2B:
 s_or_b32 s[sgprStructNumB], s[sgprStructNumB], 0x40000000 // 
 s_or_b32 s[sgprSrdB+1], s[sgprSrdB+1], s[sgprStructNumB]  // 
-
-/* MegaMoE dispatch-pull stages peer x rows into contiguous staged_x, so keep the original
- * DeepGEMM B SRD, including AddressB + tileStart and swizzle-struct bits.
- */
 
 
 /* global read addresses: increments a */
@@ -3331,6 +2961,10 @@ s_mov_b32 s54, 32                                  //
 v_mul_lo_u32 v134, s54, v134                       // v134 = waveId * 32 
 v_lshlrev_b32 v129, 0, v133                        // v129 = (v[vgprSerial] % 64) / 16
 _v_add_co_u32 v129, vcc, v129, v134                // col, v129 + v134
+/* K3COMBINE: keep D row_combine_ptrs before sgprAddressD is reused for stride offsets. */
+s_mov_b64 s[92:93], s[sgprAddressD:sgprAddressD+1]
+s_mov_b32 s94, BufferLimit
+s_mov_b32 s95, Srd127_96
 s_mul_i32 s[sgprStrideoffC+0], 8, s[sgprStridesC] //
 s_mul_i32 s[sgprStrideoffC+1], 16, s[sgprStridesC] //
 s_mul_i32 s[sgprStrideoffC+2], 24, s[sgprStridesC] //
@@ -3339,6 +2973,7 @@ s_mul_i32 s[sgprStrideoffD+1], 16, s[sgprStridesD] //
 s_mul_i32 s[sgprStrideoffD+2], 24, s[sgprStridesD] // 
 v_mul_lo_u32 v130, v129, s[sgprStrideC1J]          // rowStart vgpr
 v_mul_lo_u32 v131, v129, s[sgprStrideD1J]          // rowStart vgpr
+v_mov_b32 v147, v129                               // K3COMBINE: local C-layout row unit
 
 s_mul_i32 s54, 0x100, s[sgprWorkGroup0]            // s54 = wg0*MT0
 _v_add_co_u32 v128, vcc, s54, v128                 // coord0 = tid0*VW + wg0*MT0
@@ -3346,175 +2981,119 @@ s_mul_i32 s56, 0x100, s[sgprWorkGroup1]            // <- wg1*MT1
 _v_add_co_u32 v129, vcc, s56, v129                 // coord1 = tid1*VW + wg1*MT1
 GW_B0_E0_18:
 
-_v_add_lshl_u32 v134, v131, v128, 0x1              // optSingleColVgpr scaleToBpe: sharedAddrVgpr <- cinRowPtr + coord0, scaled by BPE. BSHERE:coord0=128, coord0Vgpr=128
+/* K3COMBINE: half-tile LDS staging, then vectorized remote combine stores. */
+s_lshl_b32 s54, s54, 1
+v_lshlrev_b32 v200, 1, v132
 
-/* apply mask, calc new C and issue writes */
-buffer_store_short v0, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v1, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v2, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v3, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v4, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v5, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v6, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v7, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v8, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v9, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v10, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v11, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v12, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v13, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v14, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v15, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v16, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v17, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v18, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v19, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v20, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v21, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v22, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v23, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v24, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v25, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v26, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v27, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v28, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v29, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v30, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v31, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v32, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v33, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v34, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v35, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v36, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v37, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v38, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v39, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v40, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v41, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v42, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v43, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v44, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v45, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v46, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v47, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v48, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v49, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v50, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v51, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v52, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v53, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v54, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v55, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v56, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v57, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v58, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v59, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v60, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v61, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v62, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v63, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_lshl_u32 v134, v131, v128, 0x1              // 
-s_mul_i32 s54, s[sgprStrideD1J], 32                // scale StrideD *= numRows(16) * bpe
+s_cmp_le_i32 s[sgprWaveiD], 3
+s_cbranch_scc0 .L_k3_stage_h0_skip
+K3_STAGE_TILE_H0
+.L_k3_stage_h0_skip:
+s_waitcnt lgkmcnt(0)
+s_barrier
 
-s_add_u32  s[sgprSrdD+0], s[sgprSrdD+0], s54       // incToNextRow: gra SRD += inc(lower)
-s_addc_u32  s[sgprSrdD+1], s[sgprSrdD+1], 0        // incToNextRow: gra SRD += inc(upper)
-buffer_store_short v64, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v65, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v66, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v67, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v68, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v69, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v70, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v71, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v72, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v73, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v74, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v75, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v76, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v77, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v78, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v79, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v80, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v81, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v82, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v83, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v84, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v85, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v86, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v87, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v88, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v89, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v90, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v91, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v92, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v93, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v94, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v95, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v96, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v97, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v98, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v99, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v100, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v101, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v102, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v103, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v104, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v105, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v106, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v107, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v108, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v109, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v110, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v111, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v112, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v113, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v114, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v115, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v116, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v117, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v118, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v119, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v120, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v121, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v122, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v123, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
-_v_add_co_u32 v134, vcc, v134, 0x20                // 
-buffer_store_short v124, v134, s[sgprSrdD:sgprSrdD+3], 0, offen, offset:0 // store D
-buffer_store_short v125, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+0], offen, offset:0 // store D
-buffer_store_short v126, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+1], offen, offset:0 // store D
-buffer_store_short v127, v134, s[sgprSrdD:sgprSrdD+3], s[sgprStrideoffD+2], offen, offset:0 // store D
+s_cmp_le_i32 s[sgprWaveiD], 3
+s_cbranch_scc0 .L_k3_store_h0_skip
+v_mov_b32 v150, v[vgprSerial]
+K3_STORE_STAGED_HALF 0, 1024
+.L_k3_store_h0_skip:
+s_barrier
+
+s_cmp_le_i32 s[sgprWaveiD], 3
+s_cbranch_scc1 .L_k3_stage_h1_skip
+s_cmp_le_i32 s[sgprWaveiD], 7
+s_cbranch_scc0 .L_k3_stage_h1_skip
+v_mov_b32 v201, 128
+K3_STAGE_TILE_H1
+.L_k3_stage_h1_skip:
+s_waitcnt lgkmcnt(0)
+s_barrier
+
+s_cmp_le_i32 s[sgprWaveiD], 3
+s_cbranch_scc1 .L_k3_store_h1_skip
+s_cmp_le_i32 s[sgprWaveiD], 7
+s_cbranch_scc0 .L_k3_store_h1_skip
+v_mov_b32 v201, 256
+v_sub_u32 v150, v[vgprSerial], v201
+K3_STORE_STAGED_HALF 1024, 1024
+.L_k3_store_h1_skip:
+s_waitcnt vmcnt(0)
+s_branch label_GW_End_20
+
+/* K3COMBINE: direct combine epilogue. Keep row pointer loads outside the
+ * column loop and advance four row addresses exactly like the original C
+ * epilogue advances its four row offsets. */
+.L_k3_direct_scalar_epilogue:
+K3_LOAD_COMBINE_ADDR4 0, 4, 8, 12
+K3_STORE4 v0, v1, v2, v3
+K3_INC_ADDR4
+K3_STORE4 v4, v5, v6, v7
+K3_INC_ADDR4
+K3_STORE4 v8, v9, v10, v11
+K3_INC_ADDR4
+K3_STORE4 v12, v13, v14, v15
+K3_INC_ADDR4
+K3_STORE4 v16, v17, v18, v19
+K3_INC_ADDR4
+K3_STORE4 v20, v21, v22, v23
+K3_INC_ADDR4
+K3_STORE4 v24, v25, v26, v27
+K3_INC_ADDR4
+K3_STORE4 v28, v29, v30, v31
+K3_INC_ADDR4
+K3_STORE4 v32, v33, v34, v35
+K3_INC_ADDR4
+K3_STORE4 v36, v37, v38, v39
+K3_INC_ADDR4
+K3_STORE4 v40, v41, v42, v43
+K3_INC_ADDR4
+K3_STORE4 v44, v45, v46, v47
+K3_INC_ADDR4
+K3_STORE4 v48, v49, v50, v51
+K3_INC_ADDR4
+K3_STORE4 v52, v53, v54, v55
+K3_INC_ADDR4
+K3_STORE4 v56, v57, v58, v59
+K3_INC_ADDR4
+K3_STORE4 v60, v61, v62, v63
+
+K3_LOAD_COMBINE_ADDR4 16, 20, 24, 28
+K3_STORE4 v64, v65, v66, v67
+K3_INC_ADDR4
+K3_STORE4 v68, v69, v70, v71
+K3_INC_ADDR4
+K3_STORE4 v72, v73, v74, v75
+K3_INC_ADDR4
+K3_STORE4 v76, v77, v78, v79
+K3_INC_ADDR4
+K3_STORE4 v80, v81, v82, v83
+K3_INC_ADDR4
+K3_STORE4 v84, v85, v86, v87
+K3_INC_ADDR4
+K3_STORE4 v88, v89, v90, v91
+K3_INC_ADDR4
+K3_STORE4 v92, v93, v94, v95
+K3_INC_ADDR4
+K3_STORE4 v96, v97, v98, v99
+K3_INC_ADDR4
+K3_STORE4 v100, v101, v102, v103
+K3_INC_ADDR4
+K3_STORE4 v104, v105, v106, v107
+K3_INC_ADDR4
+K3_STORE4 v108, v109, v110, v111
+K3_INC_ADDR4
+K3_STORE4 v112, v113, v114, v115
+K3_INC_ADDR4
+K3_STORE4 v116, v117, v118, v119
+K3_INC_ADDR4
+K3_STORE4 v120, v121, v122, v123
+K3_INC_ADDR4
+K3_STORE4 v124, v125, v126, v127
 s_branch label_GW_End_20                           // jump to end
 label_GW_End_20:
-
+s_waitcnt vmcnt(0) lgkmcnt(0)
+buffer_wbinvl1_vol
+s_waitcnt vmcnt(0)
 s_endpgm                                           // Kernel End
 
 

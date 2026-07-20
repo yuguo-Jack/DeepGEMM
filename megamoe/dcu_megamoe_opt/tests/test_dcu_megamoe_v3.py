@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import re
+import typing
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 
 ROOT = Path(__file__).resolve().parents[3]
+INIT_PATH = ROOT / "megamoe" / "__init__.py"
 V3_CONFIG_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "v3_config.py"
 V3_LAYOUT_PATH = ROOT / "megamoe" / "dcu_megamoe_opt" / "v3_layout.py"
 OPT_PATH = ROOT / "megamoe" / "opt.py"
@@ -23,6 +28,16 @@ MEGA_DCU_KERNEL_PATH = (
 K1_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_opt" / "K1_fused"
 K2_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_opt" / "K2_fused"
 K3_FUSED_DIR = ROOT / "megamoe" / "dcu_megamoe_opt" / "K3_fused"
+K1_INT8_ASM_PATH = (
+    K1_FUSED_DIR
+    / "DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_"
+    "MEGAMOE_DISPATCH_PULL_L1_PACK5.s"
+)
+K3_INT8_ASM_PATH = (
+    K3_FUSED_DIR
+    / "DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_"
+    "K3COMBINE_PACK5.s"
+)
 
 
 def load_module(name: str, path: Path):
@@ -37,6 +52,163 @@ def source_int(source: str, name: str) -> int:
     match = re.search(rf"\b{name}\s*=\s*([0-9]+)\b", source)
     assert match is not None, f"missing integer constant {name}"
     return int(match.group(1))
+
+
+def source_node_text(source: str, node: ast.AST) -> str:
+    lines = source.splitlines(keepends=True)
+    assert hasattr(node, "lineno") and hasattr(node, "end_lineno")
+    return "".join(lines[node.lineno - 1 : node.end_lineno])
+
+
+def top_level_function_source(source: str, name: str) -> str:
+    tree = ast.parse(source)
+    node = next(
+        item
+        for item in tree.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and item.name == name
+    )
+    return source_node_text(source, node)
+
+
+def load_init_quant_namespace():
+    source = INIT_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(INIT_PATH))
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "cast_to_int8_channelwise"
+    ]
+    assert len(selected) == 1
+    namespace = {"torch": torch, "Tuple": tuple}
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), str(INIT_PATH), "exec"),
+        namespace,
+    )
+    return namespace
+
+
+def load_prepare_grouped_int8_weight_namespace():
+    source = INIT_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(INIT_PATH))
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_prepare_grouped_int8_weight"
+    ]
+    assert len(selected) == 1
+    namespace = {
+        "torch": torch,
+        "Any": typing.Any,
+        "Optional": typing.Optional,
+        "Tuple": tuple,
+        "cast_grouped_weight_to_int8_channelwise": lambda weight: (_ for _ in ()).throw(
+            AssertionError("prequantized INT8 input must not be requantized")
+        ),
+    }
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), str(INIT_PATH), "exec"),
+        namespace,
+    )
+    return namespace
+
+
+def load_opt_scratch_formula_namespace():
+    source = OPT_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(OPT_PATH))
+    constant_names = {
+        "K_K1_ROUTE_TILE_M",
+        "K_K1_LL_ROW_TILE",
+        "K_K1_LL_HEADROOM_EXPECTED_ROWS_THRESHOLD",
+        "K_K1_LL_HEADROOM_ROWS",
+        "K_PRO_EP8_LL_MASKED_K1_MIN_ROWS_PER_EXPERT",
+        "K_K1_ASM_LAUNCH_ARGS_BYTES",
+        "K_PROB_STORAGE_BYTES",
+        "K_TAIL_DONE_COUNTER_RING_SLOTS",
+        "K_TAIL_DONE_COUNTER_INTS",
+        "K_DTYPE_SIZES",
+    }
+    function_names = {
+        "_align",
+        "_ceil_div",
+        "_dcu_tail_signal_addrs_count",
+        "_route_task_workspace_bytes",
+        "_v3_staged_capacity_rows",
+        "_v3_ll_active_rows_per_expert",
+        "_v3_pro_ll_compact_rows_per_expert",
+        "_v3_normal_skew_safe_compact_tiles",
+        "_route_tile_offsets",
+        "_route_scratch_tensor",
+        "_route_scratch_views",
+    }
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in constant_names
+            for target in node.targets
+        ):
+            selected.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name == "_RouteScratchViews":
+            selected.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in function_names:
+            selected.append(node)
+
+    namespace = {"torch": torch, "dataclass": dataclass}
+    formula_module = ast.Module(body=selected, type_ignores=[])
+    exec(compile(formula_module, str(OPT_PATH), "exec"), namespace)
+    return namespace
+
+
+def opt_route_scratch_total_bytes(
+    formulas,
+    *,
+    num_ranks: int,
+    num_experts: int,
+    num_max_tokens: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+    ll_capacity_tokens: int,
+    enable_ll_scratch: bool,
+    quant_dtype: torch.dtype,
+) -> tuple[int, tuple[int, ...]]:
+    offsets = formulas["_route_tile_offsets"](
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_max_tokens=num_max_tokens,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+        ll_capacity_tokens=ll_capacity_tokens,
+        enable_ll_scratch=enable_ll_scratch,
+        quant_dtype=quant_dtype,
+    )
+    route_base = formulas["_route_task_workspace_bytes"](
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_max_tokens=num_max_tokens,
+    )
+    dtype_sizes = formulas["K_DTYPE_SIZES"]
+    align = formulas["_align"]
+    prob_offset = route_base + offsets[-1]
+    tail_done_offset = align(
+        prob_offset + formulas["K_PROB_STORAGE_BYTES"],
+        dtype_sizes[torch.int32],
+    )
+    tail_signal_addrs_offset = align(
+        tail_done_offset
+        + formulas["K_TAIL_DONE_COUNTER_INTS"] * dtype_sizes[torch.int32],
+        dtype_sizes[torch.int64],
+    )
+    total_bytes = align(
+        tail_signal_addrs_offset
+        + formulas["_dcu_tail_signal_addrs_count"](num_ranks)
+        * dtype_sizes[torch.int64],
+        16,
+    )
+    return total_bytes, offsets
 
 
 def test_v3_backend_auto_policy(monkeypatch):
@@ -107,6 +279,178 @@ def test_v3_model_shape_registry_covers_flash_and_pro_ep_sizes():
     assert "DeepSeek-V4-Pro" in config.STAGED_PACK5_SHAPE_CONTRACT
 
 
+def test_v3_exact_capability_gate_preserves_fp8_and_scopes_ygzp_int8():
+    config = load_module("dcu_megamoe_v3_config_capabilities", V3_CONFIG_PATH)
+
+    for shape in (
+        (256, 6, 4096, 2048),
+        (384, 6, 7168, 3072),
+    ):
+        num_experts, num_topk, hidden, intermediate_hidden = shape
+        for backend in ("ll", "normal"):
+            for num_ranks in (8, 16, 32):
+                assert config.staged_v3_capability_supported(
+                    quant="fp8",
+                    backend=backend,
+                    num_ranks=num_ranks,
+                    num_experts=num_experts,
+                    num_topk=num_topk,
+                    hidden=hidden,
+                    intermediate_hidden=intermediate_hidden,
+                )
+
+    ygzp = {
+        "num_experts": 288,
+        "num_topk": 8,
+        "hidden": 4096,
+        "intermediate_hidden": 2048,
+    }
+    assert config.staged_v3_capability_supported(
+        quant="int8", backend="normal", num_ranks=8, **ygzp
+    )
+    assert (
+        config.staged_v3_capability_local_experts(
+            quant="int8", backend="normal", num_ranks=8, **ygzp
+        )
+        == 36
+    )
+
+    rejected = (
+        ("int8", "normal", 16),
+        ("int8", "normal", 32),
+        ("int8", "normal", 0),
+        ("int8", "ll", 8),
+        ("fp8", "normal", 8),
+        ("fp8", "ll", 8),
+        ("bogus", "normal", 8),
+        ("int8", "bogus", 8),
+    )
+    for quant, backend, num_ranks in rejected:
+        assert not config.staged_v3_capability_supported(
+            quant=quant,
+            backend=backend,
+            num_ranks=num_ranks,
+            **ygzp,
+        )
+
+    for field, unsupported_value in (
+        ("num_experts", 287),
+        ("num_topk", 7),
+        ("hidden", 4095),
+        ("intermediate_hidden", 2049),
+    ):
+        unsupported_shape = {**ygzp, field: unsupported_value}
+        assert not config.staged_v3_capability_supported(
+            quant="int8", backend="normal", num_ranks=8, **unsupported_shape
+        )
+
+    flash = {
+        "num_experts": 256,
+        "num_topk": 6,
+        "hidden": 4096,
+        "intermediate_hidden": 2048,
+    }
+    assert not config.staged_v3_capability_supported(
+        quant="int8", backend="normal", num_ranks=8, **flash
+    )
+    assert not config.staged_v3_capability_supported(
+        quant="fp8", backend="auto", num_ranks=8, **flash
+    )
+
+    assert not config.staged_pack5_shape_supported(num_ranks=8, **ygzp)
+    assert not config.staged_pack5_local_experts_supported(36)
+    assert 36 not in config.STAGED_PACK5_LOCAL_EXPERTS
+    with pytest.raises(ValueError, match="INT8 YGZP normal on EP8"):
+        config.staged_v3_capability_local_experts(
+            quant="int8", backend="normal", num_ranks=16, **ygzp
+        )
+
+
+def test_v3_quant_normalization_is_explicit():
+    config = load_module("dcu_megamoe_v3_config_quant", V3_CONFIG_PATH)
+
+    assert config.normalize_v3_quant(" FP8 ") == "fp8"
+    assert config.normalize_v3_quant("INT8") == "int8"
+    with pytest.raises(ValueError, match="V3 quant"):
+        config.normalize_v3_quant("fp16")
+
+
+def test_ygzp_int8_channelwise_quant_uses_signed_rne_and_127_scale():
+    quantize = load_init_quant_namespace()["cast_to_int8_channelwise"]
+    x = torch.tensor(
+        [
+            [-127.0, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 127.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    quant, scale = quantize(x)
+
+    assert quant.dtype == torch.int8
+    assert scale.dtype == torch.float32
+    assert quant.is_contiguous() and scale.is_contiguous()
+    torch.testing.assert_close(
+        quant,
+        torch.tensor(
+            [
+                [-127, -2, -2, 0, 0, 2, 2, 127],
+                [0, 0, 0, 0, 0, 0, 0, 0],
+            ],
+            dtype=torch.int8,
+        ),
+    )
+    torch.testing.assert_close(
+        scale,
+        torch.tensor([1.0, 1.0e-5 / 127.0], dtype=torch.float32),
+        rtol=1.0e-6,
+        atol=0.0,
+    )
+    assert int(quant.min()) == -127
+    assert int(quant.max()) == 127
+    with pytest.raises(ValueError, match="2D tensor"):
+        quantize(torch.zeros(8))
+
+    init_quant_source = top_level_function_source(
+        INIT_PATH.read_text(encoding="utf-8"), "cast_to_int8_channelwise"
+    )
+    k2_source = (K2_FUSED_DIR / "k2_fused_ext.cu").read_text(encoding="utf-8")
+    predispatch_source = MEGA_DCU_KERNEL_PATH.read_text(encoding="utf-8")
+    assert "scale = amax / 127.0" in init_quant_source
+    assert "torch.round(" in init_quant_source
+    assert ".clamp(min=-128, max=127)" in init_quant_source
+    for kernel_source in (k2_source, predispatch_source):
+        assert "nearbyintf(x)" in kernel_source
+        assert "fminf(127.0f, fmaxf(-128.0f, rounded))" in kernel_source
+        assert "kInt8 ? 127.0f : 448.0f" in kernel_source
+
+
+def test_ygzp_prequantized_int8_weight_scales_are_finite_and_positive():
+    prepare = load_prepare_grouped_int8_weight_namespace()[
+        "_prepare_grouped_int8_weight"
+    ]
+    weight = torch.zeros((2, 3, 4), dtype=torch.int8)
+    scale_storage = torch.ones((2, 3, 2), dtype=torch.float32)
+    valid_scale = scale_storage[..., 0]
+    assert not valid_scale.is_contiguous()
+
+    prepared_weight, prepared_scale = prepare(
+        weight, valid_scale, name="l1_weights"
+    )
+    torch.testing.assert_close(prepared_weight, weight)
+    torch.testing.assert_close(prepared_scale, valid_scale)
+    assert prepared_weight.is_contiguous()
+    assert prepared_scale.is_contiguous()
+
+    for invalid_value in (0.0, -1.0, float("nan"), float("inf"), -float("inf")):
+        invalid_scale = torch.ones((2, 3), dtype=torch.float32)
+        invalid_scale[0, 1] = invalid_value
+        with pytest.raises(
+            ValueError, match="scale values must be finite and strictly positive"
+        ):
+            prepare(weight, invalid_scale, name="l1_weights")
+
+
 def reference_pack5_weight(weight: torch.Tensor) -> torch.Tensor:
     experts, n, k = weight.shape
     assert n % 256 == 0 and k % 64 == 0
@@ -164,6 +508,105 @@ def test_v3_pack5_layout_matches_reference():
     assert not torch.equal(v3_layout.pack5_weight(weight), reference_plain_pack5_weight(weight))
 
 
+@pytest.mark.parametrize(
+    ("asm_path", "kernel_symbol"),
+    (
+        (
+            K1_INT8_ASM_PATH,
+            "DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_"
+            "MEGAMOE_DISPATCH_PULL_L1",
+        ),
+        (
+            K3_INT8_ASM_PATH,
+            "DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_"
+            "K3COMBINE",
+        ),
+    ),
+)
+def test_ygzp_int8_asm_has_i8_mmac_conversion_and_distinct_symbol(
+    asm_path: Path,
+    kernel_symbol: str,
+):
+    source = asm_path.read_text(encoding="utf-8")
+
+    assert len(
+        re.findall(r"^\s*v_mmac_i32_16x16x32_i8\b", source, re.MULTILINE)
+    ) == 288
+    assert not re.search(
+        r"^\s*v_mmac_f32_16x16x32_fp8_fp8\b", source, re.MULTILINE
+    )
+    assert "W8A8_F8" not in source
+
+    conversion_macro = re.search(
+        r"^\.macro INT32_TO_FP32 vgprValue:req\s*$"
+        r"(?P<body>.*?)"
+        r"^\.endm\s*$",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert conversion_macro is not None
+    converted = re.findall(
+        r"v_cvt_f32_i32_e32\s+"
+        r"v\[\\vgprValue\+(\d+)\],\s*v\[\\vgprValue\+\1\]",
+        conversion_macro.group("body"),
+    )
+    assert [int(index) for index in converted] == list(range(16))
+
+    smquant_macro = re.search(
+        r"^\.macro SMQUANT\s*$"
+        r"(?P<body>.*?)"
+        r"^\.endm\s*$",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert smquant_macro is not None
+    conversion_bases = re.findall(
+        r"^\s*INT32_TO_FP32\s+(\d+)\s*$",
+        smquant_macro.group("body"),
+        re.MULTILINE,
+    )
+    assert [int(base) for base in conversion_bases] == list(range(0, 128, 16))
+    smquant_body = smquant_macro.group("body")
+    global_to_lds_index = smquant_body.index(
+        "buffer_load_dword v251, s[52:55], 0, offen, offset:0x00, lds"
+    )
+    vmem_wait_index = smquant_body.index("s_waitcnt vmcnt(0)")
+    last_lds_read_index = smquant_body.index(
+        "ds_read_b32 v183, v254, offset:0x70"
+    )
+    lgkm_wait_index = smquant_body.index(
+        "s_waitcnt lgkmcnt(0)", last_lds_read_index
+    )
+    conversion_positions = [
+        smquant_body.index(f"INT32_TO_FP32  {base}")
+        for base in range(0, 128, 16)
+    ]
+    compute_address_index = smquant_body.index("COMPUTE_ADDRESS_SCALE")
+    assert all(position < compute_address_index for position in conversion_positions)
+    assert compute_address_index < global_to_lds_index < vmem_wait_index
+    assert vmem_wait_index < last_lds_read_index < lgkm_wait_index
+    assert len(re.findall(r"^\s*SMQUANT\s*$", source, re.MULTILINE)) == 2
+
+    assert f".globl {kernel_symbol}" in source
+    assert f".amdhsa_kernel {kernel_symbol}" in source
+    assert f"- .name: {kernel_symbol}" in source
+    assert f".symbol: '{kernel_symbol}.kd'" in source
+
+
+def test_ygzp_int8_asm_is_registered_for_build_and_artifact_verification():
+    setup_source = SETUP_PATH.read_text(encoding="utf-8")
+    build_source = BUILD_SCRIPT_PATH.read_text(encoding="utf-8")
+    stems = (
+        K1_INT8_ASM_PATH.stem,
+        K3_INT8_ASM_PATH.stem,
+    )
+
+    for stem in stems:
+        assert setup_source.count(f"'{stem}.s'") == 1
+        assert setup_source.count(f"'{stem}.co'") == 1
+        assert build_source.count(f'{stem}.co"') == 1
+
+
 def test_v3_build_surface_is_minimal_and_explicit():
     setup_source = SETUP_PATH.read_text(encoding="utf-8")
 
@@ -193,6 +636,28 @@ def test_v3_build_surface_is_minimal_and_explicit():
         "opt_k3_v3_ext",
     ):
         assert retired not in setup_source
+
+
+@pytest.mark.parametrize(
+    "asm_path",
+    (
+        K1_FUSED_DIR
+        / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s",
+        K1_FUSED_DIR
+        / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.s",
+        K1_INT8_ASM_PATH,
+    ),
+)
+def test_v3_normal_pack5_k1_omits_dead_fixed_expert_division(asm_path):
+    source = asm_path.read_text(encoding="utf-8")
+
+    assert "label_SymmFixedExpertDivLoop" not in source
+    assert "label_SymmFixedExpertDivDone" not in source
+    assert source.count(
+        "s_load_dword s10, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xcc"
+    ) == 1
+    assert "label_SymmRouteExpertDivLoop" in source
+    assert "v_readfirstlane_b32 s[sgprScaleFlag], v252" in source
 
 
 def test_v3_runtime_sources_have_clear_backend_boundaries():
@@ -415,10 +880,28 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "requires fast_math" not in opt_py
     assert "fast_math: bool = True" in k2_py
     assert "bool(fast_math)" in k2_py
-    assert "template <bool kFastMath>" in k2_ext
+    assert "template <bool kFastMath, bool kInt8>" in k2_ext
     assert "swiglu_gate<kFastMath>" in k2_ext
-    assert "launch_swiglu_quant_channelwise_auto<true>" in k2_ext
-    assert "launch_swiglu_quant_channelwise_auto<false>" in k2_ext
+    for fast_math, int8_output in (
+        ("true", "true"),
+        ("true", "false"),
+        ("false", "true"),
+        ("false", "false"),
+    ):
+        assert (
+            f"launch_swiglu_quant_channelwise_auto<{fast_math}, {int8_output}>"
+            in k2_ext
+        )
+    assert "void swiglu_quant_channelwise_out(K2_SWIGLU_QUANT_ARGS)" in k2_ext
+    assert "void swiglu_quant_int8_channelwise_out(K2_SWIGLU_QUANT_ARGS)" in k2_ext
+    fp8_entry = k2_ext.split(
+        "void swiglu_quant_channelwise_out(K2_SWIGLU_QUANT_ARGS)", 1
+    )[1].split("void swiglu_quant_int8_channelwise_out", 1)[0]
+    int8_entry = k2_ext.split(
+        "void swiglu_quant_int8_channelwise_out(K2_SWIGLU_QUANT_ARGS)", 1
+    )[1].split("#undef K2_SWIGLU_QUANT_ARGS", 1)[0]
+    assert "active_tile_m, fast_math, false);" in fp8_entry
+    assert "active_tile_m, fast_math, true);" in int8_entry
     assert 'pybind11::arg("fast_math") = true' in k2_ext
     assert "const int expected_count = (token_end - token_start) * num_topk" in k3_header
     assert "max_copy_rows <= kCopyRows" not in k3_header
@@ -631,6 +1114,155 @@ def test_v3_capacity_contract_is_skew_safe_without_overflow_fallback():
     assert "topk_idx.copy_(experts.view(1, -1).expand_as(topk_idx))" in test_harness_source
 
 
+def test_v3_compact_routes_overwrite_zero_weight_reuse_slots():
+    k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+    test_harness = (
+        ROOT / "megamoe" / "dcu_megamoe_opt" / "tests" / "test_mega_moe_dcu.py"
+    ).read_text(encoding="utf-8")
+    count_kernel = k1_ext.split(
+        "__global__ void k1_count_compact_routes_kernel(", 1
+    )[1].split("__global__ __launch_bounds__", 1)[0]
+    emit_kernel = k1_ext.split(
+        "__global__ void k1_emit_compact_routes_kernel(", 1
+    )[1].split("hipFunction_t get_asm_function", 1)[0]
+
+    assert "topk_weights" not in count_kernel
+    assert "const float weight = topk_weights[route_offset]" in emit_kernel
+    assert "if (weight == 0.0f)" not in emit_kernel
+    assert "atomicAdd(&route_scratch_i32[local_expert], 1)" in emit_kernel
+    assert "atomicAdd(local_expert_stats + local_expert, 1)" in emit_kernel
+    assert "--check-zero-weight-reuse" in test_harness
+    assert "saved_topk_weights = topk_weights.clone()" in test_harness
+    assert "topk_weights.zero_()" in test_harness
+    assert "zero-weight reuse exposed stale combine data" in test_harness
+    assert "zero-weight reuse stats mismatch" in test_harness
+
+
+def test_symm_buffer_destroy_uses_two_phase_remote_mapping_teardown():
+    destroy_source = INIT_PATH.read_text(encoding="utf-8").split(
+        "    def destroy(self):", 1
+    )[1].split("\n\ndef get_symm_buffer_for_mega_moe(", 1)[0]
+
+    handle_lookup = destroy_source.index('handle = getattr(self, "handle", None)')
+    initialized_check = destroy_source.index("not dist.is_initialized()")
+    synchronize = destroy_source.index(
+        "torch.cuda.synchronize(device=self.buffer.device)"
+    )
+    handle_claim = destroy_source.index("self.handle = None")
+    close_fabric_data = destroy_source.index(
+        "_C.close_hip_fabric_handles(remote_ptrs)"
+    )
+    close_fabric_signal = destroy_source.index(
+        "_C.close_hip_fabric_handles(remote_signal_ptrs)"
+    )
+    close_ipc_data = destroy_source.index("_C.close_hip_ipc_handles(remote_ptrs)")
+    close_ipc_signal = destroy_source.index(
+        "_C.close_hip_ipc_handles(remote_signal_ptrs)"
+    )
+    barriers = [
+        match.start()
+        for match in re.finditer(r"dist\.barrier\(group=group\)", destroy_source)
+    ]
+    free_signal = destroy_source.index(
+        "_C.free_hip_ipc_signal_buffer(handle.signal_buffer_ptr)"
+    )
+    free_data = destroy_source.index("_C.free_hip_ipc_buffer(handle.buffer_ptr)")
+    clear_group = destroy_source.index("self.group = None")
+
+    assert len(barriers) == 2
+    assert handle_lookup < initialized_check < synchronize < handle_claim
+    assert handle_claim < min(
+        close_fabric_data, close_fabric_signal, close_ipc_data, close_ipc_signal
+    )
+    assert max(
+        close_fabric_data, close_fabric_signal, close_ipc_data, close_ipc_signal
+    ) < barriers[0]
+    assert barriers[0] < free_signal < free_data < barriers[1]
+    assert barriers[1] < clear_group
+    for stale_view in (
+        "self.l1_acts = None",
+        "self.l1_acts_sf = None",
+        "self.l2_acts = None",
+        "self.l2_acts_sf = None",
+        "self.combine = None",
+        "self._opt_3stage_state = None",
+    ):
+        assert stale_view in destroy_source
+
+
+@pytest.mark.parametrize("peer_memory_mode", ["fabric", None])
+def test_symm_buffer_destroy_runtime_order_and_idempotence(peer_memory_mode):
+    module_ast = ast.parse(INIT_PATH.read_text(encoding="utf-8"))
+    symm_buffer_ast = next(
+        node
+        for node in module_ast.body
+        if isinstance(node, ast.ClassDef) and node.name == "SymmBuffer"
+    )
+    destroy_ast = next(
+        node
+        for node in symm_buffer_ast.body
+        if isinstance(node, ast.FunctionDef) and node.name == "destroy"
+    )
+    destroy_module = ast.Module(body=[destroy_ast], type_ignores=[])
+    ast.fix_missing_locations(destroy_module)
+
+    events = []
+    group = SimpleNamespace(rank=lambda: 1, size=lambda: 3)
+    fake_dist = SimpleNamespace(
+        is_initialized=lambda: True,
+        barrier=lambda *, group: events.append(("barrier", group)),
+    )
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            synchronize=lambda *, device: events.append(("synchronize", device))
+        )
+    )
+    fake_runtime = SimpleNamespace(
+        close_hip_fabric_handles=lambda ptrs: events.append(
+            ("close_fabric", tuple(ptrs))
+        ),
+        close_hip_ipc_handles=lambda ptrs: events.append(("close_ipc", tuple(ptrs))),
+        free_hip_ipc_signal_buffer=lambda ptr: events.append(("free_signal", ptr)),
+        free_hip_ipc_buffer=lambda ptr: events.append(("free_data", ptr)),
+    )
+    namespace = {"torch": fake_torch, "dist": fake_dist, "_C": fake_runtime}
+    exec(compile(destroy_module, str(INIT_PATH), "exec"), namespace)
+
+    handle = SimpleNamespace(
+        buffer_ptrs=[10, 20, 30],
+        buffer_ptr=20,
+        signal_ptrs=[110, 120, 130],
+        signal_buffer_ptr=120,
+    )
+    if peer_memory_mode is not None:
+        handle.peer_memory_mode = peer_memory_mode
+    sym_buffer = SimpleNamespace(
+        handle=handle,
+        group=group,
+        buffer=SimpleNamespace(device="cuda:1"),
+    )
+
+    namespace["destroy"](sym_buffer)
+    close_name = "close_fabric" if peer_memory_mode == "fabric" else "close_ipc"
+    assert events == [
+        ("synchronize", "cuda:1"),
+        (close_name, (10, 0, 30)),
+        (close_name, (110, 0, 130)),
+        ("barrier", group),
+        ("free_signal", 120),
+        ("free_data", 20),
+        ("barrier", group),
+    ]
+    assert sym_buffer.handle is None
+    assert sym_buffer.group is None
+    assert sym_buffer.buffer is None
+    assert sym_buffer._opt_3stage_state is None
+
+    events.clear()
+    namespace["destroy"](sym_buffer)
+    assert events == []
+
+
 def test_v3_pro_ll_masked_k1_stage_only_path_is_additive():
     k1_header = (K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh").read_text(
         encoding="utf-8"
@@ -677,7 +1309,7 @@ def test_dcu_megamoe_build_is_incremental_by_default():
 
     assert "def _generated_file_current(" in setup_source
     assert "cached_dst = project_path(rel_dst)" in setup_source
-    assert "Skipping up-to-date opt asm code object" in setup_source
+    assert "Skipping up-to-date {MEGAMOE_DCU_ARCH} opt asm code object" in setup_source
     assert "_copy_file_if_needed(cached_dst, dst)" in setup_source
     assert "def _remove_objects_stale_against_headers(" in setup_source
     assert "Removing stale object after header update" in setup_source
@@ -696,6 +1328,16 @@ def test_dcu_megamoe_build_is_incremental_by_default():
     assert "--inplace" not in build_script
     assert "verify_shared_object" in build_script
     assert "verify_code_object" in build_script
+    assert "GFX936_OPT_ASM_CODE_OBJECTS" in setup_source
+    assert "if MEGAMOE_DCU_ARCH == 'gfx936':" in setup_source
+    assert "os.path.basename(entry[1]) in GFX936_OPT_ASM_CODE_OBJECTS" in setup_source
+    assert "else [K1_INT8_OPT_ASM_CODE_OBJECT]" in setup_source
+    assert "else [K3_INT8_OPT_ASM_CODE_OBJECT]" in setup_source
+    gfx938_verify = build_script.split(
+        'if [[ "$MEGAMOE_DCU_ARCH" == "gfx938" ]]; then', 1
+    )[1].split("\nfi\n", 1)[0]
+    assert "W8A8_F8" in gfx938_verify
+    assert "W8A8_I8" not in gfx938_verify
 
 
 def test_v3_normal_graph_runtime_work_is_limited_without_d2h():
@@ -786,7 +1428,14 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "normal_baseline_graph_cache" not in test_source
     assert "def get_ll_masked_baseline_graph(" in test_source
     assert "if baseline_kind == BASELINE_LL_MASKED and not args.cuda_graph_skip_baseline" in test_source
-    assert 'fused_execution = f"v3_{v3_backend}_eager"' in test_source
+    assert 'fused_execution = f"v3_{v3_backend}_{quant_mode}_eager"' in test_source
+    assert 'choices=("fp8", "int8")' in test_source
+    assert "DEFAULT_FP8_ATOL = 0.0035" in test_source
+    assert "DEFAULT_INT8_ATOL = 0.01" in test_source
+    assert 'args.atol = DEFAULT_INT8_ATOL if quant_mode == "int8" else DEFAULT_FP8_ATOL' in test_source
+    assert "dist.all_reduce(correctness_status, op=dist.ReduceOp.SUM, group=group)" in test_source
+    assert "dist.all_reduce(global_max_abs_tensor, op=dist.ReduceOp.MAX, group=group)" in test_source
+    assert '"correctness_metrics": correctness_metrics' in test_source
     assert 'graph_execution = f"v3_{v3_backend}_cuda_graph_replay" if args.cuda_graph else "disabled"' in test_source
     assert '"fused_timing_scope": "eager_main_call"' in test_source
     assert '"baseline_timing_scope": baseline_execution' in test_source
@@ -940,6 +1589,316 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     assert "ll_capacity_tokens" in opt_source
     assert "capacity_rows * static_cast<int64_t>(hidden)" in api_source
     assert "capacity_rows * hidden" in opt_source
+
+    assert "const bool& enable_ll_scratch = true" in api_source
+    assert 'pybind11::arg("enable_ll_scratch") = true' in api_source
+    assert "enable_ll_scratch ? local_experts * ll_rows_per_expert : 0" in api_source
+    assert "enable_ll_scratch ? local_experts + 2 : 0" in api_source
+    assert "if not enable_ll_scratch:" in opt_source
+    assert "return normal_capacity_rows" in opt_source
+    assert "if enable_ll_scratch else 0" in opt_source
+    assert "torch.int8: 1" in opt_source
+    assert "K_DTYPE_SIZES[quant_dtype]" in opt_source
+    assert len(re.findall(r"^\s+dtype=quant_dtype,$", opt_source, re.MULTILINE)) == 2
+
+    assert "use_int8_dispatch ? torch::kInt8 : torch::kFloat8_e4m3fn" in api_source
+    assert "use_fp8_dispatch ? torch::kFloat8_e4m3fn : torch::kInt8" not in api_source
+    assert "empty_quant" in api_source
+    assert "quant_options" in api_source
+    assert "ygzp_int8_normal_ep8_shape" in api_source
+    assert "dcu_supported_staged_int8_normal_shape" in api_source
+
+
+def test_v3_normal_only_int8_route_scratch_formula_and_views():
+    formulas = load_opt_scratch_formula_namespace()
+    ygzp = {
+        "num_ranks": 8,
+        "num_experts": 288,
+        "num_max_tokens": 512,
+        "num_topk": 8,
+        "hidden": 4096,
+        "intermediate_hidden": 2048,
+        "ll_capacity_tokens": 512,
+        "quant_dtype": torch.int8,
+    }
+
+    normal_only_bytes, normal_offsets = opt_route_scratch_total_bytes(
+        formulas, enable_ll_scratch=False, **ygzp
+    )
+    ll_sized_bytes, ll_offsets = opt_route_scratch_total_bytes(
+        formulas, enable_ll_scratch=True, **ygzp
+    )
+
+    assert normal_offsets[0] == 41_728
+    assert ll_offsets[0] == 147_456
+    assert normal_offsets[6:12] == (normal_offsets[-1],) * 6
+    assert normal_offsets[12] == 0
+    assert normal_only_bytes == 603_110_432
+    assert ll_sized_bytes == 2_119_278_192
+    assert normal_only_bytes < ll_sized_bytes / 3
+
+    fp8_normal_only_bytes, fp8_normal_offsets = opt_route_scratch_total_bytes(
+        formulas,
+        enable_ll_scratch=False,
+        **{**ygzp, "quant_dtype": torch.float8_e4m3fn},
+    )
+    assert fp8_normal_only_bytes == normal_only_bytes
+    assert fp8_normal_offsets == normal_offsets
+
+    flash = {
+        "num_ranks": 8,
+        "num_experts": 256,
+        "num_max_tokens": 512,
+        "num_topk": 6,
+        "hidden": 4096,
+        "intermediate_hidden": 2048,
+        "ll_capacity_tokens": 512,
+    }
+    assert formulas["_route_tile_offsets"](**flash) == formulas[
+        "_route_tile_offsets"
+    ](
+        **flash,
+        enable_ll_scratch=True,
+        quant_dtype=torch.float8_e4m3fn,
+    )
+
+    small = {
+        "num_ranks": 1,
+        "num_experts": 1,
+        "num_max_tokens": 1,
+        "num_topk": 1,
+        "hidden": 16,
+        "intermediate_hidden": 8,
+        "ll_capacity_tokens": 1,
+    }
+    small_bytes, _ = opt_route_scratch_total_bytes(
+        formulas,
+        **small,
+        enable_ll_scratch=False,
+        quant_dtype=torch.int8,
+    )
+    sym_buffer = type(
+        "ScratchBuffer",
+        (),
+        {
+            "route_scratch": torch.empty(small_bytes, dtype=torch.int8),
+            "num_max_tokens_per_rank": 1,
+            "ll_scratch_capacity_tokens_per_rank": 1,
+        },
+    )()
+    views = formulas["_route_scratch_views"](
+        sym_buffer,
+        num_ranks=1,
+        num_experts=1,
+        num_topk=1,
+        hidden=16,
+        intermediate_hidden=8,
+        quant_dtype=torch.int8,
+        enable_ll_scratch=False,
+    )
+    assert views.act_fp8.dtype == torch.int8
+    assert views.pro_compact_staged_x.numel() == 0
+    assert views.pro_compact_staged_x_scale.numel() == 0
+    assert views.pro_compact_l1_out.numel() == 0
+    assert views.pro_compact_route_weights.numel() == 0
+    assert views.pro_compact_row_combine_ptrs.numel() == 0
+    assert views.pro_compact_m.numel() == 0
+    assert views.pro_compact_rows_per_expert == 0
+
+
+def test_ygzp_int8_public_dispatch_selector_is_quant_mode_not_legacy_fp8_flag():
+    init_source = INIT_PATH.read_text(encoding="utf-8")
+    init_tree = ast.parse(init_source)
+    symm_class = next(
+        node
+        for node in init_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SymmBuffer"
+    )
+    symm_init = next(
+        node
+        for node in symm_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    positional_args = [arg.arg for arg in symm_init.args.args]
+    assert "quant_mode" in positional_args
+    assert "use_fp8_dispatch" in positional_args
+    assert "use_int8_dispatch" not in positional_args
+    defaults = {
+        name: default
+        for name, default in zip(
+            positional_args[-len(symm_init.args.defaults) :],
+            symm_init.args.defaults,
+        )
+    }
+    assert ast.unparse(defaults["quant_mode"]) == "V3_QUANT_FP8"
+    assert ast.unparse(defaults["use_fp8_dispatch"]) == "True"
+
+    symm_init_source = source_node_text(init_source, symm_init)
+    assert "self.quant_mode = normalize_v3_quant(quant_mode)" in symm_init_source
+    assert "int8_compute = self.quant_mode == V3_QUANT_INT8" in symm_init_source
+    assert "int8_compute = not use_fp8_dispatch" not in symm_init_source
+    assert "int8_compute = use_fp8_dispatch" not in symm_init_source
+
+    trailing_selectors = {}
+    for call in ast.walk(symm_init):
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+            continue
+        if call.func.attr in (
+            "get_symm_buffer_size_for_mega_moe",
+            "get_mega_moe_route_scratch_size_for_mega_moe",
+        ):
+            trailing_selectors[call.func.attr] = ast.unparse(call.args[-1])
+    assert trailing_selectors == {
+        "get_symm_buffer_size_for_mega_moe": "int8_compute",
+        "get_mega_moe_route_scratch_size_for_mega_moe": "int8_compute",
+    }
+
+    helper_source = top_level_function_source(init_source, "get_symm_buffer_for_mega_moe")
+    assert "quant_mode: str = V3_QUANT_FP8" in helper_source
+    assert helper_source.count("quant_mode=quant_mode") == 2
+
+    c_api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
+    assert "const bool& use_int8_dispatch = false" in c_api_source
+    assert "use_int8_dispatch ? torch::kInt8 : torch::kFloat8_e4m3fn" in c_api_source
+    assert "!use_int8_dispatch && dcu_supported_staged_pack5_shape" in c_api_source
+    assert "use_fp8_dispatch ? torch::kFloat8_e4m3fn : torch::kInt8" not in c_api_source
+
+
+def test_ygzp_int8_public_route_is_exact_eager_normal_compact_no_tail():
+    init_source = INIT_PATH.read_text(encoding="utf-8")
+    opt_source = OPT_PATH.read_text(encoding="utf-8")
+    int8_api = top_level_function_source(init_source, "int8_mega_moe")
+    opt_3stage = top_level_function_source(opt_source, "fp8_mega_moe_opt_3stage")
+    k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
+    k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+    k3_py = (K3_FUSED_DIR / "k3_fused.py").read_text(encoding="utf-8")
+    k3_ext = (K3_FUSED_DIR / "k3_fused_ext.cu").read_text(encoding="utf-8")
+
+    assert "megamoe_backend: str = V3_BACKEND_NORMAL" in int8_api
+    assert "if v3_backend != V3_BACKEND_NORMAL:" in int8_api
+    assert "if graph:" in int8_api
+    assert "if _is_current_stream_capturing():" in int8_api
+    assert "l1_layout != \"normal\" or l2_layout != \"normal\"" in int8_api
+    assert "staged_v3_capability_supported(" in int8_api
+    assert "quant=V3_QUANT_INT8" in int8_api
+    assert "quant_mode=V3_QUANT_INT8" in int8_api
+    assert "use_unified_weight_layout=False" in int8_api
+    assert "use_pro_ll_masked_k1=False" in int8_api
+    assert "int8_w8a8_mega_moe = int8_mega_moe" in init_source
+    assert '"int8_mega_moe"' in init_source
+    assert '"int8_w8a8_mega_moe"' in init_source
+
+    assert "int8_compute = quant_mode == V3_QUANT_INT8" in opt_3stage
+    assert "if v3_backend != V3_BACKEND_NORMAL:" in opt_3stage
+    assert "use_unified_weight_layout or use_pro_ll_masked_k1" in opt_3stage
+    assert "l1_weight.dtype != torch.int8 or l2_weight.dtype != torch.int8" in opt_3stage
+    assert "not int8_compute" in opt_3stage
+    assert "and _tail_reduce_enabled_for_backend" in opt_3stage
+    assert "local_experts > 32" in opt_3stage
+    assert "force_compact_prebuild=force_safe_compact" in opt_3stage
+    assert "swiglu_quant_int8_channelwise_out" in opt_3stage
+    assert "quant_mode=quant_mode" in opt_3stage
+    assert opt_3stage.rindex("k3_launcher(") < opt_3stage.rindex("rank_barrier(")
+    assert opt_3stage.rindex("rank_barrier(") < opt_3stage.rindex(
+        "reduce_local_combine("
+    )
+
+    assert "FUSED_L1_INT8_ASM_PACK5_CO" in k1_py
+    assert "if int8_compute and use_unified_weight_layout:" in k1_py
+    assert "int8_compute ? kFusedL1Int8AsmKernelName : kFusedL1AsmKernelName" in k1_ext
+    assert "TORCH_CHECK(!int8_compute || use_compact_prebuild" in k1_ext
+    assert "hipLaunchKernelGGL(store_gpu_prob_kernel" in k1_ext
+    assert "K1 GpuProb must fit in the 256-byte argument slot" in k1_ext
+    assert "local_experts == 36" in k1_ext
+
+    assert "K3_COMBINE_INT8_PACK5_ASM_CO" in k3_py
+    assert 'backend != "normal"' in k3_py
+    assert "asm_reduce_y is not None" in k3_py
+    assert "quant_mode=quant_mode" in k3_py
+    assert "kCombineInt8AsmKernelName" in k3_ext
+    assert "!int8_compute || (!asm_tail_signal && asm_reduce_y == nullptr)" in k3_ext
+    assert "use_int8_device_gated_grid" not in k3_ext
+    assert "hipLaunchKernelGGL(store_gpu_prob_kernel" in k3_ext
+    assert "if (int8_compute)" in k3_ext
+    assert "K3 integrated tail reduction is FP8-only" in k3_ext
+    assert "local_experts ==" in k3_ext
+    assert "kDcuMegaMoeYgzpExperts / 8" in k3_ext
+
+
+def test_ygzp_int8_eager_reuses_exact_k1_active_tile_host_hint():
+    formulas = load_opt_scratch_formula_namespace()
+    expected_capacity_tiles = {
+        512: 163,
+        1024: 291,
+        4096: 1059,
+        8192: 2083,
+    }
+    for tokens, expected_tiles in expected_capacity_tiles.items():
+        capacity_tiles = formulas["_v3_normal_skew_safe_compact_tiles"](
+            num_ranks=8,
+            num_max_tokens=tokens,
+            num_topk=8,
+            local_experts=36,
+        )
+        assert capacity_tiles == expected_tiles
+        assert capacity_tiles > 128
+
+    opt_source = OPT_PATH.read_text(encoding="utf-8")
+    opt_3stage = top_level_function_source(opt_source, "fp8_mega_moe_opt_3stage")
+    opt_graph = top_level_function_source(opt_source, "_run_opt_3stage_graph")
+    k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
+    k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+    k3_py = (K3_FUSED_DIR / "k3_fused.py").read_text(encoding="utf-8")
+    k3_ext = (K3_FUSED_DIR / "k3_fused_ext.cu").read_text(encoding="utf-8")
+    k2_py = (K2_FUSED_DIR / "k2_fused.py").read_text(encoding="utf-8")
+    k2_ext = (K2_FUSED_DIR / "k2_fused_ext.cu").read_text(encoding="utf-8")
+
+    assert "return_active_tiles_host_hint: bool = False" in k1_py
+    assert "active_tiles host hint is available for INT8 K1 only" in k1_py
+    assert "active_tiles host hint is available for INT8 K1 only" in k1_ext
+    assert 'pybind11::arg("return_active_tiles_host_hint") = false' in k1_ext
+    assert "if (return_active_tiles_host_hint)" in k1_ext
+    assert "return_active_tiles_host_hint=int8_compute" in opt_3stage
+    assert "active_tiles_host_hint," in opt_3stage
+    assert (
+        'k3_kwargs["active_tiles_host_hint"] = active_tiles_host_hint'
+        in opt_3stage
+    )
+    k3_branch_start = opt_3stage.rindex("    if use_tail_reduce:")
+    no_tail_start = opt_3stage.index(
+        "\n    else:\n        k3_launcher = k3_l2_fused_v3_to_combine",
+        k3_branch_start,
+    )
+    assert "active_tiles_host_hint" not in opt_3stage[
+        k3_branch_start:no_tail_start
+    ]
+    assert "active_tiles_host_hint" in opt_3stage[no_tail_start:]
+    assert "active_tiles_host_hint: int | None = None" in k3_py
+    assert 'pybind11::arg("active_tiles_host_hint") = -1' in k3_ext
+
+    assert "return_active_tiles_host_hint" not in opt_graph
+    assert "active_tiles_host_hint" not in opt_graph
+    k1_graph = top_level_function_source(k1_py, "k1_symm_fused_l1_v3_graph")
+    assert "return_active_tiles_host_hint" not in k1_graph
+
+    hint_branch = k3_ext.index("if (active_tiles_host_hint >= 0)")
+    fallback_copy = k3_ext.index("int active_tiles_host = wg_n", hint_branch)
+    assert hint_branch < fallback_copy
+    assert "active_tiles_host_hint < 0 && !stream_capturing" in k3_ext
+    assert "active_tiles_host_hint is available for INT8 K3 only" in k3_ext
+    assert "hipMemcpyDeviceToHost" in k3_ext[fallback_copy:]
+    assert "hipStreamSynchronize(stream)" in k3_ext[fallback_copy:]
+    assert "prob.active_tiles = active_tiles->data_ptr<int32_t>()" in k3_ext
+    assert "active_tiles=k2_active_tiles" in opt_3stage
+
+    k2_call = opt_3stage.split("k2_quant(", 1)[1].split(
+        "if use_tail_reduce:", 1
+    )[0]
+    assert "K_K2_GRAPH_ROW_BLOCKS = 8192" in opt_source
+    assert "max_row_blocks=K_K2_GRAPH_ROW_BLOCKS if k2_active_tiles is not None else None" in k2_call
+    assert "active_tiles_host_hint" not in k2_call
+    assert "active_tiles_host_hint" not in k2_py
+    assert "active_tiles_host_hint" not in k2_ext
 
 
 def test_v3_supernode_source_support():

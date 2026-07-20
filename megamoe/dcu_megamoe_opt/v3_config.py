@@ -8,17 +8,22 @@ V3_BACKEND_LL = "ll"
 V3_BACKEND_NORMAL = "normal"
 V3_BACKEND_AUTO = "auto"
 
+V3_QUANT_FP8 = "fp8"
+V3_QUANT_INT8 = "int8"
+
 BACKEND_ENV = "MEGAMOE_DCU_BACKEND"
 NORMAL_LL_TOKEN_THRESHOLD_ENV = "MEGAMOE_DCU_NORMAL_LL_TOKEN_THRESHOLD"
 DEFAULT_NORMAL_LL_TOKEN_THRESHOLD = 512
 
 _VALID_V3_BACKENDS = {V3_BACKEND_LL, V3_BACKEND_NORMAL}
 _VALID_BACKEND_MODES = {V3_BACKEND_AUTO, V3_BACKEND_LL, V3_BACKEND_NORMAL}
+_VALID_V3_QUANTS = {V3_QUANT_FP8, V3_QUANT_INT8}
 
 SUPPORTED_STAGED_EP_RANKS = (8, 16, 32)
 
 DEEPSEEK_V4_FLASH_SHAPE = (256, 6, 4096, 2048)
 DEEPSEEK_V4_PRO_SHAPE = (384, 6, 7168, 3072)
+YGZP_INT8_SHAPE = (288, 8, 4096, 2048)
 STAGED_PACK5_MODEL_SHAPES = {
     "DeepSeek-V4-Flash": DEEPSEEK_V4_FLASH_SHAPE,
     "DeepSeek-V4-Pro": DEEPSEEK_V4_PRO_SHAPE,
@@ -39,6 +44,35 @@ STAGED_PACK5_SHAPE_CONTRACT = (
     "topk=6 hidden=7168 intermediate=3072"
 )
 
+# This registry is deliberately separate from STAGED_PACK5_MODEL_SHAPES.  The
+# latter describes the legacy FP8 shape/layout whitelist, while this one is the
+# exact execution capability gate used by quant-aware dispatch.
+STAGED_V3_MODEL_CAPABILITIES = {
+    "DeepSeek-V4-Flash": {
+        "shape": DEEPSEEK_V4_FLASH_SHAPE,
+        "quant": V3_QUANT_FP8,
+        "backends": (V3_BACKEND_LL, V3_BACKEND_NORMAL),
+        "ep_ranks": SUPPORTED_STAGED_EP_RANKS,
+    },
+    "DeepSeek-V4-Pro": {
+        "shape": DEEPSEEK_V4_PRO_SHAPE,
+        "quant": V3_QUANT_FP8,
+        "backends": (V3_BACKEND_LL, V3_BACKEND_NORMAL),
+        "ep_ranks": SUPPORTED_STAGED_EP_RANKS,
+    },
+    "YGZP-INT8": {
+        "shape": YGZP_INT8_SHAPE,
+        "quant": V3_QUANT_INT8,
+        "backends": (V3_BACKEND_NORMAL,),
+        "ep_ranks": (8,),
+    },
+}
+STAGED_V3_CAPABILITY_CONTRACT = (
+    "DCU MegaMoE staged V3 supports FP8 DeepSeek-V4-Flash/Pro LL or normal "
+    "on EP8/EP16/EP32, and INT8 YGZP normal on EP8 with experts=288 topk=8 "
+    "hidden=4096 intermediate=2048"
+)
+
 
 def normalize_v3_backend(value: str) -> str:
     backend = str(value).strip().lower()
@@ -47,6 +81,15 @@ def normalize_v3_backend(value: str) -> str:
             f"V3 backend must be one of {sorted(_VALID_V3_BACKENDS)}, got {value!r}"
         )
     return backend
+
+
+def normalize_v3_quant(value: str) -> str:
+    quant = str(value).strip().lower()
+    if quant not in _VALID_V3_QUANTS:
+        raise ValueError(
+            f"V3 quant must be one of {sorted(_VALID_V3_QUANTS)}, got {value!r}"
+        )
+    return quant
 
 
 def normalize_backend_mode(value: str) -> str:
@@ -107,6 +150,70 @@ def staged_pack5_shape_supported(
             intermediate_hidden=intermediate_hidden,
         )
     )
+
+
+def staged_v3_capability_supported(
+    *,
+    quant: str,
+    backend: str,
+    num_ranks: int,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> bool:
+    """Return whether an exact quant/backend/EP/model-shape combination exists."""
+
+    quant_mode = str(quant).strip().lower()
+    backend_mode = str(backend).strip().lower()
+    ranks = int(num_ranks)
+    experts = int(num_experts)
+    if (
+        quant_mode not in _VALID_V3_QUANTS
+        or backend_mode not in _VALID_V3_BACKENDS
+        or ranks <= 0
+        or experts % ranks != 0
+    ):
+        return False
+
+    shape = (
+        experts,
+        int(num_topk),
+        int(hidden),
+        int(intermediate_hidden),
+    )
+    return any(
+        shape == capability["shape"]
+        and quant_mode == capability["quant"]
+        and backend_mode in capability["backends"]
+        and ranks in capability["ep_ranks"]
+        for capability in STAGED_V3_MODEL_CAPABILITIES.values()
+    )
+
+
+def staged_v3_capability_local_experts(
+    *,
+    quant: str,
+    backend: str,
+    num_ranks: int,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> int:
+    """Return local experts only after the exact execution gate succeeds."""
+
+    if not staged_v3_capability_supported(
+        quant=quant,
+        backend=backend,
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+    ):
+        raise ValueError(STAGED_V3_CAPABILITY_CONTRACT)
+    return int(num_experts) // int(num_ranks)
 
 
 def staged_pack5_local_experts(

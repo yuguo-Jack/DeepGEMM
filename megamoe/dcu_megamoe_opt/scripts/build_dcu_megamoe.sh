@@ -4,6 +4,16 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$repo_dir"
 
+export MEGAMOE_DCU_ARCH="${MEGAMOE_DCU_ARCH:-gfx938}"
+case "$MEGAMOE_DCU_ARCH" in
+    gfx936|gfx938) ;;
+    *)
+        echo "MEGAMOE_DCU_ARCH must be gfx936 or gfx938, got: $MEGAMOE_DCU_ARCH" >&2
+        exit 2
+        ;;
+esac
+echo "MegaMoE DCU build target: $MEGAMOE_DCU_ARCH"
+
 python_bin="python"
 if command -v python3 >/dev/null 2>&1; then
     python_bin="python3"
@@ -97,13 +107,17 @@ verify_shared_object "megamoe/dcu_megamoe_opt/K1_fused/k1_fused_ext*.so"
 verify_shared_object "megamoe/dcu_megamoe_opt/K2_fused/k2_fused_ext*.so"
 verify_shared_object "megamoe/dcu_megamoe_opt/K3_fused/k3_fused_ext*.so"
 verify_shared_object "megamoe/dcu_megamoe_opt/K3_fused/k3_v3_fused_ext*.so"
-verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co"
-verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.co"
-verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co"
-verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co"
-verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_UNIFIED_PACK5.co"
-verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.co"
-verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_UNIFIED_PACK5.co"
+verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co"
+verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co"
+if [[ "$MEGAMOE_DCU_ARCH" == "gfx938" ]]; then
+    verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co"
+    verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_UNIFIED_PACK5.co"
+    verify_code_object "megamoe/dcu_megamoe_opt/K1_fused/deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co"
+    verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co"
+    verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_UNIFIED_PACK5.co"
+    verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_PACK5.co"
+    verify_code_object "megamoe/dcu_megamoe_opt/K3_fused/DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_TAILREDUCE_UNIFIED_PACK5.co"
+fi
 
 "$python_bin" - <<'PY'
 import importlib

@@ -35,6 +35,24 @@ DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '0' if IS_HIP_EXTENSION else '1')) == 1
 DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
+MEGAMOE_DCU_ARCH = os.environ.get('MEGAMOE_DCU_ARCH', 'gfx938').strip().lower()
+if IS_HIP_EXTENSION and MEGAMOE_DCU_ARCH not in ('gfx936', 'gfx938'):
+    raise ValueError(
+        'MEGAMOE_DCU_ARCH must be gfx936 or gfx938, '
+        f'got {MEGAMOE_DCU_ARCH!r}'
+    )
+
+K1_INT8_OPT_ASM_CODE_OBJECT = (
+    'DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_'
+    'MEGAMOE_DISPATCH_PULL_L1_PACK5.co'
+)
+K3_INT8_OPT_ASM_CODE_OBJECT = (
+    'DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_'
+    'K3COMBINE_PACK5.co'
+)
+GFX936_OPT_ASM_CODE_OBJECTS = frozenset(
+    (K1_INT8_OPT_ASM_CODE_OBJECT, K3_INT8_OPT_ASM_CODE_OBJECT)
+)
 
 # Compiler flags
 cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
@@ -45,7 +63,7 @@ if DG_JIT_USE_RUNTIME_API:
     cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
 hipcc_flags = list(cxx_flags)
 if IS_HIP_EXTENSION:
-    hipcc_flags.append('--offload-arch=gfx938')
+    hipcc_flags.append(f'--offload-arch={MEGAMOE_DCU_ARCH}')
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -228,6 +246,16 @@ def get_package_data():
         ] if not IS_HIP_EXTENSION else [],
     }
     if IS_HIP_EXTENSION and package_name == 'megamoe':
+        k1_code_objects = (
+            ['*.co']
+            if MEGAMOE_DCU_ARCH == 'gfx938'
+            else [K1_INT8_OPT_ASM_CODE_OBJECT]
+        )
+        k3_code_objects = (
+            ['*.co']
+            if MEGAMOE_DCU_ARCH == 'gfx938'
+            else [K3_INT8_OPT_ASM_CODE_OBJECT]
+        )
         data.update({
             'megamoe.dcu_megamoe_opt': [
                 'include/mega_moe_dcu/*.cuh',
@@ -237,9 +265,13 @@ def get_package_data():
                 'tests/*.py',
                 'scripts/*.sh',
             ],
-            'megamoe.dcu_megamoe_opt.K1_fused': ['*.cu', '*.cuh', '*.s', '*.co'],
+            'megamoe.dcu_megamoe_opt.K1_fused': [
+                '*.cu', '*.cuh', '*.s', *k1_code_objects
+            ],
             'megamoe.dcu_megamoe_opt.K2_fused': ['*.cu'],
-            'megamoe.dcu_megamoe_opt.K3_fused': ['*.cu', '*.cuh', '*.s', '*.co'],
+            'megamoe.dcu_megamoe_opt.K3_fused': [
+                '*.cu', '*.cuh', '*.s', *k3_code_objects
+            ],
         })
     return data
 
@@ -257,6 +289,21 @@ OPT_ASM_CODE_OBJECTS = [
             'dcu_megamoe_opt',
             'K1_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co',
+        ),
+        'K1_CLANG',
+    ),
+    (
+        project_path(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K1_fused',
+            'DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s',
+        ),
+        os.path.join(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K1_fused',
+            'DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.co',
         ),
         'K1_CLANG',
     ),
@@ -287,6 +334,21 @@ OPT_ASM_CODE_OBJECTS = [
             'dcu_megamoe_opt',
             'K3_fused',
             'DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co',
+        ),
+        'K3_CLANG',
+    ),
+    (
+        project_path(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K3_fused',
+            'DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.s',
+        ),
+        os.path.join(
+            'megamoe',
+            'dcu_megamoe_opt',
+            'K3_fused',
+            'DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE_PACK5.co',
         ),
         'K3_CLANG',
     ),
@@ -337,6 +399,13 @@ OPT_ASM_CODE_OBJECTS = [
     ),
 ]
 
+if MEGAMOE_DCU_ARCH == 'gfx936':
+    OPT_ASM_CODE_OBJECTS = [
+        entry
+        for entry in OPT_ASM_CODE_OBJECTS
+        if os.path.basename(entry[1]) in GFX936_OPT_ASM_CODE_OBJECTS
+    ]
+
 
 PREBUILT_CODE_OBJECTS = [
     (
@@ -355,7 +424,7 @@ PREBUILT_CODE_OBJECTS = [
             'deepgemm_groupgemm_masked_fp8_marlin_256x64x128_TN_BF16_WGM8.co',
         ),
     ),
-]
+] if MEGAMOE_DCU_ARCH == 'gfx938' else []
 
 
 def _existing_paths(paths):
@@ -424,6 +493,64 @@ def _generated_file_current(path, dependency):
     )
 
 
+_OPT_ASM_TARGET_RE = re.compile(
+    r'(?m)^[ \t]*\.amdgcn_target[ \t]+"amdgcn-amd-amdhsa--[^"\n]+"[ \t]*$'
+)
+
+
+def _write_targeted_opt_asm_source(src, temp_root):
+    source_text = Path(src).read_text(encoding='utf-8-sig')
+    source_text = source_text.replace('\r\n', '\n').replace('\r', '\n')
+    target_directive = f'.amdgcn_target "amdgcn-amd-amdhsa--{MEGAMOE_DCU_ARCH}"'
+    targeted_text, replacements = _OPT_ASM_TARGET_RE.subn(target_directive, source_text)
+    if replacements != 1:
+        raise RuntimeError(
+            f'expected exactly one .amdgcn_target directive in {src}, '
+            f'found {replacements}'
+        )
+
+    rel_src = os.path.relpath(src, current_dir)
+    targeted_src = os.path.join(
+        temp_root,
+        'opt_asm',
+        MEGAMOE_DCU_ARCH,
+        'targeted_sources',
+        rel_src,
+    )
+    os.makedirs(os.path.dirname(targeted_src), exist_ok=True)
+    with open(targeted_src, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(targeted_text)
+    return targeted_src
+
+
+def _opt_asm_cache_stamp_value(src, cached_dst):
+    src_stat = os.stat(src)
+    cached_stat = os.stat(cached_dst)
+    return (
+        f'arch={MEGAMOE_DCU_ARCH}\n'
+        f'source_size={src_stat.st_size}\n'
+        f'source_mtime_ns={src_stat.st_mtime_ns}\n'
+        f'code_object_size={cached_stat.st_size}\n'
+        f'code_object_mtime_ns={cached_stat.st_mtime_ns}\n'
+    )
+
+
+def _opt_asm_cache_current(src, cached_dst, stamp_path):
+    if not _generated_file_current(cached_dst, src) or not os.path.exists(stamp_path):
+        return False
+    try:
+        stamp = Path(stamp_path).read_text(encoding='utf-8')
+        return stamp == _opt_asm_cache_stamp_value(src, cached_dst)
+    except (OSError, UnicodeError):
+        return False
+
+
+def _write_opt_asm_cache_stamp(src, cached_dst, stamp_path):
+    os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
+    with open(stamp_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(_opt_asm_cache_stamp_value(src, cached_dst))
+
+
 def _copy_file_if_needed(src, dst):
     if os.path.abspath(src) == os.path.abspath(dst):
         return
@@ -441,12 +568,18 @@ def build_opt_asm_code_objects(output_root, temp_root):
             raise FileNotFoundError(f'opt asm source not found: {src}')
         cached_dst = project_path(rel_dst)
         dst = os.path.join(output_root, rel_dst)
-        obj = os.path.join(temp_root, 'opt_asm', os.path.basename(rel_dst) + '.o')
-        if not _generated_file_current(cached_dst, src):
+        arch_temp_root = os.path.join(temp_root, 'opt_asm', MEGAMOE_DCU_ARCH)
+        obj = os.path.join(arch_temp_root, rel_dst + '.o')
+        stamp = os.path.join(arch_temp_root, rel_dst + '.stamp')
+        if not _opt_asm_cache_current(src, cached_dst, stamp):
             os.makedirs(os.path.dirname(cached_dst), exist_ok=True)
             os.makedirs(os.path.dirname(obj), exist_ok=True)
             clang = _opt_asm_clang(clang_env)
-            print(f'Building opt asm code object: {cached_dst}')
+            targeted_src = _write_targeted_opt_asm_source(src, temp_root)
+            print(
+                f'Building opt asm code object for {MEGAMOE_DCU_ARCH}: '
+                f'{cached_dst}'
+            )
             subprocess.run(
                 [
                     clang,
@@ -455,11 +588,11 @@ def build_opt_asm_code_objects(output_root, temp_root):
                     '-target',
                     'amdgcn-amd-amdhsa',
                     '-mcode-object-version=4',
-                    '-mcpu=gfx938',
+                    f'-mcpu={MEGAMOE_DCU_ARCH}',
                     '-c',
                     '-o',
                     obj,
-                    src,
+                    targeted_src,
                 ],
                 check=True,
             )
@@ -474,8 +607,12 @@ def build_opt_asm_code_objects(output_root, temp_root):
                 ],
                 check=True,
             )
+            _write_opt_asm_cache_stamp(src, cached_dst, stamp)
         else:
-            print(f'Skipping up-to-date opt asm code object: {cached_dst}')
+            print(
+                f'Skipping up-to-date {MEGAMOE_DCU_ARCH} opt asm code object: '
+                f'{cached_dst}'
+            )
         _copy_file_if_needed(cached_dst, dst)
 
 

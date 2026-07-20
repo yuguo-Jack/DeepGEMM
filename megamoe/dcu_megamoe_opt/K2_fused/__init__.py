@@ -1,1 +1,1 @@
-"""K2 SwiGLU plus FP8 quant path."""
+"""K2 SwiGLU plus channelwise FP8/INT8 quant paths."""

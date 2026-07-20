@@ -13,7 +13,10 @@ from .dcu_megamoe_opt.K1_fused.k1_fused import (
     k1_symm_fused_l1_v3,
     k1_symm_fused_l1_v3_graph,
 )
-from .dcu_megamoe_opt.K2_fused.k2_fused import swiglu_quant_channelwise_out
+from .dcu_megamoe_opt.K2_fused.k2_fused import (
+    swiglu_quant_channelwise_out,
+    swiglu_quant_int8_channelwise_out,
+)
 from .dcu_megamoe_opt.K3_fused.k3_fused import (
     build_asm_tail_signal_addrs,
     k3_l2_fused_v3_to_combine,
@@ -23,10 +26,16 @@ from .dcu_megamoe_opt.K3_fused.k3_fused import (
 )
 from .dcu_megamoe_opt.v3_config import (
     STAGED_PACK5_SHAPE_CONTRACT,
+    STAGED_V3_CAPABILITY_CONTRACT,
     SUPPORTED_STAGED_EP_RANKS,
     V3_BACKEND_LL,
+    V3_BACKEND_NORMAL,
+    V3_QUANT_FP8,
+    V3_QUANT_INT8,
     normalize_v3_backend,
+    normalize_v3_quant,
     staged_pack5_shape_supported,
+    staged_v3_capability_supported,
 )
 
 
@@ -53,6 +62,7 @@ K_DTYPE_SIZES = {
     torch.bfloat16: 2,
     torch.float32: 4,
     torch.float8_e4m3fn: 1,
+    torch.int8: 1,
     torch.uint8: 1,
     torch.int32: 4,
     torch.int64: 8,
@@ -283,8 +293,21 @@ def _v3_staged_capacity_rows(
     num_max_tokens: int,
     num_topk: int,
     ll_capacity_tokens: int | None = None,
+    enable_ll_scratch: bool = True,
 ) -> int:
     local_experts = num_experts // num_ranks
+    normal_capacity_rows = (
+        _v3_normal_skew_safe_compact_tiles(
+            num_ranks=num_ranks,
+            num_max_tokens=num_max_tokens,
+            num_topk=num_topk,
+            local_experts=local_experts,
+        )
+        * K_K1_ROUTE_TILE_M
+    )
+    if not enable_ll_scratch:
+        return normal_capacity_rows
+
     ll_capacity_tokens = (
         int(num_max_tokens)
         if ll_capacity_tokens is None
@@ -316,15 +339,6 @@ def _v3_staged_capacity_rows(
             K_PRO_EP8_LL_MASKED_K1_MIN_ROWS_PER_EXPERT,
         )
     ll_capacity_rows = local_experts * ll_rows_per_expert
-    normal_capacity_rows = (
-        _v3_normal_skew_safe_compact_tiles(
-            num_ranks=num_ranks,
-            num_max_tokens=num_max_tokens,
-            num_topk=num_topk,
-            local_experts=local_experts,
-        )
-        * K_K1_ROUTE_TILE_M
-    )
     return max(ll_capacity_rows, normal_capacity_rows)
 
 
@@ -359,7 +373,10 @@ def _v3_pro_ll_compact_rows_per_expert(
     intermediate_hidden: int,
     ll_capacity_tokens: int | None,
     num_max_tokens: int,
+    enable_ll_scratch: bool = True,
 ) -> int:
+    if not enable_ll_scratch:
+        return 0
     if (
         int(num_experts),
         int(num_topk),
@@ -413,13 +430,18 @@ def _route_tile_offsets(
     hidden: int,
     intermediate_hidden: int,
     ll_capacity_tokens: int | None = None,
+    enable_ll_scratch: bool = True,
+    quant_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> tuple[int, int, int, int, int, int, int, int, int, int, int, int, int, int]:
+    if quant_dtype not in (torch.float8_e4m3fn, torch.int8):
+        raise ValueError("route scratch quant_dtype must be FP8 E4M3 or INT8")
     capacity_rows = _v3_staged_capacity_rows(
         num_ranks=num_ranks,
         num_experts=num_experts,
         num_max_tokens=num_max_tokens,
         num_topk=num_topk,
         ll_capacity_tokens=ll_capacity_tokens,
+        enable_ll_scratch=enable_ll_scratch,
     )
     offset = 0
     offset += capacity_rows * hidden
@@ -442,7 +464,7 @@ def _route_tile_offsets(
         offset += capacity_rows * hidden * K_DTYPE_SIZES[torch.bfloat16]
         offset = _align(offset, 16)
     act_fp8_offset = offset
-    offset += capacity_rows * intermediate_hidden * K_DTYPE_SIZES[torch.float8_e4m3fn]
+    offset += capacity_rows * intermediate_hidden * K_DTYPE_SIZES[quant_dtype]
     offset = _align(offset, 16)
     act_scale_offset = offset
     offset += capacity_rows * K_DTYPE_SIZES[torch.float32]
@@ -456,10 +478,11 @@ def _route_tile_offsets(
         intermediate_hidden=intermediate_hidden,
         ll_capacity_tokens=ll_capacity_tokens,
         num_max_tokens=num_max_tokens,
+        enable_ll_scratch=enable_ll_scratch,
     )
     pro_compact_rows = (num_experts // num_ranks) * pro_compact_rows_per_expert
     pro_compact_staged_x_offset = offset
-    offset += pro_compact_rows * hidden * K_DTYPE_SIZES[torch.float8_e4m3fn]
+    offset += pro_compact_rows * hidden * K_DTYPE_SIZES[quant_dtype]
     offset = _align(offset, 16)
     pro_compact_staged_x_scale_offset = offset
     offset += pro_compact_rows * K_DTYPE_SIZES[torch.float32]
@@ -474,7 +497,10 @@ def _route_tile_offsets(
     offset += pro_compact_rows * K_DTYPE_SIZES[torch.int64]
     offset = _align(offset, 16)
     pro_compact_counts_offset = offset
-    offset += ((num_experts // num_ranks) + 2) * K_DTYPE_SIZES[torch.int32]
+    pro_compact_counts = (
+        (num_experts // num_ranks) + 2 if enable_ll_scratch else 0
+    )
+    offset += pro_compact_counts * K_DTYPE_SIZES[torch.int32]
     offset = _align(offset, 16)
     scratch_end_offset = offset
     return (
@@ -525,6 +551,8 @@ def _route_scratch_views(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    quant_dtype: torch.dtype = torch.float8_e4m3fn,
+    enable_ll_scratch: bool = True,
 ) -> _RouteScratchViews:
     route_scratch = sym_buffer.route_scratch
     if route_scratch.dtype != torch.int8 or not route_scratch.is_contiguous():
@@ -564,6 +592,8 @@ def _route_scratch_views(
             "ll_scratch_capacity_tokens_per_rank",
             num_max_tokens,
         ),
+        enable_ll_scratch=enable_ll_scratch,
+        quant_dtype=quant_dtype,
     )
     l1_cols = intermediate_hidden * 2
     l1_capacity_bytes = capacity_rows * l1_cols * K_DTYPE_SIZES[torch.bfloat16]
@@ -572,7 +602,7 @@ def _route_scratch_views(
     act_scale_capacity_bytes = act_scale_end_offset - act_scale_offset
     pro_compact_rows = local_experts * pro_compact_rows_per_expert
     pro_compact_staged_x_bytes = (
-        pro_compact_rows * hidden * K_DTYPE_SIZES[torch.float8_e4m3fn]
+        pro_compact_rows * hidden * K_DTYPE_SIZES[quant_dtype]
     )
     pro_compact_staged_x_scale_bytes = (
         pro_compact_rows * K_DTYPE_SIZES[torch.float32]
@@ -586,7 +616,8 @@ def _route_scratch_views(
     pro_compact_row_combine_ptrs_bytes = (
         pro_compact_rows * K_DTYPE_SIZES[torch.int64]
     )
-    pro_compact_counts_bytes = (local_experts + 2) * K_DTYPE_SIZES[torch.int32]
+    pro_compact_counts = local_experts + 2 if enable_ll_scratch else 0
+    pro_compact_counts_bytes = pro_compact_counts * K_DTYPE_SIZES[torch.int32]
     prob_offset = route_base + scratch_end_offset
     tail_done_offset = _align(prob_offset + K_PROB_STORAGE_BYTES, K_DTYPE_SIZES[torch.int32])
     tail_signal_addrs_count = _dcu_tail_signal_addrs_count(num_ranks)
@@ -621,7 +652,7 @@ def _route_scratch_views(
             route_scratch,
             byte_offset=route_base + act_fp8_offset,
             byte_capacity=act_fp8_capacity_bytes,
-            dtype=torch.float8_e4m3fn,
+            dtype=quant_dtype,
             shape=(capacity_rows, intermediate_hidden),
         ),
         act_scale=_route_scratch_tensor(
@@ -635,7 +666,7 @@ def _route_scratch_views(
             route_scratch,
             byte_offset=route_base + pro_compact_staged_x_offset,
             byte_capacity=pro_compact_staged_x_bytes,
-            dtype=torch.float8_e4m3fn,
+            dtype=quant_dtype,
             shape=(pro_compact_rows, hidden),
         ),
         pro_compact_staged_x_scale=_route_scratch_tensor(
@@ -671,7 +702,7 @@ def _route_scratch_views(
             byte_offset=route_base + pro_compact_counts_offset,
             byte_capacity=pro_compact_counts_bytes,
             dtype=torch.int32,
-            shape=(local_experts + 2,),
+            shape=(pro_compact_counts,),
         ),
         pro_compact_rows_per_expert=pro_compact_rows_per_expert,
         k3_prob_storage=_route_scratch_tensor(
@@ -723,6 +754,8 @@ def _state(
     intermediate_hidden: int,
     init_tail_reduce: bool,
     verbose_build: bool,
+    quant_dtype: torch.dtype = torch.float8_e4m3fn,
+    enable_ll_scratch: bool = True,
 ) -> _OptState:
     device = sym_buffer.buffer.device
     key = (
@@ -735,6 +768,8 @@ def _state(
         num_topk,
         hidden,
         intermediate_hidden,
+        quant_dtype,
+        bool(enable_ll_scratch),
     )
     cached = getattr(sym_buffer, "_opt_3stage_state", None)
     if cached is not None and cached[0] == key:
@@ -758,6 +793,8 @@ def _state(
             num_topk=num_topk,
             hidden=hidden,
             intermediate_hidden=intermediate_hidden,
+            quant_dtype=quant_dtype,
+            enable_ll_scratch=enable_ll_scratch,
         ),
         empty_bf16=sym_buffer.buffer[:0].view(torch.bfloat16),
     )
@@ -775,6 +812,10 @@ def _state(
 
 
 def prepare_opt_3stage(sym_buffer, *, verbose_build: bool = False) -> None:
+    quant_mode = normalize_v3_quant(
+        getattr(sym_buffer, "quant_mode", V3_QUANT_FP8)
+    )
+    int8_compute = quant_mode == V3_QUANT_INT8
     _check_shape(
         num_ranks=sym_buffer.group.size(),
         num_experts=sym_buffer.num_experts,
@@ -783,6 +824,8 @@ def prepare_opt_3stage(sym_buffer, *, verbose_build: bool = False) -> None:
         intermediate_hidden=sym_buffer.intermediate_hidden,
         num_tokens=1,
         num_max_tokens_per_rank=int(sym_buffer.num_max_tokens_per_rank),
+        quant_mode=quant_mode,
+        v3_backend=V3_BACKEND_NORMAL,
     )
     _state(
         sym_buffer,
@@ -792,10 +835,13 @@ def prepare_opt_3stage(sym_buffer, *, verbose_build: bool = False) -> None:
         num_topk=sym_buffer.num_topk,
         hidden=sym_buffer.hidden,
         intermediate_hidden=sym_buffer.intermediate_hidden,
-        init_tail_reduce=k3_tail_reduce_enabled(
-            default=int(sym_buffer.group.size()) <= 8
+        init_tail_reduce=(
+            not int8_compute
+            and k3_tail_reduce_enabled(default=int(sym_buffer.group.size()) <= 8)
         ),
         verbose_build=verbose_build,
+        quant_dtype=torch.int8 if int8_compute else torch.float8_e4m3fn,
+        enable_ll_scratch=not int8_compute,
     )
 
 
@@ -808,9 +854,15 @@ def _check_shape(
     intermediate_hidden: int,
     num_tokens: int,
     num_max_tokens_per_rank: int,
+    quant_mode: str = V3_QUANT_FP8,
+    v3_backend: str = V3_BACKEND_NORMAL,
 ) -> None:
+    quant_mode = normalize_v3_quant(quant_mode)
+    v3_backend = normalize_v3_backend(v3_backend)
     if (
-        not staged_pack5_shape_supported(
+        not staged_v3_capability_supported(
+            quant=quant_mode,
+            backend=v3_backend,
             num_ranks=num_ranks,
             num_experts=num_experts,
             num_topk=num_topk,
@@ -821,7 +873,7 @@ def _check_shape(
         or num_tokens > num_max_tokens_per_rank
     ):
         raise ValueError(
-            f"{STAGED_PACK5_SHAPE_CONTRACT} and "
+            f"{STAGED_V3_CAPABILITY_CONTRACT} and "
             "0<=num_tokens_per_rank<=num_max_tokens_per_rank"
         )
 
@@ -843,6 +895,7 @@ def fp8_mega_moe_opt_3stage(
     capacity_num_tokens: Optional[int] = None,
     use_unified_weight_layout: bool = False,
     use_pro_ll_masked_k1: bool = False,
+    quant_mode: str = V3_QUANT_FP8,
 ) -> None:
     l1_weight, l1_scale = l1_weights
     l2_weight, l2_scale = l2_weights
@@ -851,6 +904,19 @@ def fp8_mega_moe_opt_3stage(
     intermediate_hidden = int(l1_scale.size(1) // 2)
     num_max_tokens_per_rank = int(sym_buffer.num_max_tokens_per_rank)
     v3_backend = normalize_v3_backend(v3_backend)
+    quant_mode = normalize_v3_quant(quant_mode)
+    int8_compute = quant_mode == V3_QUANT_INT8
+    if int8_compute:
+        if v3_backend != V3_BACKEND_NORMAL:
+            raise NotImplementedError("YGZP INT8 supports the normal backend only")
+        if use_unified_weight_layout or use_pro_ll_masked_k1:
+            raise NotImplementedError(
+                "YGZP INT8 supports normal non-unified weights only"
+            )
+        if getattr(sym_buffer, "quant_mode", quant_mode) != V3_QUANT_INT8:
+            raise ValueError("YGZP INT8 requires an INT8 SymmBuffer")
+        if l1_weight.dtype != torch.int8 or l2_weight.dtype != torch.int8:
+            raise TypeError("YGZP INT8 requires signed INT8 L1/L2 weights")
     route_capacity_num_tokens = (
         num_tokens if capacity_num_tokens is None else int(capacity_num_tokens)
     )
@@ -870,11 +936,16 @@ def fp8_mega_moe_opt_3stage(
         intermediate_hidden=intermediate_hidden,
         num_tokens=num_tokens,
         num_max_tokens_per_rank=num_max_tokens_per_rank,
+        quant_mode=quant_mode,
+        v3_backend=v3_backend,
     )
 
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
-    use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend, num_ranks)
+    use_tail_reduce = (
+        not int8_compute
+        and _tail_reduce_enabled_for_backend(v3_backend, num_ranks)
+    )
     use_ll_split_tail = _ll_k3_split_tail_enabled_for_tokens(v3_backend, num_tokens)
     state = _state(
         sym_buffer,
@@ -886,6 +957,8 @@ def fp8_mega_moe_opt_3stage(
         intermediate_hidden=intermediate_hidden,
         init_tail_reduce=use_tail_reduce,
         verbose_build=verbose_build,
+        quant_dtype=torch.int8 if int8_compute else torch.float8_e4m3fn,
+        enable_ll_scratch=not int8_compute,
     )
     asm_signal_generation = 1
     if use_tail_reduce:
@@ -932,7 +1005,9 @@ def fp8_mega_moe_opt_3stage(
         force_compact_prebuild=force_safe_compact,
         capacity_num_tokens=route_capacity_num_tokens,
         use_unified_weight_layout=use_unified_weight_layout,
+        quant_mode=quant_mode,
         verbose_build=verbose_build,
+        return_active_tiles_host_hint=int8_compute,
     )
     k1_kwargs["backend"] = v3_backend
     if v3_backend == V3_BACKEND_LL:
@@ -990,6 +1065,15 @@ def fp8_mega_moe_opt_3stage(
                 verbose_build=verbose_build,
             )
         )
+    elif int8_compute:
+        (
+            l1_out,
+            route_weights,
+            m_indices,
+            output_index,
+            row_combine_ptrs,
+            active_tiles_host_hint,
+        ) = k1_result
     else:
         l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_result
     rows = int(l1_out.size(0))
@@ -1001,7 +1085,12 @@ def fp8_mega_moe_opt_3stage(
     k2_active_tiles = (
         state.scratch.k1_active_tiles if v3_backend != V3_BACKEND_LL else None
     )
-    swiglu_quant_channelwise_out(
+    k2_quant = (
+        swiglu_quant_int8_channelwise_out
+        if int8_compute
+        else swiglu_quant_channelwise_out
+    )
+    k2_quant(
         l1_out,
         route_weights,
         act_fp8,
@@ -1049,6 +1138,7 @@ def fp8_mega_moe_opt_3stage(
             ll_split_tail=use_ll_split_tail,
             active_tiles=k2_active_tiles,
             use_unified_weight_layout=use_unified_weight_layout,
+            quant_mode=quant_mode,
             verbose_build=verbose_build,
         )
         k3_kwargs["backend"] = v3_backend
@@ -1069,9 +1159,12 @@ def fp8_mega_moe_opt_3stage(
             prob_storage=state.scratch.k3_prob_storage,
             active_tiles=k2_active_tiles,
             use_unified_weight_layout=use_unified_weight_layout,
+            quant_mode=quant_mode,
             verbose_build=verbose_build,
         )
         k3_kwargs["backend"] = v3_backend
+        if int8_compute:
+            k3_kwargs["active_tiles_host_hint"] = active_tiles_host_hint
         if v3_backend == V3_BACKEND_LL:
             k3_kwargs["ll_block_m"] = ll_block_m
         k3_launcher(

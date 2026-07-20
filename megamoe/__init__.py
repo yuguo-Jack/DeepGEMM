@@ -8,12 +8,17 @@ import torch.distributed as dist
 from . import _C
 from .dcu_megamoe_opt.v3_config import (
     STAGED_PACK5_SHAPE_CONTRACT,
+    STAGED_V3_CAPABILITY_CONTRACT,
     V3_BACKEND_LL,
     V3_BACKEND_NORMAL,
+    V3_QUANT_FP8,
+    V3_QUANT_INT8,
     normal_ll_token_threshold,
     normalize_v3_backend,
+    normalize_v3_quant,
     staged_pack5_model_shape_supported,
     staged_pack5_shape_supported,
+    staged_v3_capability_supported,
 )
 from .dcu_megamoe_opt.v3_layout import (
     flatten_pack5_weight,
@@ -139,7 +144,21 @@ def cast_to_fp8_channelwise(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     return fp8.contiguous(), scale.float().contiguous()
 
 
-def mega_moe_pre_dispatch(
+def cast_to_int8_channelwise(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric signed-INT8 quantization with one FP32 scale per row."""
+    if x.dim() != 2:
+        raise ValueError("channelwise INT8 cast expects a 2D tensor")
+    amax = x.abs().float().amax(dim=1).clamp(min=1.0e-5)
+    scale = amax / 127.0
+    quant = (
+        torch.round(x.float() / scale.view(-1, 1))
+        .clamp(min=-128, max=127)
+        .to(torch.int8)
+    )
+    return quant.contiguous(), scale.float().contiguous()
+
+
+def _mega_moe_pre_dispatch_impl(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -148,6 +167,8 @@ def mega_moe_pre_dispatch(
     out_topk_idx: torch.Tensor,
     out_topk_weights: torch.Tensor,
     num_tokens: int,
+    *,
+    int8_output: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse LL pre-dispatch input quantization and top-k buffer staging."""
     if x.dim() != 2:
@@ -156,6 +177,10 @@ def mega_moe_pre_dispatch(
         raise ValueError("pre-dispatch topk tensors must be 2D")
     if topk_idx.shape != topk_weights.shape:
         raise ValueError("pre-dispatch topk_idx/topk_weights shape mismatch")
+    expected_dtype = torch.int8 if int8_output else torch.float8_e4m3fn
+    if out_fp8.dtype != expected_dtype:
+        label = "out_int8" if int8_output else "out_fp8"
+        raise ValueError(f"{label} must have {expected_dtype} dtype")
     input_rows, hidden = x.shape
     rows = int(num_tokens)
     if rows < 0 or rows > input_rows:
@@ -198,10 +223,13 @@ def mega_moe_pre_dispatch(
         topk_weights if topk_weights.is_contiguous() else topk_weights.contiguous()
     )
     try:
-        pre_dispatch = _C.mega_moe_pre_dispatch
+        pre_dispatch = getattr(
+            _C,
+            "mega_moe_pre_dispatch_int8" if int8_output else "mega_moe_pre_dispatch",
+        )
     except AttributeError:
         raise RuntimeError(
-            "DCU W8A8 MegaMoE requires _C.mega_moe_pre_dispatch; "
+            "DCU W8A8 MegaMoE requires the selected pre-dispatch extension; "
             "rebuild the megamoe HIP extension"
         ) from None
 
@@ -216,6 +244,52 @@ def mega_moe_pre_dispatch(
         rows,
     )
     return out_fp8_view, out_scale_view, out_topk_idx_view, out_topk_weights_view
+
+
+def mega_moe_pre_dispatch(
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out_fp8: torch.Tensor,
+    out_scale: torch.Tensor,
+    out_topk_idx: torch.Tensor,
+    out_topk_weights: torch.Tensor,
+    num_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _mega_moe_pre_dispatch_impl(
+        x,
+        topk_idx,
+        topk_weights,
+        out_fp8,
+        out_scale,
+        out_topk_idx,
+        out_topk_weights,
+        num_tokens,
+        int8_output=False,
+    )
+
+
+def mega_moe_pre_dispatch_int8(
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out_int8: torch.Tensor,
+    out_scale: torch.Tensor,
+    out_topk_idx: torch.Tensor,
+    out_topk_weights: torch.Tensor,
+    num_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _mega_moe_pre_dispatch_impl(
+        x,
+        topk_idx,
+        topk_weights,
+        out_int8,
+        out_scale,
+        out_topk_idx,
+        out_topk_weights,
+        num_tokens,
+        int8_output=True,
+    )
 
 
 def cast_grouped_weight_to_fp8_channelwise(
@@ -238,6 +312,36 @@ def cast_grouped_weight_to_fp8_channelwise(
             fp8[offset:end].copy_((chunk.float() / chunk_scale.view(-1, 1)).to(torch.float8_e4m3fn))
             scale[offset:end].copy_(chunk_scale)
     return fp8.reshape(num_groups, rows, k).contiguous(), scale.reshape(num_groups, rows).contiguous()
+
+
+def cast_grouped_weight_to_int8_channelwise(
+    weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if weights.dim() != 3:
+        raise ValueError("MegaMoE grouped weights must be 3D tensors")
+    num_groups, rows, k = weights.shape
+    flat_weights = weights.reshape(num_groups * rows, k)
+    chunk_rows = int(os.getenv("MEGAMOE_DCU_WEIGHT_CAST_CHUNK_ROWS", "8192"))
+    if chunk_rows <= 0 or flat_weights.size(0) <= chunk_rows:
+        quant, scale = cast_to_int8_channelwise(flat_weights)
+    else:
+        quant = torch.empty(
+            flat_weights.shape, dtype=torch.int8, device=flat_weights.device
+        )
+        scale = torch.empty(
+            (flat_weights.size(0),), dtype=torch.float32, device=flat_weights.device
+        )
+        for offset in range(0, flat_weights.size(0), chunk_rows):
+            end = min(offset + chunk_rows, flat_weights.size(0))
+            chunk_quant, chunk_scale = cast_to_int8_channelwise(
+                flat_weights[offset:end]
+            )
+            quant[offset:end].copy_(chunk_quant)
+            scale[offset:end].copy_(chunk_scale)
+    return (
+        quant.reshape(num_groups, rows, k).contiguous(),
+        scale.reshape(num_groups, rows).contiguous(),
+    )
 
 
 def weight8bit_nt_kpack2_marlin(
@@ -365,6 +469,8 @@ def get_mega_moe_hip_build_config():
         "auto selection belongs to the framework/test layer"
     )
     config["supported_staged_shape"] = STAGED_PACK5_SHAPE_CONTRACT
+    config["supported_staged_capability"] = STAGED_V3_CAPABILITY_CONTRACT
+    config["int8_ygzp_path"] = "EP8 normal eager, signed W8A8, topk=8"
     config["cuda_graph_max_tokens_source"] = "requested num_max_tokens_per_rank"
     config["cuda_graph_execution"] = "graph=True captures the selected v3_staged backend"
     return config
@@ -403,6 +509,7 @@ class SymmBuffer:
         cuda_graph_max_tokens_per_rank: Optional[int] = None,
         prepare_opt_3stage: bool = True,
         ll_scratch_capacity_tokens_per_rank: Optional[int] = None,
+        quant_mode: str = V3_QUANT_FP8,
     ):
         if not _is_hip_backend():
             raise RuntimeError("megamoe is the HIP/DCU MegaMoE package")
@@ -413,6 +520,9 @@ class SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        self.quant_mode = normalize_v3_quant(quant_mode)
+        int8_compute = self.quant_mode == V3_QUANT_INT8
+        self.use_fp8_dispatch = bool(use_fp8_dispatch)
         self.cuda_graph_max_tokens_per_rank = int(
             cuda_graph_max_tokens_per_rank
             if cuda_graph_max_tokens_per_rank is not None
@@ -439,13 +549,25 @@ class SymmBuffer:
                 "ll_scratch_capacity_tokens_per_rank must be in "
                 f"1..{self.num_max_tokens_per_rank}"
             )
-        _check_staged_pack5_shape(
-            num_ranks=group.size(),
-            num_experts=num_experts,
-            num_topk=num_topk,
-            hidden=hidden,
-            intermediate_hidden=intermediate_hidden,
-        )
+        if int8_compute:
+            if not staged_v3_capability_supported(
+                quant=self.quant_mode,
+                backend=V3_BACKEND_NORMAL,
+                num_ranks=group.size(),
+                num_experts=num_experts,
+                num_topk=num_topk,
+                hidden=hidden,
+                intermediate_hidden=intermediate_hidden,
+            ):
+                raise ValueError(STAGED_V3_CAPABILITY_CONTRACT)
+        else:
+            _check_staged_pack5_shape(
+                num_ranks=group.size(),
+                num_experts=num_experts,
+                num_topk=num_topk,
+                hidden=hidden,
+                intermediate_hidden=intermediate_hidden,
+            )
 
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(),
@@ -456,6 +578,7 @@ class SymmBuffer:
             intermediate_hidden,
             use_fp8_dispatch,
             activation,
+            int8_compute,
         )
         route_scratch_num_bytes = _C.get_mega_moe_route_scratch_size_for_mega_moe(
             group.size(),
@@ -467,6 +590,8 @@ class SymmBuffer:
             use_fp8_dispatch,
             activation,
             self.ll_scratch_capacity_tokens_per_rank,
+            not int8_compute,
+            int8_compute,
         )
 
         peer_memory_mode = _dcu_peer_memory_mode()
@@ -545,25 +670,54 @@ class SymmBuffer:
             )
 
     def destroy(self):
-        if self.handle is not None:
-            torch.cuda.synchronize()
+        handle = getattr(self, "handle", None)
+        if handle is not None:
+            group = getattr(self, "group", None)
+            if group is None or not dist.is_initialized():
+                raise RuntimeError(
+                    "SymmBuffer.destroy() must be called collectively before "
+                    "destroy_process_group()"
+                )
+            group_size = group.size()
+            if (
+                len(handle.buffer_ptrs) != group_size
+                or len(handle.signal_ptrs) != group_size
+            ):
+                raise RuntimeError(
+                    "SymmBuffer handle peer count does not match its process group"
+                )
+
+            torch.cuda.synchronize(device=self.buffer.device)
+            group_rank = group.rank()
             remote_ptrs = [
-                ptr if rank != self.group.rank() else 0
-                for rank, ptr in enumerate(self.handle.buffer_ptrs)
+                ptr if rank != group_rank else 0
+                for rank, ptr in enumerate(handle.buffer_ptrs)
             ]
             remote_signal_ptrs = [
-                ptr if rank != self.group.rank() else 0
-                for rank, ptr in enumerate(self.handle.signal_ptrs)
+                ptr if rank != group_rank else 0
+                for rank, ptr in enumerate(handle.signal_ptrs)
             ]
-            peer_memory_mode = getattr(self.handle, "peer_memory_mode", "ipc")
+            peer_memory_mode = getattr(handle, "peer_memory_mode", "ipc")
+
+            # From this point teardown is fail-stop: never retry native close or
+            # free operations on a partially destroyed handle.
+            self.handle = None
             if peer_memory_mode == "fabric":
                 _C.close_hip_fabric_handles(remote_ptrs)
                 _C.close_hip_fabric_handles(remote_signal_ptrs)
             else:
                 _C.close_hip_ipc_handles(remote_ptrs)
                 _C.close_hip_ipc_handles(remote_signal_ptrs)
-            _C.free_hip_ipc_signal_buffer(self.handle.signal_buffer_ptr)
-            _C.free_hip_ipc_buffer(self.handle.buffer_ptr)
+
+            # Every importer must close/detach its remote mappings before any
+            # owner frees the corresponding exported allocation.
+            dist.barrier(group=group)
+            _C.free_hip_ipc_signal_buffer(handle.signal_buffer_ptr)
+            _C.free_hip_ipc_buffer(handle.buffer_ptr)
+
+            # Keep the process group alive until every rank has released its
+            # local exports, so immediate distributed teardown is also safe.
+            dist.barrier(group=group)
         self.handle = None
         self.buffer = None
         self.group = None
@@ -571,8 +725,14 @@ class SymmBuffer:
         self.x_sf = None
         self.topk_idx = None
         self.topk_weights = None
+        self.l1_acts = None
+        self.l1_acts_sf = None
+        self.l2_acts = None
+        self.l2_acts_sf = None
+        self.combine = None
         self.route_scratch = None
         self.cuda_graph_num_tokens = None
+        self._opt_3stage_state = None
 
 
 def get_symm_buffer_for_mega_moe(
@@ -585,7 +745,9 @@ def get_symm_buffer_for_mega_moe(
     use_fp8_dispatch: bool = True,
     activation: str = "swiglu",
     cuda_graph_max_tokens_per_rank: Optional[int] = None,
+    quant_mode: str = V3_QUANT_FP8,
 ) -> SymmBuffer:
+    quant_mode = normalize_v3_quant(quant_mode)
     requested_num_max_tokens_per_rank = int(num_max_tokens_per_rank)
     requested_cuda_graph_max_tokens = (
         int(cuda_graph_max_tokens_per_rank)
@@ -626,6 +788,7 @@ def get_symm_buffer_for_mega_moe(
                     max(1, normal_ll_token_threshold()),
                 ),
                 prepare_opt_3stage=False,
+                quant_mode=quant_mode,
             )
         finally:
             if dummy_buffer is not None:
@@ -644,6 +807,7 @@ def get_symm_buffer_for_mega_moe(
             num_max_tokens_per_rank,
             ll_scratch_capacity_tokens,
         ),
+        quant_mode=quant_mode,
     )
 
 
@@ -668,6 +832,83 @@ def transform_fp8_weights_for_mega_moe_pro_ll_masked_k1(
     return (
         {"ll_pro_masked": (weight8bit_nt_kpack2_marlin_masked(l1_fp8), l1_scale)},
         {"unified": (flatten_pack5_weight(l2_fp8), l2_scale)},
+    )
+
+
+def _prepare_grouped_int8_weight(
+    weight: Any,
+    scale: Optional[torch.Tensor],
+    *,
+    name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(weight, (tuple, list)):
+        if len(weight) != 2:
+            raise ValueError(f"{name} INT8 weight tuple must be (weight, scale)")
+        if scale is not None:
+            raise ValueError(f"{name} scale was provided both in tuple and argument")
+        weight, scale = weight
+    if not isinstance(weight, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor or (tensor, scale) tuple")
+    if weight.dim() != 3:
+        raise ValueError(f"{name} must have shape [experts, output_channels, K]")
+
+    if weight.dtype != torch.int8:
+        if scale is not None:
+            raise ValueError(
+                f"{name} scale may only be supplied with an already-quantized INT8 weight"
+            )
+        return cast_grouped_weight_to_int8_channelwise(weight)
+
+    if scale is None:
+        raise ValueError(f"{name} requires FP32 channelwise scales for INT8 weights")
+    if not isinstance(scale, torch.Tensor):
+        raise TypeError(f"{name} scale must be a tensor")
+    if scale.dim() == 3 and scale.size(-1) == 1:
+        scale = scale.squeeze(-1)
+    if scale.dim() != 2 or tuple(scale.shape) != tuple(weight.shape[:2]):
+        raise ValueError(
+            f"{name} scale must have shape [experts, output_channels] or "
+            "[experts, output_channels, 1]"
+        )
+    if scale.dtype != torch.float32:
+        raise ValueError(f"{name} scale must have torch.float32 dtype")
+    if scale.device != weight.device:
+        raise ValueError(f"{name} weight and scale must be on the same device")
+    scale = scale.contiguous()
+    # User-supplied quantized weights bypass our channelwise quantizer. Validate
+    # their scales once while preparing the packed layout, outside launch paths.
+    if not torch.all(torch.isfinite(scale) & (scale > 0.0)).item():
+        raise ValueError(f"{name} scale values must be finite and strictly positive")
+    return weight.contiguous(), scale
+
+
+def transform_int8_weights_for_mega_moe_normal(
+    l1_weights: Any,
+    l2_weights: Any,
+    *,
+    l1_scale: Optional[torch.Tensor] = None,
+    l2_scale: Optional[torch.Tensor] = None,
+):
+    """Prepare YGZP signed-INT8 weights for the normal fused PACK5 path."""
+    l1_int8, l1_scale_out = _prepare_grouped_int8_weight(
+        l1_weights, l1_scale, name="l1_weights"
+    )
+    l2_int8, l2_scale_out = _prepare_grouped_int8_weight(
+        l2_weights, l2_scale, name="l2_weights"
+    )
+    return (
+        {
+            "normal": (
+                flatten_pack5_weight_asm_normal(l1_int8),
+                l1_scale_out,
+            )
+        },
+        {
+            "normal": (
+                flatten_pack5_weight_asm_normal(l2_int8),
+                l2_scale_out,
+            )
+        },
     )
 
 
@@ -757,6 +998,10 @@ def fp8_mega_moe(
     graph: bool = False,
     capacity_num_tokens: Optional[int] = None,
 ):
+    if normalize_v3_quant(
+        getattr(sym_buffer, "quant_mode", V3_QUANT_FP8)
+    ) != V3_QUANT_FP8:
+        raise ValueError("fp8_mega_moe requires an FP8 SymmBuffer")
     call_y = y
     v3_backend = normalize_v3_backend(megamoe_backend)
     l1_weights, l1_layout = _select_v3_weight_layout(l1_weights, v3_backend)
@@ -887,6 +1132,80 @@ def fp8_mega_moe(
 fp8_w8a8_mega_moe = fp8_mega_moe
 
 
+def int8_mega_moe(
+    y: torch.Tensor,
+    l1_weights: Any,
+    l2_weights: Any,
+    sym_buffer: SymmBuffer,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    recipe: Tuple[int, int, int] = (1, 1, 32),
+    activation: str = "swiglu",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    megamoe_backend: str = V3_BACKEND_NORMAL,
+    graph: bool = False,
+    capacity_num_tokens: Optional[int] = None,
+) -> None:
+    """Run the YGZP EP8 normal eager signed-INT8 W8A8 path."""
+    v3_backend = normalize_v3_backend(megamoe_backend)
+    if v3_backend != V3_BACKEND_NORMAL:
+        raise NotImplementedError("YGZP INT8 supports megamoe_backend='normal' only")
+    if graph:
+        raise NotImplementedError("YGZP INT8 CUDA Graph capture is not implemented")
+    if _is_current_stream_capturing():
+        raise RuntimeError("YGZP INT8 currently supports eager execution only")
+    if normalize_v3_quant(
+        getattr(sym_buffer, "quant_mode", V3_QUANT_FP8)
+    ) != V3_QUANT_INT8:
+        raise ValueError("int8_mega_moe requires SymmBuffer(..., quant_mode='int8')")
+    if recipe != (1, 1, 32):
+        raise ValueError("DCU W8A8 MegaMoE expects recipe=(1, 1, 32)")
+    if activation != "swiglu":
+        raise ValueError("DCU W8A8 MegaMoE supports swiglu only")
+    if y.dim() != 2 or y.dtype != torch.bfloat16:
+        raise ValueError("YGZP INT8 output workspace y must be 2D BF16")
+
+    l1_weights, l1_layout = _select_v3_weight_layout(l1_weights, v3_backend)
+    l2_weights, l2_layout = _select_v3_weight_layout(l2_weights, v3_backend)
+    if l1_layout != "normal" or l2_layout != "normal":
+        raise NotImplementedError("YGZP INT8 supports normal PACK5 weights only")
+    intermediate_hidden = int(l1_weights[1].size(1) // 2)
+    if not staged_v3_capability_supported(
+        quant=V3_QUANT_INT8,
+        backend=v3_backend,
+        num_ranks=sym_buffer.group.size(),
+        num_experts=sym_buffer.num_experts,
+        num_topk=sym_buffer.num_topk,
+        hidden=int(y.size(1)),
+        intermediate_hidden=intermediate_hidden,
+    ):
+        raise ValueError(STAGED_V3_CAPABILITY_CONTRACT)
+
+    from .opt import fp8_mega_moe_opt_3stage
+
+    fp8_mega_moe_opt_3stage(
+        y,
+        l1_weights,
+        l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer,
+        rank_idx=sym_buffer.group.rank(),
+        num_ranks=len(sym_buffer.handle.buffer_ptrs),
+        num_experts=sym_buffer.num_experts,
+        num_topk=sym_buffer.num_topk,
+        activation_clamp=activation_clamp,
+        fast_math=fast_math,
+        v3_backend=v3_backend,
+        capacity_num_tokens=capacity_num_tokens,
+        use_unified_weight_layout=False,
+        use_pro_ll_masked_k1=False,
+        quant_mode=V3_QUANT_INT8,
+    )
+
+
+int8_w8a8_mega_moe = int8_mega_moe
+
+
 try:
     _C.init(os.path.dirname(os.path.abspath(__file__)), os.environ.get("ROCM_HOME", "/opt/dtk"))
 except Exception:
@@ -896,8 +1215,11 @@ except Exception:
 __all__ = [
     "SymmBuffer",
     "cast_to_fp8_channelwise",
+    "cast_to_int8_channelwise",
     "mega_moe_pre_dispatch",
+    "mega_moe_pre_dispatch_int8",
     "cast_grouped_weight_to_fp8_channelwise",
+    "cast_grouped_weight_to_int8_channelwise",
     "weight8bit_nt_kpack2_marlin",
     "weight8bit_nt_kpack2_marlin_contiguous_k64n16",
     "weight8bit_nt_kpack2_marlin_masked",
@@ -905,12 +1227,15 @@ __all__ = [
     "get_symm_buffer_for_mega_moe",
     "transform_fp8_weights_for_masked_deepgemm",
     "transform_fp8_weights_for_mega_moe_pro_ll_masked_k1",
+    "transform_int8_weights_for_mega_moe_normal",
     "flatten_pack5_weight",
     "flatten_pack5_weight_asm_normal",
     "deepep_deepgemm_preprocess_channelwise",
     "deepep_deepgemm_postprocess_channelwise",
     "fp8_mega_moe",
     "fp8_w8a8_mega_moe",
+    "int8_mega_moe",
+    "int8_w8a8_mega_moe",
 ]
 
 __version__ = "0.1"
