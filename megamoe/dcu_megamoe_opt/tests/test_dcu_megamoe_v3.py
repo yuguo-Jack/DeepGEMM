@@ -442,6 +442,29 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "V3_K3_Pure" not in k3_header
 
 
+def test_k3_split_reducer_batches_loads_with_early_clobber():
+    k3_header = (K3_FUSED_DIR / "k3_v3_pack5_groupgemm_impl.cuh").read_text(
+        encoding="utf-8"
+    )
+    helper_parts = k3_header.split(
+        "__device__ static inline void global_load_uint4_triple_device("
+    )
+    assert len(helper_parts) == 3
+    helper = helper_parts[2].split(
+        "__device__ static inline void lds_store_bf16_device(", 1
+    )[0]
+
+    load0 = '"global_load_dwordx4 %0, %3, off\\n\\t"'
+    load1 = '"global_load_dwordx4 %1, %4, off\\n\\t"'
+    load2 = '"global_load_dwordx4 %2, %5, off\\n\\t"'
+    wait0 = '"s_waitcnt vmcnt(0)\\n\\t"'
+    assert helper.count("global_load_dwordx4") == 3
+    assert 0 <= helper.index(load0) < helper.index(load1) < helper.index(load2)
+    assert helper.index(load2) < helper.index(wait0)
+    assert ': "=&v"(packed0), "=&v"(packed1), "=&v"(packed2)' in helper
+    assert ': "=v"(packed0)' not in helper
+
+
 def test_retired_v3_debug_and_dormant_api_are_absent_from_production_sources():
     test_harness_source = (
         ROOT / "megamoe" / "dcu_megamoe_opt" / "tests" / "test_mega_moe_dcu.py"

@@ -692,7 +692,10 @@ the weight FP8 conversion chunked by default; tune
 `MEGAMOE_DCU_WEIGHT_CAST_CHUNK_ROWS` if the random-weight setup needs a smaller
 or larger temporary allocation.
 
-Check one captured LL graph bucket across several token prefixes:
+Check the default per-bucket LL graph cache across several token counts.  Each
+entry in `--cuda-graph-test-tokens` is captured separately; add
+`--cuda-graph-single-capture` to capture once at
+`--num-max-tokens-per-rank` and replay all listed prefixes:
 
 ```bash
 source /opt/dtk-26.04/env.sh
@@ -710,8 +713,10 @@ python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --skip-bench
 ```
 
-Check one captured normal K1/K2/K3 graph bucket across token prefixes with a
-8192-token symmetric buffer:
+Check the default per-bucket normal K1/K2/K3 graph cache across token counts
+with an 8192-token symmetric buffer.  As above, add
+`--cuda-graph-single-capture` when the intended test is one max-capacity graph
+replayed across all listed prefixes:
 
 ```bash
 source /opt/dtk-26.04/env.sh

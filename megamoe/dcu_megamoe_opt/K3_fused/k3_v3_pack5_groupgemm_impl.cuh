@@ -41,6 +41,13 @@ __device__ static inline int load_signal_system_acquire_device(
 __device__ static inline int64_t global_load_i64_glc_device(
     const int64_t* ptr);
 __device__ static inline uint4 global_load_uint4_device(const uint4* ptr);
+__device__ static inline void global_load_uint4_triple_device(
+    const uint4* ptr0,
+    const uint4* ptr1,
+    const uint4* ptr2,
+    uint4& value0,
+    uint4& value1,
+    uint4& value2);
 __device__ static inline void wait_vmem_lds_store_device();
 __device__ static inline int v3_k3_tail_effective_tokens_device(
     int num_tokens,
@@ -340,28 +347,76 @@ __device__ static inline void v3_k3_split_reduce_chunk_tile_device(
         float sum_z_hi = 0.0f;
         float sum_w_lo = 0.0f;
         float sum_w_hi = 0.0f;
-        for (int topk_slot = 0; topk_slot < num_topk; ++topk_slot) {
-            const int64_t partial_row =
-                static_cast<int64_t>(topk_slot) * num_max_tokens_per_rank +
-                token_idx;
-            const auto packed = global_load_uint4_device(
-                reinterpret_cast<const uint4*>(
-                    combine_base + partial_row * hidden) +
-                vec_idx);
-#define V3_K3_SPLIT_REDUCE_ACCUM(FIELD, SUM_LO, SUM_HI)                       \
+#define V3_K3_SPLIT_REDUCE_ACCUM_FIELD(PACKED, FIELD, SUM_LO, SUM_HI)         \
             do {                                                               \
-                const uint32_t word = packed.FIELD;                            \
+                const uint32_t word = (PACKED).FIELD;                          \
                 SUM_LO += deep_gemm::mega::bf16_bits_to_float(                 \
                     static_cast<uint16_t>(word));                              \
                 SUM_HI += deep_gemm::mega::bf16_bits_to_float(                 \
                     static_cast<uint16_t>(word >> 16));                        \
             } while (0)
-            V3_K3_SPLIT_REDUCE_ACCUM(x, sum_x_lo, sum_x_hi);
-            V3_K3_SPLIT_REDUCE_ACCUM(y, sum_y_lo, sum_y_hi);
-            V3_K3_SPLIT_REDUCE_ACCUM(z, sum_z_lo, sum_z_hi);
-            V3_K3_SPLIT_REDUCE_ACCUM(w, sum_w_lo, sum_w_hi);
-#undef V3_K3_SPLIT_REDUCE_ACCUM
+#define V3_K3_SPLIT_REDUCE_ACCUM_PACKED(PACKED)                               \
+            do {                                                               \
+                V3_K3_SPLIT_REDUCE_ACCUM_FIELD(                                \
+                    PACKED, x, sum_x_lo, sum_x_hi);                            \
+                V3_K3_SPLIT_REDUCE_ACCUM_FIELD(                                \
+                    PACKED, y, sum_y_lo, sum_y_hi);                            \
+                V3_K3_SPLIT_REDUCE_ACCUM_FIELD(                                \
+                    PACKED, z, sum_z_lo, sum_z_hi);                            \
+                V3_K3_SPLIT_REDUCE_ACCUM_FIELD(                                \
+                    PACKED, w, sum_w_lo, sum_w_hi);                            \
+            } while (0)
+        if (num_topk == 6) {
+#pragma unroll
+            for (int group = 0; group < 2; ++group) {
+                const int topk_slot0 = group * 3;
+                const int topk_slot1 = topk_slot0 + 1;
+                const int topk_slot2 = topk_slot0 + 2;
+                const int64_t partial_row0 =
+                    static_cast<int64_t>(topk_slot0) *
+                        num_max_tokens_per_rank +
+                    token_idx;
+                const int64_t partial_row1 =
+                    static_cast<int64_t>(topk_slot1) *
+                        num_max_tokens_per_rank +
+                    token_idx;
+                const int64_t partial_row2 =
+                    static_cast<int64_t>(topk_slot2) *
+                        num_max_tokens_per_rank +
+                    token_idx;
+                const auto* ptr0 = reinterpret_cast<const uint4*>(
+                                       combine_base + partial_row0 * hidden) +
+                                   vec_idx;
+                const auto* ptr1 = reinterpret_cast<const uint4*>(
+                                       combine_base + partial_row1 * hidden) +
+                                   vec_idx;
+                const auto* ptr2 = reinterpret_cast<const uint4*>(
+                                       combine_base + partial_row2 * hidden) +
+                                   vec_idx;
+                uint4 packed0;
+                uint4 packed1;
+                uint4 packed2;
+                global_load_uint4_triple_device(
+                    ptr0, ptr1, ptr2, packed0, packed1, packed2);
+                V3_K3_SPLIT_REDUCE_ACCUM_PACKED(packed0);
+                V3_K3_SPLIT_REDUCE_ACCUM_PACKED(packed1);
+                V3_K3_SPLIT_REDUCE_ACCUM_PACKED(packed2);
+            }
+        } else {
+            for (int topk_slot = 0; topk_slot < num_topk; ++topk_slot) {
+                const int64_t partial_row =
+                    static_cast<int64_t>(topk_slot) *
+                        num_max_tokens_per_rank +
+                    token_idx;
+                const auto packed = global_load_uint4_device(
+                    reinterpret_cast<const uint4*>(
+                        combine_base + partial_row * hidden) +
+                    vec_idx);
+                V3_K3_SPLIT_REDUCE_ACCUM_PACKED(packed);
+            }
         }
+#undef V3_K3_SPLIT_REDUCE_ACCUM_PACKED
+#undef V3_K3_SPLIT_REDUCE_ACCUM_FIELD
         uint4 out;
         out.x = deep_gemm::mega::pack2_f32_to_bf16_bits(sum_x_lo, sum_x_hi);
         out.y = deep_gemm::mega::pack2_f32_to_bf16_bits(sum_y_lo, sum_y_hi);
@@ -966,6 +1021,43 @@ __device__ static inline uint4 global_load_uint4_device(const uint4* ptr) {
         static_cast<uint32_t>(value.y),
         static_cast<uint32_t>(value.z),
         static_cast<uint32_t>(value.w)};
+}
+
+__device__ static inline void global_load_uint4_triple_device(
+    const uint4* ptr0,
+    const uint4* ptr1,
+    const uint4* ptr2,
+    uint4& value0,
+    uint4& value1,
+    uint4& value2) {
+    const uint64_t addr0 = reinterpret_cast<uint64_t>(ptr0);
+    const uint64_t addr1 = reinterpret_cast<uint64_t>(ptr1);
+    const uint64_t addr2 = reinterpret_cast<uint64_t>(ptr2);
+    int32x4_t packed0;
+    int32x4_t packed1;
+    int32x4_t packed2;
+    asm volatile("global_load_dwordx4 %0, %3, off\n\t"
+                 "global_load_dwordx4 %1, %4, off\n\t"
+                 "global_load_dwordx4 %2, %5, off\n\t"
+                 "s_waitcnt vmcnt(0)\n\t"
+                 : "=&v"(packed0), "=&v"(packed1), "=&v"(packed2)
+                 : "v"(addr0), "v"(addr1), "v"(addr2)
+                 : "memory");
+    value0 = uint4{
+        static_cast<uint32_t>(packed0.x),
+        static_cast<uint32_t>(packed0.y),
+        static_cast<uint32_t>(packed0.z),
+        static_cast<uint32_t>(packed0.w)};
+    value1 = uint4{
+        static_cast<uint32_t>(packed1.x),
+        static_cast<uint32_t>(packed1.y),
+        static_cast<uint32_t>(packed1.z),
+        static_cast<uint32_t>(packed1.w)};
+    value2 = uint4{
+        static_cast<uint32_t>(packed2.x),
+        static_cast<uint32_t>(packed2.y),
+        static_cast<uint32_t>(packed2.z),
+        static_cast<uint32_t>(packed2.w)};
 }
 
 __device__ static inline void lds_store_bf16_device(

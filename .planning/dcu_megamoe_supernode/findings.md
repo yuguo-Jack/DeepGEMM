@@ -952,3 +952,162 @@ Normal graph post-K2-pool finding:
 - Flash EP8 Normal token4096 does not materially benefit from the K2 generic CTA-pool fix. The post-fix same-run numbers were graph replay `6.9424 ms` versus eager `5.9765 ms`, compared with the earlier `6.9821 ms` versus `6.0118 ms`.
 - This matches the source expectation: Flash Normal uses K2 `hidden=2048`, which already had the register-kernel CTA-pool path before the generic K2 fix. The remaining Normal graph gap is still K1/K3 normal ASM capacity-grid early-exit overhead, not K2 launch waste.
 - Pro Normal may still be the normal-backend case that benefits from K2 generic pooling because it uses `intermediate=3072`, but the attempted Pro EP8 Normal graph512 probe could not complete on 151.1 due to HIP OOM during baseline weight packing and persistent `86%` VRAM reporting with no visible KFD PIDs. Do not infer a Pro Normal graph result from that failed run.
+
+## 2026-07-14 - Flash LL Optimization Restart Constraints
+
+- The user reports that framework-integrated Flash decode currently shows no gain, so end-to-end LL latency—not isolated GEMM throughput—is the optimization objective.
+- Flash EP8/EP16 with `ll-masked` is the approved fast validation surface. Primary decode buckets are `8,32,64,128,256,512`; per-bucket graph replay is the first timing surface because it reflects the existing LL graph design without single-capacity padding bias.
+- Current source already contains the prior active-work recoveries: LL K1 active-only initialization, K3 split-tail active copy/CTA pooling, and K2 fixed CTA pooling. Repeating those ideas without new profile evidence would not be a new optimization.
+- The next candidate must be chosen from fresh current-artifact profiling. Likely attribution buckets are K1 stage/groupgemm, K3 local GEMM, K3 split combine/reduce, rank/barrier/signal protocol, and launch overhead; this is a hypothesis list, not a conclusion.
+- Correctness remains non-negotiable: no expected-M clamp, no graph host readback, no capacity crop, and no optimization that only passes random routes while failing `single-local-rank` skew.
+- Existing uncommitted `task_plan.md` changes only repair mojibake/checkmark characters. Preserve them separately from new kernel work.
+
+### Initial DCU RAG retrieval
+
+- `dcu-rag-kb` resolved its Hygon sources under `D:\git\geak_dcu\mcp_tools\rag-mcp\knowledge-base\amd-knowledge-base\layer-6-extended\hygon-extend` and returned source-backed gfx938/DeepEP references.
+- The first optimize query did not return a direct MegaMoE K1/K3 recipe. Its useful Hygon-specific guidance is narrower: keep hot shapes specialized, treat combine as an independently tunable stage, use fixed low-latency layouts/double buffering, overlap at chunk granularity with explicit readiness signals, and compile quantization into the transfer/stage path when message movement dominates.
+- The retrieved LDS microbenchmark evidence explicitly pairs `ds_read_*` consumers with `s_waitcnt lgkmcnt(0)`. Any waitcnt removal/reordering in K1/K3 therefore requires generated-ISA and correctness proof; it is not a safe source-only cleanup.
+- The KB also points to gfx938 native FP8 `__builtin_hcu_mmac_f32_16x16x32_fp8_fp8_lit_lts`, but the current production kernels already use `v_mmac`/pack5 paths. This is evidence for ISA verification, not justification to rewrite the GEMM core before profiling.
+- Relevant original sources to inspect next are the Hygon DeepEP low-latency report plus `DeepEP-main/csrc/kernels/internode_ll.cu`, the gfx938 builtin reference/source sheet, and the LDS microbenchmark sources. These are supporting patterns; current MegaMoE source and 151.1 profile remain authoritative.
+
+### Optimizer method/metrics constraints
+
+- The optimizer catalog confirms that the current Flash LL GEMM path already satisfies the high-priority MMAC/FP8 direction; a rewrite to another builtin is not justified unless `SQ_INSTS_MMOP` or final ISA unexpectedly shows the production kernel is not using `v_mmac`.
+- For the expected small/irregular decode workload, the first evidence-driven method candidates are `compute.launch_config_wave64`, `compute.register_pressure_control`, `latency.waitcnt_pipeline`, `latency.reduce_barrier`, `latency.persistent_scheduler`, and possibly `memory.vectorized_global_access`/`memory.epilogue_fusion`. None is selected until current profile/resource evidence triggers it.
+- Required evidence mapping is now explicit: low waves/CU activity for launch/persistent changes; high VGPR/SGPR or low occupancy for register control; clustered waits/SQTT stalls for waitcnt movement; barrier count/stalls for sync reduction; packed load/store ISA plus request counters for vectorization; fewer launches/global round trips for fusion.
+- Final proof for low-level changes must use `dccobjdump`: `v_mmac_*`, vector global/buffer operations, `ds_read*`, `s_waitcnt vmcnt/lgkmcnt`, `s_barrier`, and resource usage. Missing or empty dumps are inconclusive rather than proof of failure.
+
+### DeepEP original-source comparison
+
+- Deep retrieval reached the original Hygon DeepEP `internode_ll.cu`, not only the KB summary. Its strongest relevant pattern is chunk-granular combine readiness: `combine_sbo` maps `packed_recv_count` into `block_m` chunks, waits on a per-expert/per-chunk `comp_signal`, sends ready token chunks, and keeps clean/finish counters explicit.
+- DeepEP also uses shape/quant compile-time specialization, fixed low-latency layouts, double buffers, and explicit send/receive phases. These are architectural patterns rather than direct MegaMoE patches.
+- The source contains real system/workgroup-scope atomic and readiness protocols plus block-wide barriers. It reinforces that signal/barrier removal is high risk and must be justified by current MegaMoE profile plus scope analysis.
+- Current MegaMoE K3 already has split-tail chunk signals and active copy blocks, so the novel question is not "add chunking" but whether its current chunk size, worker assignment, signal publication/wait, or phase coupling leaves measurable decode bubbles. Fresh K3 profile/ISA must answer that before changes.
+- Framework-side delayed receive hooks could matter to the user's reported no-gain decode result, but this round remains kernel-first as requested. If isolated MegaMoE beats `ll-masked` while framework decode still does not, overlap/control-plane integration becomes a separate follow-up rather than evidence that the kernel branch failed.
+
+### 151.1 pre-baseline verification
+
+- SHA256 matches between local workspace and `/root/yuguo/DeepGEMM` for `opt.py`, K1/K3 LL implementation headers, K2 extension source, and the integrated test harness. The remote mapped source is therefore current for the hot paths under study.
+- Existing source-tree extensions were built on 2026-07-08 18:12-18:13, after the retained K2 pool change. `hipprof` and `dccobjdump` resolve from `/root/yuguo/dtk-26.04.1/bin`.
+- Before the baseline, all 16 HCUs reported `VRAM=0%`, `HCU=0%`, Normal mode, and `hy-smi --showpids` reported no KFD PIDs. The previous persistent-86%-VRAM incident is not present now.
+
+### Flash LL fast-validation contract
+
+- The fair fast matrix is Flash `hidden=4096`, `intermediate=2048`, `experts=256`, `topk=6`, explicit `--megamoe-backend ll --baseline-kind ll-masked --seed 1234`, and default per-bucket graph capture for tokens `8,32,64,128,256,512`.
+- `--skip-bench` only removes the top-level eager benchmark. Graph-bucket correctness and graph replay timing still execute, so each JSON contains a scope-aligned MegaMoE-graph versus `ll-masked`-graph pair. `--cuda-graph-skip-baseline` is profile-only and must not be used for speedup claims.
+- Branch selection starts with EP8 (`HIP_VISIBLE_DEVICES=0..7`) using graph warmup 1/replays 3 and test warmup 3/repeat 10. Only promising branches move to EP16 (`0..15`); the champion is rerun with 20 replays in at least two clean trials.
+- 151.1's framework-aligned Flash LL transport contract is RPC: `MEGAMOE_DCU_PEER_MEMORY=rpc` plus the retained ROCSHMEM/DUSHMEM low-latency environment. IPC and RPC results must never be mixed in one A/B comparison.
+- Every candidate keeps random correctness in the paired graph run and adds EP8 `single-local-rank` token128. A champion also runs EP16 skew. Any route/signal/barrier change adds uneven-rank coverage. Historical Flash skew errors were about `0.000244141`, so merely fitting the broad `atol=0.0035` is not sufficient evidence.
+- Historical guardrails are EP8 fused `0.4989/0.6451/0.6853/0.7688/1.0380/1.8168 ms` and EP16 fused `0.3732/0.4078/0.4771/0.5932/0.9963/1.8817 ms` for `8/32/64/128/256/512`. These are only drift checks; optimization claims must use same-run paired JSON because old runs used different capacity/capture policies.
+- The README phrase describing one captured graph is stale for its shown command: without `--cuda-graph-single-capture`, the current harness captures one graph per token bucket. The current round intentionally keeps per-bucket capture.
+
+### K3 batch3 adjacent retake
+
+- The isolated 3-load/1-wait reducer branch is repeatably positive, but the >=2% evidence is bucket-specific. The first 20-replay comparison gave `2.42%/2.02%/2.08%` at tokens `64/128/256`; the immediately adjacent original-to-candidate retake gave `2.46%/1.71%/1.27%`. Token64 is the only bucket currently above the 2% gate in both trials; no tested bucket regressed.
+- Do not claim a broad 2% win yet. Run a focused higher-replay original/candidate A/B for tokens `64/128/256`; retain only if the branch remains precision-clean and its middle-bucket benefit survives the stricter noise check.
+- The 100-replay retake confirms the precise interpretation: batch3 is a repeatable token64 optimization (`+2.43%`) and a smaller positive token128/token256 optimization (`+1.79%/+1.02%`), not a broad >=2% middle-bucket win. Because every tested bucket remains non-regressing and the compiled resource tuple is unchanged, advance it to skew and EP16 guardrails while keeping the claim bucket-specific.
+- EP16 invalidates the current batch3 implementation despite its EP8 gains: the adjacent original binary passes token512, while batch3 VM-faults there. Source review points to a concrete inline-assembly hazard to verify: the multi-instruction block uses ordinary `=v` outputs, so the compiler may overlap an output with a later address input even though the first load writes that output before the later address is consumed. The outputs likely need early-clobber constraints (`=&v`). Treat this as a hypothesis until ISA/compile evidence and a fixed retest confirm it.
+- The project itself confirms the correct constraint convention: K1/K3 multi-load helpers already mark their vector results `=&v`. The batch3 helper now follows that convention. Validate the fix first on EP16 token512; only then repeat performance, skew, and resource/ISA checks because early-clobber can change allocation pressure.
+- The fixed EP16 token512 pass strongly supports the register-overlap diagnosis, but does not yet prove the optimization remains worthwhile. Early-clobber constrains allocation and may consume more live VGPRs; all fixed-binary EP8/EP16 performance and resource measurements must replace the pre-fix data.
+- Fixed batch3 retains useful performance: EP8 remains centered on token64 (`+2.61%`, token128 `+1.99%`), while EP16 shows a broader middle-bucket effect at token32/64/128 (`+2.14%/+3.98%/+3.60%`). The candidate is now correctness-safe on the previously failing EP16/512 bucket, but an adjacent higher-replay EP16 original/candidate run is still required before retention.
+- The high-replay EP16 retake narrows the defensible claim: token64 is repeatably improved (`+3.70%`), while token32/token128 are smaller positives (`+1.25%/+1.02%`) and the earlier >2% readings were not stable. Together with the EP8 high-replay `+2.43%` token64 result, the branch clears the noise gate specifically for token64 on both EP sizes and is non-regressing outside a sub-noise EP8 token512 reading.
+- Final compiler assembly validates both intended scheduling and the safety fix: each topk6 half issues three vector loads before one VMEM wait, and the destination/address VGPR ranges are disjoint. This is stronger evidence than the degraded `dccobjdump` rendering and closes the ISA-sequence acceptance criterion.
+- High-sample profiling closes the method attribution: batching three reducer loads before one wait lowers the instrumented combine/reduce kernel average by `8.01%` at EP8 token64, while the adjacent K3 local GEMM changes by under 1%. End-to-end gains are smaller because combine/reduce is only one stage of the LL graph.
+- Against the requested same-run `ll-masked` baseline, the retained fixed binary wins all six full-matrix buckets. EP8 gains for tokens `8/32/64/128/256/512` are `17.56%/12.34%/14.49%/16.15%/9.28%/12.87%`; EP16 gains are `19.10%/16.24%/12.45%/11.93%/13.49%/4.66%`. These quantify the full MegaMoE LL path versus masked LL; incremental attribution versus the saved original K3 remains the narrower token64 result.
+
+### Fresh Flash EP8 LL baseline (2026-07-14)
+
+- A clean 151.1 EP8 run using the frozen RPC/per-bucket contract passed the eager correctness check and all six graph-bucket checks. Random-route max error was `0.000488281`; graph-bucket max error was `0.000244141` through token128 and `0.000549316` at token256/512.
+- Same-run graph medians for MegaMoE LL were `0.5050/0.6549/0.6946/0.7757/1.0664/1.8218 ms` for tokens `8/32/64/128/256/512`.
+- The paired `ll-masked` graph medians were `0.6081/0.7382/0.7908/0.9108/1.1587/2.1204 ms`. Baseline/LL speedups are therefore about `1.204x/1.127x/1.139x/1.174x/1.087x/1.164x`; LL wins every isolated bucket, but token256 has the smallest margin.
+- The result is inside the prior Flash EP8 stable band, so the current artifact is suitable for branch comparison. It also separates two questions: isolated MegaMoE LL still has a real paired advantage, while the user's missing framework decode gain likely includes integration/overlap/control-plane effects outside this kernel-only timing scope.
+- Run directory: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_flash_ll_opt/ep8_baseline_20260714_114627`.
+
+### Framework decode data supplied by the user
+
+- Framework TPOT uses input lengths 4096 and 16384, output length 1024, and max concurrency `1,2,4,8,16,32,64`. For input 4096, DeepEP versus MegaMoe TPOT is `20.16/20.66`, `20.85/22.54`, `22.49/21.85`, `23.99/23.75`, `24.81/24.39`, `29.52/26.39`, and `28.95/30.35 ms`, corresponding to reported changes `-2.48%/-8.11%/+2.85%/+1.00%/+1.69%/+10.60%/-4.84%`.
+- For input 16384, DeepEP versus MegaMoe TPOT is `21.25/20.04`, `20.87/21.84`, `22.36/22.10`, `22.19/23.55`, `26.31/23.29`, `25.46/26.50`, and `28.72/29.01 ms`, corresponding to `+5.69%/-4.65%/+1.16%/-6.13%/+11.48%/-4.08%/-1.01%`. The input-51200 rows are present but not yet populated.
+- The sign changes across adjacent concurrency points are much larger and less monotonic than the isolated EP8 per-bucket LL wins. This does not prove a specific integration bug, but it means final success cannot be inferred from one isolated token bucket: scheduler batching, graph selection/reuse, communication overlap, or measurement variance must be separated after the kernel branch is chosen.
+- The framework table makes low-concurrency/tiny-token latency especially relevant: concurrency 1/2 often regresses even though isolated token8/32 LL currently wins. The fresh token32 profile and the proposed partial-M-repeat K1 branch are therefore aligned with the observed weak framework region.
+
+### Initial Flash EP8 token32 profile
+
+- The graph-only token32 `hipprof --stats --hip-trace --follow-fork --devices 0` collection completed and wrote its database before the wrapper failed. The failure was only the final remote file-list command receiving a trailing CR (`sort\r`); the workload, result JSON, and profiler database completed successfully.
+- Coarse profiler statistics are heavily instrumented and include capture/setup, so their absolute kernel times are not benchmark times. Within the MegaMoE kernels visible on device 0, K1 masked group GEMM and K3 combine/reduce dominate; K3 local GEMM and K2 are small. This supports inspecting K1 tiny-tail work and K3 synchronization separately rather than changing K2 again.
+- Run directory: `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_flash_ll_opt/ep8_profile_t32_20260714_114841`.
+
+### Flash EP8 token512 profile comparison and first branch
+
+- The matching token512 graph-only profile completed cleanly at `/root/yuguo/DeepGEMM/hygon_tmp/supernode_debug/151_1_flash_ll_opt/ep8_profile_t512_20260714_115152`.
+- Under the same heavy instrumentation, K1 masked group GEMM was about `4.44 ms/call` at token32 and `4.31 ms/call` at token512; K3 combine/reduce was about `3.25` and `3.17 ms/call`. These values are effectively fixed/noisy profiler costs, not replay latency. K3 local GEMM changed much more clearly from about `0.171` to `0.445 ms/call`, while K2 stayed tiny (`0.032` to `0.037 ms/call`).
+- Source audit found that the Flash LL K1 BM32 tiny specialization masks invalid BF16 stores but still generates the second 16-row A-load/shuffle/scale/MMAC repeat. Historical K1-only BM16 evidence improved token32 K1 while K3 BM16 caused the end-to-end regression. The safest new branch is therefore K1-only: keep BM32 scheduling and K3 untouched, but compile out the empty second M16 repeat for the existing tiny specialization.
+- The first branch must be compile-time/specialization-limited, not a per-lane divergent shortcut. Evidence requirements are same-run EP8 paired graph timing, random and skew correctness, final ISA showing the second MMAC/load group removed, and no VGPR/SGPR/private-segment regression. A dynamic `remaining_m <= 16` extension is deferred until this narrow ablation wins.
+- Lower-priority K1 candidates are row-major 4096-byte staging (only if ISA shows redundant pointer VMEM), disabling an apparently unconsumed LL `row_expert_out` store as a separate A/B, and token-major topk6 route emit only if route-phase profiling justifies it.
+
+### K1 tiny-repeat precision gate
+
+- Exact source inspection adds a critical precondition to the proposed K1 branch. The host selects `kMaskTinyStore` from `valid_rows_per_expert <= 16`, but the kernel schedules per-expert tiles from device-side `cur_tokens = min(gemm_m[expert], m_per_expert)`. The current specialization only masks stores whose row is beyond `cur_tokens`; it does not assert that every expert has at most 16 rows.
+- Therefore compiling out `mr=1` is safe only if `valid_rows_per_expert` is proven to be a hard per-expert upper bound. If it is an expected/average row count, random hot experts and `single-local-rank` routes can exceed 16 and the branch would silently omit legal rows. No implementation is allowed until the caller semantics are traced.
+- The K3 audit provides a precision-preserving fallback: in split combine/reduce, issue topk6 `global_load_dwordx4` operations in pairs followed by one `s_waitcnt vmcnt(0)`, then retain the exact slot0..slot5 FP32 accumulation order. It changes only the VMEM wait window, leaves signals/barriers/fences unchanged, and has an objective ISA acceptance test.
+- Caller tracing proves `valid_rows_per_expert` is `ll_expected_rows_per_expert`, while physical capacity is separately expanded to `ll_worst_rows_per_expert = route_capacity_tokens_per_rank * num_ranks`. It is explicitly an expected count with random-routing headroom, so compile-time removal of `mr=1` is rejected as skew-unsafe.
+- A safe K1 ablation remains possible: for the existing tiny specialization only, compute the number of required 16-row repeats for the current expert/tile from device-side `cur_tokens`, and guard A loads, shuffles, MMACs, and scale loads with a block-uniform `mr < active_m_repeats`. Complete skew tiles retain every repeat; only the final partial tile skips empty repeats, and the existing per-row store mask remains for the partial 16-row repeat.
+
+### Rejected K1 device-count partial-repeat branch
+
+- The device-count-driven branch compiled and passed all random correctness checks, but catastrophically regressed exactly the three buckets using the tiny specialization: token `8/32/64` moved from `0.5050/0.6549/0.6946 ms` to `2.0103/2.3879/2.8151 ms`.
+- Token128, which does not use this specialization, stayed noise-level (`0.7757` baseline versus `0.7793 ms` branch), and paired `ll-masked` graph timings stayed stable. This isolates the regression to the new inner-pipeline control flow rather than node load or baseline drift.
+- The branch is rejected despite correct output. Repeated runtime guards inside unrolled A-load/shuffle/MMAC loops evidently destroy the intended pipeline/code generation; no EP16 or skew run is justified. Local source is restored immediately and the remote extension will be rebuilt before the next branch.
+- This result also closes the broader dynamic-repeat direction for the current kernel structure. A future K1 partial-repeat attempt would need a separately compiled/static body selected outside the hot K loop while retaining a skew-safe full-repeat path, not inner-loop runtime `continue` checks.
+
+### K3 paired-load branch design
+
+- Source inspection confirms split reduce currently calls `global_load_uint4_device` once per topk slot, and that helper places `s_waitcnt vmcnt(0)` immediately after every `global_load_dwordx4`. With topk6 this creates six serial load/wait windows before six ordered FP32 accumulations.
+- The safest implementation is not a no-wait helper whose result could be consumed early by compiler scheduling. Instead, add a pair helper containing two `global_load_dwordx4` instructions and the single `s_waitcnt vmcnt(0)` in one volatile inline-assembly block; expose both register results only after the wait completes.
+- The topk6 path will process fixed pairs `(0,1)`, `(2,3)`, `(4,5)` and accumulate the first result then the second, preserving the exact slot0..slot5 FP32 addition order. Other topk values retain the existing loop/helper. No copy phase, readiness signal, barrier, store wait, or fence changes in this A/B.
+
+### K3 paired-load first EP8 result
+
+- The candidate passed eager and every graph-bucket precision check with exactly the same reported errors as baseline: graph max error `0.000244141` through token128 and `0.000549316` at token256/512.
+- Candidate medians for `8/32/64/128/256/512` were `0.5028/0.6496/0.6822/0.7650/1.0505/1.8385 ms`, versus the original fresh baseline `0.5050/0.6549/0.6946/0.7757/1.0664/1.8218 ms`.
+- This is about `0.4%/0.8%/1.8%/1.4%/1.5%` faster through token256 but about `0.9%` slower at token512. Token512 minimum (`1.8080 ms`) is effectively equal to baseline (`1.8091 ms`), suggesting median jitter rather than a clear large-token regression.
+- The signal is plausible but below the optimizer's 2% noise gate. Preserve both old and candidate `.so` files and run alternating 20-replay A/B without rebuild between trials before deciding. No EP16 claim is allowed from this three-replay screen.
+
+### K3 paired-load alternating 20-replay A/B
+
+- The restored baseline `.so` and candidate `.so` were swapped into the same source-tree runtime path without rebuild, then run back-to-back with identical environment, seed, per-bucket capture, three graph warmups, and 20 replays. The candidate binary was restored afterward.
+- Baseline medians were `0.50420/0.65496/0.69450/0.77852/1.06396/1.82360 ms`; candidate medians were `0.50320/0.64916/0.68220/0.76574/1.04872/1.82302 ms` for tokens `8/32/64/128/256/512`.
+- Candidate improvements are `0.20%/0.89%/1.77%/1.64%/1.43%/0.03%`. The direction and magnitude reproduce the three-replay screen, so batching two loads is a real middle-bucket improvement with no observed regression, but it remains below the 2% branch-selection threshold.
+- Before rejecting the wait-window family, inspect candidate ISA/resource usage and test a separate batch3 branch if register pressure is still safe. Batch3 must preserve pairwise slot order (`0,1,2`, then `3,4,5`) and remain a single-variable replacement, not be combined with copy changes.
+
+### K3 batch3 first 20-replay result
+
+- Batch3 compiled with the same Flash combine/reduce metadata as batch2: 39 VGPR, 100 SGPR, 4 pre-existing SGPR spills, zero VGPR spills, wave64, no private segment, and a 44060-byte function. It did not cross a resource threshold.
+- Against the saved original-binary 20-replay baseline, batch3 medians are `0.50380/0.64554/0.67772/0.76280/1.04180/1.82324 ms` versus `0.50420/0.65496/0.69450/0.77852/1.06396/1.82360 ms` for tokens `8/32/64/128/256/512`.
+- Improvements are about `0.08%/1.44%/2.42%/2.02%/2.08%/0.02%`. This is the first branch to cross the 2% gate in three contiguous middle decode buckets while remaining flat at the endpoints. Every graph-bucket precision check passed with baseline-level errors.
+- Batch3 is a provisional champion, not yet retained. Run an adjacent candidate→baseline→candidate sequence, then skew correctness, EP16, profile, and final generated-code verification before selection.
+
+### 2026-07-14 Pro K3 validation preflight
+
+- The first Pro EP8 launch intentionally reused the Flash validation heap and failed before any fused or baseline kernel ran: DeepEP requested `num_rdma_bytes(11450456192)`, while `ROCSHMEM_HEAP_SIZE`/`DUSHMEM_HEAP_SIZE` were only `4737418240`.
+- This exactly matches the recorded 2026-07-03 Pro EP8 requirement. The established successful Pro setting is `12884901888` bytes (12 GiB) for both heaps; use it for all current Pro `ll-masked` runs.
+- The failed initializer left no KFD PIDs and did not change the retained runtime SHA. It is an environment-capacity preflight failure, not a correctness or performance observation.
+- With the established 12 GiB heaps, the retained fixed K3 Pro EP8 six-bucket matrix passed. Fused graph medians for tokens `8/32/64/128/256/512` are `1.43582/1.90560/1.97538/2.12872/2.45262/3.95552 ms`; same-run `ll-masked` medians are `1.44408/2.08698/2.17298/2.54806/3.19218/5.74220 ms`.
+- Pro EP8 fused gains are `0.57%/8.69%/9.09%/16.46%/23.17%/31.11%`. All per-bucket graph comparisons passed with max absolute error from `0.000488281` to `0.000976562`; runtime SHA stayed fixed and no KFD PIDs remained.
+- The matching retained-K3 Pro EP16 matrix also passed. Fused medians are `1.09655/1.20865/1.28934/1.47813/2.39638/4.14787 ms`; same-run `ll-masked` medians are `1.14419/1.28061/1.40935/1.71316/2.84173/5.10637 ms`.
+- Pro EP16 fused gains are `4.16%/5.62%/8.52%/13.72%/15.67%/18.77%` for tokens `8/32/64/128/256/512`. All graph checks passed with max absolute error `<=0.000976562`, the runtime SHA remained fixed, and all 16 cards were clean afterward.
+- Pro EP8 `single-local-rank` token128 passed both eager and graph precision against `ll-masked`; both max absolute errors were `0.000488281`. Run status was 0.
+- A later host-level card audit found a separate DeepSeek-V4-Pro SGLang service in container `wanghl_dev1`, parent PID `3325901`, using all 16 cards at roughly `87%-93%` VRAM. Epoch/timestamp comparison proves it started at `2026-07-14 14:25:52 +08:00`, about one hour after the retained Pro EP8/EP16 matrices and EP8 skew results were written at `13:25-13:29`; those results are therefore not load-contaminated.
+- Container-local `hy-smi --showpids` cannot resolve process directories owned by the other container and reports a generic error; host-level `hy-smi` is authoritative while that service is active. Do not run EP16 skew or binary A/B until host-level cards are clean, and do not terminate the external service without explicit authority.
+- Both attribution artifacts remain intact: saved original K3 SHA256 `41abd49f6f96f430894c0e8aeaeba2c623932d3bbb2fe314574d8976e332676c`; retained early-clobber K3 SHA256 `e32d9b94784d584ad7fdd0aaf699938742d4affa827134b4598a2feb3c53047c`. The source-tree runtime still matches the retained artifact.
+
+### K3 artifact-attribution correction in progress
+
+- `dccobjdump --show-sass` successfully produced full baseline/candidate gfx938 ISA files after extracting device ELFs and passing an output directory rather than a filename. The device ELFs and SASS hashes differ, but the inspected `k3_v3_fused_ext.so` diff currently shows changed branch offsets without changed `global_load_dwordx4`/`s_waitcnt` sequences.
+- This raises a concrete attribution concern: the shared header rebuilds both `k3_fused_ext.so` and `k3_v3_fused_ext.so`, and the split reducer may live in the former even though the staged launch wrapper lives in the latter. If so, swapping only the V3 `.so` did not switch the modified kernel and the apparent 1-2% A/B difference is just run-order noise.
+- Do not credit batch2 or start batch3 until the Python/binding symbol path is traced and the actual owning `.so` is saved/swapped. The correct binary must show the intended load-load-wait sequence in SASS.
+- Python/binding tracing rules out the wrong-extension hypothesis: LL assigns `ext = load_v3_ll_extension()`, calls `ext.k3_v3_ll_combine_tail_split`, and `k3_v3_fused_ext.cu` directly launches `V3_K3_LowLatencyCombineReduceKernel`, which calls the edited split reducer. The saved/swapped V3 `.so` is the correct owner.
+- The remaining question is generated-code equivalence: either the compiler did not materialize the intended branch as expected, or the first diff filters missed the changed body. A complete ISA diff and exact sequence extraction are required before interpreting the A/B.
+- The persisted `--show-sass` text dumps have exactly `387868` lines and `24783890` bytes and expose only six changed branch immediates. Initially this looked like a no-op, but ELF symbol sizes prove that conclusion was too strong: Flash combine/reduce grows from `43224` to `44060` bytes (`+836`, exactly 209 4-byte instructions), and the Pro specialization grows from `44248` to `45112` bytes (`+864`, 216 instructions).
+- The branch-immediate deltas match those inserted instruction counts, so the candidate body did materialize. The DTK `--show-sass` text output is incomplete/misleading for this internal branch body and cannot be used alone to compare the sequence. Use ELF metadata and a symbol-bounded disassembler/function extraction instead; the batch2 runtime A/B remains potentially valid pending that proof.
+- ELF metadata is unchanged for the Flash combine/reduce specialization: baseline and batch2 both use wave64, `VGPR=39`, `SGPR=100`, `SGPR spills=4`, `VGPR spills=0`, and `private_segment_fixed_size=0`. Batch2 therefore did not cross a reported register/spill threshold.
+- `dccobjdump --function`, `--recompile`, and `--disassembleAll` still expose only the kernel entry/control stub rather than the inserted internal branch body in this DTK build. Final wait-sequence proof must come from compiler save-temps assembly or another symbol-bounded AMDGPU disassembler; the empty/incomplete output is recorded as degraded tooling, not proof of absence.

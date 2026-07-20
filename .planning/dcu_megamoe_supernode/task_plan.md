@@ -243,9 +243,9 @@ Plan:
 - ✅ Add adversarial routing test support: `--route-pattern single-local-rank` routes unique top-k entries from all ranks into a selected target rank's local experts.
 - ✅ Validate on 151.1 with clean HCU state: source tests, build, Flash EP8 normal adversarial correctness, and Flash EP8 LL adversarial correctness passed.
 - ✅ Normal performance recovery: Flash EP8 normal eager 4096 regressed to `17.2707 ms` after exact compact capacity, versus historical `5.7636 ms`. K1 active launch alone improved only to `16.1966 ms`; adding K3 active launch/done-target handling and K2 active CTA pooling recovered the final same-node check to `5.9164 ms` versus `9.7064 ms` baseline, about `+2.7%` from the historical MegaMoE reference and `1.64x` faster than baseline.
-- 鉁?LL active-only work: remove row-capacity-wide K1 stage metadata/scale initialization while preserving safe padding rows for the active tile tail.
-- 鉁?LL active-only work: make K3 split-tail copy blocks follow `max(actual_m)` without launching a full `m_per_expert` capacity grid. The bounded CTA pool grid-strides over active copy blocks and preserves the adversarial skew case.
-- 鉁?Performance guardrail: Flash EP8 LL graph cap512 returned to the historical post-guard band after the K3 CTA-pool rebuild (`0.558/0.668/0.703/0.779/1.046/1.841 ms` for replay `8/32/64/128/256/512`) and adversarial LL correctness still passed.
+- ✅ LL active-only work: remove row-capacity-wide K1 stage metadata/scale initialization while preserving safe padding rows for the active tile tail.
+- ✅ LL active-only work: make K3 split-tail copy blocks follow `max(actual_m)` without launching a full `m_per_expert` capacity grid. The bounded CTA pool grid-strides over active copy blocks and preserves the adversarial skew case.
+- ✅ Performance guardrail: Flash EP8 LL graph cap512 returned to the historical post-guard band after the K3 CTA-pool rebuild (`0.558/0.668/0.703/0.779/1.046/1.841 ms` for replay `8/32/64/128/256/512`) and adversarial LL correctness still passed.
 - ✅ Pro LL graph default now captures MegaMoE per replay bucket instead of forcing every bucket through one max-capacity graph. Pro EP8 cap512 per-bucket medians are `1.438/1.930/2.049/2.295/2.774/4.656 ms`, faster than the aligned `ll-masked` baseline.
 - [ ] Pro LL performance fix: default Pro split still regresses after exact worst-capacity because the bundled masked K1 ASM uses `size_m = rows_per_expert` for both work and physical expert stride. Pro EP8 cap512 exact-worst measured `2.159/2.625/2.694/2.854/3.173/4.652 ms`, and eager compact-active improves token256/token512 to `2.602/4.095 ms` while preserving random correctness. Continue performance work only after the current Pro skew correctness blocker is resolved.
 - ✅ First Pro compact-head attempt was rejected and removed: correctness passed, but graph cap512 measured `2.277/2.747/2.823/2.980/3.282/4.792 ms`, slower than the exact split run. The production branch now keeps only compact-active plus exact per-bucket graph behavior.
@@ -429,20 +429,20 @@ Status: [] active; ordered by current user priority.
 ## 2026-07-08 Graph Performance Follow-Up
 Status: [] measured; no low-risk correctness-safe performance patch has been applied.
 
-- 鉁?Reproduced the current post-fix graph/eager gaps on rebuilt 151.1 artifacts:
+- ✅ Reproduced the current post-fix graph/eager gaps on rebuilt 151.1 artifacts:
   - Normal Flash EP8 token4096 graph `6.9821 ms` versus eager `6.0118 ms`.
   - Pro EP8 LL cap512 graph replay512 `4.6485 ms` versus eager `4.1925 ms`.
-- 鉁?Rejected simple toggles:
+- ✅ Rejected simple toggles:
   - `K3_USE_ASM_TAIL_REDUCE=0` made Normal graph slower (`7.0714 ms`).
   - `MEGAMOE_DCU_LL_K3_SPLIT_TAIL=0` made Pro LL graph slower (`5.2302 ms`).
-- 鉁?Profiled graph kernels on 151.1:
+- ✅ Profiled graph kernels on 151.1:
   - Normal gap is dominated by K1/K3 normal ASM capacity-grid early-exit overhead; compact route prebuild kernels are not the bottleneck.
   - Pro LL graph gap still points to Pro masked K1 exact physical stride / `num_MBlocks`, not K2/K3 full-capacity copy work.
-- 鉁?Collected the previously missing fair Pro EP16 `ll-masked` baseline cap512 single-capture data. With both MegaMoE and baseline captured at cap512, MegaMoE replay medians were `1.8216/1.9240/2.0016/2.2017/3.1074/4.8633 ms` and baseline medians were `2.5676/2.6352/2.6780/2.8035/3.5800/5.1097 ms` for `8/32/64/128/256/512`.
+- ✅ Collected the previously missing fair Pro EP16 `ll-masked` baseline cap512 single-capture data. With both MegaMoE and baseline captured at cap512, MegaMoE replay medians were `1.8216/1.9240/2.0016/2.2017/3.1074/4.8633 ms` and baseline medians were `2.5676/2.6352/2.6780/2.8035/3.5800/5.1097 ms` for `8/32/64/128/256/512`.
 - [ ] If graph performance becomes required, implement one of the correctness-safe graph work-shaping designs:
   - Normal: K1/K3 capture-compatible active-tile CTA pool or device-side active-tile consumer.
   - Pro LL: masked K1 device-side max-count M-block scheduling, or true compact LL graph where K1/K2/K3 consume compact active rows.
-- 馃毇 Do not use expected-M or compact-stride clamping as a graph shortcut. It would skip legal skew rows and reintroduce the precision hazard fixed by exact capacity.
+- 🚫 Do not use expected-M or compact-stride clamping as a graph shortcut. It would skip legal skew rows and reintroduce the precision hazard fixed by exact capacity.
 
 ## 2026-07-08 Final LL Follow-Up
 Status: [] active; final correctness/performance retest is complete for EP8 and EP16 LL, with Normal graph performance deferred by user direction.
@@ -474,10 +474,10 @@ Status: [] active; evidence correction complete, implementation not started.
 
 ### 2026-07-08 Pro LL Graph K2 Pool
 
-- [x] Profile whole Pro LL graph exact path again after the masked-K1 correction. Clean profile showed K2 generic hidden=3072 was the major graph-only outlier.
-- [x] Fix K2 generic kernel to use the existing graph fixed CTA pool contract: `dim3(launch_blocks)` plus grid-stride over `effective_rows`.
-- [x] Verify EP8 graph random and skew correctness/performance on 151.1.
-- [x] Verify EP16 token512 graph sanity on 151.1 using IPC peer mode after a fabric attach failure.
+- ✅ Profile whole Pro LL graph exact path again after the masked-K1 correction. Clean profile showed K2 generic hidden=3072 was the major graph-only outlier.
+- ✅ Fix K2 generic kernel to use the existing graph fixed CTA pool contract: `dim3(launch_blocks)` plus grid-stride over `effective_rows`.
+- ✅ Verify EP8 graph random and skew correctness/performance on 151.1.
+- ✅ Verify EP16 token512 graph sanity on 151.1 using IPC peer mode after a fabric attach failure.
 - [ ] Continue graph optimization only after measuring the remaining K3 combine / K1 stage-only gap; do not touch the packaged masked K1 `.co` unless a layout-compatible ABI source is proven.
 
 ### 2026-07-08 Pro LL K2 Graph Pool
@@ -488,7 +488,65 @@ Status: [] active; evidence correction complete, implementation not started.
 
 ### 2026-07-08 Normal Graph Recheck After K2 Pool
 
-- [x] Rerun Flash EP8 Normal graph token4096 after the K2 generic CTA-pool fix.
+- ✅ Rerun Flash EP8 Normal graph token4096 after the K2 generic CTA-pool fix.
 - Result: correctness passed; graph replay `6.9424 ms` versus eager `5.9765 ms`. This is noise-level versus the earlier `6.9821 ms` / `6.0118 ms`, so the K2 pool fix does not recover the Flash Normal graph/eager gap.
 - Interpretation: expected, because Flash Normal uses K2 `hidden=2048` register-kernel path, which already used CTA pooling. The remaining Normal graph work is still K1/K3 ASM active-tile scheduling.
 - [ ] Optional later: rerun Pro Normal graph on a clean-VRAM node to measure the `intermediate=3072` generic-K2 normal-backend case. The first attempt failed with HIP OOM during baseline weight packing, and the node reported persistent `86%` VRAM usage with no visible KFD PIDs.
+
+## 2026-07-14 Flash LL Kernel Optimization Follow-Up
+Status: [x] complete; fixed K3 batch3 reducer-load scheduling retained and validated.
+
+Goal:
+- Recover additional framework-relevant decode latency from the Flash LL path while preserving BF16/FP8 correctness and legal skew handling.
+- Use Flash EP8/EP16 as the fast validation surface and compare against the aligned DeepEP `ll-masked` baseline.
+- Keep current exact-capacity, active-only, split-tail, and fixed-CTA-pool correctness contracts intact.
+
+Validation matrix:
+- Primary graph replay buckets: `8,32,64,128,256,512` tokens, Flash shape `experts=256, topk=6, hidden=4096, intermediate=2048`.
+- Run EP8 first for fast branch selection, then EP16 for communication/rank-count validation.
+- Baseline: `--baseline-kind ll-masked`; default per-bucket graph capture for fair small-bucket timing unless a single-capture question is explicitly under test.
+- Precision gates: existing harness tolerance plus nonfinite checks and expert recv-stat equality; every retained branch must also pass `single-local-rank` skew at a representative bucket.
+- Noise gate: require a repeatable improvement beyond the run noise band (normally >=2%) before retaining a method; compare same-run fused and baseline numbers and rerun the champion.
+
+Optimization phases:
+- [x] Record current 151.1 environment/artifact state and collect clean EP8/EP16 Flash LL baseline JSON.
+- [x] Profile representative decode buckets and attribute time to K1 stage/groupgemm, K2, K3 local GEMM, split combine/reduce, barriers, and launch overhead.
+- [x] Inspect code-object resources and generated ISA for the top hotspot; query DCU KB for exact gfx938 instruction/wait/LDS guidance before source changes.
+- [x] Implement one low-risk, single-variable branch locally; run compile/source-contract checks before remote sync.
+- [x] Rebuild on 151.1, validate random plus adversarial precision, benchmark EP8, then benchmark EP16 only for promising branches.
+- [x] Profile and ISA-check the champion, run an ablation/revert comparison, retain only attributable improvements, and document rejected branches.
+
+Retained outcome:
+- K3 split combine/reduce topk6 loads are issued in two groups of three, with one `vmcnt(0)` wait per group and unchanged slot accumulation order.
+- All three inline-assembly outputs use early-clobber `=&v`; this fixes the pre-retention EP16 token512 address-overlap VM fault found by the guardrail matrix.
+- Repeatable high-replay incremental gain over the saved original K3 is concentrated at token64: `+2.43%` for EP8 and `+3.70%` for EP16. High-sample hipprof attributes an `8.01%` reduction to K3 combine/reduce itself.
+- Random six-bucket graph precision, EP8/EP16 `single-local-rank` token128, EP16 token512, source-contract tests, resource metadata, and compiler assembly all passed. Resource tuple remains wave64 / 39 VGPR / 100 SGPR / 4 SGPR spills / 0 VGPR spills / 0 private bytes.
+
+Rejected/negative branches:
+- K1 device-count partial-repeat gating was correctness-safe but catastrophically slower for small buckets and was fully reverted.
+- K3 pair-load batching was positive but stayed below the 2% retention gate; batch3 superseded it.
+
+Do not repeat or reintroduce:
+- Capacity/expected-M clamping, graph D2H active-count reads, or any path that can drop legal skew rows.
+- The rejected Pro C-groupgemm/LDS orientation experiments or historical layout-incompatible masked `.s` replacement.
+- Disabling LL split-tail as a generic optimization; previous Pro evidence showed it was slower.
+- K2 generic CTA-pool work already retained in current source.
+
+## 2026-07-14 Pro LL K3 Validation
+Status: [ ] paused at user request after external 16-card occupancy; clean random matrices and EP8 skew are complete, while EP16 skew and original/fixed attribution remain.
+
+Validation contract:
+- Shape: `experts=384`, `topk=6`, `hidden=7168`, `intermediate=3072`; test EP8 and EP16.
+- Primary graph buckets: `8,32,64,128,256,512`, capacity `512`, per-bucket capture, `LL` against same-run `ll-masked`.
+- Precision gates: every graph bucket plus representative `single-local-rank` token128 for both EP sizes.
+- Attribution gate: compare the saved original and retained K3 binaries at a representative bucket after the full same-run matrices; preserve/restore the retained runtime artifact around every swap.
+- Operational gate: verify local/remote source and runtime hashes before testing and require clean KFD PID state after every run.
+
+Phases:
+- [x] Verify 151.1 card state, mapped-source hashes, and retained runtime artifact.
+- [x] Run Pro EP8 six-bucket graph correctness/performance matrix.
+- [x] Run Pro EP16 six-bucket graph correctness/performance matrix.
+- [x] Run Pro EP8 `single-local-rank` token128 correctness check.
+- [ ] Run Pro EP16 `single-local-rank` token128 correctness check after 151.1 is clean.
+- [ ] Run focused saved-original versus retained-K3 attribution if the matrices are stable.
+- [ ] Record results, clean-card state, and retained/rejected conclusion.
