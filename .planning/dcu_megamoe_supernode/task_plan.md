@@ -550,3 +550,13 @@ Phases:
 - [ ] Run Pro EP16 `single-local-rank` token128 correctness check after 151.1 is clean.
 - [ ] Run focused saved-original versus retained-K3 attribution if the matrices are stable.
 - [ ] Record results, clean-card state, and retained/rejected conclusion.
+
+## 2026-07-20 Generic correctness and collective teardown hardening
+
+Status: [x] requested generic landings complete; residual cap512 driver warning documented.
+
+- [x] Land zero-route stale-row prevention as `3499767` with EP8/EP16 reuse and skew gates.
+- [x] Land the dead K1 fixed-expert quotient cleanup for PACK5 and UNIFIED as `3c41e8d`, with legal-size attribution and extreme-skew eager/graph gates.
+- [x] Land collective `SymmBuffer.destroy()` ordering as `e12ba9f`, with local/remote source tests and isolated EP8/EP16 cap128 RPC graph-vs-eager lifecycle gates.
+- [x] Fast-forward local `supernode` only; leave `origin/supernode=d192ea1`, perform no push, and merge no INT8 implementation back from `ygzp-int8`.
+- [ ] Non-blocking residual: EP16 cap512 is numerically correct but produced six delayed process-exit `gpu_bo_vm_destroy/list_del` warnings. External DeepEP cleanup and driver root cause remain outside these commits.
