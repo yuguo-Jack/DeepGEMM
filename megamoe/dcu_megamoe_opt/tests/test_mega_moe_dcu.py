@@ -1194,6 +1194,50 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         baseline_stats = stats_initial + baseline_counts if baseline_counts is not None else None
         return baseline_y, baseline_stats, meta
 
+    def run_zero_weight_reuse_check():
+        if v3_backend != "normal":
+            raise ValueError("--check-zero-weight-reuse requires --megamoe-backend normal")
+        if num_tokens <= 0:
+            raise ValueError("--check-zero-weight-reuse requires at least one local token")
+        saved_topk_weights = topk_weights.clone()
+        try:
+            nonzero_y, _ = run_fused(reset_stats=True)
+            torch.cuda.synchronize()
+            if nonfinite_count(nonzero_y):
+                raise AssertionError("zero-weight reuse precondition produced nonfinite output")
+            if int(torch.count_nonzero(nonzero_y).item()) == 0:
+                raise AssertionError(
+                    "zero-weight reuse precondition did not populate combine output"
+                )
+
+            topk_weights.zero_()
+            zero_y, zero_stats = run_fused(reset_stats=True)
+            torch.cuda.synchronize()
+            zero_nonfinite = nonfinite_count(zero_y)
+            zero_max_abs = zero_y.float().abs().max().item() if zero_y.numel() else 0.0
+            expected_stats = stats_initial + get_expected_local_counts_eager()
+            if zero_nonfinite:
+                raise AssertionError(
+                    f"zero-weight reuse output has {zero_nonfinite} nonfinite values"
+                )
+            if zero_max_abs > args.atol:
+                raise AssertionError(
+                    "zero-weight reuse exposed stale combine data: "
+                    f"max_abs={zero_max_abs} exceeds --atol={args.atol}"
+                )
+            if not torch.equal(zero_stats, expected_stats):
+                raise AssertionError(
+                    "zero-weight reuse stats mismatch: "
+                    f"fused={zero_stats}, expected={expected_stats}"
+                )
+            print_once(
+                rank,
+                "Zero-weight same-buffer reuse: "
+                f"max_abs={zero_max_abs:.6g}, stats_exact=True",
+            )
+        finally:
+            topk_weights.copy_(saved_topk_weights)
+
     def run_cuda_graph_bucket_check():
         max_capture_tokens = int(sym_buffer.cuda_graph_max_tokens_per_rank)
         if args.cuda_graph_test_tokens:
@@ -1500,6 +1544,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_weights,
         )
 
+    if args.check_zero_weight_reuse:
+        run_zero_weight_reuse_check()
+
     for i in range(args.correctness_iters):
         fused_y, fused_stats = run_fused(reset_stats=True)
         baseline_y, baseline_stats, _ = run_baseline(return_stats=True)
@@ -1796,6 +1843,14 @@ def parse_args():
     )
     parser.add_argument("--correctness-iters", type=int, default=1)
     parser.add_argument("--atol", type=float, default=0.0035)
+    parser.add_argument(
+        "--check-zero-weight-reuse",
+        action="store_true",
+        help=(
+            "run an eager-normal same-buffer nonzero-to-zero route regression "
+            "and require exact cumulative local-expert stats"
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--skip-bench", action="store_true")

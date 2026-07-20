@@ -631,6 +631,30 @@ def test_v3_capacity_contract_is_skew_safe_without_overflow_fallback():
     assert "topk_idx.copy_(experts.view(1, -1).expand_as(topk_idx))" in test_harness_source
 
 
+def test_v3_compact_routes_overwrite_zero_weight_reuse_slots():
+    k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+    test_harness = (
+        ROOT / "megamoe" / "dcu_megamoe_opt" / "tests" / "test_mega_moe_dcu.py"
+    ).read_text(encoding="utf-8")
+    count_kernel = k1_ext.split(
+        "__global__ void k1_count_compact_routes_kernel(", 1
+    )[1].split("__global__ __launch_bounds__", 1)[0]
+    emit_kernel = k1_ext.split(
+        "__global__ void k1_emit_compact_routes_kernel(", 1
+    )[1].split("hipFunction_t get_asm_function", 1)[0]
+
+    assert "topk_weights" not in count_kernel
+    assert "const float weight = topk_weights[route_offset]" in emit_kernel
+    assert "if (weight == 0.0f)" not in emit_kernel
+    assert "atomicAdd(&route_scratch_i32[local_expert], 1)" in emit_kernel
+    assert "atomicAdd(local_expert_stats + local_expert, 1)" in emit_kernel
+    assert "--check-zero-weight-reuse" in test_harness
+    assert "saved_topk_weights = topk_weights.clone()" in test_harness
+    assert "topk_weights.zero_()" in test_harness
+    assert "zero-weight reuse exposed stale combine data" in test_harness
+    assert "zero-weight reuse stats mismatch" in test_harness
+
+
 def test_v3_pro_ll_masked_k1_stage_only_path_is_additive():
     k1_header = (K1_FUSED_DIR / "k1_v3_pack5_groupgemm_impl.cuh").read_text(
         encoding="utf-8"

@@ -662,10 +662,9 @@ __global__ void k1_emit_compact_routes_kernel(
         if (expert < first_expert || expert >= last_expert) {
             continue;
         }
+        // The count pass already reserved this route. Keep zero weights so K2
+        // writes a zero partial and K3 overwrites a reused combine slot.
         const float weight = topk_weights[route_offset];
-        if (weight == 0.0f) {
-            continue;
-        }
         const int local_expert = static_cast<int>(expert) - first_expert;
         const int row_in_expert =
             atomicAdd(&route_scratch_i32[local_expert], 1);
