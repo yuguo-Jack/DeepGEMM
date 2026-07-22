@@ -1523,6 +1523,50 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert '"normal" if v3_backend == "normal" else "unified"' in test_source
 
 
+def test_int8_normal_contiguous_baseline_is_true_w8a8_end_to_end():
+    test_source = (
+        ROOT
+        / "megamoe"
+        / "dcu_megamoe_opt"
+        / "tests"
+        / "test_mega_moe_int8_baseline.py"
+    ).read_text(encoding="utf-8")
+    api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")
+    kernel_source = MEGA_DCU_KERNEL_PATH.read_text(encoding="utf-8")
+
+    assert 'NUM_RANKS = 8' in test_source
+    assert 'NUM_EXPERTS = 288' in test_source
+    assert 'NUM_TOPK = 8' in test_source
+    assert 'HIDDEN = 4096' in test_source
+    assert 'INTERMEDIATE_HIDDEN = 2048' in test_source
+    assert "megamoe.mega_moe_pre_dispatch_int8" in test_source
+    assert "megamoe.int8_w8a8_mega_moe" in test_source
+    assert "megamoe.cast_grouped_weight_to_int8_channelwise" in test_source
+    assert "megamoe.weight8bit_nt_kpack2_marlin" in test_source
+    assert "deepgemm.m_grouped_i8_gemm_nt_contiguous" in test_source
+    assert "swiglu_quant_int8_channelwise_out" in test_source
+    assert "expert_alignment=DEEPEP_EXPERT_ALIGNMENT" in test_source
+    assert "INT8 fused/baseline stats mismatch" in test_source
+    assert '"speedup_vs_int8_baseline"' in test_source
+    assert "m_grouped_fp8_gemm" not in test_source
+    assert "compare-int8-fp8" not in test_source
+
+    assert "recv_x.scalar_type() == torch::kFloat8_e4m3fn ||" in api_source
+    assert "recv_x.scalar_type() == torch::kInt8" in api_source
+    assert "torch::empty({rows, hidden}, recv_x.options())" in api_source
+    assert "recv_x.scalar_type() == torch::kInt8);" in api_source
+    assert "DeepEP preprocess requires at least one local expert" in api_source
+    preprocess_api = api_source.split(
+        "static pybind11::tuple deepep_deepgemm_preprocess_channelwise(", 1
+    )[1].split("static void deepep_deepgemm_postprocess_channelwise(", 1)[0]
+    assert "dtype(torch::kFloat8_e4m3fn).device(device)" not in preprocess_api
+    assert "deepep_sanitize_int8_tile_heads_kernel" in kernel_source
+    assert "m_indices[tile_head] < 0" in kernel_source
+    assert "grouped_x_scale[tile_head] = 0.0f" in kernel_source
+    assert "route_weights[tile_head] = 0.0f" in kernel_source
+    assert "m_indices[tile_head] = 0" in kernel_source
+
+
 def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     init_source = (ROOT / "megamoe" / "__init__.py").read_text(encoding="utf-8")
     api_source = MEGA_DCU_API_PATH.read_text(encoding="utf-8")

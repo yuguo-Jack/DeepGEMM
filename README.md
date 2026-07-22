@@ -657,30 +657,29 @@ python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
   --out hygon_tmp/megamoe_dcu_dsv4_flash_512.json
 ```
 
-Run the YGZP signed-INT8 EP8 normal eager path against the unchanged FP8
-normal-contiguous correctness/performance oracle.  Eager performance validation
-uses token sizes of at least 512:
+Use the dedicated test for YGZP signed-INT8 EP8 normal eager versus the true
+signed-INT8 normal-contiguous baseline.  It is intentionally separate from the
+general FP8/LL harness and fixes the model shape to experts/topk/hidden/
+intermediate `288/8/4096/2048`.  Eager validation uses token sizes of at least
+512:
 
 ```bash
 source /opt/dtk-26.04/env.sh
 HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 MEGAMOE_DCU_PEER_MEMORY=ipc \
-python megamoe/dcu_megamoe_opt/tests/test_mega_moe_dcu.py \
+python megamoe/dcu_megamoe_opt/tests/test_mega_moe_int8_baseline.py \
   --num-processes 8 \
   --num-max-tokens-per-rank 512 \
   --num-tokens 512 \
-  --hidden 4096 \
-  --intermediate-hidden 2048 \
-  --num-experts 288 \
-  --num-topk 8 \
-  --quant-mode int8 \
-  --megamoe-backend normal \
-  --baseline-kind normal-contiguous \
   --correctness-iters 1 \
   --warmup 10 \
-  --repeat 50 \
+  --repeat 20 \
   --out hygon_tmp/megamoe_dcu_ygzp_int8_ep8_512.json
 ```
+
+This test uses HIP pre/post, 256-row DeepEP expert alignment, the DeepGEMM INT8
+contiguous kernel, and the legacy N16-flat INT8 weight layout.  The general
+`test_mega_moe_dcu.py` behavior remains unchanged.
 
 For the DeepSeek-V4-Pro EP16 shape, use the same harness with:
 

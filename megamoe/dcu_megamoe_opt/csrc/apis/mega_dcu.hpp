@@ -58,7 +58,8 @@ void launch_mega_moe_deepep_scatter_channelwise_hip(
     int topk,
     int hidden,
     int num_experts,
-    bool topk_ids_i64);
+    bool topk_ids_i64,
+    bool sanitize_int8_tile_heads);
 
 void launch_mega_moe_deepep_gather_channelwise_hip(
     void* recv_y,
@@ -531,8 +532,9 @@ static pybind11::tuple deepep_deepgemm_preprocess_channelwise(
     TORCH_CHECK(recv_x.is_cuda() && recv_x_scale.is_cuda() && recv_topk_ids.is_cuda() &&
                 recv_topk_weights.is_cuda() && num_recv_tokens_per_expert.is_cuda(),
                 "DeepEP preprocess tensors must be CUDA/HIP tensors");
-    TORCH_CHECK(recv_x.scalar_type() == torch::kFloat8_e4m3fn,
-                "DeepEP preprocess expects FP8 E4M3 recv_x");
+    TORCH_CHECK(recv_x.scalar_type() == torch::kFloat8_e4m3fn ||
+                    recv_x.scalar_type() == torch::kInt8,
+                "DeepEP preprocess expects FP8 E4M3 or signed INT8 recv_x");
     TORCH_CHECK(recv_x_scale.scalar_type() == torch::kFloat32 &&
                 recv_topk_weights.scalar_type() == torch::kFloat32,
                 "DeepEP preprocess scales and weights must be FP32");
@@ -560,12 +562,12 @@ static pybind11::tuple deepep_deepgemm_preprocess_channelwise(
     const int recv_rows = static_cast<int>(recv_x.size(0));
     const int topk = static_cast<int>(recv_topk_ids.size(1));
     const int num_experts = static_cast<int>(num_recv_tokens_per_expert.numel());
+    TORCH_CHECK(num_experts > 0, "DeepEP preprocess requires at least one local expert");
     const auto device = recv_x.device();
-    const auto fp8_options = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(device);
     const auto f32_options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
     const auto i32_options = torch::TensorOptions().dtype(torch::kInt).device(device);
 
-    auto grouped_x = torch::empty({rows, hidden}, fp8_options);
+    auto grouped_x = torch::empty({rows, hidden}, recv_x.options());
     auto grouped_x_scale = torch::empty({rows}, f32_options);
     auto route_weights = torch::zeros({rows}, f32_options);
     auto m_indices = torch::full({rows}, -1, i32_options);
@@ -589,7 +591,8 @@ static pybind11::tuple deepep_deepgemm_preprocess_channelwise(
         topk,
         hidden,
         num_experts,
-        recv_topk_ids.scalar_type() == torch::kLong);
+        recv_topk_ids.scalar_type() == torch::kLong,
+        recv_x.scalar_type() == torch::kInt8);
     return pybind11::make_tuple(grouped_x, grouped_x_scale, route_weights, m_indices, output_index);
 }
 

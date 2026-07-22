@@ -509,6 +509,22 @@ __global__ void deepep_gather_channelwise_kernel(uint16_t* recv_y,
     }
 }
 
+__global__ void deepep_sanitize_int8_tile_heads_kernel(float* grouped_x_scale,
+                                                       float* route_weights,
+                                                       int* m_indices,
+                                                       const int total_rows) {
+    constexpr int kContiguousTileRows = 256;
+    const int tile = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int tile_head = tile * kContiguousTileRows;
+    if (tile_head < total_rows && m_indices[tile_head] < 0) {
+        // The INT8 contiguous ASM dereferences the tile-head expert before its
+        // per-row -1 mask. Point an empty tile at a valid zero-scaled dummy row.
+        grouped_x_scale[tile_head] = 0.0f;
+        route_weights[tile_head] = 0.0f;
+        m_indices[tile_head] = 0;
+    }
+}
+
 void launch_mega_moe_deepep_scatter_channelwise_hip(
     void* grouped_x,
     float* grouped_x_scale,
@@ -526,7 +542,8 @@ void launch_mega_moe_deepep_scatter_channelwise_hip(
     const int topk,
     const int hidden,
     const int num_experts,
-    const bool topk_ids_i64) {
+    const bool topk_ids_i64,
+    const bool sanitize_int8_tile_heads) {
     constexpr int kThreads = 256;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     hipLaunchKernelGGL(deepep_scatter_prefix_kernel, dim3(1), dim3(1), 0, stream,
@@ -568,6 +585,18 @@ void launch_mega_moe_deepep_scatter_channelwise_hip(
                            topk,
                            hidden,
                            num_experts);
+    }
+    if (sanitize_int8_tile_heads) {
+        constexpr int kContiguousTileRows = 256;
+        const int tile_count = (total_rows + kContiguousTileRows - 1) /
+                               kContiguousTileRows;
+        const int sanitize_blocks = (tile_count + kThreads - 1) / kThreads;
+        hipLaunchKernelGGL(deepep_sanitize_int8_tile_heads_kernel,
+                           dim3(sanitize_blocks), dim3(kThreads), 0, stream,
+                           grouped_x_scale,
+                           route_weights,
+                           m_indices,
+                           total_rows);
     }
     DG_HIP_CHECK(hipGetLastError());
 }
