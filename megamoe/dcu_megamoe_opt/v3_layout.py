@@ -89,6 +89,67 @@ def flatten_pack5_weight(weight: torch.Tensor) -> torch.Tensor:
     return packed.reshape(weight.shape[0], weight.shape[1] * weight.shape[2])
 
 
+def _repack_grouped_weight_inplace_(
+    weight: torch.Tensor,
+    pack_chunk,
+    *,
+    chunk_experts: int,
+    function_name: str,
+) -> torch.Tensor:
+    if weight.dim() != 3:
+        raise ValueError(f"{function_name} expects [expert, n, k]")
+    if not isinstance(chunk_experts, int) or isinstance(chunk_experts, bool):
+        raise TypeError(f"{function_name} expects chunk_experts to be an integer")
+    if chunk_experts <= 0:
+        raise ValueError(f"{function_name} expects chunk_experts to be positive")
+    if not weight.is_contiguous():
+        raise ValueError(f"{function_name} requires contiguous input storage")
+    if weight.storage_offset() != 0:
+        raise ValueError(f"{function_name} requires zero storage_offset")
+
+    expected_nbytes = weight.numel() * weight.element_size()
+    if weight.untyped_storage().nbytes() != expected_nbytes:
+        raise ValueError(
+            f"{function_name} requires independent storage covering exactly the input tensor"
+        )
+
+    experts = weight.shape[0]
+    with torch.no_grad():
+        for start in range(0, experts, chunk_experts):
+            end = min(start + chunk_experts, experts)
+            packed = pack_chunk(weight[start:end])
+            weight[start:end].reshape(-1).copy_(packed.reshape(-1))
+            del packed
+    return weight.detach()
+
+
+def flatten_pack5_weight_inplace_(
+    weight: torch.Tensor,
+    *,
+    chunk_experts: int = 1,
+) -> torch.Tensor:
+    """Repack LL/unified pack5 weights into their existing storage.
+
+    The returned ``[expert, n * k]`` tensor is a detached view of ``weight`` and
+    has the same storage pointer. This destructive post-load helper is intended
+    for inference weights that own independent contiguous storage.
+    """
+    if weight.dim() != 3:
+        raise ValueError("flatten_pack5_weight_inplace_ expects [expert, n, k]")
+    experts, n, k = weight.shape
+    if n % PACK5_N256 != 0 or k % PACK5_K64 != 0:
+        raise ValueError(
+            "flatten_pack5_weight_inplace_ expects n divisible by 256 and k divisible by 64"
+        )
+    repacked = _repack_grouped_weight_inplace_(
+        weight,
+        pack5_weight,
+        chunk_experts=chunk_experts,
+        function_name="flatten_pack5_weight_inplace_",
+    )
+    return repacked.reshape(experts, n * k)
+
+
 def pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
     """Pack weights in plain ni order for the isolated normal ASM path."""
     if weight.dim() != 3:
@@ -114,3 +175,28 @@ def pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
 def flatten_pack5_weight_asm_normal(weight: torch.Tensor) -> torch.Tensor:
     packed = pack5_weight_asm_normal(weight)
     return packed.reshape(weight.shape[0], weight.shape[1] * weight.shape[2])
+
+
+def flatten_pack5_weight_asm_normal_inplace_(
+    weight: torch.Tensor,
+    *,
+    chunk_experts: int = 1,
+) -> torch.Tensor:
+    """Repack normal-ASM pack5 weights into their existing storage."""
+    if weight.dim() != 3:
+        raise ValueError(
+            "flatten_pack5_weight_asm_normal_inplace_ expects [expert, n, k]"
+        )
+    experts, n, k = weight.shape
+    if n % PACK5_N256 != 0 or k % PACK5_K64 != 0:
+        raise ValueError(
+            "flatten_pack5_weight_asm_normal_inplace_ expects n divisible by 256 "
+            "and k divisible by 64"
+        )
+    repacked = _repack_grouped_weight_inplace_(
+        weight,
+        pack5_weight_asm_normal,
+        chunk_experts=chunk_experts,
+        function_name="flatten_pack5_weight_asm_normal_inplace_",
+    )
+    return repacked.reshape(experts, n * k)

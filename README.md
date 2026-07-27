@@ -270,6 +270,16 @@ layout dictionary, or the legacy tuple.  The unified mode loads `_UNIFIED_PACK5`
 ASM code objects and is intended as a compatibility path, not the default
 best-performance path.
 
+For post-load conversion when the framework keeps only one packed copy, the
+three production layouts also expose destructive, storage-reusing helpers:
+`flatten_pack5_weight_inplace_()`,
+`flatten_pack5_weight_asm_normal_inplace_()`, and
+`weight8bit_nt_kpack2_marlin_masked_inplace_()`.  They process grouped weights
+in `chunk_experts=1` chunks by default, overwrite independent contiguous input
+storage, and return the final packed-shape view with the same storage pointer.
+The framework must replace its parameter metadata with that returned view; the
+existing non-inplace helpers remain unchanged.
+
 For the DeepSeek-V4-Pro LL performance path, L1 can use the Pro-only masked-K1
 layout while L2 stays on the existing unified pack5 layout.  Like the helpers
 above, these layout transforms take already-quantized FP8 weights plus their

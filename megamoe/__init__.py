@@ -16,8 +16,11 @@ from .dcu_megamoe_opt.v3_config import (
     staged_pack5_shape_supported,
 )
 from .dcu_megamoe_opt.v3_layout import (
+    _repack_grouped_weight_inplace_,
     flatten_pack5_weight,
+    flatten_pack5_weight_inplace_,
     flatten_pack5_weight_asm_normal,
+    flatten_pack5_weight_asm_normal_inplace_,
 )
 
 
@@ -355,6 +358,54 @@ def weight8bit_nt_kpack2_marlin_masked(
         .contiguous()
         .reshape(num_groups, rows // k_tile, k * k_tile)
     )
+
+
+def weight8bit_nt_kpack2_marlin_masked_inplace_(
+    weight: torch.Tensor,
+    k_tile: int = 16,
+    k_tile_group: int = 4,
+    n_tile: int = 16,
+    n_tile_group: int = 16,
+    *,
+    chunk_experts: int = 1,
+) -> torch.Tensor:
+    """Repack masked Marlin weights into their existing storage.
+
+    Grouped 3D weights are processed in expert chunks. The 2D form is accepted
+    for API parity, but it is necessarily processed as one group.
+    """
+    if weight.dim() not in (2, 3):
+        raise ValueError(
+            "weight8bit_nt_kpack2_marlin_masked_inplace_ expects a 2D or 3D tensor"
+        )
+    if k_tile != 16 or k_tile_group != 4 or n_tile != 16 or n_tile_group != 16:
+        raise ValueError(
+            "DCU masked DeepGEMM currently supports only 16x4 by 16x16 kpack2 tiles"
+        )
+
+    original_dim = weight.dim()
+    grouped_weight = weight.unsqueeze(0) if original_dim == 2 else weight
+    num_groups, rows, k = grouped_weight.shape
+    if rows % (n_tile * n_tile_group) != 0 or k % (k_tile * k_tile_group) != 0:
+        raise ValueError(
+            "masked Marlin weights require rows divisible by 256 and K divisible by 64"
+        )
+
+    repacked = _repack_grouped_weight_inplace_(
+        grouped_weight,
+        lambda chunk: weight8bit_nt_kpack2_marlin_masked(
+            chunk,
+            k_tile=k_tile,
+            k_tile_group=k_tile_group,
+            n_tile=n_tile,
+            n_tile_group=n_tile_group,
+        ),
+        chunk_experts=chunk_experts,
+        function_name="weight8bit_nt_kpack2_marlin_masked_inplace_",
+    )
+    if original_dim == 2:
+        return repacked.reshape(rows // k_tile, k * k_tile)
+    return repacked.reshape(num_groups, rows // k_tile, k * k_tile)
 
 
 def get_mega_moe_hip_build_config():
@@ -936,12 +987,15 @@ __all__ = [
     "weight8bit_nt_kpack2_marlin",
     "weight8bit_nt_kpack2_marlin_contiguous_k64n16",
     "weight8bit_nt_kpack2_marlin_masked",
+    "weight8bit_nt_kpack2_marlin_masked_inplace_",
     "get_mega_moe_hip_build_config",
     "get_symm_buffer_for_mega_moe",
     "transform_fp8_weights_for_masked_deepgemm",
     "transform_fp8_weights_for_mega_moe_pro_ll_masked_k1",
     "flatten_pack5_weight",
+    "flatten_pack5_weight_inplace_",
     "flatten_pack5_weight_asm_normal",
+    "flatten_pack5_weight_asm_normal_inplace_",
     "deepep_deepgemm_preprocess_channelwise",
     "deepep_deepgemm_postprocess_channelwise",
     "fp8_mega_moe",

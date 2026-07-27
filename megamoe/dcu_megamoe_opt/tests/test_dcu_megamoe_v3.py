@@ -166,6 +166,65 @@ def test_v3_pack5_layout_matches_reference():
     assert not torch.equal(v3_layout.pack5_weight(weight), reference_plain_pack5_weight(weight))
 
 
+def test_v3_pack5_inplace_layouts_match_out_of_place():
+    v3_layout = load_module("dcu_megamoe_v3_layout_inplace", V3_LAYOUT_PATH)
+    weight = torch.arange(3 * 512 * 128, dtype=torch.int32).reshape(3, 512, 128)
+
+    expected_ll = v3_layout.flatten_pack5_weight(weight)
+    inplace_ll_input = weight.clone()
+    ll_storage_ptr = inplace_ll_input.untyped_storage().data_ptr()
+    actual_ll = v3_layout.flatten_pack5_weight_inplace_(
+        inplace_ll_input,
+        chunk_experts=1,
+    )
+    torch.testing.assert_close(actual_ll, expected_ll)
+    assert actual_ll.untyped_storage().data_ptr() == ll_storage_ptr
+    assert inplace_ll_input.untyped_storage().data_ptr() == ll_storage_ptr
+
+    expected_normal = v3_layout.flatten_pack5_weight_asm_normal(weight)
+    inplace_normal_input = weight.clone()
+    normal_storage_ptr = inplace_normal_input.untyped_storage().data_ptr()
+    actual_normal = v3_layout.flatten_pack5_weight_asm_normal_inplace_(
+        inplace_normal_input,
+        chunk_experts=2,
+    )
+    torch.testing.assert_close(actual_normal, expected_normal)
+    assert actual_normal.untyped_storage().data_ptr() == normal_storage_ptr
+    assert inplace_normal_input.untyped_storage().data_ptr() == normal_storage_ptr
+
+    oversized_storage = torch.empty(4 * 512 * 128, dtype=torch.uint8)
+    shared_view = oversized_storage[: 3 * 512 * 128].reshape(3, 512, 128)
+    with pytest.raises(ValueError, match="independent storage"):
+        v3_layout.flatten_pack5_weight_inplace_(shared_view)
+
+
+def test_public_inplace_weight_layouts_match_out_of_place():
+    import megamoe
+
+    weight = torch.arange(3 * 512 * 128, dtype=torch.int32).reshape(3, 512, 128)
+    cases = (
+        (
+            megamoe.flatten_pack5_weight,
+            megamoe.flatten_pack5_weight_inplace_,
+        ),
+        (
+            megamoe.flatten_pack5_weight_asm_normal,
+            megamoe.flatten_pack5_weight_asm_normal_inplace_,
+        ),
+        (
+            megamoe.weight8bit_nt_kpack2_marlin_masked,
+            megamoe.weight8bit_nt_kpack2_marlin_masked_inplace_,
+        ),
+    )
+    for out_of_place, inplace in cases:
+        expected = out_of_place(weight)
+        target = weight.clone()
+        storage_ptr = target.untyped_storage().data_ptr()
+        actual = inplace(target, chunk_experts=1)
+        torch.testing.assert_close(actual, expected)
+        assert actual.untyped_storage().data_ptr() == storage_ptr
+
+
 def test_v3_build_surface_is_minimal_and_explicit():
     setup_source = SETUP_PATH.read_text(encoding="utf-8")
 
@@ -901,7 +960,9 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "capacity_num_tokens: Optional[int] = None" in api_source
     assert "from .dcu_megamoe_opt.v3_layout import" in api_source
     assert "flatten_pack5_weight" in api_source
+    assert "flatten_pack5_weight_inplace_" in api_source
     assert "flatten_pack5_weight_asm_normal" in api_source
+    assert "flatten_pack5_weight_asm_normal_inplace_" in api_source
     assert "def mega_moe_pre_dispatch(" in api_source
     assert "num_tokens: int" in api_source
     assert 'm.def("mega_moe_pre_dispatch"' in c_api_source
@@ -915,6 +976,7 @@ def test_public_capacity_token_and_graph_backend_contract_is_explicit():
     assert "__builtin_hcu_cvt_f32_bf16" in c_kernel_source
     assert "lightop" not in api_source
     assert "weight8bit_nt_kpack2_marlin_masked" in api_source
+    assert "weight8bit_nt_kpack2_marlin_masked_inplace_" in api_source
     assert "transform_fp8_weights_for_mega_moe_pro_ll_masked_k1" in api_source
     old_pro_helper = (
         "transform_fp8_weights_for_mega_moe_v3_" "pro_ll_masked_k1"
